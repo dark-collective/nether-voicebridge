@@ -1,0 +1,8 @@
+/target/
+
+# Real secrets — never commit. Only config.example.toml (placeholders) is tracked.
+config.toml
+config.local.toml
+*.secret.toml
+.env
+.env.*
