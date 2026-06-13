@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
+mod capture;
 mod config;
 mod discord;
 mod matrix;
@@ -27,10 +29,27 @@ async fn main() -> Result<()> {
 
     cfg.log_redacted_summary();
 
+    // The CaptureSink is shared between the Discord task and the Ctrl-C handler.
+    let sink = Arc::new(capture::CaptureSink::new());
+
+    // Ctrl-C handler: finalise all WAV files so headers are correct.
+    {
+        let sink = Arc::clone(&sink);
+        tokio::spawn(async move {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::warn!(error = %e, "ctrl_c signal handler failed");
+                return;
+            }
+            tracing::info!("shutting down — finalising WAV files");
+            sink.finalize_all();
+            std::process::exit(0);
+        });
+    }
+
     // Run both gateway connections concurrently; propagate the first error.
     tokio::try_join!(
         matrix::run(&cfg.matrix),
-        discord::run(&cfg.discord),
+        discord::run(&cfg.discord, Arc::clone(&sink)),
     )?;
 
     Ok(())
