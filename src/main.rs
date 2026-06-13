@@ -6,6 +6,7 @@ mod capture;
 mod config;
 mod discord;
 mod matrix;
+mod rtc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,6 +33,14 @@ async fn main() -> Result<()> {
     // The CaptureSink is shared between the Discord task and the Ctrl-C handler.
     let sink = Arc::new(capture::CaptureSink::new());
 
+    // Build the Matrix client once; clone it into the sync task and the RTC task.
+    // matrix_sdk::Client is internally Arc-backed, so cloning is cheap.
+    let matrix_client = matrix::build_client(&cfg.matrix).await?;
+
+    // Watch channel: matrix::run signals when the call becomes active / inactive.
+    // rtc::run subscribes and joins / leaves accordingly.
+    let (call_active_tx, call_active_rx) = tokio::sync::watch::channel(false);
+
     // Ctrl-C handler: finalise all WAV files so headers are correct.
     {
         let sink = Arc::clone(&sink);
@@ -46,9 +55,10 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Run both gateway connections concurrently; propagate the first error.
+    // Run all three gateway connections concurrently; propagate the first error.
     tokio::try_join!(
-        matrix::run(&cfg.matrix),
+        matrix::run(matrix_client.clone(), &cfg.matrix, call_active_tx),
+        rtc::run(matrix_client, &cfg.livekit, &cfg.matrix, call_active_rx),
         discord::run(&cfg.discord, Arc::clone(&sink)),
     )?;
 
