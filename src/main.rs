@@ -7,6 +7,11 @@ mod matrix;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Two transitive deps (matrix-sdk via reqwest, serenity via tokio-tungstenite) each
+    // pull in a different rustls crypto provider (aws-lc-rs and ring). rustls panics if
+    // no default is installed before the first TLS connection. Pick ring explicitly.
+    rustls::crypto::ring::default_provider().install_default().ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
