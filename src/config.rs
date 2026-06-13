@@ -29,6 +29,10 @@ pub struct DiscordConfig {
     pub puppet_tokens: Vec<String>,
 }
 
+fn default_store_path() -> String {
+    "./nether-store".to_string()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct MatrixConfig {
     pub homeserver_url: String,
@@ -40,6 +44,9 @@ pub struct MatrixConfig {
     pub access_token: String,
     pub appservice_id: String,
     pub appservice_token: String,
+    /// Path to the matrix-sdk SQLite store (Olm crypto + state). Defaults to ./nether-store.
+    #[serde(default = "default_store_path")]
+    pub store_path: String,
 }
 
 #[derive(Debug, Deserialize)]

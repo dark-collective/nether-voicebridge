@@ -98,6 +98,7 @@ async fn apply_member_event(
 pub async fn build_client(cfg: &MatrixConfig) -> Result<Client> {
     let client = Client::builder()
         .homeserver_url(&cfg.homeserver_url)
+        .sqlite_store(&cfg.store_path, None)
         .build()
         .await?;
 
