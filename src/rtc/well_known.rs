@@ -28,8 +28,11 @@ struct WellKnownClient {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RtcFocus {
     Livekit {
-        /// Alias of the LiveKit room on the SFU.
-        livekit_alias: String,
+        /// Alias of the LiveKit room on the SFU. Optional — some deployments
+        /// (including nether.im) omit it from `.well-known`; callers should
+        /// fall back to the Matrix room ID as the LiveKit room name.
+        #[serde(default)]
+        livekit_alias: Option<String>,
         /// URL of the lk-jwt-service for token exchange.
         livekit_service_url: String,
     },
@@ -39,10 +42,12 @@ enum RtcFocus {
 
 /// Fetch the first LiveKit focus from the homeserver's `.well-known/matrix/client`.
 ///
-/// Returns the alias and lk-jwt-service URL.
+/// `room_id` is used as the LiveKit room alias when the well-known entry
+/// doesn't include `livekit_alias` (which is optional per observed deployments).
 pub async fn discover_livekit_focus(
     client: &reqwest::Client,
     homeserver_url: &str,
+    room_id: &str,
 ) -> Result<LivekitFocusInfo> {
     let url = format!("{homeserver_url}/.well-known/matrix/client");
     let _span = tracing::info_span!("rtc.well_known", %url).entered();
@@ -63,7 +68,10 @@ pub async fn discover_livekit_focus(
         .into_iter()
         .find_map(|f| match f {
             RtcFocus::Livekit { livekit_alias, livekit_service_url } => {
-                Some(LivekitFocusInfo { alias: livekit_alias, service_url: livekit_service_url })
+                Some(LivekitFocusInfo {
+                    alias: livekit_alias.unwrap_or_else(|| room_id.to_owned()),
+                    service_url: livekit_service_url,
+                })
             }
             RtcFocus::Unknown => None,
         })

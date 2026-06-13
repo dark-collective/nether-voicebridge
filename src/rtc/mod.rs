@@ -29,7 +29,7 @@ use crate::config::{LiveKitConfig, MatrixConfig};
 ///   participants join (`true`) or all leave (`false`)
 pub async fn run(
     client: Client,
-    lk_cfg: &LiveKitConfig,
+    _lk_cfg: &LiveKitConfig,
     mx_cfg: &MatrixConfig,
     mut call_active_rx: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -46,17 +46,23 @@ pub async fn run(
     // that the homeserver, lk-jwt-service, and config are all reachable before
     // we ever need to join a call.
 
-    let focus = well_known::discover_livekit_focus(&http, &mx_cfg.homeserver_url).await?;
+    let focus = well_known::discover_livekit_focus(&http, &mx_cfg.homeserver_url, &mx_cfg.room_id).await?;
     let openid_token = openid::get_openid_token(&client).await?;
 
     // The "room" name for the LiveKit room. Element Call uses the Matrix room ID.
     let room_name = mx_cfg.room_id.as_str();
 
+    let user_id = client
+        .user_id()
+        .ok_or_else(|| anyhow::anyhow!("Matrix client not authenticated"))?
+        .to_string();
+
     let jwt_resp = lk_jwt::fetch_livekit_token(
         &http,
-        &lk_cfg.lk_jwt_url,
-        room_name,
-        &mx_cfg.device_id,
+        &focus.service_url,
+        room_name,           // room_id
+        &mx_cfg.device_id,  // slot_id
+        &user_id,
         &openid_token,
     )
     .await?;

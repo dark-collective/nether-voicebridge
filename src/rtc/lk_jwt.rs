@@ -3,20 +3,32 @@
 //! lk-jwt-service accepts a Matrix OpenID token and returns a LiveKit JWT
 //! that can be used to connect to the SFU's LiveKit room.
 //!
-//! Endpoint: `POST {lk_jwt_url}/sfu/get`
-//! Body:  `{ "device_id": "...", "room": "...", "openid_token": { ... } }`
+//! Endpoint: `POST {livekit_service_url}/sfu/get`
+//! Body:  `{ "room_id": "...", "slot_id": "...", "openid_token": { ... } }`
 //! Response: `{ "jwt": "<token>", "url": "wss://..." }`  (jwt also aliased as "token")
+//!
+//! The server verifies the openid_token with the Matrix homeserver to determine
+//! the caller's identity — no separate `member` field is needed in the request.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::rtc::openid::OpenIdToken;
 
-/// Request body for `POST {lk_jwt_url}/sfu/get`.
+/// The `member` sub-object identifying the calling participant.
+#[derive(Debug, Serialize)]
+struct Member<'a> {
+    id: &'a str,
+    claimed_user_id: &'a str,
+    claimed_device_id: &'a str,
+}
+
+/// Request body for `POST {livekit_service_url}/sfu/get`.
 #[derive(Debug, Serialize)]
 struct LkJwtRequest<'a> {
-    device_id: &'a str,
-    room: &'a str,
+    room_id: &'a str,
+    slot_id: &'a str,
+    member: Member<'a>,
     openid_token: &'a OpenIdToken,
 }
 
@@ -32,34 +44,43 @@ pub struct LkJwtResponse {
     pub url: String,
 }
 
-/// Fetch a LiveKit JWT for the given `room` from lk-jwt-service.
+/// Fetch a LiveKit JWT for the given room from the SFU's lk-jwt-service.
 ///
-/// `lk_jwt_url` — base URL of the lk-jwt-service (e.g. `https://lk-jwt.nether.im`)
-/// `room`       — the LiveKit room name / alias
-/// `device_id`  — the Matrix device id of the joining participant
+/// `service_url` — `livekit_service_url` from the `.well-known` focus entry
+/// `room_id`     — the Matrix room ID (used as the LiveKit room name)
+/// `slot_id`     — the participant slot identifier (Matrix device ID)
+/// `user_id`     — the bot's Matrix user ID
 /// `openid_token` — a freshly-minted Matrix OpenID token
 pub async fn fetch_livekit_token(
     client: &reqwest::Client,
-    lk_jwt_url: &str,
-    room: &str,
-    device_id: &str,
+    service_url: &str,
+    room_id: &str,
+    slot_id: &str,
+    user_id: &str,
     openid_token: &OpenIdToken,
 ) -> Result<LkJwtResponse> {
-    let url = format!("{lk_jwt_url}/sfu/get");
-    let _span = tracing::info_span!("rtc.lk_jwt", %url, %room).entered();
+    let url = format!("{service_url}/sfu/get");
+    let _span = tracing::info_span!("rtc.lk_jwt", %url, %room_id).entered();
 
-    let body = LkJwtRequest { device_id, room, openid_token };
+    let member = Member { id: slot_id, claimed_user_id: user_id, claimed_device_id: slot_id };
+    let body = LkJwtRequest { room_id, slot_id, member, openid_token };
 
-    let resp: LkJwtResponse = client
+    let raw = client
         .post(&url)
         .json(&body)
         .send()
         .await
-        .with_context(|| format!("POST {url}"))?
-        .error_for_status()
-        .with_context(|| format!("POST {url} returned error status"))?
-        .json()
-        .await
+        .with_context(|| format!("POST {url}"))?;
+
+    let status = raw.status();
+    let bytes = raw.bytes().await.with_context(|| format!("reading body from {url}"))?;
+
+    if !status.is_success() {
+        let body_text = String::from_utf8_lossy(&bytes);
+        anyhow::bail!("POST {url} returned {status}: {body_text}");
+    }
+
+    let resp: LkJwtResponse = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing lk-jwt JSON response from {url}"))?;
 
     // Log the SFU URL; never log the JWT itself (it is a bearer credential).
