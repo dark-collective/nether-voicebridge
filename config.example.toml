@@ -44,6 +44,12 @@ room_id = "!yourroomid:nether.im"
 # MXID of the bridge bot account you created on nether.im.
 bot_user_id = "@voicebridge:nether.im"
 
+# Device ID associated with the access token below.
+# To find it: Element (logged in as the bot) → Settings → Help & About → "Session ID",
+# or call GET /_matrix/client/v3/account/whoami (returns { device_id: "..." }).
+# Must match the token — matrix-sdk uses this to restore the session correctly.
+device_id = "ABCDEFGHIJ"
+
 # Access token for the bot account.
 # Element (logged in as the bot): Settings → Help & About → Access Token
 # Or via the Matrix /_matrix/client/v3/login API.

@@ -34,6 +34,9 @@ pub struct MatrixConfig {
     pub homeserver_url: String,
     pub room_id: String,
     pub bot_user_id: String,
+    /// The device ID associated with the access_token (from /_matrix/client/v3/account/whoami
+    /// or recorded when the token was minted). Required by matrix-sdk to restore a session.
+    pub device_id: String,
     pub access_token: String,
     pub appservice_id: String,
     pub appservice_token: String,
@@ -65,6 +68,7 @@ impl Config {
             matrix_homeserver_url = %self.matrix.homeserver_url,
             matrix_room_id = %self.matrix.room_id,
             matrix_bot_user_id = %self.matrix.bot_user_id,
+            matrix_device_id = %self.matrix.device_id,
             matrix_access_token = "[redacted]",
             matrix_appservice_id = %self.matrix.appservice_id,
             matrix_appservice_token = "[redacted]",
@@ -94,6 +98,7 @@ puppet_tokens = ["Bot def", "Bot ghi"]
 homeserver_url = "https://nether.im"
 room_id = "!room:nether.im"
 bot_user_id = "@bridge:nether.im"
+device_id = "BRIDGE01"
 access_token = "syt_tok"
 appservice_id = "voicebridge"
 appservice_token = "hs_tok"

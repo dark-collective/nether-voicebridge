@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
 
 mod config;
+mod discord;
+mod matrix;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,6 +21,12 @@ async fn main() -> Result<()> {
         .with_context(|| format!("loading config from {config_path}"))?;
 
     cfg.log_redacted_summary();
+
+    // Run both gateway connections concurrently; propagate the first error.
+    tokio::try_join!(
+        matrix::run(&cfg.matrix),
+        discord::run(&cfg.discord),
+    )?;
 
     Ok(())
 }
