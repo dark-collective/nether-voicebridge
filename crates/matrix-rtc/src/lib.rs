@@ -39,7 +39,13 @@ pub async fn run(
     let (call_active_tx, call_active_rx) = watch::channel(false);
 
     tokio::try_join!(
-        matrix::run(client.clone(), matrix_cfg, call_active_tx, bridge.clone()),
+        matrix::run(
+            client.clone(),
+            matrix_cfg,
+            call_active_tx,
+            router.clone(),
+            bridge.clone(),
+        ),
         rtc::run(
             client,
             livekit_cfg,

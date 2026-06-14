@@ -5,7 +5,7 @@ use matrix_sdk::{
     config::SyncSettings,
     deserialized_responses::SyncOrStrippedState,
     ruma::{
-        MilliSecondsSinceUnixEpoch, OwnedUserId, RoomId,
+        MilliSecondsSinceUnixEpoch, OwnedUserId, RoomId, UserId,
         events::{
             SyncStateEvent,
             call::member::{CallMemberEventContent, SyncCallMemberEvent},
@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, watch};
 use tracing::Instrument;
 
+use nvb_audio::routing::PlaybackRouter;
 use nvb_config::MatrixConfig;
 
 /// Live participants: (sender user_id, state_key) pairs.
@@ -39,10 +40,35 @@ fn log_snapshot(set: &HashSet<(OwnedUserId, String)>) {
     tracing::info!(participants = ?users, count = users.len(), "call participants");
 }
 
+/// Derive the LiveKit participant identity `{mxid}:{device}` from a call-member
+/// `(user_id, state_key)`. Modern Element Call state keys are
+/// `_{mxid}_{device}_m.call`; the device is the final `_`-delimited segment (the
+/// mxid may itself contain `_`, but the device never does, so `rsplit_once`
+/// recovers it). Returns `None` for legacy `{mxid}` keys (no device → cannot
+/// correlate to an RTC participant, so no dedicated puppet).
+fn member_identity(user_id: &UserId, state_key: &str) -> Option<String> {
+    let inner = state_key.strip_prefix('_')?.strip_suffix("_m.call")?;
+    let device = inner.rsplit_once('_').map(|(_, d)| d)?;
+    Some(format!("{}:{}", user_id.as_str(), device))
+}
+
+/// Resolve a Matrix member's display name from room state; falls back to the MXID.
+async fn resolve_member_name(room: &Room, user_id: &UserId) -> String {
+    match room.get_member(user_id).await {
+        Ok(Some(m)) => m
+            .display_name()
+            .map(str::to_owned)
+            .unwrap_or_else(|| user_id.to_string()),
+        _ => user_id.to_string(),
+    }
+}
+
 /// Apply a single call-member event (from sync or initial state scan) to the
-/// participant set, then log. Handles echo-exclusion for the bridge bot.
-/// Returns `true` if the call transitioned from no-humans to some-humans
-/// (call became active), or `false` if nothing changed regarding call activity.
+/// participant set, raise call-active transitions, and drive the per-participant
+/// puppet **presence** off membership (constraint: one Discord bot per Matrix
+/// call participant, present even when muted/not transmitting). Echo-excludes the
+/// bridge bot itself.
+#[allow(clippy::too_many_arguments)]
 async fn apply_member_event(
     user_id: OwnedUserId,
     state_key: String,
@@ -51,6 +77,8 @@ async fn apply_member_event(
     bot_user_id: &OwnedUserId,
     participants: &ParticipantSet,
     call_active_tx: &watch::Sender<bool>,
+    room: &Room,
+    router: &Arc<dyn PlaybackRouter>,
 ) {
     if &user_id == bot_user_id {
         return; // echo-exclusion: bridge bot's own call membership never counted
@@ -61,33 +89,45 @@ async fn apply_member_event(
         c => !c.active_memberships(Some(ts)).is_empty(),
     };
 
-    let mut set = participants.lock().await;
-    let prev_users = set
-        .iter()
-        .map(|(u, _)| u)
-        .collect::<HashSet<_>>()
-        .len();
+    // Only act on a real membership transition (insert/remove returning true), so
+    // periodic m.call.member refreshes don't re-resolve names or re-assign.
+    let changed;
+    {
+        let mut set = participants.lock().await;
+        let prev_users = set.iter().map(|(u, _)| u).collect::<HashSet<_>>().len();
+        let entry = (user_id.clone(), state_key.clone());
+        changed = if is_active {
+            set.insert(entry)
+        } else {
+            set.remove(&entry)
+        };
+        let new_users = set.iter().map(|(u, _)| u).collect::<HashSet<_>>().len();
 
-    if is_active {
-        set.insert((user_id, state_key));
-    } else {
-        set.remove(&(user_id, state_key));
+        if prev_users == 0 && new_users > 0 {
+            tracing::info!("call active");
+            let _ = call_active_tx.send(true);
+        } else if prev_users > 0 && new_users == 0 {
+            tracing::info!("call ended");
+            let _ = call_active_tx.send(false);
+        }
+        log_snapshot(&set);
     }
 
-    let new_users = set
-        .iter()
-        .map(|(u, _)| u)
-        .collect::<HashSet<_>>()
-        .len();
-
-    if prev_users == 0 && new_users > 0 {
-        tracing::info!("call active");
-        let _ = call_active_tx.send(true);
-    } else if prev_users > 0 && new_users == 0 {
-        tracing::info!("call ended");
-        let _ = call_active_tx.send(false);
+    // Membership owns puppet presence: a member joining gets a (present, possibly
+    // silent) named puppet; leaving releases it. Audio + mute are driven
+    // separately by the LiveKit track in `rtc::session`.
+    if changed {
+        if let Some(key) = member_identity(&user_id, &state_key) {
+            if is_active {
+                let name = resolve_member_name(room, &user_id).await;
+                tracing::info!(identity = %key, display_name = %name, "member joined — assigning puppet");
+                router.assign(&key, &name);
+            } else {
+                tracing::info!(identity = %key, "member left — releasing puppet");
+                router.release(&key);
+            }
+        }
     }
-    log_snapshot(&set);
 }
 
 /// Build and authenticate a Matrix client from config. Joins the target room,
@@ -139,6 +179,7 @@ pub(crate) async fn run(
     client: Client,
     cfg: &MatrixConfig,
     call_active_tx: watch::Sender<bool>,
+    router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
 ) -> Result<()> {
     let bot_user_id: OwnedUserId = cfg.bot_user_id.parse()?;
@@ -153,10 +194,12 @@ pub(crate) async fn run(
         // matrix-sdk dispatches this handler from its own sync task, which does
         // not inherit the bridge span — re-establish it for per-bridge logs.
         let bridge = bridge.clone();
-        client.add_event_handler(move |ev: SyncCallMemberEvent, _room: Room| {
+        let router = router.clone();
+        client.add_event_handler(move |ev: SyncCallMemberEvent, room: Room| {
             let participants = participants.clone();
             let bot_user_id = bot_user_id.clone();
             let call_active_tx = call_active_tx.clone();
+            let router = router.clone();
             let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
             async move {
                 let Some(orig) = ev.as_original() else { return };
@@ -171,6 +214,8 @@ pub(crate) async fn run(
                     &bot_user_id,
                     &participants,
                     &call_active_tx,
+                    &room,
+                    &router,
                 )
                 .await;
             }
@@ -200,6 +245,8 @@ pub(crate) async fn run(
                 &bot_user_id,
                 &participants,
                 &call_active_tx,
+                &room,
+                &router,
             )
             .await;
         }

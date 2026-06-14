@@ -274,8 +274,11 @@ async fn playback_consumer(
         }
     }
 
-    router.release(&key);
-    tracing::info!(track = %key, "playback consumer ended");
+    // Track end does NOT release the puppet — call *membership* (matrix::run)
+    // owns presence now, so a member who stops transmitting keeps their bot
+    // (present, silent). We simply stop feeding; the mixer drains to silence.
+    // Explicit mute is handled by TrackMuted/TrackUnmuted, not inferred here.
+    tracing::info!(track = %key, "playback consumer ended (puppet kept; membership owns release)");
 }
 
 /// Drain LiveKit room events: log for observability, and route subscribed audio
