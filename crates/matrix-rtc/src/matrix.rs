@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{Mutex, watch};
 
-use crate::config::MatrixConfig;
+use nvb_config::MatrixConfig;
 
 /// Live participants: (sender user_id, state_key) pairs.
 ///
@@ -93,9 +93,9 @@ async fn apply_member_event(
 /// runs one sync round to populate the local state store, and returns the
 /// ready client.
 ///
-/// This is kept separate from `run()` so `main` can clone the client into the
-/// RTC task before starting the perpetual sync loop.
-pub async fn build_client(cfg: &MatrixConfig) -> Result<Client> {
+/// This is kept separate from `run()` so the crate's `run()` can clone the
+/// client into the RTC task before starting the perpetual sync loop.
+pub(crate) async fn build_client(cfg: &MatrixConfig) -> Result<Client> {
     let client = Client::builder()
         .homeserver_url(&cfg.homeserver_url)
         .build()
@@ -132,7 +132,7 @@ pub async fn build_client(cfg: &MatrixConfig) -> Result<Client> {
 /// `build_client`. Drives the `SyncCallMemberEvent` handler and sends
 /// call-active signals through `call_active_tx` when the first human
 /// joins or the last human leaves.
-pub async fn run(
+pub(crate) async fn run(
     client: Client,
     cfg: &MatrixConfig,
     call_active_tx: watch::Sender<bool>,

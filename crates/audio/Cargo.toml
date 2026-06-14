@@ -1,0 +1,14 @@
+[package]
+name = "nvb-audio"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "nvb_audio"
+path = "src/lib.rs"
+
+# SDK-free PCM core: no songbird/livekit/matrix-sdk/tokio. `hound`/`anyhow` are
+# only for the WAV file-in/out test harness (wav.rs).
+[dependencies]
+hound = { workspace = true }
+anyhow = { workspace = true }

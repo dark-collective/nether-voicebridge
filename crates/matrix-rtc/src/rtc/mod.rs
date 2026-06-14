@@ -40,9 +40,9 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
 
-use crate::audio::jitter::JitterBuffer;
-use crate::audio::mixer::PlaybackMixer;
-use crate::config::{LiveKitConfig, MatrixConfig};
+use nvb_audio::jitter::JitterBuffer;
+use nvb_audio::mixer::PlaybackMixer;
+use nvb_config::{LiveKitConfig, MatrixConfig};
 use keys::CallEncryptionKeysEventContent;
 use well_known::LivekitFocusInfo;
 
@@ -119,7 +119,7 @@ async fn audio_consumer(
                     tracing::debug!(
                         depth = jitter.depth_samples(),
                         target = jitter.target_samples(),
-                        level_db = format_args!("{:.1}", crate::audio::rms_dbfs(&frame20)),
+                        level_db = format_args!("{:.1}", nvb_audio::rms_dbfs(&frame20)),
                         "jitter buffer depth / inbound level"
                     );
                 }
@@ -150,7 +150,7 @@ async fn audio_consumer(
 /// * `lk_cfg` — LiveKit / lk-jwt config from TOML
 /// * `mx_cfg`  — Matrix config (bot user_id + device_id + room_id)
 /// * `call_active_rx` — watch receiver: `true` when humans are in the call
-pub async fn run(
+pub(crate) async fn run(
     client: Client,
     lk_cfg: &LiveKitConfig,
     mx_cfg: &MatrixConfig,

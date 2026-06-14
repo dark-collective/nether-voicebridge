@@ -1,0 +1,19 @@
+[package]
+name = "nether-voicebridge"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nether-voicebridge"
+path = "src/main.rs"
+
+[dependencies]
+nvb-config = { workspace = true }
+nvb-audio = { workspace = true }
+nvb-discord = { workspace = true }
+nvb-matrix-rtc = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rustls = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name = "nvb-discord"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "nvb_discord"
+path = "src/lib.rs"
+
+[dependencies]
+nvb-audio = { workspace = true }
+nvb-config = { workspace = true }
+serenity = { workspace = true }
+songbird = { workspace = true }
+symphonia = { workspace = true }
+hound = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+tracing = { workspace = true }
+anyhow = { workspace = true }

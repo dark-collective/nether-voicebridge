@@ -2,12 +2,8 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
-mod audio;
-mod capture;
-mod config;
-mod discord;
-mod matrix;
-mod rtc;
+use nvb_audio::mixer::PlaybackMixer;
+use nvb_discord::CaptureSink;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,35 +12,31 @@ async fn main() -> Result<()> {
     // no default is installed before the first TLS connection. Pick ring explicitly.
     rustls::crypto::ring::default_provider().install_default().ok();
 
+    // Default filter enables info for every workspace crate. The split moved the
+    // log targets from `nether_voicebridge` to per-crate names (`nvb_audio`,
+    // `nvb_discord`, `nvb_matrix_rtc`, `nvb_config`), so RUST_LOG now targets
+    // those — e.g. `RUST_LOG=nvb_discord=debug,nvb_matrix_rtc=debug`.
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("nether_voicebridge=info")),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(
+                "nether_voicebridge=info,nvb_audio=info,nvb_discord=info,\
+                 nvb_matrix_rtc=info,nvb_config=info",
+            )
+        }))
         .init();
 
     let config_path =
         std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
 
-    let cfg = config::Config::load(&config_path)
+    let cfg = nvb_config::Config::load(&config_path)
         .with_context(|| format!("loading config from {config_path}"))?;
 
     cfg.log_redacted_summary();
 
     // Optional WAV capture (Phase 3 debugging artifact), off unless configured.
     // When enabled it is shared between the Discord task and the Ctrl-C handler.
-    let capture_sink: Option<Arc<capture::CaptureSink>> = cfg
-        .discord
-        .capture_wav
-        .then(|| Arc::new(capture::CaptureSink::new()));
-
-    // Build the Matrix client once; clone it into the sync task and the RTC task.
-    // matrix_sdk::Client is internally Arc-backed, so cloning is cheap.
-    let matrix_client = matrix::build_client(&cfg.matrix).await?;
-
-    // Watch channel: matrix::run signals when the call becomes active / inactive.
-    // rtc::run subscribes and joins / leaves accordingly.
-    let (call_active_tx, call_active_rx) = tokio::sync::watch::channel(false);
+    let capture_sink: Option<Arc<CaptureSink>> =
+        cfg.discord.capture_wav.then(|| Arc::new(CaptureSink::new()));
 
     // Audio forward path: Discord capture → RTC publish. 20 ms mono frames.
     // Bounded; the Discord side drops on a full channel (real-time audio).
@@ -53,7 +45,7 @@ async fn main() -> Result<()> {
     // Reverse path: Matrix (LiveKit) → Discord playback. Per-participant jitter
     // buffers mixed to one mono stream; shared by the RTC consumers (producers)
     // and the Discord playback source (consumer).
-    let playback = Arc::new(audio::mixer::PlaybackMixer::new());
+    let playback = Arc::new(PlaybackMixer::new());
 
     // Ctrl-C handler: finalise WAV files (if capturing) so headers are correct.
     {
@@ -72,18 +64,11 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Run all three gateway connections concurrently; propagate the first error.
+    // Run the Matrix side (sync + RTC) and the Discord side concurrently;
+    // propagate the first error.
     tokio::try_join!(
-        matrix::run(matrix_client.clone(), &cfg.matrix, call_active_tx),
-        rtc::run(
-            matrix_client,
-            &cfg.livekit,
-            &cfg.matrix,
-            call_active_rx,
-            audio_rx,
-            playback.clone(),
-        ),
-        discord::run(&cfg.discord, audio_tx, capture_sink.clone(), playback),
+        nvb_matrix_rtc::run(&cfg.matrix, &cfg.livekit, audio_rx, playback.clone()),
+        nvb_discord::run(&cfg.discord, audio_tx, capture_sink.clone(), playback),
     )?;
 
     Ok(())

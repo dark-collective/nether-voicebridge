@@ -3099,24 +3099,12 @@ name = "nether-voicebridge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
- "base64 0.22.1",
- "futures-util",
- "hound",
- "livekit",
- "matrix-sdk",
- "rand 0.8.6",
- "reqwest 0.12.28",
+ "nvb-audio",
+ "nvb-config",
+ "nvb-discord",
+ "nvb-matrix-rtc",
  "rustls 0.23.40",
- "serde",
- "serde_json",
- "serenity",
- "songbird",
- "symphonia",
- "thiserror 2.0.18",
  "tokio",
- "tokio-util",
- "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3256,6 +3244,60 @@ checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
 dependencies = [
  "hermit-abi",
  "libc",
+]
+
+[[package]]
+name = "nvb-audio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hound",
+]
+
+[[package]]
+name = "nvb-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
+ "tracing",
+]
+
+[[package]]
+name = "nvb-discord"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hound",
+ "nvb-audio",
+ "nvb-config",
+ "serenity",
+ "songbird",
+ "symphonia",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "nvb-matrix-rtc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "futures-util",
+ "livekit",
+ "matrix-sdk",
+ "nvb-audio",
+ "nvb-config",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

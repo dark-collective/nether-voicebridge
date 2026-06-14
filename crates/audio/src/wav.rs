@@ -57,7 +57,7 @@ pub fn write_wav_mono_48k(path: &str, samples: &[i16]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::{jitter::JitterBuffer, mix_mono, rms_dbfs, SAMPLES_20MS};
+    use crate::{jitter::JitterBuffer, mix_mono, rms_dbfs, SAMPLES_20MS};
 
     /// Build a temp path under the OS temp dir (no Date/rand: use the test name).
     fn tmp(name: &str) -> String {

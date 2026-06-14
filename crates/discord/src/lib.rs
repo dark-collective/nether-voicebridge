@@ -21,7 +21,11 @@ use std::{
 };
 use tokio::sync::{mpsc, Mutex};
 
-use crate::{audio, audio::mixer::PlaybackMixer, capture::CaptureSink, config::DiscordConfig};
+pub mod capture;
+pub use capture::CaptureSink;
+
+use nvb_audio::{self as audio, mixer::PlaybackMixer};
+use nvb_config::DiscordConfig;
 
 /// Output sample rate / channel layout for the Discord playback track. We hand
 /// songbird mono 48 kHz f32 PCM and let it upmix to stereo and Opus-encode.

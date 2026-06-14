@@ -36,6 +36,12 @@ pub struct CaptureSink {
     inner: Mutex<HashMap<u32, SsrcState>>,
 }
 
+impl Default for CaptureSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CaptureSink {
     pub fn new() -> Self {
         Self {

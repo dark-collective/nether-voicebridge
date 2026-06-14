@@ -21,7 +21,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 use livekit::RoomEvent;
 
-use crate::audio::mixer::PlaybackMixer;
+use nvb_audio::mixer::PlaybackMixer;
 
 /// Sample rate / channel count we ask libwebrtc to resample inbound tracks to.
 /// 48 kHz mono matches the playback path (songbird upmixes mono → stereo).
@@ -184,7 +184,7 @@ async fn playback_consumer(
             frame = stream.next() => match frame {
                 Some(f) => {
                     frames += 1;
-                    peak_db = peak_db.max(crate::audio::rms_dbfs(&f.data));
+                    peak_db = peak_db.max(nvb_audio::rms_dbfs(&f.data));
                     if frames == 1 {
                         tracing::info!(
                             track = %key,

@@ -1,10 +1,19 @@
-[package]
-name = "nether-voicebridge"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = [
+    "crates/config",
+    "crates/audio",
+    "crates/discord",
+    "crates/matrix-rtc",
+    "crates/bridge",
+]
 
-[dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+# Shared dependency versions. The pinned, version-sensitive crates (songbird for
+# DAVE, livekit for E2EE/frame crypto — see CLAUDE.md constraint #7) live here so
+# every member resolves the exact same release. Per-crate manifests reference
+# these with `{ workspace = true }` and add only the features they need.
+[workspace.dependencies]
+tokio = { version = "1" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"
@@ -23,11 +32,15 @@ livekit = { version = "0.7.34", default-features = false, features = ["tokio", "
 base64 = "0.22"
 rand = "0.8"
 tokio-util = { version = "0.7", features = ["rt"] }
-# StreamExt for draining LiveKit's NativeAudioStream on the Matrix → Discord path.
 futures-util = { version = "0.3", default-features = false }
 # Enables symphonia's PCM (f32) decoder in the SAME symphonia crate songbird
-# compiles (via Cargo feature unification). songbird depends on symphonia with
-# default-features = false and registers no codecs, so its RawAdapter live-PCM
-# path fails to promote ("no compatible track found") without this. Pinned to
-# match songbird 0.6's symphonia 0.5.x.
+# compiles (Cargo feature unification). Without it, songbird's RawAdapter live-PCM
+# path fails to promote ("no compatible track found"). Matches songbird 0.6's
+# symphonia 0.5.x.
 symphonia = { version = "0.5", default-features = false, features = ["pcm"] }
+
+# Internal crates.
+nvb-config = { path = "crates/config" }
+nvb-audio = { path = "crates/audio" }
+nvb-discord = { path = "crates/discord" }
+nvb-matrix-rtc = { path = "crates/matrix-rtc" }
