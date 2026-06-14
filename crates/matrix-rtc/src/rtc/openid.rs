@@ -10,8 +10,10 @@ use matrix_sdk::ruma::api::client::account::request_openid_token;
 /// A Matrix OpenID token ready to forward to lk-jwt-service.
 ///
 /// Field names and types match the Matrix spec wire format so the struct
-/// can be serialised directly into the lk-jwt-service request JSON.
-#[derive(Debug, Clone, serde::Serialize)]
+/// can be serialised directly into the lk-jwt-service request JSON — and
+/// deserialised straight from the `/openid/request_token` response (Phase 8
+/// ghosts fetch theirs via raw CS-API, not matrix-sdk).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OpenIdToken {
     pub access_token: String,
     pub token_type: String,

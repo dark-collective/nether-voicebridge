@@ -69,8 +69,10 @@ pub async fn fetch_livekit_token(
     device_id: &str,
     openid_token: &OpenIdToken,
 ) -> Result<LkJwtResponse> {
+    // NOTE: do not hold an `.entered()` span guard across the awaits below — it
+    // would make this future `!Send`, and Phase 8 calls this from a spawned
+    // (Send-required) ghost task. The `url`/`room_id` context is logged inline.
     let url = format!("{service_url}/sfu/get");
-    let _span = tracing::info_span!("rtc.lk_jwt", %url, %room_id).entered();
 
     let body = LegacyLkJwtRequest { room: room_id, device_id, openid_token };
 

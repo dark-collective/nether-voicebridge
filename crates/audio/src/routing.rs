@@ -54,6 +54,40 @@ pub trait PlaybackRouter: Send + Sync {
     fn release_all(&self);
 }
 
+/// A sink for one Discord speaker's mono audio (48 kHz, 20 ms frames as the
+/// anchor's `VoiceTick` delivers them).  The opposite-direction twin of
+/// [`ParticipantSink`]: the Discord capture side pushes a single speaker's
+/// frames here, and the Matrix side reframes them into that speaker's ghost
+/// LiveKit track.  Cheap to hold and `push` to from the capture hot path.
+pub trait CaptureSink: Send + Sync {
+    /// Append one Discord speaker frame to their ghost's publish path.
+    fn push(&self, mono: &[i16]);
+}
+
+/// Routes Discord speakers to Matrix ghosts (Discord → Matrix attribution,
+/// Phase 8).  The mirror of [`PlaybackRouter`]: implemented by the Matrix-side
+/// ghost pool (which owns one LiveKit participant per Discord speaker) and
+/// consumed by the Discord capture side.
+///
+/// `assign`/`release` are intentionally **synchronous** (no async), like
+/// [`PlaybackRouter`]: an implementation must do its slow work (registering the
+/// ghost, joining the call, connecting to LiveKit) off-thread so these can be
+/// called directly from serenity's voice-state handler.
+pub trait CaptureRouter: Send + Sync {
+    /// Bind a Discord speaker (`key` — a stable per-speaker id, e.g. the Discord
+    /// user id) to a ghost and return its sink.  Idempotent: calling again with
+    /// the same `key` returns a sink for the same ghost without re-minting.
+    fn assign(&self, key: &str, display_name: &str) -> Arc<dyn CaptureSink>;
+
+    /// Retire the speaker's ghost (they left the voice channel).  A no-op for an
+    /// unknown `key`.
+    fn release(&self, key: &str);
+
+    /// Retire every ghost (call teardown).  Belt-and-suspenders alongside
+    /// per-speaker [`release`](Self::release).
+    fn release_all(&self);
+}
+
 /// A [`ParticipantSink`] that appends to one key of a [`PlaybackMixer`].
 ///
 /// Works for both shapes of output in Phase 7: a puppet's *single-participant*
@@ -95,5 +129,83 @@ mod tests {
         b.push(&vec![50i16; PRIME]);
         let mixed = mixer.pop_10ms_mixed();
         assert!(mixed.iter().all(|&s| s == 150), "both keys mixed");
+    }
+
+    // ── CaptureRouter contract (Phase 8) ────────────────────────────────────────
+
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// Per-speaker sink that records the frames pushed to it.
+    #[derive(Default)]
+    struct RecordingSink {
+        frames: Mutex<Vec<Vec<i16>>>,
+    }
+    impl CaptureSink for RecordingSink {
+        fn push(&self, mono: &[i16]) {
+            self.frames.lock().unwrap().push(mono.to_vec());
+        }
+    }
+
+    /// Minimal `CaptureRouter` that hands out one `RecordingSink` per key,
+    /// reusing it on re-assign (idempotence) and dropping it on release. Keeps
+    /// the concrete `RecordingSink` handles so a test can inspect what was pushed.
+    #[derive(Default)]
+    struct StubRouter {
+        sinks: Mutex<HashMap<String, Arc<RecordingSink>>>,
+    }
+    impl StubRouter {
+        fn recorded(&self, key: &str) -> Vec<Vec<i16>> {
+            self.sinks.lock().unwrap()[key].frames.lock().unwrap().clone()
+        }
+        fn len(&self) -> usize {
+            self.sinks.lock().unwrap().len()
+        }
+    }
+    impl CaptureRouter for StubRouter {
+        fn assign(&self, key: &str, _display_name: &str) -> Arc<dyn CaptureSink> {
+            self.sinks
+                .lock()
+                .unwrap()
+                .entry(key.to_owned())
+                .or_insert_with(|| Arc::new(RecordingSink::default()))
+                .clone()
+        }
+        fn release(&self, key: &str) {
+            self.sinks.lock().unwrap().remove(key);
+        }
+        fn release_all(&self) {
+            self.sinks.lock().unwrap().clear();
+        }
+    }
+
+    #[test]
+    fn capture_router_demuxes_per_speaker() {
+        let router = StubRouter::default();
+        let alice = router.assign("alice", "Alice");
+        let bob = router.assign("bob", "Bob");
+
+        alice.push(&[1, 1, 1]);
+        bob.push(&[2, 2]);
+        alice.push(&[3]);
+
+        // Re-assign returns the *same* sink (idempotent): its history is intact.
+        router.assign("alice", "Alice").push(&[4]);
+
+        assert_eq!(router.recorded("alice"), vec![vec![1, 1, 1], vec![3], vec![4]]);
+        assert_eq!(router.recorded("bob"), vec![vec![2, 2]]);
+    }
+
+    #[test]
+    fn capture_router_release_drops_the_sink() {
+        let router = StubRouter::default();
+        router.assign("alice", "Alice");
+        assert_eq!(router.len(), 1);
+        router.release("alice");
+        assert_eq!(router.len(), 0);
+        router.assign("a", "A");
+        router.assign("b", "B");
+        router.release_all();
+        assert_eq!(router.len(), 0);
     }
 }

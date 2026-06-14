@@ -36,12 +36,12 @@ use songbird::{
 use tokio::sync::mpsc;
 
 use nvb_audio::mixer::PlaybackMixer;
-use nvb_audio::routing::{ParticipantSink, PlaybackRouter};
+use nvb_audio::routing::{CaptureRouter, ParticipantSink, PlaybackRouter};
 use nvb_config::DiscordConfig;
 
 use crate::{
-    CaptureSink, ConnectionLogger, PlaybackSource, SpeakingLogger, VoiceReceiver,
-    PLAYBACK_CHANNELS, PLAYBACK_SAMPLE_RATE,
+    BotIdSet, CaptureSink, ConnectionLogger, PlaybackSource, SpeakingLogger, SsrcMap, UserSinkMap,
+    VoiceReceiver, PLAYBACK_CHANNELS, PLAYBACK_SAMPLE_RATE,
 };
 
 /// Sentinel for "no anchor currently elected" in [`PuppetPool::anchor`].
@@ -196,7 +196,7 @@ impl PuppetPool {
         guild_id: GuildId,
         channel_id: ChannelId,
         bridge: Arc<str>,
-        audio_tx: mpsc::Sender<Vec<i16>>,
+        capture_router: Arc<dyn CaptureRouter>,
         capture_sink: Option<Arc<CaptureSink>>,
     ) -> Result<()> {
         if self.slots.is_empty() {
@@ -206,6 +206,14 @@ impl PuppetPool {
 
         let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
         let mut futs = Vec::with_capacity(self.slots.len());
+
+        // Shared Discord→Matrix (ghost) capture state, created once and cloned to
+        // every puppet handler: the anchor's `VoiceReceiver` demuxes per speaker
+        // using `ssrc_map` + `user_sinks`; the slot-0 voice-state handler drives
+        // ghost presence into `user_sinks` (skipping `bot_ids` — our own puppets).
+        let ssrc_map: SsrcMap = Arc::new(RwLock::new(HashMap::new()));
+        let user_sinks: UserSinkMap = Arc::new(RwLock::new(HashMap::new()));
+        let bot_ids: BotIdSet = Arc::new(RwLock::new(HashSet::new()));
 
         for (idx, slot) in self.slots.iter().enumerate() {
             let rx = slot
@@ -223,8 +231,11 @@ impl PuppetPool {
                 mixer: slot.mixer.clone(),
                 exclude: self.exclude.clone(),
                 nickname_prefix: self.nickname_prefix.clone(),
-                audio_tx: audio_tx.clone(),
+                capture_router: capture_router.clone(),
                 capture_sink: capture_sink.clone(),
+                ssrc_map: ssrc_map.clone(),
+                user_sinks: user_sinks.clone(),
+                bot_ids: bot_ids.clone(),
                 anchor: self.anchor.clone(),
                 overflow_mixer: self.overflow_mixer.clone(),
                 current_ssrc: slot.current_ssrc.clone(),
@@ -530,11 +541,18 @@ struct PuppetHandler {
     mixer: Arc<PlaybackMixer>,
     exclude: SharedExclude,
     nickname_prefix: Arc<str>,
-    /// Forward channel to the RTC publish path, used when this puppet is the
-    /// capture anchor.
-    audio_tx: mpsc::Sender<Vec<i16>>,
+    /// Routes each Discord speaker to their Matrix ghost (Phase 8). The slot-0
+    /// handler drives presence (`assign`/`release`); the anchor demuxes audio
+    /// into the sinks it returns.
+    capture_router: Arc<dyn CaptureRouter>,
     /// Optional WAV capture (used by the anchor's `VoiceReceiver`).
     capture_sink: Option<Arc<CaptureSink>>,
+    /// SSRC → Discord user id (anchor demux attribution).
+    ssrc_map: SsrcMap,
+    /// Discord user id → ghost sink (presence + anchor demux target).
+    user_sinks: UserSinkMap,
+    /// Our own puppet bot ids — never minted as ghosts.
+    bot_ids: BotIdSet,
     /// Shared current-anchor marker (gates this puppet's capture forwarding).
     anchor: Arc<AtomicUsize>,
     /// Shared overflow mix — the anchor also plays this (un-slotted speakers).
@@ -548,6 +566,14 @@ impl EventHandler for PuppetHandler {
     #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
     async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!(idx = self.idx, bot_user = %ready.user.name, "puppet connected");
+
+        // Record this puppet's own user id so it is never minted as a ghost
+        // (a bridge-owned bot in the channel is not a Discord human). Safe to
+        // re-insert on a reconnect `ready`.
+        self.bot_ids
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(ready.user.id.get());
 
         // `ready` can fire again on reconnect; only the first run takes the rx
         // and owns the command loop.
@@ -569,13 +595,81 @@ impl EventHandler for PuppetHandler {
             self.mixer.clone(),
             self.exclude.clone(),
             self.nickname_prefix.clone(),
-            self.audio_tx.clone(),
             self.capture_sink.clone(),
+            self.ssrc_map.clone(),
+            self.user_sinks.clone(),
             self.anchor.clone(),
             self.overflow_mixer.clone(),
             self.current_ssrc.clone(),
             rx,
         ));
+    }
+
+    /// Drive ghost **presence** off Discord voice-channel membership (Phase 8).
+    /// Only the slot-0 handler acts (voice-state events reach every puppet's
+    /// gateway, but presence must be decided once). A non-bot user joining the
+    /// target channel gets a ghost; leaving (or moving away) retires it.
+    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
+    async fn voice_state_update(&self, _ctx: Context, _old: Option<VoiceState>, new: VoiceState) {
+        if self.idx != 0 {
+            return;
+        }
+        // Only this bridge's guild.
+        if new.guild_id != Some(self.guild_id) {
+            return;
+        }
+        let user_id = new.user_id.get();
+        // Skip bots — our own puppets (definitively, via `bot_ids`) and any other
+        // bot in the channel (no ghost for a non-human).
+        let is_bot = new.member.as_ref().is_some_and(|m| m.user.bot)
+            || self
+                .bot_ids
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&user_id);
+        if is_bot {
+            return;
+        }
+
+        let in_channel = new.channel_id == Some(self.channel_id);
+        let key = user_id.to_string();
+        let known = self
+            .user_sinks
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&user_id);
+
+        match (in_channel, known) {
+            (true, false) => {
+                // Joined (or moved into) the channel → mint a ghost.
+                let name = new
+                    .member
+                    .as_ref()
+                    .and_then(|m| {
+                        m.nick
+                            .clone()
+                            .or_else(|| m.user.global_name.clone())
+                            .or_else(|| Some(m.user.name.clone()))
+                    })
+                    .unwrap_or_else(|| key.clone());
+                let sink = self.capture_router.assign(&key, &name);
+                self.user_sinks
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(user_id, sink);
+                tracing::info!(user_id, display_name = %name, "Discord user joined — ghost assigned");
+            }
+            (false, true) => {
+                // Left or moved away → retire the ghost.
+                self.user_sinks
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&user_id);
+                self.capture_router.release(&key);
+                tracing::info!(user_id, "Discord user left — ghost released");
+            }
+            _ => {}
+        }
     }
 }
 
@@ -591,8 +685,9 @@ async fn puppet_command_loop(
     mixer: Arc<PlaybackMixer>,
     exclude: SharedExclude,
     nickname_prefix: Arc<str>,
-    audio_tx: mpsc::Sender<Vec<i16>>,
     capture_sink: Option<Arc<CaptureSink>>,
+    ssrc_map: SsrcMap,
+    user_sinks: UserSinkMap,
     anchor: Arc<AtomicUsize>,
     overflow_mixer: Arc<PlaybackMixer>,
     current_ssrc: Arc<StdMutex<Option<u32>>>,
@@ -622,7 +717,8 @@ async fn puppet_command_loop(
                     idx,
                     guild_id,
                     &exclude,
-                    audio_tx.clone(),
+                    ssrc_map.clone(),
+                    user_sinks.clone(),
                     capture_sink.clone(),
                     anchor.clone(),
                     &overflow_mixer,
@@ -649,10 +745,10 @@ async fn puppet_command_loop(
 }
 
 /// Register the Discord→Matrix capture handlers on this puppet's voice connection
-/// (it has become the anchor). The `VoiceReceiver` forwards all non-excluded
-/// Discord speakers to `audio_tx`; only one puppet holds these at a time. If this
-/// puppet hasn't joined voice yet, the command is dropped — the pool only elects
-/// an anchor among assigned puppets, which join on `Assign`.
+/// (it has become the anchor). The `VoiceReceiver` demuxes each non-excluded
+/// Discord speaker into their ghost sink; only one puppet holds these at a time.
+/// If this puppet hasn't joined voice yet, the command is dropped — the pool only
+/// elects an anchor among assigned puppets, which join on `Assign`.
 #[allow(clippy::too_many_arguments)]
 async fn puppet_become_anchor(
     bridge: &Arc<str>,
@@ -660,7 +756,8 @@ async fn puppet_become_anchor(
     idx: usize,
     guild_id: GuildId,
     exclude: &SharedExclude,
-    audio_tx: mpsc::Sender<Vec<i16>>,
+    ssrc_map: SsrcMap,
+    user_sinks: UserSinkMap,
     capture_sink: Option<Arc<CaptureSink>>,
     anchor: Arc<AtomicUsize>,
     overflow_mixer: &Arc<PlaybackMixer>,
@@ -673,12 +770,20 @@ async fn puppet_become_anchor(
         return;
     };
     let mut call = call_lock.lock().await;
-    // The VoiceReceiver only forwards while `anchor == idx`, so even if a previous
+    // The VoiceReceiver only captures while `anchor == idx`, so even if a previous
     // anchor's handler is still briefly registered during handoff, exactly one
-    // puppet forwards at a time.
+    // puppet captures at a time.
     call.add_global_event(
         CoreEvent::VoiceTick.into(),
-        VoiceReceiver::new(bridge.clone(), audio_tx, exclude.clone(), capture_sink, anchor, idx),
+        VoiceReceiver::new(
+            bridge.clone(),
+            exclude.clone(),
+            ssrc_map.clone(),
+            user_sinks,
+            capture_sink,
+            anchor,
+            idx,
+        ),
     );
     // The anchor also plays the shared overflow mix (un-slotted speakers), in
     // addition to its own participant — so overflow audio is never lost. Silent
@@ -689,7 +794,7 @@ async fn puppet_become_anchor(
     let _overflow_handle = call.play_input(overflow_input);
     call.add_global_event(
         CoreEvent::SpeakingStateUpdate.into(),
-        SpeakingLogger::new(bridge.clone()),
+        SpeakingLogger::new(bridge.clone(), ssrc_map.clone()),
     );
     for ev in [
         CoreEvent::DriverConnect,
@@ -697,9 +802,9 @@ async fn puppet_become_anchor(
         CoreEvent::DriverDisconnect,
         CoreEvent::ClientDisconnect,
     ] {
-        call.add_global_event(ev.into(), ConnectionLogger::new(bridge.clone()));
+        call.add_global_event(ev.into(), ConnectionLogger::new(bridge.clone(), ssrc_map.clone()));
     }
-    tracing::info!(idx, "anchor capture active — Discord→Matrix forwarding from this puppet");
+    tracing::info!(idx, "anchor capture active — Discord→Matrix demux from this puppet");
 }
 
 /// Self-mute/unmute this puppet's voice connection to mirror the Matrix

@@ -4,8 +4,9 @@ use std::sync::Arc;
 use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
-use nvb_audio::routing::PlaybackRouter;
+use nvb_audio::routing::{CaptureRouter, PlaybackRouter};
 use nvb_discord::{CaptureSink, PuppetPool};
+use nvb_matrix_rtc::GhostPool;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -68,16 +69,20 @@ async fn main() -> Result<()> {
             capture_sinks.push(sink.clone());
         }
 
-        // Audio forward path: Discord capture → RTC publish. 20 ms mono frames.
-        // Bounded; the Discord side drops on a full channel (real-time audio).
-        let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(50);
-
-        // Reverse path: Matrix (LiveKit) → Discord playback. The puppet pool routes
-        // each Matrix speaker to a dedicated, named puppet bot (Phase 7); overflow
-        // falls back to the shared listener mix. It is both the `PlaybackRouter` the
-        // Matrix side pushes into and the owner of the Discord-side puppet clients.
+        // Matrix → Discord playback. The puppet pool routes each Matrix speaker to
+        // a dedicated, named puppet bot (Phase 7); overflow falls back to the
+        // shared listener mix. It is both the `PlaybackRouter` the Matrix side
+        // pushes into and the owner of the Discord-side puppet clients.
         let pool = PuppetPool::new(&bridge.discord);
         let router: Arc<dyn PlaybackRouter> = pool.clone();
+
+        // Discord → Matrix attribution (Phase 8). The ghost pool mints one Matrix
+        // appservice ghost per Discord speaker. Created once and shared: handed to
+        // the Discord side as the `CaptureRouter` it pushes per-speaker audio into,
+        // and back to the Matrix side (`run`) to be driven. Mirrors the puppet pool.
+        let ghost_pool = GhostPool::new(&bridge.matrix, &bridge.livekit)
+            .context("building ghost pool")?;
+        let capture_router: Arc<dyn CaptureRouter> = ghost_pool.clone();
 
         let span = tracing::info_span!("bridge", name = %label);
         let bridge_task = bridge.clone();
@@ -88,11 +93,17 @@ async fn main() -> Result<()> {
                 nvb_matrix_rtc::run(
                     &bridge_task.matrix,
                     &bridge_task.livekit,
-                    audio_rx,
                     router,
+                    ghost_pool,
                     label.clone(),
                 ),
-                nvb_discord::run(&bridge_task.discord, audio_tx, capture_sink, pool, label.clone()),
+                nvb_discord::run(
+                    &bridge_task.discord,
+                    capture_router,
+                    capture_sink,
+                    pool,
+                    label.clone(),
+                ),
             );
             match result {
                 // No reconnection yet (Phase 10); a clean exit is unexpected.

@@ -6,13 +6,13 @@ use songbird::{
     Event, EventContext, EventHandler as SongbirdEventHandler,
 };
 use std::{
+    collections::{HashMap, HashSet},
     io::{self, Read, Seek, SeekFrom},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, PoisonError,
+        Arc, PoisonError, RwLock,
     },
 };
-use tokio::sync::mpsc;
 
 pub mod capture;
 pub use capture::CaptureSink;
@@ -20,8 +20,27 @@ pub use capture::CaptureSink;
 pub mod puppet;
 pub use puppet::{PuppetPool, SharedExclude};
 
+// The Matrix-side ghost sink trait (one per Discord speaker). Aliased so it
+// doesn't clash with this crate's WAV-writing `capture::CaptureSink`.
+use nvb_audio::routing::{CaptureRouter, CaptureSink as GhostSink};
 use nvb_audio::{self as audio, mixer::PlaybackMixer};
 use nvb_config::DiscordConfig;
+
+// ─── Discord → Matrix (ghost) capture routing shared state (Phase 8) ───────────
+
+/// SSRC → Discord user id. Populated from `SpeakingStateUpdate` (which carries
+/// both), read by the anchor's capture demux to attribute each speaker's audio
+/// to their ghost. An `RwLock`: written rarely (a speaker (re)announces), read on
+/// every 50 Hz capture tick.
+pub type SsrcMap = Arc<RwLock<HashMap<u32, u64>>>;
+
+/// Discord user id → that speaker's ghost sink. Populated by the voice-state
+/// handler on a member joining the channel, read by the capture demux.
+pub type UserSinkMap = Arc<RwLock<HashMap<u64, Arc<dyn GhostSink>>>>;
+
+/// Bridge-owned puppet bot user ids — excluded from ghost minting (a puppet in
+/// the channel is not a Discord human). Filled from each puppet's `ready`.
+pub type BotIdSet = Arc<RwLock<HashSet<u64>>>;
 
 /// Output sample rate / channel layout for the Discord playback track. We hand
 /// songbird mono 48 kHz f32 PCM and let it upmix to stereo and Opus-encode.
@@ -141,29 +160,33 @@ impl MediaSource for PlaybackSource {
 
 // ─── Voice capture handler ────────────────────────────────────────────────────
 
-/// Songbird event handler: at each 20 ms `VoiceTick`, mixes all non-excluded
-/// Discord speakers (songbird delivers them already time-aligned for the tick)
-/// into one mono frame and forwards it to the Matrix publish path.  Optionally
-/// also writes per-SSRC WAV files for debugging.
+/// Songbird event handler: at each 20 ms `VoiceTick`, **demuxes** each
+/// non-excluded Discord speaker to their own Matrix ghost (Phase 8). songbird
+/// delivers all speakers time-aligned for the tick; rather than mix them, this
+/// pushes each speaker's mono frame into that speaker's [`GhostSink`] so each
+/// Discord user publishes their own attributed LiveKit track. Optionally also
+/// writes per-SSRC WAV files for debugging.
 struct VoiceReceiver {
     /// Bridge label for per-bridge log attribution (songbird calls `act` from its
     /// own driver task, outside the bridge span).
     bridge: Arc<str>,
-    /// Forward channel to the RTC audio consumer.  20 ms mono frames (960 i16).
-    audio_tx: mpsc::Sender<Vec<i16>>,
     /// Bridge-owned SSRCs to exclude from capture (echo prevention).  Populated
-    /// at runtime as puppets join voice (Phase 7): the listener hears the
-    /// puppets replaying Matrix audio and must not re-capture and loop it back.
+    /// at runtime as puppets join voice (Phase 7): the anchor hears the puppets
+    /// replaying Matrix audio and must not re-capture and loop it back.
     exclude: SharedExclude,
+    /// SSRC → Discord user id, to attribute each captured stream to a ghost.
+    ssrc_map: SsrcMap,
+    /// Discord user id → that speaker's ghost sink (the demux target).
+    user_sinks: UserSinkMap,
     /// Optional Phase 3 WAV capture, enabled via `[discord] capture_wav`.
     capture_sink: Option<Arc<CaptureSink>>,
     /// Shared current-anchor marker and this puppet's own slot index. This
-    /// handler only forwards to Matrix while `anchor == idx`, so capture moves
-    /// cleanly between puppets on handoff (no doubled or dropped forwarding).
+    /// handler only captures while `anchor == idx`, so capture moves cleanly
+    /// between puppets on handoff (no doubled or dropped capture).
     anchor: Arc<std::sync::atomic::AtomicUsize>,
     idx: usize,
-    /// Count of frames dropped because the forward channel was full (logged
-    /// periodically rather than per-drop to avoid spamming the audio path).
+    /// Count of speaker frames dropped because no ghost sink was resolvable yet
+    /// (unknown SSRC→user, or the user has no ghost). Logged periodically.
     dropped: AtomicU64,
     /// Total VoiceTicks seen — logged periodically with speaking/silent sizes so
     /// we can tell "ticks stopped" (connection dead) from "ticks fire but all
@@ -173,18 +196,21 @@ struct VoiceReceiver {
 
 impl VoiceReceiver {
     /// Construct the capture handler for the anchor puppet.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         bridge: Arc<str>,
-        audio_tx: mpsc::Sender<Vec<i16>>,
         exclude: SharedExclude,
+        ssrc_map: SsrcMap,
+        user_sinks: UserSinkMap,
         capture_sink: Option<Arc<CaptureSink>>,
         anchor: Arc<std::sync::atomic::AtomicUsize>,
         idx: usize,
     ) -> Self {
         Self {
             bridge,
-            audio_tx,
             exclude,
+            ssrc_map,
+            user_sinks,
             capture_sink,
             anchor,
             idx,
@@ -193,30 +219,32 @@ impl VoiceReceiver {
         }
     }
 
-    /// Build the mixed 20 ms mono frame for this tick from the present,
-    /// non-excluded speakers.  Returns silence (zeros) when nobody is speaking
-    /// so the downstream clock/jitter buffer keeps ticking at a steady 50 Hz.
-    fn mix_tick(&self, tick: &songbird::events::context_data::VoiceTick) -> Vec<i16> {
-        let mut monos: Vec<Vec<i16>> = Vec::new();
-        // One read-lock for the whole tick; writers (puppet join/leave) are rare.
+    /// Push each present, non-excluded speaker's 20 ms mono frame to their ghost
+    /// sink. Returns the number of speaker frames dropped for want of a ghost.
+    fn demux_tick(&self, tick: &songbird::events::context_data::VoiceTick) -> u64 {
+        // One read-lock each per tick; writers (puppet join/leave, speaker
+        // announce, ghost assign) are all rare relative to the 50 Hz tick.
         let excluded = self.exclude.read().unwrap_or_else(PoisonError::into_inner);
+        let ssrc_map = self.ssrc_map.read().unwrap_or_else(PoisonError::into_inner);
+        let sinks = self.user_sinks.read().unwrap_or_else(PoisonError::into_inner);
+        let mut dropped = 0u64;
         for (ssrc, data) in &tick.speaking {
             if excluded.contains(ssrc) {
                 continue;
             }
-            if let Some(pcm) = &data.decoded_voice {
-                if let Some(sink) = &self.capture_sink {
-                    sink.write_frame(*ssrc, pcm);
-                }
-                monos.push(audio::downmix_stereo_to_mono(pcm));
+            let Some(pcm) = &data.decoded_voice else { continue };
+            if let Some(sink) = &self.capture_sink {
+                sink.write_frame(*ssrc, pcm);
+            }
+            // Attribute SSRC → user → ghost. A speaker with no mapping yet (their
+            // SpeakingStateUpdate or ghost assign hasn't landed) is dropped this
+            // tick; the next tick (or their next utterance) resolves it.
+            match ssrc_map.get(ssrc).and_then(|uid| sinks.get(uid)) {
+                Some(sink) => sink.push(&audio::downmix_stereo_to_mono(pcm)),
+                None => dropped += 1,
             }
         }
-
-        if monos.is_empty() {
-            return vec![0i16; audio::SAMPLES_20MS];
-        }
-        let refs: Vec<&[i16]> = monos.iter().map(|m| m.as_slice()).collect();
-        audio::mix_mono(&refs)
+        dropped
     }
 }
 
@@ -225,7 +253,7 @@ impl SongbirdEventHandler for VoiceReceiver {
     #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::VoiceTick(tick) = ctx {
-            // Only the current anchor forwards; a stale/overlapping handler that
+            // Only the current anchor captures; a stale/overlapping handler that
             // is no longer the anchor goes silent (handoff is seamless).
             if self.anchor.load(Ordering::Relaxed) != self.idx {
                 return None;
@@ -242,13 +270,11 @@ impl SongbirdEventHandler for VoiceReceiver {
                 );
             }
 
-            let frame = self.mix_tick(tick);
-            // Never block or panic on the audio path: drop on a full channel
-            // (audio is real-time; a stale backlog is worse than a gap).
-            if self.audio_tx.try_send(frame).is_err() {
-                let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_multiple_of(50) {
-                    tracing::warn!(dropped = n, "audio forward channel full — dropping frames");
+            let dropped = self.demux_tick(tick);
+            if dropped > 0 {
+                let total = self.dropped.fetch_add(dropped, Ordering::Relaxed) + dropped;
+                if total.is_multiple_of(50) {
+                    tracing::warn!(dropped = total, "speaker frames dropped — no ghost sink yet");
                 }
             }
         }
@@ -256,16 +282,17 @@ impl SongbirdEventHandler for VoiceReceiver {
     }
 }
 
-/// Logs the SSRC → UserId mapping whenever a participant sends a speaking-state
-/// update.  This lets you correlate `capture_<ssrc>.wav` with real Discord users
-/// without any additional tooling.
+/// Records the SSRC → Discord user id mapping whenever a participant sends a
+/// speaking-state update — the key that lets the anchor attribute each captured
+/// stream to a ghost (and correlate `capture_<ssrc>.wav` with a real user).
 struct SpeakingLogger {
     bridge: Arc<str>,
+    ssrc_map: SsrcMap,
 }
 
 impl SpeakingLogger {
-    pub(crate) fn new(bridge: Arc<str>) -> Self {
-        Self { bridge }
+    pub(crate) fn new(bridge: Arc<str>, ssrc_map: SsrcMap) -> Self {
+        Self { bridge, ssrc_map }
     }
 }
 
@@ -274,6 +301,10 @@ impl SongbirdEventHandler for SpeakingLogger {
     #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::SpeakingStateUpdate(Speaking { ssrc, user_id: Some(uid), .. }) = ctx {
+            self.ssrc_map
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(*ssrc, uid.0);
             tracing::info!(ssrc, user_id = uid.0, "SSRC → Discord user mapping");
         }
         None
@@ -288,11 +319,14 @@ impl SongbirdEventHandler for SpeakingLogger {
 /// `voice_state_update` handler.)
 struct ConnectionLogger {
     bridge: Arc<str>,
+    /// Drop a departed user's SSRC mappings so the map doesn't grow unbounded
+    /// over a long call (a recycled SSRC is also re-announced on next speech).
+    ssrc_map: SsrcMap,
 }
 
 impl ConnectionLogger {
-    pub(crate) fn new(bridge: Arc<str>) -> Self {
-        Self { bridge }
+    pub(crate) fn new(bridge: Arc<str>, ssrc_map: SsrcMap) -> Self {
+        Self { bridge, ssrc_map }
     }
 }
 
@@ -313,9 +347,14 @@ impl SongbirdEventHandler for ConnectionLogger {
                 kind = ?d.kind, reason = ?d.reason, channel_id = ?d.channel_id,
                 "songbird DriverDisconnect"
             ),
-            EventContext::ClientDisconnect(cd) => tracing::info!(
-                user_id = cd.user_id.0, "songbird ClientDisconnect (user left voice)"
-            ),
+            EventContext::ClientDisconnect(cd) => {
+                let uid = cd.user_id.0;
+                self.ssrc_map
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retain(|_ssrc, mapped| *mapped != uid);
+                tracing::info!(user_id = uid, "songbird ClientDisconnect (user left voice)");
+            }
             _ => {}
         }
         None
@@ -331,7 +370,7 @@ impl SongbirdEventHandler for ConnectionLogger {
 #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
 pub async fn run(
     cfg: &DiscordConfig,
-    audio_tx: mpsc::Sender<Vec<i16>>,
+    capture_router: Arc<dyn CaptureRouter>,
     capture_sink: Option<Arc<CaptureSink>>,
     pool: Arc<PuppetPool>,
     bridge: Arc<str>,
@@ -349,10 +388,12 @@ pub async fn run(
 
     // There is no dedicated listener bot anymore: the puppet pool owns the whole
     // Discord side. One puppet is elected the "anchor" and captures Discord→Matrix
-    // audio; the rest just play their participant. `audio_tx` + `capture_sink` go
-    // to the pool so the anchor can forward.
+    // audio, demuxed per speaker into their ghost via `capture_router`; the rest
+    // just play their Matrix participant. `capture_router` + `capture_sink` go to
+    // the pool so the anchor can attribute and the voice-state handler can drive
+    // ghost presence.
     tracing::info!("starting Discord gateway (puppet pool)");
-    pool.run_puppets(guild_id, channel_id, bridge, audio_tx, capture_sink)
+    pool.run_puppets(guild_id, channel_id, bridge, capture_router, capture_sink)
         .await?;
     Ok(())
 }

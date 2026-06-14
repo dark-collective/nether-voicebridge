@@ -36,7 +36,9 @@ pub struct LiveSession {
     pub room: Room,
     /// Present only when E2EE is enabled (`media_e2ee = true` in config).
     pub key_provider: Option<KeyProvider>,
-    /// Our LiveKit participant identity (the JWT `sub` claim).
+    /// Our LiveKit participant identity (the JWT `sub` claim). Read only on the
+    /// dormant E2EE publish path (subscribe-only bot no longer sets its own key).
+    #[allow(dead_code)]
     pub our_identity: String,
     /// Cancels the event task and all per-track playback consumers on teardown.
     cancel: CancellationToken,
@@ -338,9 +340,13 @@ async fn handle_room_events(
                     kind = ?track.kind(),
                     "LiveKit: subscribed to remote participant track"
                 );
-                // TODO(Phase 8): skip tracks from bridge-owned ghost identities
-                // here (echo prevention, constraint #5). No ghosts exist yet, so
-                // every remote participant is a human and is bridged.
+                // Echo prevention (constraint #5): a ghost is a Discord speaker we
+                // ourselves publish into this call. Re-bridging its audio back to
+                // Discord would loop. Skip bridge-owned ghost identities.
+                if super::ghost::is_ghost_identity(&identity) {
+                    tracing::debug!(from_identity = %identity, "skipping bridge-owned ghost track (echo prevention)");
+                    continue;
+                }
                 let initial_muted = publication.is_muted();
                 // Per-track cancel token, keyed by SID (a participant may have
                 // more than one track); the router key is the bare MXID derived

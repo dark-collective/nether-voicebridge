@@ -71,6 +71,14 @@ async fn apply_member_event(
     if &user_id == bot_user_id {
         return; // echo-exclusion: bridge bot's own call membership never counted
     }
+    // Echo-exclusion (constraint #5): a ghost is a Discord speaker WE publish into
+    // this call (Phase 8). Its m.call.member must never be counted as a Matrix
+    // participant — otherwise it would trip call-active and, worse, get a Discord
+    // puppet (a self-duplicate of the Discord user). Ghosts are driven entirely by
+    // the Discord side's voice-state handler, not by membership here.
+    if crate::rtc::ghost::is_ghost_identity(user_id.as_str()) {
+        return;
+    }
 
     let is_active = match content {
         CallMemberEventContent::Empty(_) => false,

@@ -2,9 +2,13 @@
 //!
 //! Two internal modules: [`matrix`] (matrix-sdk client login/sync and
 //! call-membership detection) and [`rtc`] (MatrixRTC/LiveKit session join,
-//! key exchange, publish, and inbound-track playback). They are wired together
-//! by the single public [`run`] entry point; the `call_active` signal between
-//! them never leaves this crate.
+//! key exchange, subscribe/playback, and the ghost pool). They are wired
+//! together by the single public [`run`] entry point; the `call_active` signal
+//! between sync and the subscriber never leaves this crate.
+//!
+//! [`GhostPool`] is re-exported so the binary can construct it once and hand it
+//! to both sides — to the Discord side as a `CaptureRouter`, and back here to be
+//! driven — mirroring how the Discord `PuppetPool` is shared.
 
 mod matrix;
 mod rtc;
@@ -12,23 +16,27 @@ mod rtc;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 use nvb_audio::routing::PlaybackRouter;
 use nvb_config::{LiveKitConfig, MatrixConfig};
 
+pub use rtc::ghost::GhostPool;
+
 /// Run the Matrix side of the bridge to completion.
 ///
 /// Builds the matrix-sdk client, then drives the sync loop (which raises
-/// call-active transitions over an internal watch channel) and the RTC
-/// participation loop concurrently. The caller supplies only the cross-side
-/// plumbing: `audio_rx` (Discord → Matrix frames to publish) and the
-/// `router` (Matrix → Discord audio, routed per-participant to puppets).
+/// call-active transitions over an internal watch channel), the RTC subscriber
+/// loop, and the ghost-pool driver concurrently. The caller supplies the
+/// cross-side plumbing: the `router` (Matrix → Discord audio, routed
+/// per-participant to puppets) and the `ghost_pool` (Discord → Matrix audio,
+/// one ghost per Discord speaker — also handed to the Discord side as the
+/// `CaptureRouter`).
 pub async fn run(
     matrix_cfg: &MatrixConfig,
     livekit_cfg: &LiveKitConfig,
-    audio_rx: mpsc::Receiver<Vec<i16>>,
     router: Arc<dyn PlaybackRouter>,
+    ghost_pool: Arc<GhostPool>,
     bridge: Arc<str>,
 ) -> Result<()> {
     // Build the client first (surfaces login/restore errors before the loops).
@@ -51,10 +59,10 @@ pub async fn run(
             livekit_cfg,
             matrix_cfg,
             call_active_rx,
-            audio_rx,
             router,
             bridge.clone(),
         ),
+        ghost_pool.run(bridge.clone()),
     )?;
 
     Ok(())

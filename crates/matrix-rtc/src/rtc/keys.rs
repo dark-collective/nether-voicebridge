@@ -78,8 +78,14 @@ pub struct CallEncryptionKeysEventContent {
 }
 
 // ── Key generation ────────────────────────────────────────────────────────────
+//
+// These are the E2EE *publish-side* helpers (generate our key, encode it, send it
+// to peers). Dormant since Phase 8: the bridge bot is subscribe-only and ghosts
+// publish plaintext (deployment runs media E2EE off). Kept compiling for the
+// future encrypted-room branch — see the architecture doc's E2EE section.
 
 /// Generate a fresh 16-byte random media key.
+#[allow(dead_code)]
 pub fn generate_key() -> [u8; 16] {
     let mut key = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut key);
@@ -87,6 +93,7 @@ pub fn generate_key() -> [u8; 16] {
 }
 
 /// Encode 16 raw key bytes as base64 standard with padding (matching JS-SDK output).
+#[allow(dead_code)]
 pub fn encode_key(key: &[u8]) -> String {
     general_purpose::STANDARD.encode(key)
 }
@@ -101,6 +108,7 @@ pub fn decode_key(s: &str) -> Result<Vec<u8>> {
 }
 
 /// Current Unix timestamp in milliseconds.
+#[allow(dead_code)]
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -121,6 +129,7 @@ fn now_ms() -> u64 {
 /// `room_id`       — the Matrix room ID string
 /// `key_index`     — 0 for initial key
 /// `key`           — 16 raw bytes
+#[allow(dead_code)]
 pub async fn send_key(
     client: &Client,
     room: &Room,
