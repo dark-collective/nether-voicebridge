@@ -8,6 +8,17 @@ before any routing logic exists. Rust difficulty ramps with the phases.
 Assumes intermediate Rust (you know ownership/traits/async; you haven't shipped
 a real project). Notes flag the idioms that matter, not syntax.
 
+> **Cross-cutting milestone — multi-bridge config (done, `6a9cd46`, 2026-06-14).**
+> Config is a `[[bridge]]` array; one process runs N independent Discord↔Matrix
+> pipelines (each with its own tokens/client/room — no multiplexing). Landed
+> *before* Phases 8–9 so those are built multi-bridge-aware. Per-bridge `run`
+> futures are `!Send` (tracing span guards held across awaits), so `main` drives
+> them with `futures_util::join_all` over boxed-local futures rather than
+> `tokio::spawn`; one bridge failing ends only that bridge (verified live).
+> `store_path` is still unused (in-memory matrix-sdk store) — wire up the SQLite
+> store before Phase 8. Full per-line bridge log attribution (instrumenting the
+> inner crates' spawned tasks) is a follow-up.
+
 ---
 
 ## Phase 0 — Scaffold & config
