@@ -1,21 +1,22 @@
-//! Puppet pool — per-Matrix-speaker attribution on the Discord side (Phase 7).
+//! Puppet pool — one Discord bot per Matrix call participant (Phase 7+).
 //!
-//! Each configured puppet token is a **separate** Discord bot that joins the
-//! voice channel on demand, takes a Matrix speaker's display name as its
-//! nickname, and plays only that speaker's audio.  The pool implements
-//! [`PlaybackRouter`]: the Matrix RTC side calls [`assign`](PuppetPool::assign)
-//! when a participant's track is subscribed and [`release`](PuppetPool::release)
-//! when it ends.  When every puppet is busy, the overflow speaker falls back to
-//! the shared listener mix (no audio is lost, just un-attributed).
+//! Each configured puppet token is a **separate** Discord bot. There is no
+//! dedicated listener bot: the pool owns the whole Discord side. The Matrix RTC
+//! side drives [`PlaybackRouter`] — `assign` on call membership (the bot joins,
+//! takes the participant's display name, present even if silent), `release` on
+//! leave, `set_muted` to mirror mute. One assigned puppet is elected the
+//! **anchor**: it captures all Discord speakers (Discord→Matrix) and plays the
+//! shared **overflow** mix. When members exceed the puppet count, the extras are
+//! mixed into that overflow (no audio lost) and the anchor is relabeled.
 //!
 //! Lifecycle is on-demand *per participant*: a puppet joins/leaves voice only
 //! when a Matrix user joins/leaves the call, so nickname edits stay well within
 //! Discord's rate limits (no per-utterance churn).
 //!
 //! Echo prevention (constraint #5): each puppet registers its own SSRC into the
-//! shared [`SharedExclude`] set on `DriverConnect`, so the listener bot — which
-//! hears every speaker in the channel, puppets included — never re-captures
-//! puppet playback and loops it back to Matrix.
+//! shared [`SharedExclude`] set on `DriverConnect`, so the anchor — which hears
+//! every speaker in the channel, puppets included — never re-captures puppet
+//! playback and loops it back to Matrix.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -46,6 +47,10 @@ use crate::{
 /// Sentinel for "no anchor currently elected" in [`PuppetPool::anchor`].
 const NO_ANCHOR: usize = usize::MAX;
 
+/// Nickname (before the configured prefix) shown on the overflow-host puppet while
+/// it is carrying more than one Matrix speaker (members beyond the puppet count).
+const OVERFLOW_LABEL: &str = "Overflow";
+
 /// Discord's hard cap on guild nicknames (Unicode characters).
 const NICKNAME_MAX_CHARS: usize = 32;
 
@@ -63,10 +68,10 @@ fn build_nickname(prefix: &str, name: &str) -> String {
     nick
 }
 
-/// Shared, mutable set of bridge-owned SSRCs to exclude from listener capture.
-/// Owned by the pool; shared with the listener and every puppet.  Reads happen
-/// on the listener's 50 Hz tick (one read-lock per tick), writes only on a
-/// puppet join/leave — so an `RwLock` keeps the hot path uncontended.
+/// Shared, mutable set of bridge-owned SSRCs to exclude from capture.
+/// Owned by the pool; shared with every puppet.  Reads happen on the anchor's
+/// 50 Hz capture tick (one read-lock per tick), writes only on a puppet
+/// join/leave — so an `RwLock` keeps the hot path uncontended.
 pub type SharedExclude = Arc<RwLock<HashSet<u32>>>;
 
 /// Commands sent from the (sync) pool allocator to a puppet's async command loop.
@@ -78,6 +83,9 @@ enum PuppetCommand {
     BecomeAnchor,
     /// Mirror the Matrix participant's mute state onto this bot's voice connection.
     SetMuted(bool),
+    /// Set this puppet's nickname (used to relabel the overflow host to/from the
+    /// overflow label). The configured prefix is applied by the puppet.
+    SetNickname(String),
     /// Reset the nickname, leave voice, drop the SSRC exclusion.
     Release,
 }
@@ -86,8 +94,8 @@ enum PuppetCommand {
 enum Assign {
     /// A dedicated puppet (index into [`PuppetPool::slots`]).
     Puppet(usize),
-    /// Overflow — mixed into the shared listener bot.
-    Listener,
+    /// Overflow — mixed into the shared overflow mix that the anchor plays.
+    Overflow,
 }
 
 /// One puppet's shared state.  `cmd_tx`/`cmd_rx` connect the sync allocator to
@@ -101,6 +109,10 @@ struct PuppetSlot {
     /// Taken (once) by [`PuppetPool::run_puppets`] to drive this puppet's client.
     cmd_rx: StdMutex<Option<mpsc::Receiver<PuppetCommand>>>,
     current_ssrc: Arc<StdMutex<Option<u32>>>,
+    /// This slot's current participant display name — used to restore the anchor's
+    /// nickname after it has been relabeled to the overflow label. Guarded by the
+    /// `assignments` lock.
+    name: StdMutex<Option<String>>,
     /// True while assigned to a participant.  Only mutated under the
     /// `assignments` lock, so `Relaxed` ordering is sufficient.
     busy: AtomicBool,
@@ -108,9 +120,9 @@ struct PuppetSlot {
 
 /// The puppet pool / playback router.
 pub struct PuppetPool {
-    /// Shared listener mixer (overflow + Phase-6 fallback path).  Also read by
-    /// the listener bot's `PlaybackSource`.
-    listener_mixer: Arc<PlaybackMixer>,
+    /// Shared overflow mix — un-slotted speakers (members beyond the puppet
+    /// count). Played by the current anchor's `PlaybackSource`.
+    overflow_mixer: Arc<PlaybackMixer>,
     exclude: SharedExclude,
     /// Prefix for puppet nicknames (e.g. `"[Matrix] "`; empty disables).
     nickname_prefix: Arc<str>,
@@ -142,29 +154,20 @@ impl PuppetPool {
                     cmd_tx,
                     cmd_rx: StdMutex::new(Some(cmd_rx)),
                     current_ssrc: Arc::new(StdMutex::new(None)),
+                    name: StdMutex::new(None),
                     busy: AtomicBool::new(false),
                 }
             })
             .collect();
 
         Arc::new(Self {
-            listener_mixer: Arc::new(PlaybackMixer::new()),
+            overflow_mixer: Arc::new(PlaybackMixer::new()),
             exclude: Arc::new(RwLock::new(HashSet::new())),
             nickname_prefix: Arc::from(cfg.nickname_prefix.as_str()),
             slots,
             assignments: StdMutex::new(HashMap::new()),
             anchor: Arc::new(AtomicUsize::new(NO_ANCHOR)),
         })
-    }
-
-    /// The shared listener mixer (handed to the listener bot's playback source).
-    pub fn listener_mixer(&self) -> Arc<PlaybackMixer> {
-        self.listener_mixer.clone()
-    }
-
-    /// The shared echo-exclusion set (handed to the listener's capture handler).
-    pub fn exclude(&self) -> SharedExclude {
-        self.exclude.clone()
     }
 
     /// Start every puppet's serenity client and drive them to completion.
@@ -205,6 +208,7 @@ impl PuppetPool {
                 audio_tx: audio_tx.clone(),
                 capture_sink: capture_sink.clone(),
                 anchor: self.anchor.clone(),
+                overflow_mixer: self.overflow_mixer.clone(),
                 current_ssrc: slot.current_ssrc.clone(),
                 cmd_rx: StdMutex::new(Some(rx)),
             };
@@ -237,6 +241,23 @@ impl PuppetPool {
     fn sink(&self, mixer: Arc<PlaybackMixer>, key: &str) -> Arc<dyn ParticipantSink> {
         Arc::new(MixerSink::new(mixer, key.to_owned()))
     }
+
+    /// Send the current anchor a nickname (used to toggle the overflow label).
+    /// No-op when there is no anchor. Call only on a transition (Discord rate-
+    /// limits nickname edits).
+    fn relabel_anchor(&self, name: String) {
+        let anchor = self.anchor.load(Ordering::Relaxed);
+        if anchor != NO_ANCHOR {
+            let _ = self.slots[anchor]
+                .cmd_tx
+                .try_send(PuppetCommand::SetNickname(name));
+        }
+    }
+}
+
+/// Count overflow participants (those routed to the shared mix, no dedicated puppet).
+fn overflow_count(map: &HashMap<String, Assign>) -> usize {
+    map.values().filter(|a| matches!(a, Assign::Overflow)).count()
 }
 
 impl PlaybackRouter for PuppetPool {
@@ -247,7 +268,7 @@ impl PlaybackRouter for PuppetPool {
         if let Some(existing) = map.get(key) {
             let mixer = match existing {
                 Assign::Puppet(idx) => self.slots[*idx].mixer.clone(),
-                Assign::Listener => self.listener_mixer.clone(),
+                Assign::Overflow => self.overflow_mixer.clone(),
             };
             return self.sink(mixer, key);
         }
@@ -256,6 +277,8 @@ impl PlaybackRouter for PuppetPool {
         for (idx, slot) in self.slots.iter().enumerate() {
             if !slot.busy.swap(true, Ordering::Relaxed) {
                 map.insert(key.to_owned(), Assign::Puppet(idx));
+                *slot.name.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(display_name.to_owned());
                 if slot
                     .cmd_tx
                     .try_send(PuppetCommand::Assign {
@@ -276,10 +299,16 @@ impl PlaybackRouter for PuppetPool {
             }
         }
 
-        // Pool exhausted → overflow into the shared listener mix.
-        map.insert(key.to_owned(), Assign::Listener);
-        tracing::info!(key, display_name, "puppet pool exhausted — overflow to listener mix");
-        self.sink(self.listener_mixer.clone(), key)
+        // Pool exhausted → overflow into the shared overflow mix (played by the
+        // anchor). If this is the first overflow participant, relabel the anchor
+        // to the overflow label.
+        let was_overflowing = overflow_count(&map) > 0;
+        map.insert(key.to_owned(), Assign::Overflow);
+        tracing::info!(key, display_name, "puppet pool exhausted — overflow to anchor mix");
+        if !was_overflowing {
+            self.relabel_anchor(OVERFLOW_LABEL.to_string());
+        }
+        self.sink(self.overflow_mixer.clone(), key)
     }
 
     fn set_muted(&self, key: &str, muted: bool) {
@@ -300,6 +329,7 @@ impl PlaybackRouter for PuppetPool {
                 let slot = &self.slots[idx];
                 slot.mixer.clear();
                 slot.busy.store(false, Ordering::Relaxed);
+                *slot.name.lock().unwrap_or_else(PoisonError::into_inner) = None;
                 if slot.cmd_tx.try_send(PuppetCommand::Release).is_err() {
                     tracing::warn!(idx, "puppet command channel full/closed on release");
                 }
@@ -309,7 +339,7 @@ impl PlaybackRouter for PuppetPool {
                 if self.anchor.load(Ordering::Relaxed) == idx {
                     let next = map.values().find_map(|a| match a {
                         Assign::Puppet(i) => Some(*i),
-                        Assign::Listener => None,
+                        Assign::Overflow => None,
                     });
                     match next {
                         Some(new_idx) => {
@@ -318,6 +348,11 @@ impl PlaybackRouter for PuppetPool {
                                 .cmd_tx
                                 .try_send(PuppetCommand::BecomeAnchor);
                             tracing::info!(old = idx, new = new_idx, "capture anchor handed off");
+                            // Carry the overflow label onto the new anchor if
+                            // overflow is still active (else it keeps its own name).
+                            if overflow_count(&map) > 0 {
+                                self.relabel_anchor(OVERFLOW_LABEL.to_string());
+                            }
                         }
                         None => {
                             self.anchor.store(NO_ANCHOR, Ordering::Relaxed);
@@ -326,9 +361,22 @@ impl PlaybackRouter for PuppetPool {
                     }
                 }
             }
-            Some(Assign::Listener) => {
-                self.listener_mixer.remove(key);
-                tracing::info!(key, "released overflow participant from listener mix");
+            Some(Assign::Overflow) => {
+                self.overflow_mixer.remove(key);
+                tracing::info!(key, "released overflow participant from overflow mix");
+                // Overflow just cleared → restore the anchor to its own name.
+                if overflow_count(&map) == 0 {
+                    let anchor = self.anchor.load(Ordering::Relaxed);
+                    if anchor != NO_ANCHOR {
+                        let base = self.slots[anchor]
+                            .name
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .clone()
+                            .unwrap_or_default();
+                        self.relabel_anchor(base);
+                    }
+                }
             }
             None => {}
         }
@@ -341,11 +389,12 @@ impl PlaybackRouter for PuppetPool {
                 let slot = &self.slots[idx];
                 slot.mixer.clear();
                 slot.busy.store(false, Ordering::Relaxed);
+                *slot.name.lock().unwrap_or_else(PoisonError::into_inner) = None;
                 let _ = slot.cmd_tx.try_send(PuppetCommand::Release);
             }
         }
         self.anchor.store(NO_ANCHOR, Ordering::Relaxed);
-        self.listener_mixer.clear();
+        self.overflow_mixer.clear();
     }
 }
 
@@ -368,6 +417,8 @@ struct PuppetHandler {
     capture_sink: Option<Arc<CaptureSink>>,
     /// Shared current-anchor marker (gates this puppet's capture forwarding).
     anchor: Arc<AtomicUsize>,
+    /// Shared overflow mix — the anchor also plays this (un-slotted speakers).
+    overflow_mixer: Arc<PlaybackMixer>,
     current_ssrc: Arc<StdMutex<Option<u32>>>,
     cmd_rx: StdMutex<Option<mpsc::Receiver<PuppetCommand>>>,
 }
@@ -401,6 +452,7 @@ impl EventHandler for PuppetHandler {
             self.audio_tx.clone(),
             self.capture_sink.clone(),
             self.anchor.clone(),
+            self.overflow_mixer.clone(),
             self.current_ssrc.clone(),
             rx,
         ));
@@ -422,6 +474,7 @@ async fn puppet_command_loop(
     audio_tx: mpsc::Sender<Vec<i16>>,
     capture_sink: Option<Arc<CaptureSink>>,
     anchor: Arc<AtomicUsize>,
+    overflow_mixer: Arc<PlaybackMixer>,
     current_ssrc: Arc<StdMutex<Option<u32>>>,
     mut cmd_rx: mpsc::Receiver<PuppetCommand>,
 ) {
@@ -452,11 +505,20 @@ async fn puppet_command_loop(
                     audio_tx.clone(),
                     capture_sink.clone(),
                     anchor.clone(),
+                    &overflow_mixer,
                 )
                 .await;
             }
             PuppetCommand::SetMuted(muted) => {
                 puppet_set_muted(&ctx, idx, guild_id, muted).await;
+            }
+            PuppetCommand::SetNickname(name) => {
+                let nick = build_nickname(&nickname_prefix, &name);
+                if let Err(e) = guild_id.edit_nickname(&ctx.http, Some(nick.as_str())).await {
+                    tracing::warn!(idx, error = %e, "failed to relabel puppet nickname");
+                } else {
+                    tracing::info!(idx, nick = %nick, "puppet relabeled");
+                }
             }
             PuppetCommand::Release => {
                 puppet_leave(&ctx, idx, guild_id, &exclude, &current_ssrc).await;
@@ -481,6 +543,7 @@ async fn puppet_become_anchor(
     audio_tx: mpsc::Sender<Vec<i16>>,
     capture_sink: Option<Arc<CaptureSink>>,
     anchor: Arc<AtomicUsize>,
+    overflow_mixer: &Arc<PlaybackMixer>,
 ) {
     let Some(manager) = songbird::get(ctx).await else {
         return;
@@ -497,6 +560,13 @@ async fn puppet_become_anchor(
         CoreEvent::VoiceTick.into(),
         VoiceReceiver::new(bridge.clone(), audio_tx, exclude.clone(), capture_sink, anchor, idx),
     );
+    // The anchor also plays the shared overflow mix (un-slotted speakers), in
+    // addition to its own participant — so overflow audio is never lost. Silent
+    // when nobody is overflowed.
+    let overflow_src = PlaybackSource::new(overflow_mixer.clone());
+    let overflow_input =
+        Input::from(RawAdapter::new(overflow_src, PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS));
+    let _overflow_handle = call.play_input(overflow_input);
     call.add_global_event(
         CoreEvent::SpeakingStateUpdate.into(),
         SpeakingLogger::new(bridge.clone()),
