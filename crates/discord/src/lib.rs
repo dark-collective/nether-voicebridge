@@ -1,15 +1,9 @@
 use anyhow::Result;
-use serenity::{
-    async_trait,
-    model::prelude::*,
-    prelude::*,
-};
+use serenity::{async_trait, model::prelude::*};
 use songbird::{
-    driver::{DecodeConfig, DecodeMode},
-    input::{core::io::MediaSource, Input, RawAdapter},
+    input::core::io::MediaSource,
     model::payload::Speaking,
-    CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler,
-    SerenityInit,
+    Event, EventContext, EventHandler as SongbirdEventHandler,
 };
 use std::{
     io::{self, Read, Seek, SeekFrom},
@@ -18,7 +12,7 @@ use std::{
         Arc, PoisonError,
     },
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 pub mod capture;
 pub use capture::CaptureSink;
@@ -163,6 +157,11 @@ struct VoiceReceiver {
     exclude: SharedExclude,
     /// Optional Phase 3 WAV capture, enabled via `[discord] capture_wav`.
     capture_sink: Option<Arc<CaptureSink>>,
+    /// Shared current-anchor marker and this puppet's own slot index. This
+    /// handler only forwards to Matrix while `anchor == idx`, so capture moves
+    /// cleanly between puppets on handoff (no doubled or dropped forwarding).
+    anchor: Arc<std::sync::atomic::AtomicUsize>,
+    idx: usize,
     /// Count of frames dropped because the forward channel was full (logged
     /// periodically rather than per-drop to avoid spamming the audio path).
     dropped: AtomicU64,
@@ -173,6 +172,27 @@ struct VoiceReceiver {
 }
 
 impl VoiceReceiver {
+    /// Construct the capture handler for the anchor puppet.
+    pub(crate) fn new(
+        bridge: Arc<str>,
+        audio_tx: mpsc::Sender<Vec<i16>>,
+        exclude: SharedExclude,
+        capture_sink: Option<Arc<CaptureSink>>,
+        anchor: Arc<std::sync::atomic::AtomicUsize>,
+        idx: usize,
+    ) -> Self {
+        Self {
+            bridge,
+            audio_tx,
+            exclude,
+            capture_sink,
+            anchor,
+            idx,
+            dropped: AtomicU64::new(0),
+            ticks: AtomicU64::new(0),
+        }
+    }
+
     /// Build the mixed 20 ms mono frame for this tick from the present,
     /// non-excluded speakers.  Returns silence (zeros) when nobody is speaking
     /// so the downstream clock/jitter buffer keeps ticking at a steady 50 Hz.
@@ -205,6 +225,11 @@ impl SongbirdEventHandler for VoiceReceiver {
     #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::VoiceTick(tick) = ctx {
+            // Only the current anchor forwards; a stale/overlapping handler that
+            // is no longer the anchor goes silent (handoff is seamless).
+            if self.anchor.load(Ordering::Relaxed) != self.idx {
+                return None;
+            }
             // Tick-health: distinguishes "ticks stopped" from "ticks fire but
             // everyone is silent" (decode dead) when capture goes quiet.
             let n = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
@@ -238,6 +263,12 @@ struct SpeakingLogger {
     bridge: Arc<str>,
 }
 
+impl SpeakingLogger {
+    pub(crate) fn new(bridge: Arc<str>) -> Self {
+        Self { bridge }
+    }
+}
+
 #[async_trait]
 impl SongbirdEventHandler for SpeakingLogger {
     #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
@@ -257,6 +288,12 @@ impl SongbirdEventHandler for SpeakingLogger {
 /// `voice_state_update` handler.)
 struct ConnectionLogger {
     bridge: Arc<str>,
+}
+
+impl ConnectionLogger {
+    pub(crate) fn new(bridge: Arc<str>) -> Self {
+        Self { bridge }
+    }
 }
 
 #[async_trait]
@@ -285,122 +322,9 @@ impl SongbirdEventHandler for ConnectionLogger {
     }
 }
 
-// ─── Serenity gateway handler ─────────────────────────────────────────────────
-
-struct Handler {
-    /// Bridge label for per-bridge log attribution (multi-bridge spans). Serenity
-    /// invokes these callbacks from its own gateway task, which does not inherit
-    /// the bridge span set up in `main`, so each callback re-establishes it.
-    bridge: Arc<str>,
-    guild_id: GuildId,
-    channel_id: ChannelId,
-    /// The listener bot's own UserId — seeded in `ready`, used to filter its
-    /// own voice-state events (echo-exclusion seed for future phases).
-    bridge_user_ids: Arc<Mutex<Vec<UserId>>>,
-    /// Forward channel to the RTC audio consumer.
-    audio_tx: mpsc::Sender<Vec<i16>>,
-    /// Bridge-owned SSRCs to exclude from capture (puppet SSRCs, Phase 7).
-    exclude: SharedExclude,
-    /// Optional WAV capture, enabled via `[discord] capture_wav`.
-    capture_sink: Option<Arc<CaptureSink>>,
-    /// Inbound Matrix audio to play into the voice channel: the shared listener
-    /// mix (overflow / un-attributed speakers in Phase 7).
-    playback: Arc<PlaybackMixer>,
-}
-
-#[async_trait]
-impl EventHandler for Handler {
-    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
-    async fn ready(&self, ctx: Context, ready: Ready) {
-        tracing::info!(bot_user = %ready.user.name, "Discord listener connected");
-
-        // Register ourselves so join/leave events for the bot are filtered out.
-        self.bridge_user_ids.lock().await.push(ready.user.id);
-
-        let manager = songbird::get(&ctx).await.expect("songbird not registered");
-        match manager.join(self.guild_id, self.channel_id).await {
-            Ok(call) => {
-                tracing::info!(channel_id = %self.channel_id, "joined voice channel");
-
-                // Register the capture and speaking-logger handlers.
-                let mut call = call.lock().await;
-                call.add_global_event(
-                    CoreEvent::VoiceTick.into(),
-                    VoiceReceiver {
-                        bridge: self.bridge.clone(),
-                        audio_tx: self.audio_tx.clone(),
-                        exclude: Arc::clone(&self.exclude),
-                        capture_sink: self.capture_sink.clone(),
-                        dropped: AtomicU64::new(0),
-                        ticks: AtomicU64::new(0),
-                    },
-                );
-                call.add_global_event(
-                    CoreEvent::SpeakingStateUpdate.into(),
-                    SpeakingLogger { bridge: self.bridge.clone() },
-                );
-
-                // Diagnostic: log voice-connection lifecycle + client disconnects.
-                for ev in [
-                    CoreEvent::DriverConnect,
-                    CoreEvent::DriverReconnect,
-                    CoreEvent::DriverDisconnect,
-                    CoreEvent::ClientDisconnect,
-                ] {
-                    call.add_global_event(ev.into(), ConnectionLogger { bridge: self.bridge.clone() });
-                }
-
-                // Start the inbound playback track (Matrix → Discord). songbird
-                // reads this live source forever, even while the mixer is idle
-                // (silence), so the track stays open for the whole connection.
-                let source = PlaybackSource::new(Arc::clone(&self.playback));
-                let input = Input::from(RawAdapter::new(
-                    source,
-                    PLAYBACK_SAMPLE_RATE,
-                    PLAYBACK_CHANNELS,
-                ));
-                let _handle = call.play_input(input);
-                tracing::info!("playback track started — Matrix audio will play into Discord");
-
-                tracing::info!("audio capture active — talk in Discord to bridge into Element Call");
-            }
-            Err(e) => tracing::error!(error = %e, "failed to join voice channel"),
-        }
-    }
-
-    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
-    async fn voice_state_update(&self, _ctx: Context, old: Option<VoiceState>, new: VoiceState) {
-        let was_here = old
-            .and_then(|s| s.channel_id)
-            .map(|c| c == self.channel_id)
-            .unwrap_or(false);
-        let now_here = new
-            .channel_id
-            .map(|c| c == self.channel_id)
-            .unwrap_or(false);
-
-        {
-            let ids = self.bridge_user_ids.lock().await;
-            if ids.contains(&new.user_id) {
-                return;
-            }
-        }
-
-        match (was_here, now_here) {
-            (false, true) => tracing::info!(
-                user_id = %new.user_id,
-                channel_id = %self.channel_id,
-                "user joined voice channel"
-            ),
-            (true, false) => tracing::info!(
-                user_id = %new.user_id,
-                channel_id = %self.channel_id,
-                "user left voice channel"
-            ),
-            _ => {}
-        }
-    }
-}
+// The songbird capture handlers above (`VoiceReceiver` / `SpeakingLogger` /
+// `ConnectionLogger`) are now registered by the puppet pool's **anchor** puppet
+// (see `puppet.rs`), not by a dedicated listener. There is no listener `Handler`.
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
@@ -423,43 +347,13 @@ pub async fn run(
     let guild_id = GuildId::new(guild_id);
     let channel_id = ChannelId::new(channel_id);
 
-    let handler = Handler {
-        bridge: bridge.clone(),
-        guild_id,
-        channel_id,
-        bridge_user_ids: Arc::new(Mutex::new(Vec::new())),
-        audio_tx,
-        // The listener and every puppet share one exclude set + listener mix.
-        exclude: pool.exclude(),
-        capture_sink,
-        playback: pool.listener_mixer(),
-    };
-
-    let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
-
-    // Configure songbird to DAVE-decrypt and Opus-decode incoming packets.
-    // DecodeConfig::default() = stereo / 48 kHz, matching the WAV spec.
-    let sb_config = songbird::Config::default()
-        .decode_mode(DecodeMode::Decode(DecodeConfig::default()));
-
-    let mut client = Client::builder(&cfg.listener_token, intents)
-        .event_handler(handler)
-        .register_songbird_from_config(sb_config)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to build Discord client: {e}"))?;
-
-    tracing::info!("starting Discord gateway (listener + puppet pool)");
-    // Run the listener client and every puppet client concurrently; the first
-    // to error aborts the bridge.
-    tokio::try_join!(
-        async {
-            client
-                .start()
-                .await
-                .map_err(|e| anyhow::anyhow!("Discord listener client error: {e}"))
-        },
-        pool.run_puppets(guild_id, channel_id, bridge.clone()),
-    )?;
+    // There is no dedicated listener bot anymore: the puppet pool owns the whole
+    // Discord side. One puppet is elected the "anchor" and captures Discord→Matrix
+    // audio; the rest just play their participant. `audio_tx` + `capture_sink` go
+    // to the pool so the anchor can forward.
+    tracing::info!("starting Discord gateway (puppet pool)");
+    pool.run_puppets(guild_id, channel_id, bridge, audio_tx, capture_sink)
+        .await?;
     Ok(())
 }
 
@@ -467,6 +361,7 @@ pub async fn run(
 mod playback_tests {
     use super::*;
     use songbird::input::codecs::{get_codec_registry, get_probe};
+    use songbird::input::{Input, RawAdapter};
 
     // Reproduce songbird's promotion of our live RawAdapter input in isolation
     // (no Discord, no DAVE) to surface the exact error if it won't become playable.

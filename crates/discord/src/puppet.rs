@@ -18,7 +18,7 @@
 //! puppet playback and loops it back to Matrix.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError, RwLock};
 
 use anyhow::{anyhow, Result};
@@ -28,6 +28,7 @@ use serenity::{
     prelude::*,
 };
 use songbird::{
+    driver::{DecodeConfig, DecodeMode},
     input::{Input, RawAdapter},
     CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler, SerenityInit,
 };
@@ -37,7 +38,13 @@ use nvb_audio::mixer::PlaybackMixer;
 use nvb_audio::routing::{MixerSink, ParticipantSink, PlaybackRouter};
 use nvb_config::DiscordConfig;
 
-use crate::{PlaybackSource, PLAYBACK_CHANNELS, PLAYBACK_SAMPLE_RATE};
+use crate::{
+    CaptureSink, ConnectionLogger, PlaybackSource, SpeakingLogger, VoiceReceiver,
+    PLAYBACK_CHANNELS, PLAYBACK_SAMPLE_RATE,
+};
+
+/// Sentinel for "no anchor currently elected" in [`PuppetPool::anchor`].
+const NO_ANCHOR: usize = usize::MAX;
 
 /// Discord's hard cap on guild nicknames (Unicode characters).
 const NICKNAME_MAX_CHARS: usize = 32;
@@ -66,6 +73,9 @@ pub type SharedExclude = Arc<RwLock<HashSet<u32>>>;
 enum PuppetCommand {
     /// Join voice, start playback from this puppet's mixer, set the nickname.
     Assign { display_name: String },
+    /// Become the capture **anchor**: register the Discord→Matrix capture handler
+    /// on this puppet's voice connection (it forwards all Discord speakers).
+    BecomeAnchor,
     /// Mirror the Matrix participant's mute state onto this bot's voice connection.
     SetMuted(bool),
     /// Reset the nickname, leave voice, drop the SSRC exclusion.
@@ -108,6 +118,12 @@ pub struct PuppetPool {
     /// Participant key → current routing.  The single source of truth for
     /// allocation; guarded so `assign`/`release` stay race-free.
     assignments: StdMutex<HashMap<String, Assign>>,
+    /// Slot index of the current capture **anchor** ([`NO_ANCHOR`] if none) — the
+    /// one puppet that captures Discord→Matrix. Shared with each anchor's
+    /// `VoiceReceiver`, which only forwards while this equals its own slot, so a
+    /// handoff is seamless (no doubled or dropped forwarding during the overlap).
+    /// Written only under the `assignments` lock.
+    anchor: Arc<AtomicUsize>,
 }
 
 impl PuppetPool {
@@ -137,6 +153,7 @@ impl PuppetPool {
             nickname_prefix: Arc::from(cfg.nickname_prefix.as_str()),
             slots,
             assignments: StdMutex::new(HashMap::new()),
+            anchor: Arc::new(AtomicUsize::new(NO_ANCHOR)),
         })
     }
 
@@ -158,9 +175,11 @@ impl PuppetPool {
         guild_id: GuildId,
         channel_id: ChannelId,
         bridge: Arc<str>,
+        audio_tx: mpsc::Sender<Vec<i16>>,
+        capture_sink: Option<Arc<CaptureSink>>,
     ) -> Result<()> {
         if self.slots.is_empty() {
-            tracing::info!("no puppet tokens configured — running listener-only");
+            tracing::warn!("no puppet tokens configured — Discord side has no bots");
             return Ok(());
         }
 
@@ -183,18 +202,23 @@ impl PuppetPool {
                 mixer: slot.mixer.clone(),
                 exclude: self.exclude.clone(),
                 nickname_prefix: self.nickname_prefix.clone(),
+                audio_tx: audio_tx.clone(),
+                capture_sink: capture_sink.clone(),
+                anchor: self.anchor.clone(),
                 current_ssrc: slot.current_ssrc.clone(),
                 cmd_rx: StdMutex::new(Some(rx)),
             };
             let token = slot.token.clone();
 
             futs.push(async move {
-                // Puppets are TX-only (they only play): the default songbird
-                // config does no Opus decode/DAVE-receive. DAVE *encryption* for
-                // outgoing audio is handled by songbird automatically.
+                // Puppets both PLAY their participant and (when elected anchor)
+                // CAPTURE Discord speakers, so they need Opus decode / DAVE-receive
+                // (`DecodeMode::Decode`) — any puppet can become the anchor.
+                let sb_config = songbird::Config::default()
+                    .decode_mode(DecodeMode::Decode(DecodeConfig::default()));
                 let mut client = Client::builder(&token, intents)
                     .event_handler(handler)
-                    .register_songbird_from_config(songbird::Config::default())
+                    .register_songbird_from_config(sb_config)
                     .await
                     .map_err(|e| anyhow!("failed to build puppet {idx} client: {e}"))?;
                 tracing::info!(idx, "starting puppet gateway");
@@ -242,6 +266,12 @@ impl PlaybackRouter for PuppetPool {
                     tracing::warn!(idx, "puppet command channel full/closed on assign");
                 }
                 tracing::info!(key, display_name, idx, "assigned participant to puppet");
+                // Elect this puppet as the capture anchor if there isn't one.
+                if self.anchor.load(Ordering::Relaxed) == NO_ANCHOR {
+                    self.anchor.store(idx, Ordering::Relaxed);
+                    let _ = slot.cmd_tx.try_send(PuppetCommand::BecomeAnchor);
+                    tracing::info!(idx, "puppet elected capture anchor");
+                }
                 return self.sink(slot.mixer.clone(), key);
             }
         }
@@ -274,6 +304,27 @@ impl PlaybackRouter for PuppetPool {
                     tracing::warn!(idx, "puppet command channel full/closed on release");
                 }
                 tracing::info!(key, idx, "released puppet");
+                // If this puppet was the capture anchor, hand off to another
+                // still-assigned puppet (or none if it was the last one).
+                if self.anchor.load(Ordering::Relaxed) == idx {
+                    let next = map.values().find_map(|a| match a {
+                        Assign::Puppet(i) => Some(*i),
+                        Assign::Listener => None,
+                    });
+                    match next {
+                        Some(new_idx) => {
+                            self.anchor.store(new_idx, Ordering::Relaxed);
+                            let _ = self.slots[new_idx]
+                                .cmd_tx
+                                .try_send(PuppetCommand::BecomeAnchor);
+                            tracing::info!(old = idx, new = new_idx, "capture anchor handed off");
+                        }
+                        None => {
+                            self.anchor.store(NO_ANCHOR, Ordering::Relaxed);
+                            tracing::info!(idx, "capture anchor released — no puppets left");
+                        }
+                    }
+                }
             }
             Some(Assign::Listener) => {
                 self.listener_mixer.remove(key);
@@ -293,6 +344,7 @@ impl PlaybackRouter for PuppetPool {
                 let _ = slot.cmd_tx.try_send(PuppetCommand::Release);
             }
         }
+        self.anchor.store(NO_ANCHOR, Ordering::Relaxed);
         self.listener_mixer.clear();
     }
 }
@@ -309,6 +361,13 @@ struct PuppetHandler {
     mixer: Arc<PlaybackMixer>,
     exclude: SharedExclude,
     nickname_prefix: Arc<str>,
+    /// Forward channel to the RTC publish path, used when this puppet is the
+    /// capture anchor.
+    audio_tx: mpsc::Sender<Vec<i16>>,
+    /// Optional WAV capture (used by the anchor's `VoiceReceiver`).
+    capture_sink: Option<Arc<CaptureSink>>,
+    /// Shared current-anchor marker (gates this puppet's capture forwarding).
+    anchor: Arc<AtomicUsize>,
     current_ssrc: Arc<StdMutex<Option<u32>>>,
     cmd_rx: StdMutex<Option<mpsc::Receiver<PuppetCommand>>>,
 }
@@ -339,6 +398,9 @@ impl EventHandler for PuppetHandler {
             self.mixer.clone(),
             self.exclude.clone(),
             self.nickname_prefix.clone(),
+            self.audio_tx.clone(),
+            self.capture_sink.clone(),
+            self.anchor.clone(),
             self.current_ssrc.clone(),
             rx,
         ));
@@ -357,6 +419,9 @@ async fn puppet_command_loop(
     mixer: Arc<PlaybackMixer>,
     exclude: SharedExclude,
     nickname_prefix: Arc<str>,
+    audio_tx: mpsc::Sender<Vec<i16>>,
+    capture_sink: Option<Arc<CaptureSink>>,
+    anchor: Arc<AtomicUsize>,
     current_ssrc: Arc<StdMutex<Option<u32>>>,
     mut cmd_rx: mpsc::Receiver<PuppetCommand>,
 ) {
@@ -377,6 +442,19 @@ async fn puppet_command_loop(
                 )
                 .await;
             }
+            PuppetCommand::BecomeAnchor => {
+                puppet_become_anchor(
+                    &bridge,
+                    &ctx,
+                    idx,
+                    guild_id,
+                    &exclude,
+                    audio_tx.clone(),
+                    capture_sink.clone(),
+                    anchor.clone(),
+                )
+                .await;
+            }
             PuppetCommand::SetMuted(muted) => {
                 puppet_set_muted(&ctx, idx, guild_id, muted).await;
             }
@@ -386,6 +464,52 @@ async fn puppet_command_loop(
         }
     }
     tracing::info!(idx, "puppet command loop exited");
+}
+
+/// Register the Discord→Matrix capture handlers on this puppet's voice connection
+/// (it has become the anchor). The `VoiceReceiver` forwards all non-excluded
+/// Discord speakers to `audio_tx`; only one puppet holds these at a time. If this
+/// puppet hasn't joined voice yet, the command is dropped — the pool only elects
+/// an anchor among assigned puppets, which join on `Assign`.
+#[allow(clippy::too_many_arguments)]
+async fn puppet_become_anchor(
+    bridge: &Arc<str>,
+    ctx: &Context,
+    idx: usize,
+    guild_id: GuildId,
+    exclude: &SharedExclude,
+    audio_tx: mpsc::Sender<Vec<i16>>,
+    capture_sink: Option<Arc<CaptureSink>>,
+    anchor: Arc<AtomicUsize>,
+) {
+    let Some(manager) = songbird::get(ctx).await else {
+        return;
+    };
+    let Some(call_lock) = manager.get(guild_id) else {
+        tracing::warn!(idx, "anchor command but puppet not in voice yet");
+        return;
+    };
+    let mut call = call_lock.lock().await;
+    // The VoiceReceiver only forwards while `anchor == idx`, so even if a previous
+    // anchor's handler is still briefly registered during handoff, exactly one
+    // puppet forwards at a time.
+    call.add_global_event(
+        CoreEvent::VoiceTick.into(),
+        VoiceReceiver::new(bridge.clone(), audio_tx, exclude.clone(), capture_sink, anchor, idx),
+    );
+    call.add_global_event(
+        CoreEvent::SpeakingStateUpdate.into(),
+        SpeakingLogger::new(bridge.clone()),
+    );
+    for ev in [
+        CoreEvent::DriverConnect,
+        CoreEvent::DriverReconnect,
+        CoreEvent::DriverDisconnect,
+        CoreEvent::ClientDisconnect,
+    ] {
+        call.add_global_event(ev.into(), ConnectionLogger::new(bridge.clone()));
+    }
+    tracing::info!(idx, "anchor capture active — Discord→Matrix forwarding from this puppet");
 }
 
 /// Self-mute/unmute this puppet's voice connection to mirror the Matrix
