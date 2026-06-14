@@ -36,7 +36,7 @@ use songbird::{
 use tokio::sync::mpsc;
 
 use nvb_audio::mixer::PlaybackMixer;
-use nvb_audio::routing::{MixerSink, ParticipantSink, PlaybackRouter};
+use nvb_audio::routing::{ParticipantSink, PlaybackRouter};
 use nvb_config::DiscordConfig;
 
 use crate::{
@@ -94,8 +94,10 @@ enum PuppetCommand {
 enum Assign {
     /// A dedicated puppet (index into [`PuppetPool::slots`]).
     Puppet(usize),
-    /// Overflow — mixed into the shared overflow mix that the anchor plays.
-    Overflow,
+    /// Overflow — mixed into the shared overflow mix that the anchor plays. Holds
+    /// the speaker's name + mute so they can be **promoted** into a freed slot
+    /// (their own named bot) later.
+    Overflow { name: String, muted: bool },
 }
 
 /// One puppet's shared state.  `cmd_tx`/`cmd_rx` connect the sync allocator to
@@ -113,10 +115,20 @@ struct PuppetSlot {
     /// nickname after it has been relabeled to the overflow label. Guarded by the
     /// `assignments` lock.
     name: StdMutex<Option<String>>,
+    /// The participant's intended mute state (mirrored from Matrix). Tracked even
+    /// when not currently *applied* — the anchor stays unmuted while it hosts the
+    /// overflow mix, and reapplies this once overflow clears.
+    muted: AtomicBool,
     /// True while assigned to a participant.  Only mutated under the
     /// `assignments` lock, so `Relaxed` ordering is sufficient.
     busy: AtomicBool,
 }
+
+/// A swappable audio route: the mixer a participant's frames currently flow into.
+/// The pool re-points this (under the `assignments` lock) when a participant is
+/// promoted from the overflow mix into a freed puppet slot; the held
+/// [`RoutedSink`] then pushes to the new mixer with no change on the matrix side.
+type Route = Arc<StdMutex<Arc<PlaybackMixer>>>;
 
 /// The puppet pool / playback router.
 pub struct PuppetPool {
@@ -130,6 +142,10 @@ pub struct PuppetPool {
     /// Participant key → current routing.  The single source of truth for
     /// allocation; guarded so `assign`/`release` stay race-free.
     assignments: StdMutex<HashMap<String, Assign>>,
+    /// Participant key → its swappable audio route handle. The pool re-points a
+    /// route on promotion; the matrix-side [`RoutedSink`] holds the same handle.
+    /// Only touched under the `assignments` lock.
+    routes: StdMutex<HashMap<String, Route>>,
     /// Slot index of the current capture **anchor** ([`NO_ANCHOR`] if none) — the
     /// one puppet that captures Discord→Matrix. Shared with each anchor's
     /// `VoiceReceiver`, which only forwards while this equals its own slot, so a
@@ -155,6 +171,7 @@ impl PuppetPool {
                     cmd_rx: StdMutex::new(Some(cmd_rx)),
                     current_ssrc: Arc::new(StdMutex::new(None)),
                     name: StdMutex::new(None),
+                    muted: AtomicBool::new(false),
                     busy: AtomicBool::new(false),
                 }
             })
@@ -166,6 +183,7 @@ impl PuppetPool {
             nickname_prefix: Arc::from(cfg.nickname_prefix.as_str()),
             slots,
             assignments: StdMutex::new(HashMap::new()),
+            routes: StdMutex::new(HashMap::new()),
             anchor: Arc::new(AtomicUsize::new(NO_ANCHOR)),
         })
     }
@@ -237,40 +255,96 @@ impl PuppetPool {
         Ok(())
     }
 
-    /// Build a sink that pushes under `key` to the given mixer.
-    fn sink(&self, mixer: Arc<PlaybackMixer>, key: &str) -> Arc<dyn ParticipantSink> {
-        Arc::new(MixerSink::new(mixer, key.to_owned()))
+    /// Get or create the route handle for `key`, re-pointing it at `mixer`.
+    fn route_to(
+        routes: &mut HashMap<String, Route>,
+        key: &str,
+        mixer: Arc<PlaybackMixer>,
+    ) -> Route {
+        match routes.get(key) {
+            Some(r) => {
+                *r.lock().unwrap_or_else(PoisonError::into_inner) = mixer;
+                r.clone()
+            }
+            None => {
+                let r: Route = Arc::new(StdMutex::new(mixer));
+                routes.insert(key.to_owned(), r.clone());
+                r
+            }
+        }
     }
 
-    /// Send the current anchor a nickname (used to toggle the overflow label).
-    /// No-op when there is no anchor. Call only on a transition (Discord rate-
-    /// limits nickname edits).
-    fn relabel_anchor(&self, name: String) {
+    /// Set the anchor's nickname to reflect overflow state: the overflow label
+    /// while it hosts ≥1 overflow speaker, else its own participant's name.
+    fn reconcile_anchor_label(&self, map: &HashMap<String, Assign>) {
         let anchor = self.anchor.load(Ordering::Relaxed);
-        if anchor != NO_ANCHOR {
-            let _ = self.slots[anchor]
-                .cmd_tx
-                .try_send(PuppetCommand::SetNickname(name));
+        if anchor == NO_ANCHOR {
+            return;
         }
+        let name = if overflow_count(map) > 0 {
+            OVERFLOW_LABEL.to_string()
+        } else {
+            self.slots[anchor]
+                .name
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+                .unwrap_or_default()
+        };
+        let _ = self.slots[anchor]
+            .cmd_tx
+            .try_send(PuppetCommand::SetNickname(name));
+    }
+
+    /// Apply the anchor's mute: forced **unmuted** while it hosts the overflow mix
+    /// (so muting its own participant never silences the others), else its
+    /// participant's intended mute. (Bug-1 fix: the overflow host never self-mutes.)
+    fn reconcile_anchor_mute(&self, map: &HashMap<String, Assign>) {
+        let anchor = self.anchor.load(Ordering::Relaxed);
+        if anchor == NO_ANCHOR {
+            return;
+        }
+        let applied = overflow_count(map) == 0 && self.slots[anchor].muted.load(Ordering::Relaxed);
+        let _ = self.slots[anchor]
+            .cmd_tx
+            .try_send(PuppetCommand::SetMuted(applied));
     }
 }
 
 /// Count overflow participants (those routed to the shared mix, no dedicated puppet).
 fn overflow_count(map: &HashMap<String, Assign>) -> usize {
-    map.values().filter(|a| matches!(a, Assign::Overflow)).count()
+    map.values()
+        .filter(|a| matches!(a, Assign::Overflow { .. }))
+        .count()
+}
+
+/// A [`ParticipantSink`] whose target mixer the pool can swap (for promotion).
+struct RoutedSink {
+    route: Route,
+    key: String,
+}
+
+impl ParticipantSink for RoutedSink {
+    fn push(&self, mono: &[i16]) {
+        let mixer = self
+            .route
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        mixer.push(&self.key, mono);
+    }
 }
 
 impl PlaybackRouter for PuppetPool {
     fn assign(&self, key: &str, display_name: &str) -> Arc<dyn ParticipantSink> {
         let mut map = self.assignments.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut routes = self.routes.lock().unwrap_or_else(PoisonError::into_inner);
 
-        // Idempotent: a re-subscribe for the same participant reuses its output.
-        if let Some(existing) = map.get(key) {
-            let mixer = match existing {
-                Assign::Puppet(idx) => self.slots[*idx].mixer.clone(),
-                Assign::Overflow => self.overflow_mixer.clone(),
-            };
-            return self.sink(mixer, key);
+        // Idempotent: a re-subscribe for the same participant reuses its route.
+        if map.contains_key(key) {
+            if let Some(r) = routes.get(key) {
+                return Arc::new(RoutedSink { route: r.clone(), key: key.to_owned() });
+            }
         }
 
         // Claim the first free puppet (mutated under the lock → Relaxed is fine).
@@ -279,11 +353,10 @@ impl PlaybackRouter for PuppetPool {
                 map.insert(key.to_owned(), Assign::Puppet(idx));
                 *slot.name.lock().unwrap_or_else(PoisonError::into_inner) =
                     Some(display_name.to_owned());
+                slot.muted.store(false, Ordering::Relaxed);
                 if slot
                     .cmd_tx
-                    .try_send(PuppetCommand::Assign {
-                        display_name: display_name.to_owned(),
-                    })
+                    .try_send(PuppetCommand::Assign { display_name: display_name.to_owned() })
                     .is_err()
                 {
                     tracing::warn!(idx, "puppet command channel full/closed on assign");
@@ -295,87 +368,132 @@ impl PlaybackRouter for PuppetPool {
                     let _ = slot.cmd_tx.try_send(PuppetCommand::BecomeAnchor);
                     tracing::info!(idx, "puppet elected capture anchor");
                 }
-                return self.sink(slot.mixer.clone(), key);
+                let route = Self::route_to(&mut routes, key, slot.mixer.clone());
+                return Arc::new(RoutedSink { route, key: key.to_owned() });
             }
         }
 
         // Pool exhausted → overflow into the shared overflow mix (played by the
-        // anchor). If this is the first overflow participant, relabel the anchor
-        // to the overflow label.
+        // anchor). On the first overflow speaker, relabel the anchor and force it
+        // unmuted (it must keep transmitting the overflow mix).
         let was_overflowing = overflow_count(&map) > 0;
-        map.insert(key.to_owned(), Assign::Overflow);
+        map.insert(
+            key.to_owned(),
+            Assign::Overflow { name: display_name.to_owned(), muted: false },
+        );
         tracing::info!(key, display_name, "puppet pool exhausted — overflow to anchor mix");
+        let route = Self::route_to(&mut routes, key, self.overflow_mixer.clone());
         if !was_overflowing {
-            self.relabel_anchor(OVERFLOW_LABEL.to_string());
+            self.reconcile_anchor_label(&map);
+            self.reconcile_anchor_mute(&map);
         }
-        self.sink(self.overflow_mixer.clone(), key)
+        Arc::new(RoutedSink { route, key: key.to_owned() })
     }
 
     fn set_muted(&self, key: &str, muted: bool) {
-        let map = self.assignments.lock().unwrap_or_else(PoisonError::into_inner);
-        // Only dedicated puppets can mirror mute; overflow speakers share a bot.
-        if let Some(Assign::Puppet(idx)) = map.get(key) {
-            let slot = &self.slots[*idx];
-            if slot.cmd_tx.try_send(PuppetCommand::SetMuted(muted)).is_err() {
-                tracing::warn!(idx = *idx, "puppet command channel full/closed on set_muted");
+        let mut map = self.assignments.lock().unwrap_or_else(PoisonError::into_inner);
+        match map.get_mut(key) {
+            Some(Assign::Puppet(idx)) => {
+                let idx = *idx;
+                self.slots[idx].muted.store(muted, Ordering::Relaxed);
+                if idx == self.anchor.load(Ordering::Relaxed) {
+                    // The anchor's applied mute depends on whether it hosts overflow.
+                    self.reconcile_anchor_mute(&map);
+                } else {
+                    let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetMuted(muted));
+                }
             }
+            // Overflow speaker has no dedicated bot yet — just remember the state
+            // so a later promotion applies it.
+            Some(Assign::Overflow { muted: m, .. }) => *m = muted,
+            None => {}
         }
     }
 
     fn release(&self, key: &str) {
         let mut map = self.assignments.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut routes = self.routes.lock().unwrap_or_else(PoisonError::into_inner);
         match map.remove(key) {
             Some(Assign::Puppet(idx)) => {
-                let slot = &self.slots[idx];
-                slot.mixer.clear();
-                slot.busy.store(false, Ordering::Relaxed);
-                *slot.name.lock().unwrap_or_else(PoisonError::into_inner) = None;
-                if slot.cmd_tx.try_send(PuppetCommand::Release).is_err() {
-                    tracing::warn!(idx, "puppet command channel full/closed on release");
-                }
-                tracing::info!(key, idx, "released puppet");
-                // If this puppet was the capture anchor, hand off to another
-                // still-assigned puppet (or none if it was the last one).
-                if self.anchor.load(Ordering::Relaxed) == idx {
-                    let next = map.values().find_map(|a| match a {
-                        Assign::Puppet(i) => Some(*i),
-                        Assign::Overflow => None,
-                    });
-                    match next {
-                        Some(new_idx) => {
-                            self.anchor.store(new_idx, Ordering::Relaxed);
-                            let _ = self.slots[new_idx]
-                                .cmd_tx
-                                .try_send(PuppetCommand::BecomeAnchor);
-                            tracing::info!(old = idx, new = new_idx, "capture anchor handed off");
-                            // Carry the overflow label onto the new anchor if
-                            // overflow is still active (else it keeps its own name).
-                            if overflow_count(&map) > 0 {
-                                self.relabel_anchor(OVERFLOW_LABEL.to_string());
+                routes.remove(key);
+                // If an overflow speaker is waiting, PROMOTE them into this freed
+                // slot (reuse the bot — no leave/rejoin) instead of releasing it.
+                let promote = map.iter().find_map(|(k, a)| match a {
+                    Assign::Overflow { name, muted } => Some((k.clone(), name.clone(), *muted)),
+                    _ => None,
+                });
+                match promote {
+                    Some((yk, yname, ymuted)) => {
+                        map.insert(yk.clone(), Assign::Puppet(idx));
+                        // Re-route Y from the overflow mix to this slot's mixer.
+                        self.overflow_mixer.remove(&yk);
+                        self.slots[idx].mixer.clear();
+                        Self::route_to(&mut routes, &yk, self.slots[idx].mixer.clone());
+                        *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
+                            Some(yname.clone());
+                        self.slots[idx].muted.store(ymuted, Ordering::Relaxed);
+                        tracing::info!(key, promoted = %yk, idx, "promoted overflow speaker into freed slot");
+                        let is_anchor = idx == self.anchor.load(Ordering::Relaxed);
+                        let overflow_cleared = overflow_count(&map) == 0;
+                        if is_anchor {
+                            // The anchor's name/mute are driven by reconcile (it may
+                            // still be hosting overflow); avoid a redundant edit.
+                            if overflow_cleared {
+                                self.reconcile_anchor_label(&map);
+                                self.reconcile_anchor_mute(&map);
+                            }
+                        } else {
+                            // A normal named puppet now: set its name + Y's mute.
+                            let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetNickname(yname));
+                            let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetMuted(ymuted));
+                            if overflow_cleared {
+                                self.reconcile_anchor_label(&map);
+                                self.reconcile_anchor_mute(&map);
                             }
                         }
-                        None => {
-                            self.anchor.store(NO_ANCHOR, Ordering::Relaxed);
-                            tracing::info!(idx, "capture anchor released — no puppets left");
+                    }
+                    None => {
+                        // No overflow waiting → free the slot.
+                        self.slots[idx].mixer.clear();
+                        self.slots[idx].busy.store(false, Ordering::Relaxed);
+                        *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                        let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Release);
+                        tracing::info!(key, idx, "released puppet");
+                        // Hand the anchor off to another busy puppet if needed.
+                        if self.anchor.load(Ordering::Relaxed) == idx {
+                            let next = map.values().find_map(|a| match a {
+                                Assign::Puppet(i) => Some(*i),
+                                Assign::Overflow { .. } => None,
+                            });
+                            match next {
+                                Some(new_idx) => {
+                                    self.anchor.store(new_idx, Ordering::Relaxed);
+                                    let _ = self.slots[new_idx]
+                                        .cmd_tx
+                                        .try_send(PuppetCommand::BecomeAnchor);
+                                    tracing::info!(old = idx, new = new_idx, "capture anchor handed off");
+                                    // Reached only with no overflow (else we'd have
+                                    // promoted), so the new anchor keeps its own name
+                                    // and already-applied mute — no reconcile needed.
+                                }
+                                None => {
+                                    self.anchor.store(NO_ANCHOR, Ordering::Relaxed);
+                                    tracing::info!(idx, "capture anchor released — no puppets left");
+                                }
+                            }
                         }
                     }
                 }
             }
-            Some(Assign::Overflow) => {
+            Some(Assign::Overflow { .. }) => {
                 self.overflow_mixer.remove(key);
+                routes.remove(key);
                 tracing::info!(key, "released overflow participant from overflow mix");
-                // Overflow just cleared → restore the anchor to its own name.
+                // Only relabel/unmute the anchor when overflow actually cleared
+                // (avoids spurious nickname edits while overflow is still active).
                 if overflow_count(&map) == 0 {
-                    let anchor = self.anchor.load(Ordering::Relaxed);
-                    if anchor != NO_ANCHOR {
-                        let base = self.slots[anchor]
-                            .name
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .clone()
-                            .unwrap_or_default();
-                        self.relabel_anchor(base);
-                    }
+                    self.reconcile_anchor_label(&map);
+                    self.reconcile_anchor_mute(&map);
                 }
             }
             None => {}
@@ -384,6 +502,7 @@ impl PlaybackRouter for PuppetPool {
 
     fn release_all(&self) {
         let mut map = self.assignments.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut routes = self.routes.lock().unwrap_or_else(PoisonError::into_inner);
         for (_key, assign) in map.drain() {
             if let Assign::Puppet(idx) = assign {
                 let slot = &self.slots[idx];
@@ -393,6 +512,7 @@ impl PlaybackRouter for PuppetPool {
                 let _ = slot.cmd_tx.try_send(PuppetCommand::Release);
             }
         }
+        routes.clear();
         self.anchor.store(NO_ANCHOR, Ordering::Relaxed);
         self.overflow_mixer.clear();
     }
@@ -718,7 +838,7 @@ impl SongbirdEventHandler for PuppetSsrcRegistrar {
 
 #[cfg(test)]
 mod tests {
-    use super::build_nickname;
+    use super::*;
 
     #[test]
     fn nickname_prefix_applied() {
@@ -743,5 +863,28 @@ mod tests {
         let nick = build_nickname("[Matrix] ", &"é".repeat(40));
         assert!(nick.chars().count() <= 32);
         assert!(nick.starts_with("[Matrix] "));
+    }
+
+    // Samples a buffer must accumulate before the mixer releases it (priming).
+    const PRIME: usize = 150 * 48;
+
+    #[test]
+    fn routed_sink_follows_swapped_mixer() {
+        // A RoutedSink pushes to whatever mixer its route points at; swapping the
+        // route (as promotion does) redirects subsequent frames with no change on
+        // the matrix side.
+        let a = Arc::new(PlaybackMixer::new());
+        let b = Arc::new(PlaybackMixer::new());
+        let route: Route = Arc::new(StdMutex::new(a.clone()));
+        let sink = RoutedSink { route: route.clone(), key: "k".to_owned() };
+
+        sink.push(&vec![100i16; PRIME]);
+        assert!(a.pop_10ms_mixed().iter().all(|&s| s == 100), "frames went to A");
+
+        // Promote: swap the route to B. B was empty, so receiving the frames
+        // proves the swap redirected them (A keeps its own earlier buffer).
+        *route.lock().unwrap() = b.clone();
+        sink.push(&vec![80i16; PRIME]);
+        assert!(b.pop_10ms_mixed().iter().all(|&s| s == 80), "frames follow to B after swap");
     }
 }
