@@ -15,6 +15,8 @@ use livekit::{Room, RoomOptions};
 use livekit::e2ee::{E2eeOptions, EncryptionType, key_provider::{KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions}};
 use livekit::track::RemoteTrack;
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
+use matrix_sdk::Client;
+use matrix_sdk::ruma::{OwnedRoomId, RoomId, UserId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -90,6 +92,8 @@ pub async fn connect(
     url: &str,
     jwt: &str,
     use_e2ee: bool,
+    client: Client,
+    room_id: OwnedRoomId,
     router: Arc<dyn PlaybackRouter>,
 ) -> Result<LiveSession> {
     let span = tracing::info_span!("rtc.session", sfu_url = %url, use_e2ee);
@@ -144,7 +148,8 @@ pub async fn connect(
     // Drain room events in a background task so the channel doesn't fill up.
     // The same task routes inbound audio tracks to per-participant puppet outputs.
     let cancel = CancellationToken::new();
-    let event_task = tokio::spawn(handle_room_events(events, router, cancel.clone()));
+    let event_task =
+        tokio::spawn(handle_room_events(events, client, room_id, router, cancel.clone()));
 
     Ok(LiveSession {
         room,
@@ -161,16 +166,62 @@ pub async fn connect(
 /// frame is already in the sink's format.  The route is acquired via
 /// [`PlaybackRouter::assign`] (which checks out a puppet and sets its nickname to
 /// `display_name`) and returned via [`PlaybackRouter::release`] on exit.
+/// Resolve a human-friendly display name for a puppet nickname.
+///
+/// Element Call populates neither `participant.name()` nor metadata, and the
+/// LiveKit identity is `{mxid}:{device_id}` (e.g. `@dark:nether.im:2oQuErOThF`).
+/// Preference order: the participant name if LiveKit ever carries one; else the
+/// room member's display name (resolved from the MXID parsed out of the
+/// identity); else the bare MXID — still cleaner than the device-suffixed
+/// identity. The MXID itself contains one `:` (localpart:server), so only the
+/// final `:`-segment (the device id) is stripped.
+async fn resolve_display_name(
+    client: &Client,
+    room_id: &RoomId,
+    identity: &str,
+    participant_name: &str,
+) -> String {
+    if !participant_name.is_empty() {
+        return participant_name.to_owned();
+    }
+    let mxid_str = identity.rsplit_once(':').map_or(identity, |(mxid, _device)| mxid);
+    let Ok(user_id) = UserId::parse(mxid_str) else {
+        return mxid_str.to_owned();
+    };
+    if let Some(room) = client.get_room(room_id) {
+        match room.get_member(&user_id).await {
+            Ok(Some(member)) => {
+                if let Some(name) = member.display_name() {
+                    return name.to_owned();
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, user = %user_id, "room member lookup failed for puppet name");
+            }
+        }
+    }
+    mxid_str.to_owned()
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn playback_consumer(
     track: RemoteTrack,
     key: String,
-    display_name: String,
+    identity: String,
+    participant_name: String,
+    client: Client,
+    room_id: OwnedRoomId,
     router: Arc<dyn PlaybackRouter>,
     cancel: CancellationToken,
 ) {
     let RemoteTrack::Audio(audio) = track else {
         return; // video tracks are not bridged
     };
+    // Resolve the puppet's Discord nickname here (in the per-track task) so a
+    // homeserver round-trip never stalls the room-event loop.
+    let display_name =
+        resolve_display_name(&client, &room_id, &identity, &participant_name).await;
     let sink = router.assign(&key, &display_name);
     let mut stream =
         NativeAudioStream::new(audio.rtc_track(), PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS);
@@ -221,6 +272,8 @@ async fn playback_consumer(
 /// tracks into the playback mixer (one consumer task per track, keyed by SID).
 async fn handle_room_events(
     mut events: UnboundedReceiver<RoomEvent>,
+    client: Client,
+    room_id: OwnedRoomId,
     router: Arc<dyn PlaybackRouter>,
     cancel: CancellationToken,
 ) {
@@ -242,18 +295,17 @@ async fn handle_room_events(
             RoomEvent::TrackSubscribed { track, publication, participant } => {
                 let sid = publication.sid().to_string();
                 let identity = participant.identity().to_string();
-                // Display name for the puppet's Discord nickname. Element Call
-                // should populate `name`; fall back to the identity if not.
-                // Log all three so we can verify what EC actually sets.
+                // The puppet's Discord nickname is resolved in the consumer task
+                // (a homeserver lookup, kept off this event loop). Element Call
+                // sets neither `name` nor metadata — log both so a regression
+                // back to empty is visible.
                 let name = participant.name();
-                let display_name = if name.is_empty() { identity.clone() } else { name.clone() };
                 tracing::info!(
                     from_identity = %identity,
                     participant_name = %name,
                     participant_metadata = %participant.metadata(),
                     track_sid = %sid,
                     kind = ?track.kind(),
-                    display_name = %display_name,
                     "LiveKit: subscribed to remote participant track"
                 );
                 // TODO(Phase 8): skip tracks from bridge-owned ghost identities
@@ -261,7 +313,16 @@ async fn handle_room_events(
                 // every remote participant is a human and is bridged.
                 let ct = cancel.child_token();
                 consumers.insert(sid.clone(), ct.clone());
-                tokio::spawn(playback_consumer(track, sid, display_name, router.clone(), ct));
+                tokio::spawn(playback_consumer(
+                    track,
+                    sid,
+                    identity,
+                    name,
+                    client.clone(),
+                    room_id.clone(),
+                    router.clone(),
+                    ct,
+                ));
             }
             RoomEvent::TrackUnsubscribed { publication, participant, .. } => {
                 let sid = publication.sid().to_string();

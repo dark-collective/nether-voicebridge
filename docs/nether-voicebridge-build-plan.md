@@ -151,12 +151,15 @@ go to songbird's persistent driver event task, so pre-registration catches the
 connect event. Confirmed in logs: `puppet SSRC registered for echo-exclusion`
 now fires (it never did before), and the echo is gone.
 
-**Follow-up (cosmetic, not blocking):** Element Call populates **neither**
+**Display-name resolution (done):** Element Call populates **neither**
 `participant.name()` **nor** `participant.metadata()` (both logged empty at
-`TrackSubscribed`), so puppet nicknames fall back to the raw identity
-`@user:server:DEVICEID`. The contingency from the plan now applies: resolve the
-MXID (parsed from `identity()`) to a display name via a matrix-sdk profile
-lookup. Tracked for a later polish pass; attribution is otherwise correct.
+`TrackSubscribed`), so the LiveKit identity `@user:server:DEVICEID` was the only
+source. `session::resolve_display_name` now recovers the MXID (strip the final
+`:`-segment — the device id; the MXID keeps its own `localpart:server` colon) and
+looks up the room member's display name via `Room::get_member`, falling back to
+the bare MXID if that fails. Run in the per-track consumer task so the homeserver
+lookup never stalls the room-event loop. Verified live: `@dark:nether.im:…`
+(empty name/metadata) → puppet nickname **"Dark Collective"**.
 
 ## Phase 8 — Ghost set (Discord → Matrix attribution)
 **Build:** Register the appservice namespace on Tuwunel; mint a ghost per

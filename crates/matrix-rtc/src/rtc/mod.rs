@@ -356,7 +356,15 @@ async fn join_livekit_and_publish(
     )
     .await?;
 
-    let lk_session = session::connect(&jwt_resp.url, &jwt_resp.jwt, use_e2ee, router).await?;
+    let lk_session = session::connect(
+        &jwt_resp.url,
+        &jwt_resp.jwt,
+        use_e2ee,
+        client.clone(),
+        room_id.to_owned(),
+        router,
+    )
+    .await?;
 
     if use_e2ee {
         if let Some(ref key_provider) = lk_session.key_provider {
