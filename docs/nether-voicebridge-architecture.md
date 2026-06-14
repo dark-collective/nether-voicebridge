@@ -133,6 +133,17 @@ Handle room tombstones (follow upgrades) and call-end events.
   are legitimate MLS group members and get ratcheted sender keys — decryption
   works because they're real participants. `songbird` handles the MLS dance;
   pin a DAVE-capable release.
+  - **Epoch-transition caveat (verified 2026-06-14):** when voice-channel
+    membership changes (any human or bot joins/leaves), the DAVE/MLS group
+    re-keys to a new epoch. `songbird 0.6.0` (the latest release) does **not**
+    reliably follow that transition — after a re-key the listener decodes garbage
+    (`opus_decode InvalidPacket`) on every packet and never recovers, and the
+    crate exposes no API to query DAVE state, force a re-key, or observe decrypt
+    failures. The only cure is a fresh voice connection. **Phase 6** builds
+    detect-and-recover (decode-death heuristic → leave + rejoin the channel) so
+    the listener survives arbitrary churn; the puppet pool (Phase 8) keeps its
+    connections persistent to bound the churn it creates. Do not assume songbird
+    "just handles" epochs.
 - **Matrix (Element Call media E2EE):** per-sender keys distributed via Matrix
   to-device events. **Element Call uses HKDF; livekit-rust's built-in frame
   E2EE uses PBKDF2** — a real incompatibility. Do the key derivation yourself
