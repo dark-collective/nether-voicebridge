@@ -6,3 +6,7 @@ config.local.toml
 *.secret.toml
 .env
 .env.*
+
+# matrix-sdk SQLite store (Olm crypto keys + state + media cache) — local runtime
+# data, never commit.
+/nether-store/

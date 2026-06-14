@@ -1,69 +1,78 @@
-//! Fetch a LiveKit JWT from lk-jwt-service.
+//! Fetch a LiveKit JWT from lk-jwt-service using the **legacy** `/sfu/get` body.
 //!
-//! lk-jwt-service accepts a Matrix OpenID token and returns a LiveKit JWT
-//! that can be used to connect to the SFU's LiveKit room.
+//! ## Why legacy body, not the new `member`-bearing body
 //!
-//! Endpoint: `POST {livekit_service_url}/sfu/get`
-//! Body:  `{ "room_id": "...", "slot_id": "...", "openid_token": { ... } }`
-//! Response: `{ "jwt": "<token>", "url": "wss://..." }`  (jwt also aliased as "token")
+//! lk-jwt-service has two identity code paths selected by request body shape:
 //!
-//! The server verifies the openid_token with the Matrix homeserver to determine
-//! the caller's identity — no separate `member` field is needed in the request.
+//! * **Legacy** body `{room, device_id, openid_token}` (no `member` field):
+//!   - Room: `sha256(json([room, "m.call#ROOM"]))` — the shared room (hardcoded on server)
+//!   - Identity: **`{matrixID}:{device_id}`** — plaintext
+//!
+//! * **New** body `{room_id, slot_id, member{…}}`:
+//!   - Room: `sha256(json([room_id, slot_id]))` — shared when `slot_id = "m.call#ROOM"`
+//!   - Identity: **`sha256(json([matrixID, claimed_device_id, member.id]))`** — hash
+//!
+//! nether.im's Element Call clients (plaintext-era) use the legacy body → plaintext
+//! identity. They map incoming media keys to `{senderMXID}:{device_id}` (plaintext)
+//! derived from the sender's `m.call.member` membership. If we use the new body,
+//! our real LiveKit identity is a sha256 hash that EC can never match → "waiting
+//! for media". Using the legacy body makes our identity `@voicebridge:nether.im:BRIDGE01`
+//! which EC correctly derives from our membership content `device_id = "BRIDGE01"`.
+//!
+//! Do NOT add a `member` field back without rethinking the key-attribution scheme.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::rtc::openid::OpenIdToken;
 
-/// The `member` sub-object identifying the calling participant.
+/// Legacy request body for `POST {livekit_service_url}/sfu/get`.
+///
+/// The absence of a `member` field selects lk-jwt's legacy identity path:
+/// `identity = matrixID + ":" + device_id` (plaintext, not sha256-hashed).
 #[derive(Debug, Serialize)]
-struct Member<'a> {
-    id: &'a str,
-    claimed_user_id: &'a str,
-    claimed_device_id: &'a str,
-}
-
-/// Request body for `POST {livekit_service_url}/sfu/get`.
-#[derive(Debug, Serialize)]
-struct LkJwtRequest<'a> {
-    room_id: &'a str,
-    slot_id: &'a str,
-    member: Member<'a>,
+struct LegacyLkJwtRequest<'a> {
+    /// The Matrix room ID. lk-jwt derives the LiveKit room as
+    /// `sha256(json([room, "m.call#ROOM"]))` — the shared room, internally hardcoded.
+    room: &'a str,
+    /// The bot's Matrix device ID. Becomes the colon-suffix in our plaintext identity.
+    /// Must match the membership content `device_id` so EC can map our key to our
+    /// LiveKit participant.
+    device_id: &'a str,
+    /// Fresh Matrix OpenID token for authentication.
     openid_token: &'a OpenIdToken,
 }
 
 /// Response from lk-jwt-service.
 #[derive(Debug, Deserialize)]
 pub struct LkJwtResponse {
-    /// The LiveKit JWT. The service calls it "jwt" but some versions use "token".
-    /// Used in Stage 2 to connect to the LiveKit room.
+    /// The LiveKit JWT. Some lk-jwt versions call this field "token".
     #[serde(alias = "token")]
-    #[allow(dead_code)]
     pub jwt: String,
     /// WebSocket URL of the LiveKit SFU to connect to.
     pub url: String,
 }
 
-/// Fetch a LiveKit JWT for the given room from the SFU's lk-jwt-service.
+/// Fetch a LiveKit JWT from lk-jwt-service using the legacy body format.
 ///
-/// `service_url` — `livekit_service_url` from the `.well-known` focus entry
-/// `room_id`     — the Matrix room ID (used as the LiveKit room name)
-/// `slot_id`     — the participant slot identifier (Matrix device ID)
-/// `user_id`     — the bot's Matrix user ID
-/// `openid_token` — a freshly-minted Matrix OpenID token
+/// Yields a **plaintext** participant identity (`{userID}:{deviceID}`) so Element
+/// Call can correctly map our media key to our LiveKit participant.
+///
+/// `service_url`  — `livekit_service_url` from the `.well-known` focus entry
+/// `room_id`      — the Matrix room ID (maps to the `room` body field)
+/// `device_id`    — the bot's Matrix device ID (maps to the `device_id` body field)
+/// `openid_token` — a freshly-minted Matrix OpenID token for the bot's account
 pub async fn fetch_livekit_token(
     client: &reqwest::Client,
     service_url: &str,
     room_id: &str,
-    slot_id: &str,
-    user_id: &str,
+    device_id: &str,
     openid_token: &OpenIdToken,
 ) -> Result<LkJwtResponse> {
     let url = format!("{service_url}/sfu/get");
     let _span = tracing::info_span!("rtc.lk_jwt", %url, %room_id).entered();
 
-    let member = Member { id: slot_id, claimed_user_id: user_id, claimed_device_id: slot_id };
-    let body = LkJwtRequest { room_id, slot_id, member, openid_token };
+    let body = LegacyLkJwtRequest { room: room_id, device_id, openid_token };
 
     let raw = client
         .post(&url)
@@ -83,10 +92,11 @@ pub async fn fetch_livekit_token(
     let resp: LkJwtResponse = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing lk-jwt JSON response from {url}"))?;
 
-    // Log the SFU URL; never log the JWT itself (it is a bearer credential).
+    // Log the SFU URL only; never log the JWT itself (it is a bearer credential).
+    // Expected sub (our LiveKit identity): "@voicebridge:nether.im:{device_id}"
     tracing::info!(
         sfu_url = %resp.url,
-        "LiveKit JWT obtained from lk-jwt-service"
+        "LiveKit JWT obtained (legacy body → expected plaintext identity)"
     );
     Ok(resp)
 }

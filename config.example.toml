@@ -76,3 +76,10 @@ url = "wss://livekit.nether.im"
 # be needed if you call the LiveKit server API directly (e.g. room management).
 api_key = "your_api_key"
 api_secret = "your_api_secret_here"
+
+# Element Call media frame E2EE (AES-GCM, HKDF). Leave FALSE unless the EC
+# deployment actually runs per-frame encryption (typically only for ENCRYPTED
+# Matrix rooms). nether.im's room is unencrypted and EC runs the call without
+# media E2EE, so the bridge must NOT encrypt — encrypting into a non-E2EE call
+# makes peers hear the bridge's ciphertext as static. Default: false.
+media_e2ee = false

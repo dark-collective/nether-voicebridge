@@ -61,12 +61,12 @@ impl ActiveSession {
 /// Run the RTC participation loop.
 ///
 /// * `client` — a ready matrix-sdk client (produced by `matrix::build_client`)
-/// * `_lk_cfg` — LiveKit / lk-jwt config from TOML (currently unused post-Stage-1)
+/// * `lk_cfg` — LiveKit / lk-jwt config from TOML
 /// * `mx_cfg`  — Matrix config (bot user_id + device_id + room_id)
 /// * `call_active_rx` — watch receiver: `true` when humans are in the call
 pub async fn run(
     client: Client,
-    _lk_cfg: &LiveKitConfig,
+    lk_cfg: &LiveKitConfig,
     mx_cfg: &MatrixConfig,
     mut call_active_rx: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -88,32 +88,44 @@ pub async fn run(
     // The to-device handler uses this to install incoming peer keys.
     let shared_provider: Arc<Mutex<Option<KeyProvider>>> = Arc::new(Mutex::new(None));
 
-    // Register a handler to receive peers' media keys over encrypted to-device.
-    // The matrix-sdk sync loop auto-decrypts m.room.encrypted to-device events
-    // when e2e-encryption is enabled, delivering CallEncryptionKeysEventContent here.
+    // Register a handler to receive peers' media keys via to-device events.
+    // If the room has Olm sessions the SDK auto-decrypts before delivery; if not
+    // (unencrypted room) the event arrives in plaintext (_info is None).
     {
         let provider_ref = shared_provider.clone();
         client.add_event_handler(
-            move |ev: matrix_sdk::ruma::events::ToDeviceEvent<CallEncryptionKeysEventContent>,
-                  _info: Option<matrix_sdk::deserialized_responses::EncryptionInfo>| {
+            move |ev: matrix_sdk::ruma::events::ToDeviceEvent<CallEncryptionKeysEventContent>| {
                 let provider_ref = provider_ref.clone();
                 async move {
                     let sender = ev.sender.as_str().to_owned();
                     let content = ev.content;
-                    let device_id = content.member.claimed_device_id.clone();
+                    let claimed_device_id = content.member.claimed_device_id.clone();
+                    let member_id = content.member.id.clone();
                     let key_index = content.keys.index;
                     let key_b64 = content.keys.key.clone();
 
-                    tracing::debug!(
+                    // Diagnostic: log all identity fields so we can verify EC's scheme.
+                    // Never log the key bytes. These arrive plaintext (unencrypted room).
+                    tracing::info!(
                         sender = %sender,
-                        device = %device_id,
+                        claimed_device_id = %claimed_device_id,
+                        member_id = %member_id,
+                        session_application = %content.session.application,
+                        session_scope = %content.session.scope,
+                        session_call_id = %content.session.call_id,
                         key_index,
-                        "received encryption_keys to-device"
+                        "received io.element.call.encryption_keys to-device (plaintext)"
                     );
 
                     let guard = provider_ref.lock().expect("provider mutex poisoned");
                     if let Some(provider) = guard.as_ref() {
-                        keys::install_peer_key(&sender, &device_id, key_index, &key_b64, provider);
+                        keys::install_peer_key(
+                            &sender,
+                            &claimed_device_id,
+                            key_index,
+                            &key_b64,
+                            provider,
+                        );
                     } else {
                         tracing::debug!(
                             sender = %sender,
@@ -166,6 +178,7 @@ pub async fn run(
                     &room_id_str,
                     mx_cfg.device_id.as_str(),
                     &shared_provider,
+                    lk_cfg.media_e2ee,
                 )
                 .await
                 {
@@ -215,8 +228,8 @@ pub async fn run(
     Ok(())
 }
 
-/// Fetch a fresh JWT, connect to LiveKit, generate our media key, publish the
-/// tone, and send our key to all current call members.
+/// Fetch a fresh JWT, connect to LiveKit, optionally set up E2EE, publish the
+/// tone, and (when E2EE is enabled) send our key to all current call members.
 async fn join_livekit_and_start_tone(
     client: &Client,
     http: &reqwest::Client,
@@ -225,6 +238,7 @@ async fn join_livekit_and_start_tone(
     room_id_str: &str,
     device_id: &str,
     shared_provider: &Arc<Mutex<Option<KeyProvider>>>,
+    use_e2ee: bool,
 ) -> Result<ActiveSession> {
     let user_id = client
         .user_id()
@@ -238,49 +252,55 @@ async fn join_livekit_and_start_tone(
         &focus.service_url,
         room_id_str,
         device_id,
-        user_id.as_str(),
         &openid_token,
     )
     .await?;
 
-    let lk_session = session::connect(&jwt_resp.url, &jwt_resp.jwt).await?;
+    let lk_session = session::connect(&jwt_resp.url, &jwt_resp.jwt, use_e2ee).await?;
 
-    // Set our own key in the provider so LiveKit encrypts our outbound frames.
-    let media_key = keys::generate_key();
-    let our_identity = livekit::id::ParticipantIdentity::from(lk_session.our_identity.clone());
-    let installed = lk_session.key_provider.set_key(&our_identity, 0, media_key.to_vec());
-    tracing::info!(
-        identity = %lk_session.our_identity,
-        installed,
-        "our media key set in LiveKit key provider"
-    );
+    if use_e2ee {
+        if let Some(ref key_provider) = lk_session.key_provider {
+            // Set our own key in the provider so LiveKit encrypts our outbound frames.
+            let media_key = keys::generate_key();
+            let our_identity =
+                livekit::id::ParticipantIdentity::from(lk_session.our_identity.clone());
+            let installed = key_provider.set_key(&our_identity, 0, media_key.to_vec());
+            tracing::info!(
+                identity = %lk_session.our_identity,
+                installed,
+                "our media key set in LiveKit key provider"
+            );
 
-    // Make the provider visible to the to-device receive handler.
-    {
-        let mut guard = shared_provider.lock().expect("provider mutex poisoned");
-        *guard = Some(lk_session.key_provider.clone());
+            // Make the provider visible to the to-device receive handler.
+            {
+                let mut guard = shared_provider.lock().expect("provider mutex poisoned");
+                *guard = Some(key_provider.clone());
+            }
+
+            // Send our key to all current call members (best-effort).
+            if let Some(room) = client.get_room(room_id) {
+                if let Err(e) = keys::send_key(
+                    client,
+                    &room,
+                    &user_id,
+                    device_id,
+                    room_id_str,
+                    0,
+                    &media_key,
+                )
+                .await
+                {
+                    tracing::error!(error = %e, "failed to send media key to call members");
+                }
+            }
+        }
+    } else {
+        tracing::info!("media E2EE disabled — connecting without frame encryption");
     }
 
     // Publish the tone track.
     let tone_cancel = CancellationToken::new();
     let tone_task = tone::publish_and_run(&lk_session.room, tone_cancel.clone()).await?;
-
-    // Send our key to all current call members (best-effort).
-    if let Some(room) = client.get_room(room_id) {
-        if let Err(e) = keys::send_key(
-            client,
-            &room,
-            &user_id,
-            device_id,
-            room_id_str,
-            0,
-            &media_key,
-        )
-        .await
-        {
-            tracing::error!(error = %e, "failed to send media key to call members");
-        }
-    }
 
     Ok(ActiveSession { lk_session, tone_task, tone_cancel })
 }

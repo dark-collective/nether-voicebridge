@@ -98,7 +98,6 @@ async fn apply_member_event(
 pub async fn build_client(cfg: &MatrixConfig) -> Result<Client> {
     let client = Client::builder()
         .homeserver_url(&cfg.homeserver_url)
-        .sqlite_store(&cfg.store_path, None)
         .build()
         .await?;
 
@@ -202,8 +201,20 @@ pub async fn run(
 
     // Run sync forever — drives the event handler registered above and feeds
     // to-device decryption in Stage 2 (when e2e-encryption is enabled).
-    client
-        .sync(SyncSettings::default())
-        .await
-        .map_err(|e| anyhow::anyhow!("Matrix sync error: {e}"))
+    // Retry on transient network errors (connection resets, timeouts) with a
+    // short back-off so the bridge survives long idles.
+    loop {
+        match client.sync(SyncSettings::default()).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                // 401/403 are auth failures — propagate immediately.
+                if msg.contains("401") || msg.contains("403") || msg.contains("M_UNKNOWN_TOKEN") {
+                    return Err(anyhow::anyhow!("Matrix sync fatal auth error: {e}"));
+                }
+                tracing::warn!(error = %e, "Matrix sync error — retrying in 5 s");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
 }

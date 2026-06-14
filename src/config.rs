@@ -49,12 +49,21 @@ pub struct MatrixConfig {
     pub store_path: String,
 }
 
+fn default_media_e2ee() -> bool {
+    false
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LiveKitConfig {
     pub lk_jwt_url: String,
     pub url: String,
     pub api_key: String,
     pub api_secret: String,
+    /// Enable Element Call media E2EE (HKDF key exchange via to-device).
+    /// Set to true only when the EC deployment uses frame encryption.
+    /// Default: false (most deployments run without media E2EE).
+    #[serde(default = "default_media_e2ee")]
+    pub media_e2ee: bool,
 }
 
 impl Config {
