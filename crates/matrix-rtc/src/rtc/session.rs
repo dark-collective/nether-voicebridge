@@ -211,8 +211,10 @@ async fn resolve_display_name(
 #[allow(clippy::too_many_arguments)]
 async fn playback_consumer(
     track: RemoteTrack,
+    // Router key = the LiveKit participant identity `{mxid}:{device}` (one puppet
+    // per participant), NOT the track SID — so re-published tracks reuse the same
+    // puppet and (Phase P4) membership owns assign/release.
     key: String,
-    identity: String,
     participant_name: String,
     initial_muted: bool,
     client: Client,
@@ -226,7 +228,7 @@ async fn playback_consumer(
     // Resolve the puppet's Discord nickname here (in the per-track task) so a
     // homeserver round-trip never stalls the room-event loop.
     let display_name =
-        resolve_display_name(&client, &room_id, &identity, &participant_name).await;
+        resolve_display_name(&client, &room_id, &key, &participant_name).await;
     let sink = router.assign(&key, &display_name);
     // Seed the puppet's mute state right after assign (avoids racing a separate
     // set_muted against the assign that creates the puppet).
@@ -321,12 +323,13 @@ async fn handle_room_events(
                 // here (echo prevention, constraint #5). No ghosts exist yet, so
                 // every remote participant is a human and is bridged.
                 let initial_muted = publication.is_muted();
+                // Per-track cancel token, keyed by SID (a participant may have
+                // more than one track); the router key is the participant identity.
                 let ct = cancel.child_token();
                 consumers.insert(sid.clone(), ct.clone());
                 tokio::spawn(
                     playback_consumer(
                         track,
-                        sid,
                         identity,
                         name,
                         initial_muted,
@@ -339,14 +342,14 @@ async fn handle_room_events(
                 );
             }
             RoomEvent::TrackMuted { participant, publication } => {
-                let sid = publication.sid().to_string();
-                tracing::info!(from_identity = %participant.identity(), track_sid = %sid, "LiveKit: track muted");
-                router.set_muted(&sid, true);
+                let identity = participant.identity().to_string();
+                tracing::info!(from_identity = %identity, track_sid = %publication.sid(), "LiveKit: track muted");
+                router.set_muted(&identity, true);
             }
             RoomEvent::TrackUnmuted { participant, publication } => {
-                let sid = publication.sid().to_string();
-                tracing::info!(from_identity = %participant.identity(), track_sid = %sid, "LiveKit: track unmuted");
-                router.set_muted(&sid, false);
+                let identity = participant.identity().to_string();
+                tracing::info!(from_identity = %identity, track_sid = %publication.sid(), "LiveKit: track unmuted");
+                router.set_muted(&identity, false);
             }
             RoomEvent::TrackUnsubscribed { publication, participant, .. } => {
                 let sid = publication.sid().to_string();
