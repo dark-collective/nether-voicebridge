@@ -23,3 +23,11 @@ livekit = { version = "0.7.34", default-features = false, features = ["tokio", "
 base64 = "0.22"
 rand = "0.8"
 tokio-util = { version = "0.7", features = ["rt"] }
+# StreamExt for draining LiveKit's NativeAudioStream on the Matrix → Discord path.
+futures-util = { version = "0.3", default-features = false }
+# Enables symphonia's PCM (f32) decoder in the SAME symphonia crate songbird
+# compiles (via Cargo feature unification). songbird depends on symphonia with
+# default-features = false and registers no codecs, so its RawAdapter live-PCM
+# path fails to promote ("no compatible track found") without this. Pinned to
+# match songbird 0.6's symphonia 0.5.x.
+symphonia = { version = "0.5", default-features = false, features = ["pcm"] }

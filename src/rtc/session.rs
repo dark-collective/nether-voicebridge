@@ -10,10 +10,23 @@
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose};
+use futures_util::StreamExt;
 use livekit::{Room, RoomOptions};
 use livekit::e2ee::{E2eeOptions, EncryptionType, key_provider::{KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions}};
+use livekit::track::RemoteTrack;
+use livekit::webrtc::audio_stream::native::NativeAudioStream;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio_util::sync::CancellationToken;
 use livekit::RoomEvent;
+
+use crate::audio::mixer::PlaybackMixer;
+
+/// Sample rate / channel count we ask libwebrtc to resample inbound tracks to.
+/// 48 kHz mono matches the playback path (songbird upmixes mono → stereo).
+const PLAYBACK_SAMPLE_RATE: i32 = 48_000;
+const PLAYBACK_CHANNELS: i32 = 1;
 
 /// A live LiveKit session: room handle, optional key provider, and our participant identity.
 pub struct LiveSession {
@@ -22,12 +35,19 @@ pub struct LiveSession {
     pub key_provider: Option<KeyProvider>,
     /// Our LiveKit participant identity (the JWT `sub` claim).
     pub our_identity: String,
+    /// Cancels the event task and all per-track playback consumers on teardown.
+    cancel: CancellationToken,
     _event_task: tokio::task::JoinHandle<()>,
 }
 
 impl LiveSession {
     /// Disconnect from the LiveKit room and clean up.
+    ///
+    /// Cancel first so every inbound playback consumer stops, drops its
+    /// `NativeAudioStream` (which detaches the libwebrtc sink), and removes its
+    /// mixer buffer — *before* the room closes and the event task is aborted.
     pub async fn disconnect(self) {
+        self.cancel.cancel();
         let _ = self.room.close().await;
         self._event_task.abort();
     }
@@ -66,7 +86,12 @@ pub fn decode_jwt_claims(jwt: &str) -> Result<(String, Option<String>)> {
 /// When `use_e2ee` is true, configures HKDF/GCM frame encryption and returns
 /// a `KeyProvider` in the session. When false (the common case for deployments
 /// that run EC without media E2EE), connects plainly — no frame encryption.
-pub async fn connect(url: &str, jwt: &str, use_e2ee: bool) -> Result<LiveSession> {
+pub async fn connect(
+    url: &str,
+    jwt: &str,
+    use_e2ee: bool,
+    playback: Arc<PlaybackMixer>,
+) -> Result<LiveSession> {
     let span = tracing::info_span!("rtc.session", sfu_url = %url, use_e2ee);
     let _guard = span.enter();
 
@@ -117,20 +142,90 @@ pub async fn connect(url: &str, jwt: &str, use_e2ee: bool) -> Result<LiveSession
     tracing::info!(existing_participants = ?existing, "LiveKit room initial participants");
 
     // Drain room events in a background task so the channel doesn't fill up.
-    let event_task = tokio::spawn(log_room_events(events));
+    // The same task routes inbound audio tracks to the playback mixer.
+    let cancel = CancellationToken::new();
+    let event_task = tokio::spawn(handle_room_events(events, playback, cancel.clone()));
 
     Ok(LiveSession {
         room,
         key_provider,
         our_identity,
+        cancel,
         _event_task: event_task,
     })
 }
 
-/// Log LiveKit room events for observability.
-async fn log_room_events(mut events: UnboundedReceiver<RoomEvent>) {
+/// Drain a subscribed audio track into the playback mixer until cancelled or the
+/// track ends.  libwebrtc resamples to 48 kHz mono for us (see [`NativeAudioStream::new`]),
+/// so each frame is already in the mixer's format.  On exit the participant's
+/// buffer is removed so it stops contributing to the mix.
+async fn playback_consumer(
+    track: RemoteTrack,
+    key: String,
+    playback: Arc<PlaybackMixer>,
+    cancel: CancellationToken,
+) {
+    let RemoteTrack::Audio(audio) = track else {
+        return; // video tracks are not bridged
+    };
+    let mut stream =
+        NativeAudioStream::new(audio.rtc_track(), PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS);
+    tracing::info!(track = %key, "playback consumer started");
+
+    // Health: log the first frame (confirms frames arrive, and their shape),
+    // then the *peak* level over each ~5 s window — a single-frame snapshot would
+    // almost always sample silence even mid-speech and tell us nothing.
+    let mut frames: u64 = 0;
+    let mut peak_db = f32::NEG_INFINITY;
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            frame = stream.next() => match frame {
+                Some(f) => {
+                    frames += 1;
+                    peak_db = peak_db.max(crate::audio::rms_dbfs(&f.data));
+                    if frames == 1 {
+                        tracing::info!(
+                            track = %key,
+                            channels = f.num_channels,
+                            samples_per_channel = f.samples_per_channel,
+                            sample_rate = f.sample_rate,
+                            "playback: first frame from LiveKit"
+                        );
+                    } else if frames.is_multiple_of(500) {
+                        tracing::debug!(
+                            track = %key,
+                            frames,
+                            peak_db = format_args!("{:.1}", peak_db),
+                            "playback: inbound LiveKit level (peak over window)"
+                        );
+                        peak_db = f32::NEG_INFINITY;
+                    }
+                    playback.push(&key, &f.data);
+                }
+                None => break, // track closed
+            },
+        }
+    }
+
+    playback.remove(&key);
+    tracing::info!(track = %key, "playback consumer ended");
+}
+
+/// Drain LiveKit room events: log for observability, and route subscribed audio
+/// tracks into the playback mixer (one consumer task per track, keyed by SID).
+async fn handle_room_events(
+    mut events: UnboundedReceiver<RoomEvent>,
+    playback: Arc<PlaybackMixer>,
+    cancel: CancellationToken,
+) {
+    // Per-track child tokens so an individual unsubscribe can stop just that
+    // consumer; cancelling the parent (teardown) stops them all.
+    let mut consumers: HashMap<String, CancellationToken> = HashMap::new();
+
     while let Some(ev) = events.recv().await {
-        match &ev {
+        match ev {
             RoomEvent::ParticipantConnected(p) => {
                 tracing::info!(identity = %p.identity(), "LiveKit: remote participant connected");
             }
@@ -141,12 +236,30 @@ async fn log_room_events(mut events: UnboundedReceiver<RoomEvent>) {
                 tracing::info!(sid = %publication.sid(), kind = ?publication.kind(), muted = publication.is_muted(), "LiveKit: local track published to SFU");
             }
             RoomEvent::TrackSubscribed { track, publication, participant } => {
+                let sid = publication.sid().to_string();
                 tracing::info!(
                     from_identity = %participant.identity(),
-                    track_sid = %publication.sid(),
+                    track_sid = %sid,
                     kind = ?track.kind(),
                     "LiveKit: subscribed to remote participant track"
                 );
+                // TODO(Phase 8): skip tracks from bridge-owned ghost identities
+                // here (echo prevention, constraint #5). No ghosts exist yet, so
+                // every remote participant is a human and is bridged.
+                let ct = cancel.child_token();
+                consumers.insert(sid.clone(), ct.clone());
+                tokio::spawn(playback_consumer(track, sid, playback.clone(), ct));
+            }
+            RoomEvent::TrackUnsubscribed { publication, participant, .. } => {
+                let sid = publication.sid().to_string();
+                tracing::info!(
+                    from_identity = %participant.identity(),
+                    track_sid = %sid,
+                    "LiveKit: unsubscribed from remote participant track"
+                );
+                if let Some(ct) = consumers.remove(&sid) {
+                    ct.cancel();
+                }
             }
             RoomEvent::TrackPublished { publication, participant } => {
                 tracing::info!(
@@ -160,8 +273,8 @@ async fn log_room_events(mut events: UnboundedReceiver<RoomEvent>) {
                 tracing::warn!(reason = ?reason, "LiveKit: room disconnected");
                 break;
             }
-            _ => {
-                tracing::debug!(event = ?ev, "LiveKit room event");
+            other => {
+                tracing::debug!(event = ?other, "LiveKit room event");
             }
         }
     }

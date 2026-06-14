@@ -23,18 +23,44 @@ pub struct JitterBuffer {
     target_samples: usize,
     /// Hard cap; pushing beyond this drops the oldest samples.
     max_samples: usize,
+    /// Pre-buffer threshold. `0` disables priming (releases as soon as 10 ms is
+    /// available — the original behavior). When non-zero, `pop_10ms` withholds
+    /// frames until the queue first reaches this depth, then drains until empty
+    /// before re-priming.  This keeps a cushion against arrival jitter so the
+    /// consumer doesn't get silence injected mid-stream on every small stall.
+    prime_samples: usize,
+    /// Whether the cushion is currently filled (we may drain).  Starts `true`
+    /// when priming is disabled, `false` when it is enabled (must fill first).
+    primed: bool,
 }
 
 impl JitterBuffer {
     /// Create a buffer sized in milliseconds at the given sample rate.
     /// `target_ms` is the desired steady-state depth; `max_ms` the overflow cap.
+    /// No pre-buffering: frames are released as soon as 10 ms is queued.
     pub fn new(target_ms: u32, max_ms: u32, sample_rate: u32) -> Self {
+        Self::build(target_ms, max_ms, sample_rate, false)
+    }
+
+    /// Like [`new`](Self::new) but with **pre-buffering**: `pop_10ms` returns
+    /// `None` until the queue first reaches `target_ms` of depth, building a
+    /// cushion before playback starts (and re-builds it after a full underrun).
+    /// Use this on the playback (LiveKit → Discord) path, where the consumer
+    /// pulls in real time and an empty buffer would crackle.
+    pub fn new_primed(target_ms: u32, max_ms: u32, sample_rate: u32) -> Self {
+        Self::build(target_ms, max_ms, sample_rate, true)
+    }
+
+    fn build(target_ms: u32, max_ms: u32, sample_rate: u32, prime: bool) -> Self {
         let per_ms = sample_rate as usize / 1000;
         let max_samples = max_ms as usize * per_ms;
+        let target_samples = target_ms as usize * per_ms;
         Self {
             queue: VecDeque::with_capacity(max_samples),
-            target_samples: target_ms as usize * per_ms,
+            target_samples,
             max_samples,
+            prime_samples: if prime { target_samples } else { 0 },
+            primed: !prime,
         }
     }
 
@@ -49,17 +75,38 @@ impl JitterBuffer {
     }
 
     /// Pop exactly one 10 ms mono frame (480 samples), or `None` on underrun.
+    ///
+    /// With priming enabled, returns `None` until the cushion is first built
+    /// (depth reaches `prime_samples`).  It does **not** re-enter that filling
+    /// state on a later transient underrun: a momentary miss conceals a single
+    /// frame (`None`) and the next available frame is released immediately.
+    /// Re-priming on every touch of empty was a bug — it forced a full
+    /// cushion-rebuild from zero each time, which kept the mean depth far below
+    /// target and made the buffer re-underrun continuously.  Since producer and
+    /// consumer have no net rate drift, priming once and letting the depth
+    /// oscillate around the target is stable.  `clear()` re-arms priming for a
+    /// fresh call.
     pub fn pop_10ms(&mut self) -> Option<Vec<i16>> {
+        if !self.primed {
+            if self.queue.len() >= self.prime_samples {
+                self.primed = true;
+            } else {
+                return None; // building the initial cushion
+            }
+        }
+
         if self.queue.len() < SAMPLES_10MS {
-            return None;
+            return None; // transient underrun: conceal one frame, stay primed
         }
         Some(self.queue.drain(..SAMPLES_10MS).collect())
     }
 
     /// Drop all buffered samples (used on session activate/deactivate so a new
-    /// call does not inherit stale audio).
+    /// call does not inherit stale audio).  Re-enters the priming state if
+    /// priming is enabled, so the cushion is rebuilt before the next release.
     pub fn clear(&mut self) {
         self.queue.clear();
+        self.primed = self.prime_samples == 0;
     }
 
     /// Current queued depth in samples (for health/level logging).
@@ -126,5 +173,48 @@ mod tests {
         jb.clear();
         assert_eq!(jb.depth_samples(), 0);
         assert!(jb.pop_10ms().is_none());
+    }
+
+    #[test]
+    fn primed_withholds_until_target_then_drains() {
+        // 20 ms target → must buffer 960 samples before releasing anything.
+        let mut jb = JitterBuffer::new_primed(20, 120, SR);
+
+        // 10 ms queued: below the 20 ms cushion → still None even though a full
+        // frame's worth is present.
+        jb.push(&vec![7i16; SAMPLES_10MS]);
+        assert!(jb.pop_10ms().is_none(), "should withhold while priming");
+
+        // Reach the target: now it releases, and keeps releasing until empty.
+        jb.push(&vec![7i16; SAMPLES_10MS]);
+        assert_eq!(jb.depth_samples(), SAMPLES_10MS * 2);
+        assert!(jb.pop_10ms().is_some(), "primed: first frame");
+        assert!(jb.pop_10ms().is_some(), "primed: drains down to empty");
+        assert!(jb.pop_10ms().is_none(), "empty");
+    }
+
+    #[test]
+    fn primed_once_conceals_transient_underrun_without_reprime() {
+        let mut jb = JitterBuffer::new_primed(20, 120, SR);
+        // Prime (20 ms = 2 frames) and fully drain.
+        jb.push(&vec![1i16; SAMPLES_10MS * 2]);
+        assert!(jb.pop_10ms().is_some());
+        assert!(jb.pop_10ms().is_some());
+        assert!(jb.pop_10ms().is_none()); // transient underrun → conceal 1 frame
+
+        // Stays primed: a single fresh frame is released immediately, NOT
+        // withheld to rebuild the whole cushion (that re-prime behavior was the
+        // crackle bug).
+        jb.push(&vec![1i16; SAMPLES_10MS]);
+        assert!(jb.pop_10ms().is_some(), "released immediately after underrun");
+    }
+
+    #[test]
+    fn unprimed_releases_immediately() {
+        // Regression: the default (Phase 5 outbound) path must be unchanged —
+        // a single 10 ms frame is released right away, no pre-buffering.
+        let mut jb = JitterBuffer::new(60, 120, SR);
+        jb.push(&vec![3i16; SAMPLES_10MS]);
+        assert!(jb.pop_10ms().is_some());
     }
 }

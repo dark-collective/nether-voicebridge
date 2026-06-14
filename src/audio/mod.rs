@@ -11,6 +11,8 @@
 //! * 10 ms mono    = 480 i16             (one `capture_frame` to LiveKit)
 
 pub mod jitter;
+// Per-participant playback mixer for the Matrix → Discord direction (Phase 6).
+pub mod mixer;
 // WAV read/write — currently exercised by the file-in/out test harness and
 // reused for the Phase 6 reverse direction; not yet called from the binary.
 #[allow(dead_code)]

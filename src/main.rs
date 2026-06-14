@@ -50,6 +50,11 @@ async fn main() -> Result<()> {
     // Bounded; the Discord side drops on a full channel (real-time audio).
     let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(50);
 
+    // Reverse path: Matrix (LiveKit) → Discord playback. Per-participant jitter
+    // buffers mixed to one mono stream; shared by the RTC consumers (producers)
+    // and the Discord playback source (consumer).
+    let playback = Arc::new(audio::mixer::PlaybackMixer::new());
+
     // Ctrl-C handler: finalise WAV files (if capturing) so headers are correct.
     {
         let capture_sink = capture_sink.clone();
@@ -70,8 +75,15 @@ async fn main() -> Result<()> {
     // Run all three gateway connections concurrently; propagate the first error.
     tokio::try_join!(
         matrix::run(matrix_client.clone(), &cfg.matrix, call_active_tx),
-        rtc::run(matrix_client, &cfg.livekit, &cfg.matrix, call_active_rx, audio_rx),
-        discord::run(&cfg.discord, audio_tx, capture_sink.clone()),
+        rtc::run(
+            matrix_client,
+            &cfg.livekit,
+            &cfg.matrix,
+            call_active_rx,
+            audio_rx,
+            playback.clone(),
+        ),
+        discord::run(&cfg.discord, audio_tx, capture_sink.clone(), playback),
     )?;
 
     Ok(())

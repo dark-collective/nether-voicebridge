@@ -41,6 +41,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
 
 use crate::audio::jitter::JitterBuffer;
+use crate::audio::mixer::PlaybackMixer;
 use crate::config::{LiveKitConfig, MatrixConfig};
 use keys::CallEncryptionKeysEventContent;
 use well_known::LivekitFocusInfo;
@@ -155,6 +156,7 @@ pub async fn run(
     mx_cfg: &MatrixConfig,
     mut call_active_rx: watch::Receiver<bool>,
     audio_rx: mpsc::Receiver<Vec<i16>>,
+    playback: Arc<PlaybackMixer>,
 ) -> Result<()> {
     let span = tracing::info_span!("rtc");
     let _guard = span.enter();
@@ -272,6 +274,7 @@ pub async fn run(
                     &shared_provider,
                     lk_cfg.media_e2ee,
                     &ctrl_tx,
+                    playback.clone(),
                 )
                 .await
                 {
@@ -292,7 +295,7 @@ pub async fn run(
             (true, false) => {
                 // All humans left — tear down.
                 tracing::info!("call ended — leaving");
-                teardown(&mut active_session, &shared_provider).await;
+                teardown(&mut active_session, &shared_provider, &playback).await;
                 if let Some(room) = client.get_room(&room_id) {
                     if let Err(e) = membership::leave(&room, &user_id, &device_id).await {
                         tracing::error!(error = %e, "failed to post call leave");
@@ -311,7 +314,7 @@ pub async fn run(
 
     // Cleanup on shutdown.
     if joined {
-        teardown(&mut active_session, &shared_provider).await;
+        teardown(&mut active_session, &shared_provider, &playback).await;
         if let Some(room) = client.get_room(&room_id) {
             let _ = membership::leave(&room, &user_id, &device_id).await;
         }
@@ -335,6 +338,7 @@ async fn join_livekit_and_publish(
     shared_provider: &Arc<Mutex<Option<KeyProvider>>>,
     use_e2ee: bool,
     ctrl_tx: &mpsc::Sender<SourceControl>,
+    playback: Arc<PlaybackMixer>,
 ) -> Result<ActiveSession> {
     let user_id = client
         .user_id()
@@ -352,7 +356,7 @@ async fn join_livekit_and_publish(
     )
     .await?;
 
-    let lk_session = session::connect(&jwt_resp.url, &jwt_resp.jwt, use_e2ee).await?;
+    let lk_session = session::connect(&jwt_resp.url, &jwt_resp.jwt, use_e2ee, playback).await?;
 
     if use_e2ee {
         if let Some(ref key_provider) = lk_session.key_provider {
@@ -406,14 +410,19 @@ async fn join_livekit_and_publish(
     })
 }
 
-/// Tear down an active session, clearing the shared provider.
+/// Tear down an active session, clearing the shared provider and any buffered
+/// inbound (Matrix → Discord) audio so the next call starts clean.
 async fn teardown(
     active_session: &mut Option<ActiveSession>,
     shared_provider: &Arc<Mutex<Option<KeyProvider>>>,
+    playback: &Arc<PlaybackMixer>,
 ) {
     if let Some(sess) = active_session.take() {
         sess.close().await;
     }
+    // Consumers remove their own buffers on cancel; clear() is belt-and-suspenders
+    // in case a consumer was mid-push during teardown.
+    playback.clear();
     let mut guard = shared_provider.lock().expect("provider mutex poisoned");
     *guard = None;
 }
