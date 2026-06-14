@@ -2,15 +2,28 @@
 # Copy to config.toml and fill in real values. NEVER commit config.toml.
 # Override the config path at runtime: CONFIG_PATH=/path/to/config.toml
 #
-# All fields are required to parse. You can leave later-phase fields as
-# placeholders until you reach that phase:
-#   Phases 1+  : [matrix] homeserver_url, room_id, bot_user_id, access_token
-#   Phases 2–3 : [discord] guild_id, channel_id, listener_token
-#   Phase 4+   : [livekit] lk_jwt_url, url
-#   Phase 7    : [discord] puppet_tokens (real values)
-#   Phase 8    : [matrix] appservice_id, appservice_token
+# Config is a list of bridges. Each `[[bridge]]` block is ONE Discord voice
+# channel bridged to ONE Matrix/Element Call room, running as a fully independent
+# pipeline (its own Discord + Matrix clients, tokens, room, and audio). To bridge
+# more channel-pairs from a single process, add more `[[bridge]]` blocks (a second
+# one is shown, commented out, at the bottom).
+#
+# Within a bridge, all fields are required to parse. You can leave later-phase
+# fields as placeholders until you reach that phase:
+#   Phases 1+  : [bridge.matrix] homeserver_url, room_id, bot_user_id, access_token
+#   Phases 2–3 : [bridge.discord] guild_id, channel_id, listener_token
+#   Phase 4+   : [bridge.livekit] lk_jwt_url, url
+#   Phase 7    : [bridge.discord] puppet_tokens (real values)
+#   Phase 8    : [bridge.matrix] appservice_id, appservice_token
+#
+# IMPORTANT: each bridge needs its OWN matrix.store_path. Two matrix-sdk clients
+# sharing one store will lock/corrupt; startup validation rejects duplicates.
 
-[discord]
+[[bridge]]
+# Optional label, used in logs/spans (the `bridge{name=...}` span prefix).
+name = "general"
+
+[bridge.discord]
 # Right-click the server icon → "Copy Server ID"
 # (Enable Developer Mode first: User Settings → Advanced → Developer Mode)
 guild_id = "1234567890123456789"
@@ -37,10 +50,11 @@ puppet_tokens = [
 # files (the Phase 3 debugging artifact) alongside forwarding audio to Matrix.
 # Leave off in normal use — it writes unbounded files. Handy to A/B a fault:
 # if the WAV has audio but Element Call is silent, the problem is downstream of
-# capture.
+# capture. NOTE: filenames are not bridge-prefixed, so don't enable on two
+# bridges that might see the same SSRC at once.
 capture_wav = false
 
-[matrix]
+[bridge.matrix]
 # Fixed: your Tuwunel homeserver.
 homeserver_url = "https://nether.im"
 
@@ -69,7 +83,10 @@ access_token = "syt_your_access_token_here"
 appservice_id = "voicebridge"
 appservice_token = "your_appservice_hs_token_here"
 
-[livekit]
+# matrix-sdk store (Olm crypto + state). MUST be unique per bridge.
+store_path = "./nether-store/general"
+
+[bridge.livekit]
 # URL of the lk-jwt-service deployed on nether-red alongside LiveKit.
 # This service mints LiveKit JWTs from Matrix OpenID tokens — it's what the
 # bridge calls to join the LiveKit room as each participant.
@@ -90,3 +107,34 @@ api_secret = "your_api_secret_here"
 # media E2EE, so the bridge must NOT encrypt — encrypting into a non-E2EE call
 # makes peers hear the bridge's ciphertext as static. Default: false.
 media_e2ee = false
+
+# ─── A second bridge (different channel ↔ different room) ────────────────────
+# Uncomment and fill in to bridge a second pair from this same process. Note the
+# distinct `name` and `store_path`, and its own full set of Discord bot tokens.
+#
+# [[bridge]]
+# name = "gaming"
+#
+# [bridge.discord]
+# guild_id = "1234567890123456789"
+# channel_id = "1111111111111111111"
+# listener_token = "YOUR_SECOND_LISTENER_BOT_TOKEN"
+# puppet_tokens = ["YOUR_SECOND_PUPPET_1", "YOUR_SECOND_PUPPET_2"]
+# capture_wav = false
+#
+# [bridge.matrix]
+# homeserver_url = "https://nether.im"
+# room_id = "!anotherroomid:nether.im"
+# bot_user_id = "@voicebridge:nether.im"
+# device_id = "ABCDEFGHIJ"
+# access_token = "syt_your_access_token_here"
+# appservice_id = "voicebridge"
+# appservice_token = "your_appservice_hs_token_here"
+# store_path = "./nether-store/gaming"   # MUST differ from the first bridge
+#
+# [bridge.livekit]
+# lk_jwt_url = "https://lk-jwt.nether.im"
+# url = "wss://livekit.nether.im"
+# api_key = "your_api_key"
+# api_secret = "your_api_secret_here"
+# media_e2ee = false

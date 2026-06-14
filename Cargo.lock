@@ -3099,6 +3099,7 @@ name = "nether-voicebridge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "nvb-audio",
  "nvb-config",
  "nvb-discord",

@@ -12,10 +12,26 @@ pub enum ConfigError {
     },
     #[error("failed to parse config: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("config validation error: {0}")]
+    Validation(String),
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    /// One entry per bridged channel-pair. TOML `[[bridge]]` blocks map here.
+    /// Each bridge is a fully independent pipeline (its own Discord/Matrix
+    /// clients, tokens, room, and audio plumbing). Defaults to empty so a
+    /// bridge-less config surfaces the friendly `validate()` error rather than a
+    /// raw serde "missing field" parse failure.
+    #[serde(rename = "bridge", default)]
+    pub bridges: Vec<BridgeConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BridgeConfig {
+    /// Optional human label, used in logs/spans. Falls back to the index.
+    #[serde(default)]
+    pub name: Option<String>,
     pub discord: DiscordConfig,
     pub matrix: MatrixConfig,
     pub livekit: LiveKitConfig,
@@ -80,8 +96,82 @@ impl Config {
         toml::from_str(&content).map_err(ConfigError::Parse)
     }
 
+    /// Validate cross-bridge invariants. Hard errors abort startup; softer
+    /// likely-mistakes are logged as warnings.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.bridges.is_empty() {
+            return Err(ConfigError::Validation(
+                "config must define at least one [[bridge]]".to_string(),
+            ));
+        }
+
+        // Hard: distinct store_path per bridge. NOTE: build_client currently uses
+        // an in-memory matrix-sdk store and does not read store_path, so this is
+        // forward-looking — but the moment the SQLite store is wired up, two
+        // clients sharing one path would lock/corrupt, and the `./nether-store`
+        // default makes that the collision a multi-bridge config falls into by
+        // omission. Enforce uniqueness now so the config is correct ahead of time.
+        let mut seen_stores = std::collections::HashSet::new();
+        for b in &self.bridges {
+            if !seen_stores.insert(b.matrix.store_path.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate matrix store_path '{}' across bridges — each bridge \
+                     needs its own store",
+                    b.matrix.store_path
+                )));
+            }
+        }
+
+        // Soft: a room_id reused across bridges is almost always a copy-paste slip.
+        let mut seen_rooms = std::collections::HashMap::new();
+        for (i, b) in self.bridges.iter().enumerate() {
+            if let Some(j) = seen_rooms.insert(b.matrix.room_id.as_str(), i) {
+                tracing::warn!(
+                    room_id = %b.matrix.room_id,
+                    first = j,
+                    second = i,
+                    "duplicate Matrix room_id across bridges"
+                );
+            }
+        }
+
+        // Soft: two bridges sharing a Discord bot token would fight over one
+        // gateway connection.
+        let mut seen_tokens = std::collections::HashMap::new();
+        for (i, b) in self.bridges.iter().enumerate() {
+            for tok in std::iter::once(&b.discord.listener_token)
+                .chain(b.discord.puppet_tokens.iter())
+            {
+                if let Some(j) = seen_tokens.insert(tok.clone(), i) {
+                    tracing::warn!(
+                        bridge = i,
+                        other = j,
+                        "duplicate Discord token reused across bridges"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn log_redacted_summary(&self) {
+        tracing::info!(bridge_count = self.bridges.len(), "config loaded");
+        for b in &self.bridges {
+            b.log_redacted_summary();
+        }
+    }
+}
+
+impl BridgeConfig {
+    /// Display label for logs/spans: the configured `name`, else "unnamed".
+    pub fn label(&self) -> String {
+        self.name.clone().unwrap_or_else(|| "unnamed".to_string())
+    }
+
     pub fn log_redacted_summary(&self) {
         tracing::info!(
+            bridge = %self.label(),
             discord_guild_id = %self.discord.guild_id,
             discord_channel_id = %self.discord.channel_id,
             discord_listener_token = "[redacted]",
@@ -90,6 +180,7 @@ impl Config {
             matrix_room_id = %self.matrix.room_id,
             matrix_bot_user_id = %self.matrix.bot_user_id,
             matrix_device_id = %self.matrix.device_id,
+            matrix_store_path = %self.matrix.store_path,
             matrix_access_token = "[redacted]",
             matrix_appservice_id = %self.matrix.appservice_id,
             matrix_appservice_token = "[redacted]",
@@ -97,7 +188,7 @@ impl Config {
             livekit_url = %self.livekit.url,
             livekit_api_key = %self.livekit.api_key,
             livekit_api_secret = "[redacted]",
-            "config loaded"
+            "bridge config loaded"
         );
     }
 }
@@ -106,40 +197,111 @@ impl Config {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_valid_config() {
-        let raw = r#"
-[discord]
+    /// One `[[bridge]]` block. `store` lets each test pick a distinct store_path
+    /// so multi-bridge tests pass validation; `name` is emitted only when `Some`.
+    fn bridge_block(name: Option<&str>, room: &str, store: &str, listener: &str) -> String {
+        let name_line = match name {
+            Some(n) => format!("name = \"{n}\"\n"),
+            None => String::new(),
+        };
+        format!(
+            r#"[[bridge]]
+{name_line}[bridge.discord]
 guild_id = "111"
 channel_id = "222"
-listener_token = "Bot abc"
+listener_token = "{listener}"
 puppet_tokens = ["Bot def", "Bot ghi"]
 
-[matrix]
+[bridge.matrix]
 homeserver_url = "https://nether.im"
-room_id = "!room:nether.im"
+room_id = "{room}"
 bot_user_id = "@bridge:nether.im"
 device_id = "BRIDGE01"
 access_token = "syt_tok"
 appservice_id = "voicebridge"
 appservice_token = "hs_tok"
+store_path = "{store}"
 
-[livekit]
+[bridge.livekit]
 lk_jwt_url = "https://lk-jwt.nether.im"
 url = "wss://livekit.nether.im"
 api_key = "key"
 api_secret = "secret"
-"#;
-        let cfg: Config = toml::from_str(raw).expect("parse failed");
-        assert_eq!(cfg.discord.puppet_tokens.len(), 2);
-        assert_eq!(cfg.matrix.homeserver_url, "https://nether.im");
-        assert_eq!(cfg.livekit.api_key, "key");
+"#
+        )
+    }
+
+    #[test]
+    fn parses_single_bridge_array() {
+        let raw = bridge_block(Some("general"), "!room:nether.im", "./s1", "Bot abc");
+        let cfg: Config = toml::from_str(&raw).expect("parse failed");
+        assert_eq!(cfg.bridges.len(), 1);
+        let b = &cfg.bridges[0];
+        assert_eq!(b.name.as_deref(), Some("general"));
+        assert_eq!(b.discord.puppet_tokens.len(), 2);
+        assert_eq!(b.matrix.homeserver_url, "https://nether.im");
+        assert_eq!(b.livekit.api_key, "key");
+        cfg.validate().expect("should validate");
+    }
+
+    #[test]
+    fn parses_two_bridges() {
+        let raw = format!(
+            "{}\n{}",
+            bridge_block(Some("a"), "!a:nether.im", "./sa", "Bot a"),
+            bridge_block(Some("b"), "!b:nether.im", "./sb", "Bot b"),
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse failed");
+        assert_eq!(cfg.bridges.len(), 2);
+        assert_eq!(cfg.bridges[0].matrix.room_id, "!a:nether.im");
+        assert_eq!(cfg.bridges[1].matrix.room_id, "!b:nether.im");
+        cfg.validate().expect("should validate");
+    }
+
+    #[test]
+    fn name_is_optional() {
+        let raw = bridge_block(None, "!room:nether.im", "./s1", "Bot abc");
+        let cfg: Config = toml::from_str(&raw).expect("parse failed");
+        assert!(cfg.bridges[0].name.is_none());
+        assert_eq!(cfg.bridges[0].label(), "unnamed");
+    }
+
+    #[test]
+    fn rejects_empty_bridges() {
+        // No `[[bridge]]` at all → empty Vec → validation error.
+        let cfg: Config = toml::from_str("").expect("empty parses to zero bridges");
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn rejects_duplicate_store_path() {
+        let raw = format!(
+            "{}\n{}",
+            bridge_block(Some("a"), "!a:nether.im", "./dup", "Bot a"),
+            bridge_block(Some("b"), "!b:nether.im", "./dup", "Bot b"),
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse failed");
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn duplicate_room_and_token_are_warnings_not_errors() {
+        // Same room_id and same listener token across bridges → Ok (warn only).
+        let raw = format!(
+            "{}\n{}",
+            bridge_block(Some("a"), "!same:nether.im", "./sa", "Bot same"),
+            bridge_block(Some("b"), "!same:nether.im", "./sb", "Bot same"),
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse failed");
+        cfg.validate().expect("dupes are warnings, not errors");
     }
 
     #[test]
     fn rejects_missing_section() {
+        // A `[[bridge]]` missing its `[bridge.matrix]`/`[bridge.livekit]` sections.
         let raw = r#"
-[discord]
+[[bridge]]
+[bridge.discord]
 guild_id = "111"
 channel_id = "222"
 listener_token = "Bot abc"
