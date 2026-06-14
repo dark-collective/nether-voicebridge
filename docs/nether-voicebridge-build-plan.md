@@ -16,8 +16,10 @@ a real project). Notes flag the idioms that matter, not syntax.
 > them with `futures_util::join_all` over boxed-local futures rather than
 > `tokio::spawn`; one bridge failing ends only that bridge (verified live).
 > `store_path` is still unused (in-memory matrix-sdk store) — wire up the SQLite
-> store before Phase 8. Full per-line bridge log attribution (instrumenting the
-> inner crates' spawned tasks) is a follow-up.
+> store before Phase 8. Per-bridge log attribution is done (`fb08ad2`): an
+> `Arc<str>` label threads into both crates and every log line carries a
+> `bridge{name=…}` span (library callbacks via `#[instrument(parent = None)]`,
+> spawned tasks via `.instrument(info_span!(parent = None, …))`).
 
 ---
 
