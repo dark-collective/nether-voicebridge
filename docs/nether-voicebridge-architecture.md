@@ -139,6 +139,16 @@ Handle room tombstones (follow upgrades) and call-end events.
   (HKDF, mirroring `matrix-jukebox`) and feed raw keys to LiveKit's frame
   crypto; do **not** rely on livekit-rust's default key provider. This is the
   highest-risk module in the project.
+  - **Deployment reality (nether.im, verified 2026-06-14):** the call room is
+    *unencrypted* (`m.room.encryption` absent) and Element Call runs media frame
+    E2EE **off** for it. The bridge therefore runs with `media_e2ee = false` and
+    publishes **plaintext** frames — encrypting into this non-E2EE call makes
+    peers hear the bridge's ciphertext as static. The E2EE path above is built
+    but dormant behind the `media_e2ee` flag, for a future encrypted-room
+    deployment. Note for that branch: current EC distributes keys via
+    *Olm-encrypted* to-device (matrix-js-sdk ≥ v37.4.0), so enabling it requires
+    restoring Olm (`matrix-sdk` `e2e-encryption`+`sqlite`, `encrypt_and_send_raw_to_device`),
+    not the plaintext send currently in `keys.rs`.
 
 ## Proposed crate layout
 

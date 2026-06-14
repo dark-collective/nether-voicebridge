@@ -18,6 +18,11 @@ plan, each with its acceptance test.
   works** here — lk-jwt-service + a LiveKit container are deployed on nether-red
   and calls function. Do not redesign the homeserver or the RTC infra; this bot
   is just another participant.
+- **The call room is *unencrypted* and Element Call runs media frame E2EE
+  *off*** (verified 2026-06-14). The bridge runs `media_e2ee = false` and
+  publishes **plaintext** LiveKit frames; encrypting into this non-E2EE call
+  makes peers hear static. Keep it off unless the room becomes encrypted — see
+  constraint #3, which now applies only to that deferred encrypted-room branch.
 - Discord: a guild with a voice channel; a set of bot applications (one
   listener + N puppets), each invited with Connect, Speak, Use Voice Activity,
   Change Nickname.

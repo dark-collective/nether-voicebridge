@@ -60,6 +60,18 @@ tone**. This proves the entire MatrixRTC + EC-E2EE path — the riskiest part.
 **Note:** budget the most time here. matrix-jukebox's pink-noise milestone is
 your proof it's achievable; lean on its key-derivation code.
 
+**STATUS: ✅ DONE** (2026-06-14, commit `24ba809`). `@dark` hears a clean 440 Hz
+tone in Element Call; teardown returns to baseline. **Key finding:** nether.im's
+call room is *unencrypted* and Element Call runs media frame E2EE **off** for it,
+so the bridge connects with `media_e2ee = false` and publishes **plaintext**
+frames. Encrypting into this non-E2EE call made peers hear our ciphertext as
+static — that was the whole blocker. The HKDF/to-device key-exchange machinery
+(`src/rtc/{keys,session}.rs`) is implemented but **dormant behind `media_e2ee`**;
+it is only needed for an *encrypted*-room deployment and, if ever enabled, would
+need Olm-encrypted to-device to interop with current EC (it currently sends keys
+plaintext). Stages: Stage 1 = participant appears (`153d056`/`52f7683`);
+Stage 2 = audible tone (`df62d00` E2EE attempt, superseded by `24ba809`).
+
 ## Phase 5 — One-way: Discord → Matrix, single speaker
 **Build:** Wire Phase 3 capture PCM into Phase 4 publish. One Discord speaker
 published into the Matrix call **as the bridge's own identity** (ghosts come
