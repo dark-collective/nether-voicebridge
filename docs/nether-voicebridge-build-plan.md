@@ -87,66 +87,45 @@ tasks, ring buffers, backpressure, splitting a crate.
 in Element Call (bridge publishes one mono track as its own identity) and it
 survives Matrix leave/rejoin. Built the SDK-free `audio` core (downmix,
 saturating mix, `JitterBuffer`, wav harness) + a long-lived audio-consumer fed
-via a `SourceControl` mpsc. **Key finding:** Discord-side voice-channel
-membership changes re-key DAVE and break the listener's decode (songbird 0.6
-doesn't follow the epoch). That promoted DAVE epoch resilience to its own
-**Phase 6** (below). The workspace split was deferred to Phase 7.
+via a `SourceControl` mpsc. The workspace split was deferred to Phase 6.
+**Open issue under investigation:** one observed capture-death — the listener
+stopped decoding Discord audio and didn't self-recover; a fresh process fixed it.
+Root cause **unconfirmed**: first hypothesised as a DAVE epoch/re-key problem, but
+the timing didn't fit and songbird's DAVE receive otherwise works, so it's being
+reproduced with instrumentation (commit `1662330`) before any fix is designed.
+Lands in the Hardening phase as a capture-health watchdog unless the spike shows
+it needs more.
 
-## Phase 6 — DAVE epoch resilience  ⚠ proves DAVE survives re-keys
-**Build:** Make the listener survive Discord voice-channel membership changes.
-Any human/bot join/leave re-keys the DAVE/MLS group to a new epoch; songbird
-0.6.0 doesn't reliably follow it, so the listener decodes garbage
-(`opus_decode InvalidPacket`) until a fresh voice connection is made — and there
-is **no** songbird API to query DAVE state, force a re-key, or observe decrypt
-failures (failed decrypts just leave the SSRC in `VoiceTick.silent`).
-**Spike first** to pick the mechanism, then: detect decode-death (a user flagged
-speaking via `SpeakingStateUpdate` but stuck in `VoiceTick.silent` for >~1.5 s)
-and recover by leaving + rejoining the voice channel (fresh epoch), with
-debounce/backoff and own-event filtering so the listener's own reconnect can't
-cascade.
-**Rust concepts:** songbird event-driven supervision, a reconnect state machine
-with backoff, `tokio::sync::mpsc` from the audio handler to a supervisor task,
-own-identity filtering.
-**Acceptance:** with capture+forward live, repeatedly join/leave the Discord
-voice channel (humans and/or a test bot) while a real speaker talks — capture
-recovers within a few seconds every time, audible in Element Call, over many
-cycles, no permanent decode death, no reconnect storm.
-**Artifact:** a listener that shrugs off Discord voice churn.
-**Note:** third cryptographic de-risk milestone (after P3 DAVE receive, P4 EC
-E2EE). songbird 0.6.0 is the latest release — no upstream fix to bump to; the
-recovery is ours. Also probe DAVE **send**-after-rekey here (informs Phase 8).
-
-## Phase 7 — Reverse: Matrix → Discord, single speaker
+## Phase 6 — Reverse: Matrix → Discord, single speaker
 **Build:** Subscribe to a Matrix participant's track (`livekit` subscribe),
 decode to PCM, play through the **already-connected listener bot** (songbird does
-RX+TX on one connection — avoids adding a voice-channel member and the DAVE churn
-that implies). Reuse the audio core (reframe the other way) with a
-**per-participant** jitter buffer (LiveKit tracks arrive independently — the
-Phase 5 tick-mixing shortcut does NOT carry over). **Split the crate into the
-workspace here** (`config`/`audio`/`discord`/`matrix-rtc`/`bridge`), now that the
-audio core is exercised in both directions.
+RX+TX on one connection — no extra voice-channel member needed). Reuse the audio
+core (reframe the other way) with a **per-participant** jitter buffer (LiveKit
+tracks arrive independently — the Phase 5 tick-mixing shortcut does NOT carry
+over). **Split the crate into the workspace here**
+(`config`/`audio`/`discord`/`matrix-rtc`/`bridge`), now that the audio core is
+exercised in both directions.
 **Rust concepts:** livekit subscribe/track callbacks, symmetric routing,
 workspace split.
 **Acceptance:** talk in Element Call → heard in Discord. Both directions now
 exist (single-speaker, single-identity).
 **Artifact:** bidirectional audio, one speaker each way.
 
-## Phase 8 — Puppet pool (Matrix → Discord attribution)
+## Phase 7 — Puppet pool (Matrix → Discord attribution)
 **Build:** Multiple Discord bot tokens; a pool allocator (checkout/return keyed
 on Matrix membership); per-user puppet assignment; per-guild nickname = Matrix
-display name. Prefer a **persistent** pool — join all puppets at bridge-open and
-keep them connected for the session, assigning/nicknaming dynamically — so DAVE
-re-key churn is bounded to open/close + human churn (both covered by Phase 6).
+display name; join/leave driven by membership events. (A **persistent** pool —
+puppets joined at bridge-open and kept connected — is worth considering to
+minimise voice-channel churn; revisit once the capture-death investigation
+lands.)
 **Rust concepts:** managing N concurrent connections, an allocator state
 machine, `HashMap<MatrixUserId, Puppet>` behind a mutex, task-per-connection.
 **Acceptance:** two Matrix users in the call show as two **named** Discord
 participants you can individually volume/mute.
 **Artifact:** per-user attribution on the Discord side.
-**Reminder:** add bridge-owned puppet SSRCs to the echo-exclusion set; confirm
-DAVE **send** survives epoch changes across puppet/human churn (Phase 6 spike
-flags this).
+**Reminder:** add bridge-owned puppet SSRCs to the echo-exclusion set.
 
-## Phase 9 — Ghost set (Discord → Matrix attribution)
+## Phase 8 — Ghost set (Discord → Matrix attribution)
 **Build:** Register the appservice namespace on Tuwunel; mint a ghost per
 Discord speaker; each ghost posts its own `m.call` membership, gets its own
 lk-jwt token, connects as its own LiveKit participant, publishes that speaker's
@@ -159,23 +138,25 @@ avatars) in Element Call.
 **Reminder:** add ghost identities to the echo-exclusion set; verify lk-jwt
 accepts ghost OpenID tokens.
 
-## Phase 10 — Lifecycle coordinator & teardown
+## Phase 9 — Lifecycle coordinator & teardown
 **Build:** The on-demand open/close state machine; first-human-opens /
 last-human-closes; reconnection; tombstone following; call-end handling;
 guaranteed cleanup (no leaked connections, puppets returned, ghosts retired).
-Note: opening joins the listener + puppets to Discord voice → a burst of DAVE
-re-keys at open; the Phase 6 resilience absorbs it.
 **Rust concepts:** a real state machine (enum states + transitions), `Drop`
 / explicit teardown, cancellation (`CancellationToken`), graceful shutdown.
 **Acceptance:** open/close repeatedly from both sides; connection count returns
 to baseline every time; no orphaned bots/ghosts.
 **Artifact:** robust lifecycle.
 
-## Phase 11 — Hardening
+## Phase 10 — Hardening
 **Build:** reconnection with backoff, error recovery, drift/clock-skew
 compensation over long calls, resource caps, observability (per-bridge metrics,
-structured tracing), and tuning the Phase 6 DAVE-recovery backoff under sustained
-churn. (DAVE epoch-transition handling itself is now Phase 6.)
+structured tracing), and a **capture-health watchdog** — detect a dead/stuck
+listener capture (a speaking user yielding no decoded audio, or a
+`DriverDisconnect` with no reconnect) and recover by rejoining the voice channel.
+This is where the Phase 5 capture-death investigation lands once reproduced;
+whether it needs more than a generic watchdog (e.g. DAVE epoch-specific handling)
+depends on that spike.
 **Acceptance:** a multi-hour call with users churning on both sides stays
 stable; no drift-induced desync; clean recovery from a dropped connection.
 **Artifact:** production-usable bridge.
@@ -190,14 +171,14 @@ stable; no drift-induced desync; clean recovery from a dropped connection.
 - **Config parsing**: unit tests for the TOML schema.
 - **Integration milestones are manual** (live Discord + Matrix) but each has a
   trivially-verifiable artifact: a wav you can hear (P3), a tone in Element
-  (P4), audio crossing (P5/7), recovery from Discord voice churn (P6), named
-  participants (P8/9), baseline connection count after close (P10).
+  (P4), audio crossing (P5/6), named participants (P7/8), baseline connection
+  count after close (P9).
 - **Decouple at module boundaries** so you can replace either live SDK with a
   file/source stub when iterating on the router.
 
 ## Suggested session cadence
 
-Phases 0–2 are one warm-up session. Phases 3, 4, and 6 each deserve their own
-session (the three cryptographic de-risking milestones). 5 done; 7 on its own
-(adds the workspace split). 8 and 9 each their own. 10 and 11 ongoing. Write a
-short handoff note at the end of each.
+Phases 0–2 are one warm-up session. Phase 3 and Phase 4 each deserve their own
+session (the de-risking milestones). 5 done; 6 on its own (adds the workspace
+split). 7 and 8 each their own. 9 and 10 ongoing. Write a short handoff note at
+the end of each.

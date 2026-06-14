@@ -133,17 +133,20 @@ Handle room tombstones (follow upgrades) and call-end events.
   are legitimate MLS group members and get ratcheted sender keys — decryption
   works because they're real participants. `songbird` handles the MLS dance;
   pin a DAVE-capable release.
-  - **Epoch-transition caveat (verified 2026-06-14):** when voice-channel
-    membership changes (any human or bot joins/leaves), the DAVE/MLS group
-    re-keys to a new epoch. `songbird 0.6.0` (the latest release) does **not**
-    reliably follow that transition — after a re-key the listener decodes garbage
-    (`opus_decode InvalidPacket`) on every packet and never recovers, and the
-    crate exposes no API to query DAVE state, force a re-key, or observe decrypt
-    failures. The only cure is a fresh voice connection. **Phase 6** builds
-    detect-and-recover (decode-death heuristic → leave + rejoin the channel) so
-    the listener survives arbitrary churn; the puppet pool (Phase 8) keeps its
-    connections persistent to bound the churn it creates. Do not assume songbird
-    "just handles" epochs.
+  - **Capture-death caveat (observed 2026-06-14, root cause unconfirmed):**
+    during Phase 5 testing the listener once stopped decoding Discord audio and
+    didn't self-recover (a fresh voice connection fixed it). It was first
+    hypothesised as a DAVE epoch/re-key failure (membership change → new MLS
+    epoch songbird doesn't follow), but that didn't hold up: the timing didn't
+    match a membership change, songbird's DAVE receive otherwise works (we
+    decoded for minutes; Phase 3 proved it), and there's no matching songbird bug
+    report. It may instead be a silent voice-connection drop or a transient. It's
+    being reproduced with instrumentation (DriverConnect/Reconnect/Disconnect +
+    tick-health logging) before any fix; the likely remedy is a generic
+    capture-health watchdog that rejoins the voice channel on a dead capture
+    (Hardening phase). Note for whoever picks this up: songbird exposes no API to
+    query DAVE state or observe decrypt failures, and failed decrypts just leave
+    the SSRC in `VoiceTick.silent`.
 - **Matrix (Element Call media E2EE):** per-sender keys distributed via Matrix
   to-device events. **Element Call uses HKDF; livekit-rust's built-in frame
   E2EE uses PBKDF2** — a real incompatibility. Do the key derivation yourself
