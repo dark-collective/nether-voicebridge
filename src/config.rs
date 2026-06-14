@@ -27,6 +27,11 @@ pub struct DiscordConfig {
     pub channel_id: String,
     pub listener_token: String,
     pub puppet_tokens: Vec<String>,
+    /// When true, also write per-SSRC `capture_<ssrc>.wav` files (the Phase 3
+    /// debugging artifact) alongside forwarding audio to Matrix. Off in
+    /// production to avoid unbounded file growth.
+    #[serde(default)]
+    pub capture_wav: bool,
 }
 
 fn default_store_path() -> String {

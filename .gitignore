@@ -10,3 +10,6 @@ config.local.toml
 # matrix-sdk SQLite store (Olm crypto keys + state + media cache) — local runtime
 # data, never commit.
 /nether-store/
+
+# Per-SSRC capture WAVs written when [discord] capture_wav = true (debug only).
+capture_*.wav

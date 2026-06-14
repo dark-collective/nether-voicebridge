@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
+mod audio;
 mod capture;
 mod config;
 mod discord;
@@ -30,8 +31,12 @@ async fn main() -> Result<()> {
 
     cfg.log_redacted_summary();
 
-    // The CaptureSink is shared between the Discord task and the Ctrl-C handler.
-    let sink = Arc::new(capture::CaptureSink::new());
+    // Optional WAV capture (Phase 3 debugging artifact), off unless configured.
+    // When enabled it is shared between the Discord task and the Ctrl-C handler.
+    let capture_sink: Option<Arc<capture::CaptureSink>> = cfg
+        .discord
+        .capture_wav
+        .then(|| Arc::new(capture::CaptureSink::new()));
 
     // Build the Matrix client once; clone it into the sync task and the RTC task.
     // matrix_sdk::Client is internally Arc-backed, so cloning is cheap.
@@ -41,16 +46,23 @@ async fn main() -> Result<()> {
     // rtc::run subscribes and joins / leaves accordingly.
     let (call_active_tx, call_active_rx) = tokio::sync::watch::channel(false);
 
-    // Ctrl-C handler: finalise all WAV files so headers are correct.
+    // Audio forward path: Discord capture → RTC publish. 20 ms mono frames.
+    // Bounded; the Discord side drops on a full channel (real-time audio).
+    let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(50);
+
+    // Ctrl-C handler: finalise WAV files (if capturing) so headers are correct.
     {
-        let sink = Arc::clone(&sink);
+        let capture_sink = capture_sink.clone();
         tokio::spawn(async move {
             if let Err(e) = tokio::signal::ctrl_c().await {
                 tracing::warn!(error = %e, "ctrl_c signal handler failed");
                 return;
             }
-            tracing::info!("shutting down — finalising WAV files");
-            sink.finalize_all();
+            tracing::info!("shutting down");
+            if let Some(sink) = &capture_sink {
+                tracing::info!("finalising WAV files");
+                sink.finalize_all();
+            }
             std::process::exit(0);
         });
     }
@@ -58,8 +70,8 @@ async fn main() -> Result<()> {
     // Run all three gateway connections concurrently; propagate the first error.
     tokio::try_join!(
         matrix::run(matrix_client.clone(), &cfg.matrix, call_active_tx),
-        rtc::run(matrix_client, &cfg.livekit, &cfg.matrix, call_active_rx),
-        discord::run(&cfg.discord, Arc::clone(&sink)),
+        rtc::run(matrix_client, &cfg.livekit, &cfg.matrix, call_active_rx, audio_rx),
+        discord::run(&cfg.discord, audio_tx, capture_sink.clone()),
     )?;
 
     Ok(())

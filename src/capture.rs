@@ -82,7 +82,7 @@ impl CaptureSink {
         state.frame_count += 1;
 
         // Log RMS once per second.
-        if state.frame_count % RMS_LOG_INTERVAL == 0 {
+        if state.frame_count.is_multiple_of(RMS_LOG_INTERVAL) {
             let rms = compute_rms(pcm);
             tracing::info!(ssrc, rms_db = format_args!("{rms:.1}"), frame = state.frame_count, "audio level");
         }

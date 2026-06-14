@@ -21,41 +21,126 @@ mod keys;
 mod lk_jwt;
 mod membership;
 mod openid;
+mod publish;
 mod session;
-mod tone;
 mod well_known;
+
+// Phase 4 tone diagnostic — kept on disk (and compiling) but not used in the
+// live path now that Discord audio is forwarded. Re-wire in `publish` if a
+// standalone tone test is ever needed again.
+#[allow(dead_code)]
+mod tone;
 
 use anyhow::Result;
 use livekit::e2ee::key_provider::KeyProvider;
+use livekit::webrtc::audio_frame::AudioFrame;
+use livekit::webrtc::audio_source::native::NativeAudioSource;
 use matrix_sdk::{Client, ruma::RoomId};
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
-use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{mpsc, watch};
 
+use crate::audio::jitter::JitterBuffer;
 use crate::config::{LiveKitConfig, MatrixConfig};
 use keys::CallEncryptionKeysEventContent;
 use well_known::LivekitFocusInfo;
 
+/// Jitter buffer sizing for the outbound (Discord → LiveKit) stream.
+const JITTER_TARGET_MS: u32 = 60;
+const JITTER_MAX_MS: u32 = 120;
+const SAMPLE_RATE: u32 = 48_000;
+const SAMPLES_10MS: u32 = 480;
+
+/// Control messages to the long-lived audio consumer: which LiveKit source (if
+/// any) to feed.  Sent over an mpsc so source swaps happen *inside* the
+/// consumer task — no shared mutex, and reconnects overwrite cleanly.
+enum SourceControl {
+    Activate(NativeAudioSource),
+    Deactivate,
+}
+
 /// State held while the bridge is connected to a live call.
 struct ActiveSession {
     lk_session: session::LiveSession,
-    tone_task: tokio::task::JoinHandle<()>,
-    tone_cancel: CancellationToken,
+    /// Handle to tell the audio consumer to stop feeding our source on teardown.
+    ctrl_tx: mpsc::Sender<SourceControl>,
 }
 
 impl ActiveSession {
-    /// Tear down the LiveKit connection and tone.
+    /// Tear down the LiveKit connection.
     async fn close(self) {
-        self.tone_cancel.cancel();
-        // Give the tone loop a moment to drain.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            self.tone_task,
-        )
-        .await;
+        // Stop the consumer feeding the source *before* the source is dropped by
+        // disconnect, so it never feeds a torn-down source.
+        let _ = self.ctrl_tx.send(SourceControl::Deactivate).await;
         self.lk_session.disconnect().await;
         tracing::info!("LiveKit session closed");
     }
+}
+
+/// Long-lived task: drains forwarded Discord frames through a jitter buffer and
+/// feeds 10 ms mono frames to the currently-active LiveKit source.
+///
+/// Pacing is driven by `audio_rx.recv()` — Discord's real-time 20 ms tick is
+/// the producer clock, so (unlike the Phase 4 tone) there is no second clock
+/// racing libwebrtc's drain.  Errors from `capture_frame` (e.g. feeding a
+/// source mid-teardown) are swallowed; this task must never die, as its death
+/// would silence the bridge for the rest of the process.
+async fn audio_consumer(
+    mut audio_rx: mpsc::Receiver<Vec<i16>>,
+    mut ctrl_rx: mpsc::Receiver<SourceControl>,
+) {
+    let mut jitter = JitterBuffer::new(JITTER_TARGET_MS, JITTER_MAX_MS, SAMPLE_RATE);
+    let mut source: Option<NativeAudioSource> = None;
+    // ~5 s at 50 frames/s: periodic jitter-depth health log.
+    let mut ticks: u64 = 0;
+
+    loop {
+        tokio::select! {
+            biased;
+            ctrl = ctrl_rx.recv() => match ctrl {
+                Some(SourceControl::Activate(s)) => {
+                    tracing::info!("audio consumer: source activated");
+                    source = Some(s);
+                    jitter.clear();
+                }
+                Some(SourceControl::Deactivate) => {
+                    tracing::info!("audio consumer: source deactivated");
+                    source = None;
+                    jitter.clear();
+                }
+                None => break, // run() dropped ctrl_tx — shutting down
+            },
+            frame = audio_rx.recv() => {
+                let Some(frame20) = frame else { break }; // Discord side gone
+                jitter.push(&frame20);
+                ticks += 1;
+                if ticks.is_multiple_of(250) && source.is_some() {
+                    tracing::debug!(
+                        depth = jitter.depth_samples(),
+                        target = jitter.target_samples(),
+                        level_db = format_args!("{:.1}", crate::audio::rms_dbfs(&frame20)),
+                        "jitter buffer depth / inbound level"
+                    );
+                }
+                while let Some(f10) = jitter.pop_10ms() {
+                    // Drain even when inactive so latency stays bounded.
+                    if let Some(src) = source.as_ref() {
+                        let af = AudioFrame {
+                            data: Cow::Owned(f10),
+                            sample_rate: SAMPLE_RATE,
+                            num_channels: 1,
+                            samples_per_channel: SAMPLES_10MS,
+                        };
+                        if let Err(e) = src.capture_frame(&af).await {
+                            tracing::warn!(error = %e, "capture_frame failed — yielding");
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tracing::info!("audio consumer task exited");
 }
 
 /// Run the RTC participation loop.
@@ -69,9 +154,16 @@ pub async fn run(
     lk_cfg: &LiveKitConfig,
     mx_cfg: &MatrixConfig,
     mut call_active_rx: watch::Receiver<bool>,
+    audio_rx: mpsc::Receiver<Vec<i16>>,
 ) -> Result<()> {
     let span = tracing::info_span!("rtc");
     let _guard = span.enter();
+
+    // Spawn the long-lived audio consumer once. `ctrl_tx` lives for the whole
+    // run() so the consumer's control channel never closes until shutdown; a
+    // clone is handed to each ActiveSession to activate/deactivate its source.
+    let (ctrl_tx, ctrl_rx) = mpsc::channel::<SourceControl>(8);
+    tokio::spawn(audio_consumer(audio_rx, ctrl_rx));
 
     // Build a dedicated HTTP client on rustls.
     let http = reqwest::Client::builder().use_rustls_tls().build()?;
@@ -169,8 +261,8 @@ pub async fn run(
                     tracing::warn!("room not in local state");
                 }
 
-                // 2–6. Connect LiveKit, generate key, publish tone, send key.
-                match join_livekit_and_start_tone(
+                // 2–6. Connect LiveKit, generate key, publish track, send key.
+                match join_livekit_and_publish(
                     &client,
                     &http,
                     &focus,
@@ -179,6 +271,7 @@ pub async fn run(
                     mx_cfg.device_id.as_str(),
                     &shared_provider,
                     lk_cfg.media_e2ee,
+                    &ctrl_tx,
                 )
                 .await
                 {
@@ -229,8 +322,10 @@ pub async fn run(
 }
 
 /// Fetch a fresh JWT, connect to LiveKit, optionally set up E2EE, publish the
-/// tone, and (when E2EE is enabled) send our key to all current call members.
-async fn join_livekit_and_start_tone(
+/// bridge audio track and activate it on the consumer, and (when E2EE is
+/// enabled) send our key to all current call members.
+#[allow(clippy::too_many_arguments)]
+async fn join_livekit_and_publish(
     client: &Client,
     http: &reqwest::Client,
     focus: &LivekitFocusInfo,
@@ -239,6 +334,7 @@ async fn join_livekit_and_start_tone(
     device_id: &str,
     shared_provider: &Arc<Mutex<Option<KeyProvider>>>,
     use_e2ee: bool,
+    ctrl_tx: &mpsc::Sender<SourceControl>,
 ) -> Result<ActiveSession> {
     let user_id = client
         .user_id()
@@ -298,11 +394,16 @@ async fn join_livekit_and_start_tone(
         tracing::info!("media E2EE disabled — connecting without frame encryption");
     }
 
-    // Publish the tone track.
-    let tone_cancel = CancellationToken::new();
-    let tone_task = tone::publish_and_run(&lk_session.room, tone_cancel.clone()).await?;
+    // Publish the bridge audio track and hand the source to the consumer.
+    let source = publish::publish(&lk_session.room).await?;
+    if ctrl_tx.send(SourceControl::Activate(source)).await.is_err() {
+        tracing::error!("audio consumer gone — cannot activate source");
+    }
 
-    Ok(ActiveSession { lk_session, tone_task, tone_cancel })
+    Ok(ActiveSession {
+        lk_session,
+        ctrl_tx: ctrl_tx.clone(),
+    })
 }
 
 /// Tear down an active session, clearing the shared provider.

@@ -33,6 +33,13 @@ puppet_tokens = [
     "YOUR_PUPPET_BOT_TOKEN_2",
 ]
 
+# Optional (default false). When true, also write per-SSRC capture_<ssrc>.wav
+# files (the Phase 3 debugging artifact) alongside forwarding audio to Matrix.
+# Leave off in normal use — it writes unbounded files. Handy to A/B a fault:
+# if the WAV has audio but Element Call is silent, the problem is downstream of
+# capture.
+capture_wav = false
+
 [matrix]
 # Fixed: your Tuwunel homeserver.
 homeserver_url = "https://nether.im"
