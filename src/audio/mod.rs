@@ -23,22 +23,26 @@ pub const SAMPLES_20MS: usize = 960;
 
 /// Average the L/R of an interleaved-stereo i16 buffer into mono.
 ///
-/// Input length must be even (L,R,L,R,…); an odd trailing sample is ignored.
-/// Averaging is done in i32 to avoid overflow, then truncated back to i16.
+/// A trailing odd sample (length not a multiple of 2) is ignored — never
+/// panics, since this runs on the audio hot path. Averaging is done in i32 to
+/// avoid overflow, then truncated back to i16.
 pub fn downmix_stereo_to_mono(stereo: &[i16]) -> Vec<i16> {
-    debug_assert!(stereo.len().is_multiple_of(2), "stereo buffer must have even length");
     stereo
         .chunks_exact(2)
         .map(|lr| ((lr[0] as i32 + lr[1] as i32) / 2) as i16)
         .collect()
 }
 
-/// Sum N equal-length mono frames sample-wise with a saturating i16 clamp.
+/// Sum N mono frames sample-wise with a saturating i16 clamp.
 ///
 /// * Empty input → empty `Vec`.
 /// * A single frame → a copy of that frame.
-/// * Frames are assumed equal length (debug-asserted); the output length is
-///   that of the first frame and extra samples in longer frames are ignored.
+/// * **Frames may differ in length** — the output is as long as the longest
+///   frame, and shorter frames contribute silence past their end. songbird can
+///   hand back decoded frames of differing lengths when several speakers overlap
+///   in one tick (a speaker just starting, packet loss/PLC), so this MUST NOT
+///   assume equal lengths — an earlier `debug_assert` here panicked the songbird
+///   event thread and silently killed capture.
 ///
 /// Saturating addition means several simultaneously-loud speakers can clip;
 /// this is an accepted Phase 5 limitation (no AGC/limiter yet).
@@ -49,11 +53,7 @@ pub fn mix_mono(frames: &[&[i16]]) -> Vec<i16> {
     if frames.len() == 1 {
         return first.to_vec();
     }
-    let len = first.len();
-    debug_assert!(
-        frames.iter().all(|f| f.len() == len),
-        "mix_mono frames must be equal length"
-    );
+    let len = frames.iter().map(|f| f.len()).max().unwrap_or(0);
     (0..len)
         .map(|i| {
             let sum: i32 = frames.iter().map(|f| f.get(i).copied().unwrap_or(0) as i32).sum();
@@ -128,6 +128,19 @@ mod tests {
         let b = [10_000i16, -10_000, 100];
         // 40000 clamps to i16::MAX; -40000 clamps to i16::MIN; 200 fits.
         assert_eq!(mix_mono(&[&a, &b]), vec![i16::MAX, i16::MIN, 200]);
+    }
+
+    #[test]
+    fn mix_unequal_lengths_pad_with_silence() {
+        // Regression: songbird can hand back different-length frames when two
+        // speakers overlap in one tick. mix_mono must NOT panic (it used to
+        // `debug_assert` equal length, which killed the capture thread). Output
+        // is as long as the longest frame; the short one contributes silence.
+        let short = [10i16, 20];
+        let long = [1i16, 2, 3, 4];
+        assert_eq!(mix_mono(&[&short, &long]), vec![11, 22, 3, 4]);
+        // Order-independent, and the longer-first case works too.
+        assert_eq!(mix_mono(&[&long, &short]), vec![11, 22, 3, 4]);
     }
 
     #[test]
