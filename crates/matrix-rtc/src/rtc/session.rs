@@ -21,7 +21,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 use livekit::RoomEvent;
 
-use nvb_audio::mixer::PlaybackMixer;
+use nvb_audio::routing::PlaybackRouter;
 
 /// Sample rate / channel count we ask libwebrtc to resample inbound tracks to.
 /// 48 kHz mono matches the playback path (songbird upmixes mono → stereo).
@@ -90,7 +90,7 @@ pub async fn connect(
     url: &str,
     jwt: &str,
     use_e2ee: bool,
-    playback: Arc<PlaybackMixer>,
+    router: Arc<dyn PlaybackRouter>,
 ) -> Result<LiveSession> {
     let span = tracing::info_span!("rtc.session", sfu_url = %url, use_e2ee);
     let _guard = span.enter();
@@ -142,9 +142,9 @@ pub async fn connect(
     tracing::info!(existing_participants = ?existing, "LiveKit room initial participants");
 
     // Drain room events in a background task so the channel doesn't fill up.
-    // The same task routes inbound audio tracks to the playback mixer.
+    // The same task routes inbound audio tracks to per-participant puppet outputs.
     let cancel = CancellationToken::new();
-    let event_task = tokio::spawn(handle_room_events(events, playback, cancel.clone()));
+    let event_task = tokio::spawn(handle_room_events(events, router, cancel.clone()));
 
     Ok(LiveSession {
         room,
@@ -155,22 +155,26 @@ pub async fn connect(
     })
 }
 
-/// Drain a subscribed audio track into the playback mixer until cancelled or the
-/// track ends.  libwebrtc resamples to 48 kHz mono for us (see [`NativeAudioStream::new`]),
-/// so each frame is already in the mixer's format.  On exit the participant's
-/// buffer is removed so it stops contributing to the mix.
+/// Drain a subscribed audio track to its routed output (a Discord puppet, or the
+/// listener mix on overflow) until cancelled or the track ends.  libwebrtc
+/// resamples to 48 kHz mono for us (see [`NativeAudioStream::new`]), so each
+/// frame is already in the sink's format.  The route is acquired via
+/// [`PlaybackRouter::assign`] (which checks out a puppet and sets its nickname to
+/// `display_name`) and returned via [`PlaybackRouter::release`] on exit.
 async fn playback_consumer(
     track: RemoteTrack,
     key: String,
-    playback: Arc<PlaybackMixer>,
+    display_name: String,
+    router: Arc<dyn PlaybackRouter>,
     cancel: CancellationToken,
 ) {
     let RemoteTrack::Audio(audio) = track else {
         return; // video tracks are not bridged
     };
+    let sink = router.assign(&key, &display_name);
     let mut stream =
         NativeAudioStream::new(audio.rtc_track(), PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS);
-    tracing::info!(track = %key, "playback consumer started");
+    tracing::info!(track = %key, display_name = %display_name, "playback consumer started");
 
     // Health: log the first frame (confirms frames arrive, and their shape),
     // then the *peak* level over each ~5 s window — a single-frame snapshot would
@@ -202,14 +206,14 @@ async fn playback_consumer(
                         );
                         peak_db = f32::NEG_INFINITY;
                     }
-                    playback.push(&key, &f.data);
+                    sink.push(&f.data);
                 }
                 None => break, // track closed
             },
         }
     }
 
-    playback.remove(&key);
+    router.release(&key);
     tracing::info!(track = %key, "playback consumer ended");
 }
 
@@ -217,7 +221,7 @@ async fn playback_consumer(
 /// tracks into the playback mixer (one consumer task per track, keyed by SID).
 async fn handle_room_events(
     mut events: UnboundedReceiver<RoomEvent>,
-    playback: Arc<PlaybackMixer>,
+    router: Arc<dyn PlaybackRouter>,
     cancel: CancellationToken,
 ) {
     // Per-track child tokens so an individual unsubscribe can stop just that
@@ -237,10 +241,19 @@ async fn handle_room_events(
             }
             RoomEvent::TrackSubscribed { track, publication, participant } => {
                 let sid = publication.sid().to_string();
+                let identity = participant.identity().to_string();
+                // Display name for the puppet's Discord nickname. Element Call
+                // should populate `name`; fall back to the identity if not.
+                // Log all three so we can verify what EC actually sets.
+                let name = participant.name();
+                let display_name = if name.is_empty() { identity.clone() } else { name.clone() };
                 tracing::info!(
-                    from_identity = %participant.identity(),
+                    from_identity = %identity,
+                    participant_name = %name,
+                    participant_metadata = %participant.metadata(),
                     track_sid = %sid,
                     kind = ?track.kind(),
+                    display_name = %display_name,
                     "LiveKit: subscribed to remote participant track"
                 );
                 // TODO(Phase 8): skip tracks from bridge-owned ghost identities
@@ -248,7 +261,7 @@ async fn handle_room_events(
                 // every remote participant is a human and is bridged.
                 let ct = cancel.child_token();
                 consumers.insert(sid.clone(), ct.clone());
-                tokio::spawn(playback_consumer(track, sid, playback.clone(), ct));
+                tokio::spawn(playback_consumer(track, sid, display_name, router.clone(), ct));
             }
             RoomEvent::TrackUnsubscribed { publication, participant, .. } => {
                 let sid = publication.sid().to_string();

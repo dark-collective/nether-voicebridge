@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::{mpsc, watch};
 
-use nvb_audio::mixer::PlaybackMixer;
+use nvb_audio::routing::PlaybackRouter;
 use nvb_config::{LiveKitConfig, MatrixConfig};
 
 /// Run the Matrix side of the bridge to completion.
@@ -22,13 +22,13 @@ use nvb_config::{LiveKitConfig, MatrixConfig};
 /// Builds the matrix-sdk client, then drives the sync loop (which raises
 /// call-active transitions over an internal watch channel) and the RTC
 /// participation loop concurrently. The caller supplies only the cross-side
-/// plumbing: `audio_rx` (Discord → Matrix frames to publish) and the shared
-/// `playback` mixer (Matrix → Discord audio).
+/// plumbing: `audio_rx` (Discord → Matrix frames to publish) and the
+/// `router` (Matrix → Discord audio, routed per-participant to puppets).
 pub async fn run(
     matrix_cfg: &MatrixConfig,
     livekit_cfg: &LiveKitConfig,
     audio_rx: mpsc::Receiver<Vec<i16>>,
-    playback: Arc<PlaybackMixer>,
+    router: Arc<dyn PlaybackRouter>,
 ) -> Result<()> {
     // Build the client first (surfaces login/restore errors before the loops).
     let client = matrix::build_client(matrix_cfg).await?;
@@ -45,7 +45,7 @@ pub async fn run(
             matrix_cfg,
             call_active_rx,
             audio_rx,
-            playback,
+            router,
         ),
     )?;
 

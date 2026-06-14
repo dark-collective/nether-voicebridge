@@ -16,5 +16,6 @@ symphonia = { workspace = true }
 hound = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+futures-util = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

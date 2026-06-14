@@ -12,17 +12,19 @@ use songbird::{
     SerenityInit,
 };
 use std::{
-    collections::HashSet,
     io::{self, Read, Seek, SeekFrom},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, PoisonError,
     },
 };
 use tokio::sync::{mpsc, Mutex};
 
 pub mod capture;
 pub use capture::CaptureSink;
+
+pub mod puppet;
+pub use puppet::{PuppetPool, SharedExclude};
 
 use nvb_audio::{self as audio, mixer::PlaybackMixer};
 use nvb_config::DiscordConfig;
@@ -152,10 +154,10 @@ impl MediaSource for PlaybackSource {
 struct VoiceReceiver {
     /// Forward channel to the RTC audio consumer.  20 ms mono frames (960 i16).
     audio_tx: mpsc::Sender<Vec<i16>>,
-    /// Bridge-owned SSRCs to exclude from capture (echo prevention).  Empty in
-    /// Phase 5; populated in Phase 7 once puppets replay Matrix audio that the
-    /// listener would otherwise re-capture.
-    exclude: Arc<HashSet<u32>>,
+    /// Bridge-owned SSRCs to exclude from capture (echo prevention).  Populated
+    /// at runtime as puppets join voice (Phase 7): the listener hears the
+    /// puppets replaying Matrix audio and must not re-capture and loop it back.
+    exclude: SharedExclude,
     /// Optional Phase 3 WAV capture, enabled via `[discord] capture_wav`.
     capture_sink: Option<Arc<CaptureSink>>,
     /// Count of frames dropped because the forward channel was full (logged
@@ -173,8 +175,10 @@ impl VoiceReceiver {
     /// so the downstream clock/jitter buffer keeps ticking at a steady 50 Hz.
     fn mix_tick(&self, tick: &songbird::events::context_data::VoiceTick) -> Vec<i16> {
         let mut monos: Vec<Vec<i16>> = Vec::new();
+        // One read-lock for the whole tick; writers (puppet join/leave) are rare.
+        let excluded = self.exclude.read().unwrap_or_else(PoisonError::into_inner);
         for (ssrc, data) in &tick.speaking {
-            if self.exclude.contains(ssrc) {
+            if excluded.contains(ssrc) {
                 continue;
             }
             if let Some(pcm) = &data.decoded_voice {
@@ -281,11 +285,12 @@ struct Handler {
     bridge_user_ids: Arc<Mutex<Vec<UserId>>>,
     /// Forward channel to the RTC audio consumer.
     audio_tx: mpsc::Sender<Vec<i16>>,
-    /// Bridge-owned SSRCs to exclude from capture (empty in Phase 5).
-    exclude: Arc<HashSet<u32>>,
+    /// Bridge-owned SSRCs to exclude from capture (puppet SSRCs, Phase 7).
+    exclude: SharedExclude,
     /// Optional WAV capture, enabled via `[discord] capture_wav`.
     capture_sink: Option<Arc<CaptureSink>>,
-    /// Inbound Matrix audio to play into the voice channel (Phase 6).
+    /// Inbound Matrix audio to play into the voice channel: the shared listener
+    /// mix (overflow / un-attributed speakers in Phase 7).
     playback: Arc<PlaybackMixer>,
 }
 
@@ -386,7 +391,7 @@ pub async fn run(
     cfg: &DiscordConfig,
     audio_tx: mpsc::Sender<Vec<i16>>,
     capture_sink: Option<Arc<CaptureSink>>,
-    playback: Arc<PlaybackMixer>,
+    pool: Arc<PuppetPool>,
 ) -> Result<()> {
     let guild_id: u64 = cfg
         .guild_id
@@ -396,15 +401,18 @@ pub async fn run(
         .channel_id
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid channel_id: {}", cfg.channel_id))?;
+    let guild_id = GuildId::new(guild_id);
+    let channel_id = ChannelId::new(channel_id);
 
     let handler = Handler {
-        guild_id: GuildId::new(guild_id),
-        channel_id: ChannelId::new(channel_id),
+        guild_id,
+        channel_id,
         bridge_user_ids: Arc::new(Mutex::new(Vec::new())),
         audio_tx,
-        exclude: Arc::new(HashSet::new()),
+        // The listener and every puppet share one exclude set + listener mix.
+        exclude: pool.exclude(),
         capture_sink,
-        playback,
+        playback: pool.listener_mixer(),
     };
 
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
@@ -420,11 +428,19 @@ pub async fn run(
         .await
         .map_err(|e| anyhow::anyhow!("failed to build Discord client: {e}"))?;
 
-    tracing::info!("starting Discord gateway");
-    client
-        .start()
-        .await
-        .map_err(|e| anyhow::anyhow!("Discord client error: {e}"))
+    tracing::info!("starting Discord gateway (listener + puppet pool)");
+    // Run the listener client and every puppet client concurrently; the first
+    // to error aborts the bridge.
+    tokio::try_join!(
+        async {
+            client
+                .start()
+                .await
+                .map_err(|e| anyhow::anyhow!("Discord listener client error: {e}"))
+        },
+        pool.run_puppets(guild_id, channel_id),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
-use nvb_audio::mixer::PlaybackMixer;
-use nvb_discord::CaptureSink;
+use nvb_audio::routing::PlaybackRouter;
+use nvb_discord::{CaptureSink, PuppetPool};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -42,10 +42,12 @@ async fn main() -> Result<()> {
     // Bounded; the Discord side drops on a full channel (real-time audio).
     let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(50);
 
-    // Reverse path: Matrix (LiveKit) → Discord playback. Per-participant jitter
-    // buffers mixed to one mono stream; shared by the RTC consumers (producers)
-    // and the Discord playback source (consumer).
-    let playback = Arc::new(PlaybackMixer::new());
+    // Reverse path: Matrix (LiveKit) → Discord playback. The puppet pool routes
+    // each Matrix speaker to a dedicated, named puppet bot (Phase 7); overflow
+    // falls back to the shared listener mix. It is both the `PlaybackRouter` the
+    // Matrix side pushes into and the owner of the Discord-side puppet clients.
+    let pool = PuppetPool::new(&cfg.discord);
+    let router: Arc<dyn PlaybackRouter> = pool.clone();
 
     // Ctrl-C handler: finalise WAV files (if capturing) so headers are correct.
     {
@@ -67,8 +69,8 @@ async fn main() -> Result<()> {
     // Run the Matrix side (sync + RTC) and the Discord side concurrently;
     // propagate the first error.
     tokio::try_join!(
-        nvb_matrix_rtc::run(&cfg.matrix, &cfg.livekit, audio_rx, playback.clone()),
-        nvb_discord::run(&cfg.discord, audio_tx, capture_sink.clone(), playback),
+        nvb_matrix_rtc::run(&cfg.matrix, &cfg.livekit, audio_rx, router),
+        nvb_discord::run(&cfg.discord, audio_tx, capture_sink.clone(), pool),
     )?;
 
     Ok(())

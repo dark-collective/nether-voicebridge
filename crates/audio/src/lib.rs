@@ -13,6 +13,9 @@
 pub mod jitter;
 // Per-participant playback mixer for the Matrix → Discord direction (Phase 6).
 pub mod mixer;
+// Cross-side playback routing: Matrix participants → Discord puppet outputs
+// (Phase 7 attribution). SDK-free contract between matrix-rtc and discord.
+pub mod routing;
 // WAV read/write — currently exercised by the file-in/out test harness and
 // reused for the Phase 6 reverse direction; not yet called from the binary.
 #[allow(dead_code)]
