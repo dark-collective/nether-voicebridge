@@ -40,18 +40,6 @@ fn log_snapshot(set: &HashSet<(OwnedUserId, String)>) {
     tracing::info!(participants = ?users, count = users.len(), "call participants");
 }
 
-/// Derive the LiveKit participant identity `{mxid}:{device}` from a call-member
-/// `(user_id, state_key)`. Modern Element Call state keys are
-/// `_{mxid}_{device}_m.call`; the device is the final `_`-delimited segment (the
-/// mxid may itself contain `_`, but the device never does, so `rsplit_once`
-/// recovers it). Returns `None` for legacy `{mxid}` keys (no device → cannot
-/// correlate to an RTC participant, so no dedicated puppet).
-fn member_identity(user_id: &UserId, state_key: &str) -> Option<String> {
-    let inner = state_key.strip_prefix('_')?.strip_suffix("_m.call")?;
-    let device = inner.rsplit_once('_').map(|(_, d)| d)?;
-    Some(format!("{}:{}", user_id.as_str(), device))
-}
-
 /// Resolve a Matrix member's display name from room state; falls back to the MXID.
 async fn resolve_member_name(room: &Room, user_id: &UserId) -> String {
     match room.get_member(user_id).await {
@@ -89,18 +77,25 @@ async fn apply_member_event(
         c => !c.active_memberships(Some(ts)).is_empty(),
     };
 
-    // Only act on a real membership transition (insert/remove returning true), so
-    // periodic m.call.member refreshes don't re-resolve names or re-assign.
-    let changed;
+    // Gate assign/release on this user's *MXID* presence going 0↔1, not on the
+    // per-state-key change: a user present on two devices/sessions has two
+    // `(user_id, state_key)` entries, and dropping one must not release the puppet
+    // while the other remains. (Periodic m.call.member refreshes are also no-ops.)
+    let appeared;
+    let gone;
     {
         let mut set = participants.lock().await;
         let prev_users = set.iter().map(|(u, _)| u).collect::<HashSet<_>>().len();
         let entry = (user_id.clone(), state_key.clone());
-        changed = if is_active {
-            set.insert(entry)
+        let this_user_before = set.iter().filter(|(u, _)| u == &user_id).count();
+        if is_active {
+            set.insert(entry);
         } else {
-            set.remove(&entry)
-        };
+            set.remove(&entry);
+        }
+        let this_user_after = set.iter().filter(|(u, _)| u == &user_id).count();
+        appeared = this_user_before == 0 && this_user_after > 0;
+        gone = this_user_before > 0 && this_user_after == 0;
         let new_users = set.iter().map(|(u, _)| u).collect::<HashSet<_>>().len();
 
         if prev_users == 0 && new_users > 0 {
@@ -114,19 +109,17 @@ async fn apply_member_event(
     }
 
     // Membership owns puppet presence: a member joining gets a (present, possibly
-    // silent) named puppet; leaving releases it. Audio + mute are driven
-    // separately by the LiveKit track in `rtc::session`.
-    if changed {
-        if let Some(key) = member_identity(&user_id, &state_key) {
-            if is_active {
-                let name = resolve_member_name(room, &user_id).await;
-                tracing::info!(identity = %key, display_name = %name, "member joined — assigning puppet");
-                router.assign(&key, &name);
-            } else {
-                tracing::info!(identity = %key, "member left — releasing puppet");
-                router.release(&key);
-            }
-        }
+    // silent) named puppet keyed on their bare MXID; leaving releases it. Audio +
+    // mute are driven separately by the LiveKit track in `rtc::session`, which
+    // keys on the same bare MXID — so the track device need not match the
+    // membership state-key device.
+    if appeared {
+        let name = resolve_member_name(room, &user_id).await;
+        tracing::info!(mxid = %user_id, display_name = %name, "member joined — assigning puppet");
+        router.assign(user_id.as_str(), &name);
+    } else if gone {
+        tracing::info!(mxid = %user_id, "member left — releasing puppet");
+        router.release(user_id.as_str());
     }
 }
 

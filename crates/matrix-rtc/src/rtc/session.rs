@@ -170,15 +170,27 @@ pub async fn connect(
 /// frame is already in the sink's format.  The route is acquired via
 /// [`PlaybackRouter::assign`] (which checks out a puppet and sets its nickname to
 /// `display_name`) and returned via [`PlaybackRouter::release`] on exit.
+/// The router key for a LiveKit participant: the bare MXID, with the trailing
+/// `:{device}` stripped. The MXID is itself `@local:server` (one `:`), so we
+/// strip the final `:`-segment only when the remaining prefix parses as a real
+/// MXID; otherwise (a legacy `{mxid}`-only identity) we keep it whole. Both
+/// sides of the bridge key puppets on this so a user whose membership device
+/// differs from their LiveKit-track device still maps to one puppet.
+fn participant_mxid(identity: &str) -> &str {
+    match identity.rsplit_once(':') {
+        Some((prefix, _device)) if UserId::parse(prefix).is_ok() => prefix,
+        _ => identity,
+    }
+}
+
 /// Resolve a human-friendly display name for a puppet nickname.
 ///
 /// Element Call populates neither `participant.name()` nor metadata, and the
 /// LiveKit identity is `{mxid}:{device_id}` (e.g. `@dark:nether.im:2oQuErOThF`).
 /// Preference order: the participant name if LiveKit ever carries one; else the
 /// room member's display name (resolved from the MXID parsed out of the
-/// identity); else the bare MXID — still cleaner than the device-suffixed
-/// identity. The MXID itself contains one `:` (localpart:server), so only the
-/// final `:`-segment (the device id) is stripped.
+/// identity via [`participant_mxid`]); else the bare MXID — still cleaner than
+/// the device-suffixed identity.
 async fn resolve_display_name(
     client: &Client,
     room_id: &RoomId,
@@ -188,7 +200,7 @@ async fn resolve_display_name(
     if !participant_name.is_empty() {
         return participant_name.to_owned();
     }
-    let mxid_str = identity.rsplit_once(':').map_or(identity, |(mxid, _device)| mxid);
+    let mxid_str = participant_mxid(identity);
     let Ok(user_id) = UserId::parse(mxid_str) else {
         return mxid_str.to_owned();
     };
@@ -211,10 +223,12 @@ async fn resolve_display_name(
 #[allow(clippy::too_many_arguments)]
 async fn playback_consumer(
     track: RemoteTrack,
-    // Router key = the LiveKit participant identity `{mxid}:{device}` (one puppet
-    // per participant), NOT the track SID — so re-published tracks reuse the same
-    // puppet and (Phase P4) membership owns assign/release.
-    key: String,
+    // The full LiveKit participant identity `{mxid}:{device}`. The router key is
+    // the bare MXID derived from it (see `participant_mxid`) so one puppet maps
+    // to one participant regardless of which device the track carries — NOT the
+    // track SID, so re-published tracks reuse the same puppet and (Phase P4)
+    // membership owns assign/release.
+    identity: String,
     participant_name: String,
     initial_muted: bool,
     client: Client,
@@ -225,14 +239,16 @@ async fn playback_consumer(
     let RemoteTrack::Audio(audio) = track else {
         return; // video tracks are not bridged
     };
+    let key = participant_mxid(&identity);
     // Resolve the puppet's Discord nickname here (in the per-track task) so a
-    // homeserver round-trip never stalls the room-event loop.
+    // homeserver round-trip never stalls the room-event loop. Uses the full
+    // identity (the device suffix matters to the resolver's MXID parse).
     let display_name =
-        resolve_display_name(&client, &room_id, &key, &participant_name).await;
-    let sink = router.assign(&key, &display_name);
+        resolve_display_name(&client, &room_id, &identity, &participant_name).await;
+    let sink = router.assign(key, &display_name);
     // Seed the puppet's mute state right after assign (avoids racing a separate
     // set_muted against the assign that creates the puppet).
-    router.set_muted(&key, initial_muted);
+    router.set_muted(key, initial_muted);
     let mut stream =
         NativeAudioStream::new(audio.rtc_track(), PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS);
     tracing::info!(track = %key, display_name = %display_name, "playback consumer started");
@@ -327,7 +343,8 @@ async fn handle_room_events(
                 // every remote participant is a human and is bridged.
                 let initial_muted = publication.is_muted();
                 // Per-track cancel token, keyed by SID (a participant may have
-                // more than one track); the router key is the participant identity.
+                // more than one track); the router key is the bare MXID derived
+                // from the identity inside the consumer.
                 let ct = cancel.child_token();
                 consumers.insert(sid.clone(), ct.clone());
                 tokio::spawn(
@@ -347,12 +364,12 @@ async fn handle_room_events(
             RoomEvent::TrackMuted { participant, publication } => {
                 let identity = participant.identity().to_string();
                 tracing::info!(from_identity = %identity, track_sid = %publication.sid(), "LiveKit: track muted");
-                router.set_muted(&identity, true);
+                router.set_muted(participant_mxid(&identity), true);
             }
             RoomEvent::TrackUnmuted { participant, publication } => {
                 let identity = participant.identity().to_string();
                 tracing::info!(from_identity = %identity, track_sid = %publication.sid(), "LiveKit: track unmuted");
-                router.set_muted(&identity, false);
+                router.set_muted(participant_mxid(&identity), false);
             }
             RoomEvent::TrackUnsubscribed { publication, participant, .. } => {
                 let sid = publication.sid().to_string();
@@ -381,5 +398,23 @@ async fn handle_room_events(
                 tracing::debug!(event = ?other, "LiveKit room event");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::participant_mxid;
+
+    #[test]
+    fn strips_device_suffix() {
+        // Modern EC identity `{mxid}:{device}` → bare MXID.
+        assert_eq!(participant_mxid("@a:b.com:DEV"), "@a:b.com");
+    }
+
+    #[test]
+    fn keeps_legacy_identity_whole() {
+        // Legacy `{mxid}`-only identity: the trailing `:`-segment is the server,
+        // not a device — must NOT be stripped (the remaining `@a` is not a MXID).
+        assert_eq!(participant_mxid("@a:b.com"), "@a:b.com");
     }
 }
