@@ -48,6 +48,15 @@ pub struct DiscordConfig {
     /// production to avoid unbounded file growth.
     #[serde(default)]
     pub capture_wav: bool,
+    /// Prefix prepended to puppet nicknames so Discord users can tell which
+    /// participants are bridged from Matrix. Default `"[Matrix] "`; set to `""`
+    /// to disable. Prefix + name is truncated to Discord's 32-char nickname cap.
+    #[serde(default = "default_nickname_prefix")]
+    pub nickname_prefix: String,
+}
+
+fn default_nickname_prefix() -> String {
+    "[Matrix] ".to_string()
 }
 
 fn default_store_path() -> String {

@@ -39,6 +39,23 @@ use nvb_config::DiscordConfig;
 
 use crate::{PlaybackSource, PLAYBACK_CHANNELS, PLAYBACK_SAMPLE_RATE};
 
+/// Discord's hard cap on guild nicknames (Unicode characters).
+const NICKNAME_MAX_CHARS: usize = 32;
+
+/// Build a puppet nickname as `{prefix}{name}`, truncated to Discord's 32-char
+/// cap on a char boundary (the prefix is preserved; the name is trimmed). An
+/// empty prefix yields just the (possibly truncated) name.
+fn build_nickname(prefix: &str, name: &str) -> String {
+    let prefix_len = prefix.chars().count();
+    if prefix_len >= NICKNAME_MAX_CHARS {
+        return prefix.chars().take(NICKNAME_MAX_CHARS).collect();
+    }
+    let mut nick = String::with_capacity(prefix.len() + name.len());
+    nick.push_str(prefix);
+    nick.extend(name.chars().take(NICKNAME_MAX_CHARS - prefix_len));
+    nick
+}
+
 /// Shared, mutable set of bridge-owned SSRCs to exclude from listener capture.
 /// Owned by the pool; shared with the listener and every puppet.  Reads happen
 /// on the listener's 50 Hz tick (one read-lock per tick), writes only on a
@@ -83,6 +100,8 @@ pub struct PuppetPool {
     /// the listener bot's `PlaybackSource`.
     listener_mixer: Arc<PlaybackMixer>,
     exclude: SharedExclude,
+    /// Prefix for puppet nicknames (e.g. `"[Matrix] "`; empty disables).
+    nickname_prefix: Arc<str>,
     slots: Vec<PuppetSlot>,
     /// Participant key → current routing.  The single source of truth for
     /// allocation; guarded so `assign`/`release` stay race-free.
@@ -113,6 +132,7 @@ impl PuppetPool {
         Arc::new(Self {
             listener_mixer: Arc::new(PlaybackMixer::new()),
             exclude: Arc::new(RwLock::new(HashSet::new())),
+            nickname_prefix: Arc::from(cfg.nickname_prefix.as_str()),
             slots,
             assignments: StdMutex::new(HashMap::new()),
         })
@@ -160,6 +180,7 @@ impl PuppetPool {
                 channel_id,
                 mixer: slot.mixer.clone(),
                 exclude: self.exclude.clone(),
+                nickname_prefix: self.nickname_prefix.clone(),
                 current_ssrc: slot.current_ssrc.clone(),
                 cmd_rx: StdMutex::new(Some(rx)),
             };
@@ -274,6 +295,7 @@ struct PuppetHandler {
     channel_id: ChannelId,
     mixer: Arc<PlaybackMixer>,
     exclude: SharedExclude,
+    nickname_prefix: Arc<str>,
     current_ssrc: Arc<StdMutex<Option<u32>>>,
     cmd_rx: StdMutex<Option<mpsc::Receiver<PuppetCommand>>>,
 }
@@ -303,6 +325,7 @@ impl EventHandler for PuppetHandler {
             self.channel_id,
             self.mixer.clone(),
             self.exclude.clone(),
+            self.nickname_prefix.clone(),
             self.current_ssrc.clone(),
             rx,
         ));
@@ -320,6 +343,7 @@ async fn puppet_command_loop(
     channel_id: ChannelId,
     mixer: Arc<PlaybackMixer>,
     exclude: SharedExclude,
+    nickname_prefix: Arc<str>,
     current_ssrc: Arc<StdMutex<Option<u32>>>,
     mut cmd_rx: mpsc::Receiver<PuppetCommand>,
 ) {
@@ -334,6 +358,7 @@ async fn puppet_command_loop(
                     channel_id,
                     &mixer,
                     &exclude,
+                    &nickname_prefix,
                     &current_ssrc,
                     &display_name,
                 )
@@ -356,6 +381,7 @@ async fn puppet_join(
     channel_id: ChannelId,
     mixer: &Arc<PlaybackMixer>,
     exclude: &SharedExclude,
+    nickname_prefix: &str,
     current_ssrc: &Arc<StdMutex<Option<u32>>>,
     display_name: &str,
 ) {
@@ -395,8 +421,10 @@ async fn puppet_join(
         return;
     }
 
-    // Nickname = Matrix display name (needs CHANGE_NICKNAME perm).
-    if let Err(e) = guild_id.edit_nickname(&ctx.http, Some(display_name)).await {
+    // Nickname = prefix + Matrix display name (needs CHANGE_NICKNAME perm),
+    // truncated to Discord's 32-char cap.
+    let nick = build_nickname(nickname_prefix, display_name);
+    if let Err(e) = guild_id.edit_nickname(&ctx.http, Some(nick.as_str())).await {
         tracing::warn!(idx, error = %e, "failed to set puppet nickname");
     }
     tracing::info!(idx, display_name, "puppet joined voice and assigned");
@@ -459,5 +487,35 @@ impl SongbirdEventHandler for PuppetSsrcRegistrar {
             tracing::info!(idx = self.idx, ssrc = c.ssrc, "puppet SSRC registered for echo-exclusion");
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_nickname;
+
+    #[test]
+    fn nickname_prefix_applied() {
+        assert_eq!(build_nickname("[Matrix] ", "Dark Collective"), "[Matrix] Dark Collective");
+    }
+
+    #[test]
+    fn nickname_empty_prefix_is_just_name() {
+        assert_eq!(build_nickname("", "Victor"), "Victor");
+    }
+
+    #[test]
+    fn nickname_truncated_to_32_chars() {
+        let nick = build_nickname("[Matrix] ", "A Very Long Display Name That Exceeds The Limit");
+        assert_eq!(nick.chars().count(), 32);
+        assert!(nick.starts_with("[Matrix] A Very Long"));
+    }
+
+    #[test]
+    fn nickname_truncation_respects_char_boundaries() {
+        // Multibyte name; must not panic and must stay within the cap.
+        let nick = build_nickname("[Matrix] ", &"é".repeat(40));
+        assert!(nick.chars().count() <= 32);
+        assert!(nick.starts_with("[Matrix] "));
     }
 }

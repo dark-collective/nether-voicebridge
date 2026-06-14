@@ -54,6 +54,11 @@ puppet_tokens = [
 # bridges that might see the same SSRC at once.
 capture_wav = false
 
+# Optional (default "[Matrix] "). Prefix prepended to puppet bot nicknames so
+# Discord users can tell which voices are bridged Matrix participants. Set to
+# "" to disable. Prefix + name is truncated to Discord's 32-char nickname cap.
+nickname_prefix = "[Matrix] "
+
 [bridge.matrix]
 # Fixed: your Tuwunel homeserver.
 homeserver_url = "https://nether.im"
