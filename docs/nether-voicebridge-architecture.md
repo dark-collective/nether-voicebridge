@@ -132,21 +132,9 @@ Handle room tombstones (follow upgrades) and call-end events.
 - **Discord (DAVE):** mandatory since March 2026. Each puppet and the listener
   are legitimate MLS group members and get ratcheted sender keys — decryption
   works because they're real participants. `songbird` handles the MLS dance;
-  pin a DAVE-capable release.
-  - **Capture-death caveat (observed 2026-06-14, root cause unconfirmed):**
-    during Phase 5 testing the listener once stopped decoding Discord audio and
-    didn't self-recover (a fresh voice connection fixed it). It was first
-    hypothesised as a DAVE epoch/re-key failure (membership change → new MLS
-    epoch songbird doesn't follow), but that didn't hold up: the timing didn't
-    match a membership change, songbird's DAVE receive otherwise works (we
-    decoded for minutes; Phase 3 proved it), and there's no matching songbird bug
-    report. It may instead be a silent voice-connection drop or a transient. It's
-    being reproduced with instrumentation (DriverConnect/Reconnect/Disconnect +
-    tick-health logging) before any fix; the likely remedy is a generic
-    capture-health watchdog that rejoins the voice channel on a dead capture
-    (Hardening phase). Note for whoever picks this up: songbird exposes no API to
-    query DAVE state or observe decrypt failures, and failed decrypts just leave
-    the SSRC in `VoiceTick.silent`.
+  pin a DAVE-capable release. (DAVE receive across member join/leave was verified
+  working in Phase 5 testing — a capture-death once blamed on DAVE epochs turned
+  out to be an unrelated `mix_mono` panic in our own code.)
 - **Matrix (Element Call media E2EE):** per-sender keys distributed via Matrix
   to-device events. **Element Call uses HKDF; livekit-rust's built-in frame
   E2EE uses PBKDF2** — a real incompatibility. Do the key derivation yourself

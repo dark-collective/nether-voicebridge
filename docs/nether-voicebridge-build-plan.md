@@ -88,13 +88,13 @@ in Element Call (bridge publishes one mono track as its own identity) and it
 survives Matrix leave/rejoin. Built the SDK-free `audio` core (downmix,
 saturating mix, `JitterBuffer`, wav harness) + a long-lived audio-consumer fed
 via a `SourceControl` mpsc. The workspace split was deferred to Phase 6.
-**Open issue under investigation:** one observed capture-death — the listener
-stopped decoding Discord audio and didn't self-recover; a fresh process fixed it.
-Root cause **unconfirmed**: first hypothesised as a DAVE epoch/re-key problem, but
-the timing didn't fit and songbird's DAVE receive otherwise works, so it's being
-reproduced with instrumentation (commit `1662330`) before any fix is designed.
-Lands in the Hardening phase as a capture-health watchdog unless the spike shows
-it needs more.
+**Capture-death RESOLVED** (commit `794821b`). Reproduced under instrumentation
+(`1662330`): it was OUR bug, not DAVE/songbird — a `debug_assert` in `mix_mono`
+panicked the songbird event thread whenever **two Discord speakers overlapped in
+one tick** with mismatched frame lengths, stopping `VoiceTick` until restart.
+Fix: `mix_mono` handles unequal lengths (pad short with silence); no panics on the
+audio hot path. The DAVE-epoch hypothesis was wrong (confirmed live: 4
+simultaneous speakers now fine). Lesson logged in memory.
 
 ## Phase 6 — Reverse: Matrix → Discord, single speaker
 **Build:** Subscribe to a Matrix participant's track (`livekit` subscribe),
@@ -151,12 +151,10 @@ to baseline every time; no orphaned bots/ghosts.
 ## Phase 10 — Hardening
 **Build:** reconnection with backoff, error recovery, drift/clock-skew
 compensation over long calls, resource caps, observability (per-bridge metrics,
-structured tracing), and a **capture-health watchdog** — detect a dead/stuck
-listener capture (a speaking user yielding no decoded audio, or a
-`DriverDisconnect` with no reconnect) and recover by rejoining the voice channel.
-This is where the Phase 5 capture-death investigation lands once reproduced;
-whether it needs more than a generic watchdog (e.g. DAVE epoch-specific handling)
-depends on that spike.
+structured tracing), and a generic **capture-health watchdog** — recover from a
+genuine voice-connection drop (`DriverDisconnect` with no reconnect) by rejoining
+the channel. (Nice-to-have robustness; the Phase 5 "capture-death" turned out to
+be an unrelated `mix_mono` panic, since fixed — not a connection issue.)
 **Acceptance:** a multi-hour call with users churning on both sides stays
 stable; no drift-induced desync; clean recovery from a dropped connection.
 **Artifact:** production-usable bridge.
