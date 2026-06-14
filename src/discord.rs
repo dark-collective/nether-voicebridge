@@ -39,6 +39,10 @@ struct VoiceReceiver {
     /// Count of frames dropped because the forward channel was full (logged
     /// periodically rather than per-drop to avoid spamming the audio path).
     dropped: AtomicU64,
+    /// Total VoiceTicks seen — logged periodically with speaking/silent sizes so
+    /// we can tell "ticks stopped" (connection dead) from "ticks fire but all
+    /// silent" (decode dead) when capture goes quiet.
+    ticks: AtomicU64,
 }
 
 impl VoiceReceiver {
@@ -71,6 +75,18 @@ impl VoiceReceiver {
 impl SongbirdEventHandler for VoiceReceiver {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::VoiceTick(tick) = ctx {
+            // Tick-health: distinguishes "ticks stopped" from "ticks fire but
+            // everyone is silent" (decode dead) when capture goes quiet.
+            let n = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_multiple_of(250) {
+                tracing::info!(
+                    ticks = n,
+                    speaking = tick.speaking.len(),
+                    silent = tick.silent.len(),
+                    "voicetick health"
+                );
+            }
+
             let frame = self.mix_tick(tick);
             // Never block or panic on the audio path: drop on a full channel
             // (audio is real-time; a stale backlog is worse than a gap).
@@ -95,6 +111,39 @@ impl SongbirdEventHandler for SpeakingLogger {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::SpeakingStateUpdate(Speaking { ssrc, user_id: Some(uid), .. }) = ctx {
             tracing::info!(ssrc, user_id = uid.0, "SSRC → Discord user mapping");
+        }
+        None
+    }
+}
+
+/// Logs songbird voice-connection lifecycle events (DriverConnect/Reconnect/
+/// Disconnect) and other users leaving the channel (ClientDisconnect).
+/// Diagnostic instrumentation: lets us see whether a capture-death coincides
+/// with a voice-connection drop vs. happening with the connection still up.
+/// (songbird 0.6 has no ClientConnect event — joins come via the serenity
+/// `voice_state_update` handler.)
+struct ConnectionLogger;
+
+#[async_trait]
+impl SongbirdEventHandler for ConnectionLogger {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        match ctx {
+            EventContext::DriverConnect(c) => tracing::info!(
+                channel_id = ?c.channel_id, ssrc = c.ssrc, server = c.server,
+                "songbird DriverConnect"
+            ),
+            EventContext::DriverReconnect(c) => tracing::warn!(
+                channel_id = ?c.channel_id, ssrc = c.ssrc, server = c.server,
+                "songbird DriverReconnect"
+            ),
+            EventContext::DriverDisconnect(d) => tracing::warn!(
+                kind = ?d.kind, reason = ?d.reason, channel_id = ?d.channel_id,
+                "songbird DriverDisconnect"
+            ),
+            EventContext::ClientDisconnect(cd) => tracing::info!(
+                user_id = cd.user_id.0, "songbird ClientDisconnect (user left voice)"
+            ),
+            _ => {}
         }
         None
     }
@@ -138,12 +187,23 @@ impl EventHandler for Handler {
                         exclude: Arc::clone(&self.exclude),
                         capture_sink: self.capture_sink.clone(),
                         dropped: AtomicU64::new(0),
+                        ticks: AtomicU64::new(0),
                     },
                 );
                 call.add_global_event(
                     CoreEvent::SpeakingStateUpdate.into(),
                     SpeakingLogger,
                 );
+
+                // Diagnostic: log voice-connection lifecycle + client disconnects.
+                for ev in [
+                    CoreEvent::DriverConnect,
+                    CoreEvent::DriverReconnect,
+                    CoreEvent::DriverDisconnect,
+                    CoreEvent::ClientDisconnect,
+                ] {
+                    call.add_global_event(ev.into(), ConnectionLogger);
+                }
 
                 tracing::info!("audio capture active — talk in Discord to bridge into Element Call");
             }
