@@ -354,33 +354,41 @@ async fn puppet_join(
         return;
     };
 
-    match manager.join(guild_id, channel_id).await {
-        Ok(call_lock) => {
-            {
-                let mut call = call_lock.lock().await;
-                // Register our SSRC for echo-exclusion *before* audio flows.
-                call.add_global_event(
-                    CoreEvent::DriverConnect.into(),
-                    PuppetSsrcRegistrar {
-                        idx,
-                        exclude: exclude.clone(),
-                        current_ssrc: current_ssrc.clone(),
-                    },
-                );
-                // Play this puppet's single-participant mixer into the channel.
-                let source = PlaybackSource::new(mixer.clone());
-                let input =
-                    Input::from(RawAdapter::new(source, PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS));
-                let _handle = call.play_input(input);
-            }
-            // Nickname = Matrix display name (needs CHANGE_NICKNAME perm).
-            if let Err(e) = guild_id.edit_nickname(&ctx.http, Some(display_name)).await {
-                tracing::warn!(idx, error = %e, "failed to set puppet nickname");
-            }
-            tracing::info!(idx, display_name, "puppet joined voice and assigned");
-        }
-        Err(e) => tracing::error!(idx, error = %e, "puppet failed to join voice channel"),
+    // Register the SSRC-exclusion handler and start the playback source on the
+    // Call *before* connecting. `DriverConnect` (which carries our SSRC) fires
+    // *during* `manager.join().await` — registering after the await returns
+    // misses it entirely, so the puppet's SSRC never lands in the exclude set
+    // and the listener loops our playback back to Matrix as an echo. Events go
+    // to the driver's persistent event task, so pre-registration is safe; the
+    // Call from `get_or_insert` is the same one `join` connects.
+    let call_lock = manager.get_or_insert(guild_id);
+    {
+        let mut call = call_lock.lock().await;
+        call.add_global_event(
+            CoreEvent::DriverConnect.into(),
+            PuppetSsrcRegistrar {
+                idx,
+                exclude: exclude.clone(),
+                current_ssrc: current_ssrc.clone(),
+            },
+        );
+        // Play this puppet's single-participant mixer into the channel.
+        let source = PlaybackSource::new(mixer.clone());
+        let input = Input::from(RawAdapter::new(source, PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS));
+        let _handle = call.play_input(input);
     }
+
+    // Now connect. DriverConnect dispatches into the handler registered above.
+    if let Err(e) = manager.join(guild_id, channel_id).await {
+        tracing::error!(idx, error = %e, "puppet failed to join voice channel");
+        return;
+    }
+
+    // Nickname = Matrix display name (needs CHANGE_NICKNAME perm).
+    if let Err(e) = guild_id.edit_nickname(&ctx.http, Some(display_name)).await {
+        tracing::warn!(idx, error = %e, "failed to set puppet nickname");
+    }
+    tracing::info!(idx, display_name, "puppet joined voice and assigned");
 }
 
 async fn puppet_leave(

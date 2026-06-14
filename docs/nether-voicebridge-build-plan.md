@@ -125,24 +125,38 @@ participants you can individually volume/mute.
 **Artifact:** per-user attribution on the Discord side.
 **Reminder:** add bridge-owned puppet SSRCs to the echo-exclusion set.
 
-**STATUS: 🟡 IMPLEMENTED — builds clean, 30 tests pass, NOT yet verified live.**
-Decisions (confirmed with user): **on-demand per participant** (a puppet joins
-voice + sets its nickname when a Matrix participant's LiveKit track subscribes,
-and leaves when it ends) and **overflow → listener** (more simultaneous Matrix
-speakers than puppets fall back to the existing Phase-6 listener mix — no audio
-lost, just un-attributed). Cross-crate routing lives in a new SDK-free
-`nvb_audio::routing` (`PlaybackRouter`/`ParticipantSink`/`MixerSink`) so
-`matrix-rtc` and `discord` stay decoupled. `nvb_discord::puppet::PuppetPool`
-implements `PlaybackRouter`: each puppet is its own serenity `Client` + songbird
-(TX-only `Config::default()`) with its own `PlaybackMixer`, driven by an
-Assign/Release command loop that captures the gateway `Context` from `ready`.
-Echo-exclusion: the exclude set became a shared `Arc<RwLock<HashSet<u32>>>` —
-each puppet inserts its own SSRC on `DriverConnect`, removes it on release; the
-listener's `mix_tick` read-locks it per tick. **Open risk for the live test:**
-the puppet nickname comes from `participant.name()` (fallback: identity) — it is
-unverified what Element Call actually populates there, so identity/name/metadata
-are logged at every `TrackSubscribed`. Contingency = matrix-sdk profile lookup.
-**Live acceptance still to run** (per the build plan above).
+**STATUS: ✅ DONE — verified live (2026-06-14).** Two Matrix users appear as two
+individually-controllable, named Discord puppet bots; no echo. Decisions
+(confirmed with user): **on-demand per participant** (a puppet joins voice + sets
+its nickname when a Matrix participant's LiveKit track subscribes, and leaves
+when it ends) and **overflow → listener** (more simultaneous Matrix speakers than
+puppets fall back to the existing Phase-6 listener mix — no audio lost, just
+un-attributed). Cross-crate routing lives in a new SDK-free `nvb_audio::routing`
+(`PlaybackRouter`/`ParticipantSink`/`MixerSink`) so `matrix-rtc` and `discord`
+stay decoupled. `nvb_discord::puppet::PuppetPool` implements `PlaybackRouter`:
+each puppet is its own serenity `Client` + songbird (TX-only `Config::default()`)
+with its own `PlaybackMixer`, driven by an Assign/Release command loop that
+captures the gateway `Context` from `ready`.
+
+**Echo-exclusion (the live bug, fixed):** the exclude set is a shared
+`Arc<RwLock<HashSet<u32>>>`; each puppet inserts its own SSRC on `DriverConnect`
+and removes it on release, and the listener's `mix_tick` read-locks it per tick.
+The first live test had a **robotic delayed echo of the Matrix speaker's own
+voice**: the `DriverConnect` handler was attached *after* `manager.join().await`,
+but that event fires *during* the join, so it never ran — the puppet's SSRC never
+entered the exclude set and the listener re-captured the puppet's playback and
+looped it back to Matrix. Fix: register the handler (and start playback) on the
+`manager.get_or_insert(guild)` Call **before** calling `manager.join` — events
+go to songbird's persistent driver event task, so pre-registration catches the
+connect event. Confirmed in logs: `puppet SSRC registered for echo-exclusion`
+now fires (it never did before), and the echo is gone.
+
+**Follow-up (cosmetic, not blocking):** Element Call populates **neither**
+`participant.name()` **nor** `participant.metadata()` (both logged empty at
+`TrackSubscribed`), so puppet nicknames fall back to the raw identity
+`@user:server:DEVICEID`. The contingency from the plan now applies: resolve the
+MXID (parsed from `identity()`) to a display name via a matrix-sdk profile
+lookup. Tracked for a later polish pass; attribution is otherwise correct.
 
 ## Phase 8 — Ghost set (Discord → Matrix attribution)
 **Build:** Register the appservice namespace on Tuwunel; mint a ghost per
