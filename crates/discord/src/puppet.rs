@@ -66,6 +66,8 @@ pub type SharedExclude = Arc<RwLock<HashSet<u32>>>;
 enum PuppetCommand {
     /// Join voice, start playback from this puppet's mixer, set the nickname.
     Assign { display_name: String },
+    /// Mirror the Matrix participant's mute state onto this bot's voice connection.
+    SetMuted(bool),
     /// Reset the nickname, leave voice, drop the SSRC exclusion.
     Release,
 }
@@ -250,6 +252,17 @@ impl PlaybackRouter for PuppetPool {
         self.sink(self.listener_mixer.clone(), key)
     }
 
+    fn set_muted(&self, key: &str, muted: bool) {
+        let map = self.assignments.lock().unwrap_or_else(PoisonError::into_inner);
+        // Only dedicated puppets can mirror mute; overflow speakers share a bot.
+        if let Some(Assign::Puppet(idx)) = map.get(key) {
+            let slot = &self.slots[*idx];
+            if slot.cmd_tx.try_send(PuppetCommand::SetMuted(muted)).is_err() {
+                tracing::warn!(idx = *idx, "puppet command channel full/closed on set_muted");
+            }
+        }
+    }
+
     fn release(&self, key: &str) {
         let mut map = self.assignments.lock().unwrap_or_else(PoisonError::into_inner);
         match map.remove(key) {
@@ -364,12 +377,31 @@ async fn puppet_command_loop(
                 )
                 .await;
             }
+            PuppetCommand::SetMuted(muted) => {
+                puppet_set_muted(&ctx, idx, guild_id, muted).await;
+            }
             PuppetCommand::Release => {
                 puppet_leave(&ctx, idx, guild_id, &exclude, &current_ssrc).await;
             }
         }
     }
     tracing::info!(idx, "puppet command loop exited");
+}
+
+/// Self-mute/unmute this puppet's voice connection to mirror the Matrix
+/// participant's mute state (shows as muted in the Discord client).
+async fn puppet_set_muted(ctx: &Context, idx: usize, guild_id: GuildId, muted: bool) {
+    let Some(manager) = songbird::get(ctx).await else {
+        return;
+    };
+    if let Some(call_lock) = manager.get(guild_id) {
+        let mut call = call_lock.lock().await;
+        if let Err(e) = call.mute(muted).await {
+            tracing::warn!(idx, error = %e, muted, "failed to set puppet mute state");
+        } else {
+            tracing::info!(idx, muted, "puppet mute state mirrored");
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

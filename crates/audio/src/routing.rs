@@ -39,6 +39,11 @@ pub trait PlaybackRouter: Send + Sync {
     /// mix (overflow), so audio is never dropped, only un-attributed.
     fn assign(&self, key: &str, display_name: &str) -> Arc<dyn ParticipantSink>;
 
+    /// Mirror the participant's mute state onto their Discord puppet (so a
+    /// muted Matrix user shows muted in Discord).  A no-op for an unknown `key`
+    /// or an overflow participant with no dedicated puppet.
+    fn set_muted(&self, key: &str, muted: bool);
+
     /// Release the participant's output back to the pool (their track ended or
     /// they left the call).  A no-op for an unknown `key`.
     fn release(&self, key: &str);
