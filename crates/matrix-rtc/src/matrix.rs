@@ -15,6 +15,7 @@ use matrix_sdk::{
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{Mutex, watch};
+use tracing::Instrument;
 
 use nvb_config::MatrixConfig;
 
@@ -95,7 +96,8 @@ async fn apply_member_event(
 ///
 /// This is kept separate from `run()` so the crate's `run()` can clone the
 /// client into the RTC task before starting the perpetual sync loop.
-pub(crate) async fn build_client(cfg: &MatrixConfig) -> Result<Client> {
+#[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
+pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Client> {
     let client = Client::builder()
         .homeserver_url(&cfg.homeserver_url)
         .build()
@@ -132,10 +134,12 @@ pub(crate) async fn build_client(cfg: &MatrixConfig) -> Result<Client> {
 /// `build_client`. Drives the `SyncCallMemberEvent` handler and sends
 /// call-active signals through `call_active_tx` when the first human
 /// joins or the last human leaves.
+#[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
 pub(crate) async fn run(
     client: Client,
     cfg: &MatrixConfig,
     call_active_tx: watch::Sender<bool>,
+    bridge: Arc<str>,
 ) -> Result<()> {
     let bot_user_id: OwnedUserId = cfg.bot_user_id.parse()?;
     let room_id = RoomId::parse(&cfg.room_id)?;
@@ -146,10 +150,14 @@ pub(crate) async fn run(
         let participants = participants.clone();
         let bot_user_id = bot_user_id.clone();
         let call_active_tx = call_active_tx.clone();
+        // matrix-sdk dispatches this handler from its own sync task, which does
+        // not inherit the bridge span — re-establish it for per-bridge logs.
+        let bridge = bridge.clone();
         client.add_event_handler(move |ev: SyncCallMemberEvent, _room: Room| {
             let participants = participants.clone();
             let bot_user_id = bot_user_id.clone();
             let call_active_tx = call_active_tx.clone();
+            let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
             async move {
                 let Some(orig) = ev.as_original() else { return };
                 let user_id = orig.sender.clone();
@@ -166,6 +174,7 @@ pub(crate) async fn run(
                 )
                 .await;
             }
+            .instrument(span)
         });
     }
 

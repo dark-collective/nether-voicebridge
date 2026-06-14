@@ -130,10 +130,12 @@ impl PuppetPool {
 
     /// Start every puppet's serenity client and drive them to completion.
     /// Returns on the first client error.  Called once from `nvb_discord::run`.
+    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
     pub async fn run_puppets(
         self: &Arc<Self>,
         guild_id: GuildId,
         channel_id: ChannelId,
+        bridge: Arc<str>,
     ) -> Result<()> {
         if self.slots.is_empty() {
             tracing::info!("no puppet tokens configured — running listener-only");
@@ -152,6 +154,7 @@ impl PuppetPool {
                 .ok_or_else(|| anyhow!("puppet {idx} command receiver already taken"))?;
 
             let handler = PuppetHandler {
+                bridge: bridge.clone(),
                 idx,
                 guild_id,
                 channel_id,
@@ -265,6 +268,7 @@ impl PlaybackRouter for PuppetPool {
 /// Per-puppet gateway handler.  On `ready` it captures a live [`Context`] and
 /// spawns the command loop; it never auto-joins (joins are command-driven).
 struct PuppetHandler {
+    bridge: Arc<str>,
     idx: usize,
     guild_id: GuildId,
     channel_id: ChannelId,
@@ -276,6 +280,7 @@ struct PuppetHandler {
 
 #[async_trait]
 impl EventHandler for PuppetHandler {
+    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
     async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!(idx = self.idx, bot_user = %ready.user.name, "puppet connected");
 
@@ -291,6 +296,7 @@ impl EventHandler for PuppetHandler {
         };
 
         tokio::spawn(puppet_command_loop(
+            self.bridge.clone(),
             ctx,
             self.idx,
             self.guild_id,
@@ -305,7 +311,9 @@ impl EventHandler for PuppetHandler {
 
 /// Drain assign/release commands for one puppet, driving its voice connection.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
 async fn puppet_command_loop(
+    bridge: Arc<str>,
     ctx: Context,
     idx: usize,
     guild_id: GuildId,
@@ -319,6 +327,7 @@ async fn puppet_command_loop(
         match cmd {
             PuppetCommand::Assign { display_name } => {
                 puppet_join(
+                    &bridge,
                     &ctx,
                     idx,
                     guild_id,
@@ -340,6 +349,7 @@ async fn puppet_command_loop(
 
 #[allow(clippy::too_many_arguments)]
 async fn puppet_join(
+    bridge: &Arc<str>,
     ctx: &Context,
     idx: usize,
     guild_id: GuildId,
@@ -367,6 +377,7 @@ async fn puppet_join(
         call.add_global_event(
             CoreEvent::DriverConnect.into(),
             PuppetSsrcRegistrar {
+                bridge: bridge.clone(),
                 idx,
                 exclude: exclude.clone(),
                 current_ssrc: current_ssrc.clone(),
@@ -426,6 +437,7 @@ async fn puppet_leave(
 /// Songbird handler that records a puppet's own SSRC into the echo-exclusion set
 /// as soon as its voice driver connects.
 struct PuppetSsrcRegistrar {
+    bridge: Arc<str>,
     idx: usize,
     exclude: SharedExclude,
     current_ssrc: Arc<StdMutex<Option<u32>>>,
@@ -433,6 +445,7 @@ struct PuppetSsrcRegistrar {
 
 #[async_trait]
 impl SongbirdEventHandler for PuppetSsrcRegistrar {
+    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::DriverConnect(c) = ctx {
             self.exclude

@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use livekit::RoomEvent;
 
 use nvb_audio::routing::PlaybackRouter;
@@ -95,6 +96,7 @@ pub async fn connect(
     client: Client,
     room_id: OwnedRoomId,
     router: Arc<dyn PlaybackRouter>,
+    bridge: Arc<str>,
 ) -> Result<LiveSession> {
     let span = tracing::info_span!("rtc.session", sfu_url = %url, use_e2ee);
     let _guard = span.enter();
@@ -148,8 +150,10 @@ pub async fn connect(
     // Drain room events in a background task so the channel doesn't fill up.
     // The same task routes inbound audio tracks to per-participant puppet outputs.
     let cancel = CancellationToken::new();
-    let event_task =
-        tokio::spawn(handle_room_events(events, client, room_id, router, cancel.clone()));
+    let event_task = tokio::spawn(
+        handle_room_events(events, client, room_id, router, cancel.clone(), bridge.clone())
+            .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
+    );
 
     Ok(LiveSession {
         room,
@@ -276,6 +280,7 @@ async fn handle_room_events(
     room_id: OwnedRoomId,
     router: Arc<dyn PlaybackRouter>,
     cancel: CancellationToken,
+    bridge: Arc<str>,
 ) {
     // Per-track child tokens so an individual unsubscribe can stop just that
     // consumer; cancelling the parent (teardown) stops them all.
@@ -313,16 +318,19 @@ async fn handle_room_events(
                 // every remote participant is a human and is bridged.
                 let ct = cancel.child_token();
                 consumers.insert(sid.clone(), ct.clone());
-                tokio::spawn(playback_consumer(
-                    track,
-                    sid,
-                    identity,
-                    name,
-                    client.clone(),
-                    room_id.clone(),
-                    router.clone(),
-                    ct,
-                ));
+                tokio::spawn(
+                    playback_consumer(
+                        track,
+                        sid,
+                        identity,
+                        name,
+                        client.clone(),
+                        room_id.clone(),
+                        router.clone(),
+                        ct,
+                    )
+                    .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
+                );
             }
             RoomEvent::TrackUnsubscribed { publication, participant, .. } => {
                 let sid = publication.sid().to_string();

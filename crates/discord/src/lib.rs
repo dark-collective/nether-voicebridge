@@ -152,6 +152,9 @@ impl MediaSource for PlaybackSource {
 /// into one mono frame and forwards it to the Matrix publish path.  Optionally
 /// also writes per-SSRC WAV files for debugging.
 struct VoiceReceiver {
+    /// Bridge label for per-bridge log attribution (songbird calls `act` from its
+    /// own driver task, outside the bridge span).
+    bridge: Arc<str>,
     /// Forward channel to the RTC audio consumer.  20 ms mono frames (960 i16).
     audio_tx: mpsc::Sender<Vec<i16>>,
     /// Bridge-owned SSRCs to exclude from capture (echo prevention).  Populated
@@ -199,6 +202,7 @@ impl VoiceReceiver {
 
 #[async_trait]
 impl SongbirdEventHandler for VoiceReceiver {
+    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::VoiceTick(tick) = ctx {
             // Tick-health: distinguishes "ticks stopped" from "ticks fire but
@@ -230,10 +234,13 @@ impl SongbirdEventHandler for VoiceReceiver {
 /// Logs the SSRC → UserId mapping whenever a participant sends a speaking-state
 /// update.  This lets you correlate `capture_<ssrc>.wav` with real Discord users
 /// without any additional tooling.
-struct SpeakingLogger;
+struct SpeakingLogger {
+    bridge: Arc<str>,
+}
 
 #[async_trait]
 impl SongbirdEventHandler for SpeakingLogger {
+    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::SpeakingStateUpdate(Speaking { ssrc, user_id: Some(uid), .. }) = ctx {
             tracing::info!(ssrc, user_id = uid.0, "SSRC → Discord user mapping");
@@ -248,10 +255,13 @@ impl SongbirdEventHandler for SpeakingLogger {
 /// with a voice-connection drop vs. happening with the connection still up.
 /// (songbird 0.6 has no ClientConnect event — joins come via the serenity
 /// `voice_state_update` handler.)
-struct ConnectionLogger;
+struct ConnectionLogger {
+    bridge: Arc<str>,
+}
 
 #[async_trait]
 impl SongbirdEventHandler for ConnectionLogger {
+    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         match ctx {
             EventContext::DriverConnect(c) => tracing::info!(
@@ -278,6 +288,10 @@ impl SongbirdEventHandler for ConnectionLogger {
 // ─── Serenity gateway handler ─────────────────────────────────────────────────
 
 struct Handler {
+    /// Bridge label for per-bridge log attribution (multi-bridge spans). Serenity
+    /// invokes these callbacks from its own gateway task, which does not inherit
+    /// the bridge span set up in `main`, so each callback re-establishes it.
+    bridge: Arc<str>,
     guild_id: GuildId,
     channel_id: ChannelId,
     /// The listener bot's own UserId — seeded in `ready`, used to filter its
@@ -296,6 +310,7 @@ struct Handler {
 
 #[async_trait]
 impl EventHandler for Handler {
+    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
     async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!(bot_user = %ready.user.name, "Discord listener connected");
 
@@ -312,6 +327,7 @@ impl EventHandler for Handler {
                 call.add_global_event(
                     CoreEvent::VoiceTick.into(),
                     VoiceReceiver {
+                        bridge: self.bridge.clone(),
                         audio_tx: self.audio_tx.clone(),
                         exclude: Arc::clone(&self.exclude),
                         capture_sink: self.capture_sink.clone(),
@@ -321,7 +337,7 @@ impl EventHandler for Handler {
                 );
                 call.add_global_event(
                     CoreEvent::SpeakingStateUpdate.into(),
-                    SpeakingLogger,
+                    SpeakingLogger { bridge: self.bridge.clone() },
                 );
 
                 // Diagnostic: log voice-connection lifecycle + client disconnects.
@@ -331,7 +347,7 @@ impl EventHandler for Handler {
                     CoreEvent::DriverDisconnect,
                     CoreEvent::ClientDisconnect,
                 ] {
-                    call.add_global_event(ev.into(), ConnectionLogger);
+                    call.add_global_event(ev.into(), ConnectionLogger { bridge: self.bridge.clone() });
                 }
 
                 // Start the inbound playback track (Matrix → Discord). songbird
@@ -352,6 +368,7 @@ impl EventHandler for Handler {
         }
     }
 
+    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
     async fn voice_state_update(&self, _ctx: Context, old: Option<VoiceState>, new: VoiceState) {
         let was_here = old
             .and_then(|s| s.channel_id)
@@ -387,11 +404,13 @@ impl EventHandler for Handler {
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
+#[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
 pub async fn run(
     cfg: &DiscordConfig,
     audio_tx: mpsc::Sender<Vec<i16>>,
     capture_sink: Option<Arc<CaptureSink>>,
     pool: Arc<PuppetPool>,
+    bridge: Arc<str>,
 ) -> Result<()> {
     let guild_id: u64 = cfg
         .guild_id
@@ -405,6 +424,7 @@ pub async fn run(
     let channel_id = ChannelId::new(channel_id);
 
     let handler = Handler {
+        bridge: bridge.clone(),
         guild_id,
         channel_id,
         bridge_user_ids: Arc::new(Mutex::new(Vec::new())),
@@ -438,7 +458,7 @@ pub async fn run(
                 .await
                 .map_err(|e| anyhow::anyhow!("Discord listener client error: {e}"))
         },
-        pool.run_puppets(guild_id, channel_id),
+        pool.run_puppets(guild_id, channel_id, bridge.clone()),
     )?;
     Ok(())
 }

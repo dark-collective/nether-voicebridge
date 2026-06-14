@@ -39,6 +39,7 @@ use matrix_sdk::{Client, ruma::RoomId};
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
+use tracing::Instrument;
 
 use nvb_audio::jitter::JitterBuffer;
 use nvb_audio::routing::PlaybackRouter;
@@ -150,6 +151,7 @@ async fn audio_consumer(
 /// * `lk_cfg` — LiveKit / lk-jwt config from TOML
 /// * `mx_cfg`  — Matrix config (bot user_id + device_id + room_id)
 /// * `call_active_rx` — watch receiver: `true` when humans are in the call
+#[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
 pub(crate) async fn run(
     client: Client,
     lk_cfg: &LiveKitConfig,
@@ -157,15 +159,17 @@ pub(crate) async fn run(
     mut call_active_rx: watch::Receiver<bool>,
     audio_rx: mpsc::Receiver<Vec<i16>>,
     router: Arc<dyn PlaybackRouter>,
+    bridge: Arc<str>,
 ) -> Result<()> {
-    let span = tracing::info_span!("rtc");
-    let _guard = span.enter();
-
     // Spawn the long-lived audio consumer once. `ctrl_tx` lives for the whole
     // run() so the consumer's control channel never closes until shutdown; a
     // clone is handed to each ActiveSession to activate/deactivate its source.
+    // Spawned tasks don't inherit this task's span, so tag it for per-bridge logs.
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<SourceControl>(8);
-    tokio::spawn(audio_consumer(audio_rx, ctrl_rx));
+    tokio::spawn(
+        audio_consumer(audio_rx, ctrl_rx)
+            .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
+    );
 
     // Build a dedicated HTTP client on rustls.
     let http = reqwest::Client::builder().use_rustls_tls().build()?;
@@ -187,9 +191,12 @@ pub(crate) async fn run(
     // (unencrypted room) the event arrives in plaintext (_info is None).
     {
         let provider_ref = shared_provider.clone();
+        // Runs in matrix-sdk's sync task (no inherited span) — tag per bridge.
+        let bridge = bridge.clone();
         client.add_event_handler(
             move |ev: matrix_sdk::ruma::events::ToDeviceEvent<CallEncryptionKeysEventContent>| {
                 let provider_ref = provider_ref.clone();
+                let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
                 async move {
                     let sender = ev.sender.as_str().to_owned();
                     let content = ev.content;
@@ -227,6 +234,7 @@ pub(crate) async fn run(
                         );
                     }
                 }
+                .instrument(span)
             },
         );
     }
@@ -275,6 +283,7 @@ pub(crate) async fn run(
                     lk_cfg.media_e2ee,
                     &ctrl_tx,
                     router.clone(),
+                    bridge.clone(),
                 )
                 .await
                 {
@@ -339,6 +348,7 @@ async fn join_livekit_and_publish(
     use_e2ee: bool,
     ctrl_tx: &mpsc::Sender<SourceControl>,
     router: Arc<dyn PlaybackRouter>,
+    bridge: Arc<str>,
 ) -> Result<ActiveSession> {
     let user_id = client
         .user_id()
@@ -363,6 +373,7 @@ async fn join_livekit_and_publish(
         client.clone(),
         room_id.to_owned(),
         router,
+        bridge,
     )
     .await?;
 

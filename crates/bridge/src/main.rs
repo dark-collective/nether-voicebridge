@@ -54,7 +54,12 @@ async fn main() -> Result<()> {
         // Owned + `'static` so it can move into the spawned task (unlike the old
         // `try_join!`, `JoinSet::spawn` requires `'static`).
         let bridge = Arc::new(bridge);
-        let label = bridge.name.clone().unwrap_or_else(|| format!("bridge-{idx}"));
+        // Shared bridge label: drives the `bridge{name=…}` span here AND is passed
+        // into each crate so its internal spawned tasks / library callbacks (which
+        // don't inherit this task's span) can re-establish per-bridge attribution.
+        let label: Arc<str> = Arc::from(
+            bridge.name.clone().unwrap_or_else(|| format!("bridge-{idx}")).as_str(),
+        );
 
         // Optional WAV capture (Phase 3 debugging artifact), off unless configured.
         let capture_sink: Option<Arc<CaptureSink>> =
@@ -85,8 +90,9 @@ async fn main() -> Result<()> {
                     &bridge_task.livekit,
                     audio_rx,
                     router,
+                    label.clone(),
                 ),
-                nvb_discord::run(&bridge_task.discord, audio_tx, capture_sink, pool),
+                nvb_discord::run(&bridge_task.discord, audio_tx, capture_sink, pool, label.clone()),
             );
             match result {
                 // No reconnection yet (Phase 10); a clean exit is unexpected.

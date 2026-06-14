@@ -29,16 +29,17 @@ pub async fn run(
     livekit_cfg: &LiveKitConfig,
     audio_rx: mpsc::Receiver<Vec<i16>>,
     router: Arc<dyn PlaybackRouter>,
+    bridge: Arc<str>,
 ) -> Result<()> {
     // Build the client first (surfaces login/restore errors before the loops).
-    let client = matrix::build_client(matrix_cfg).await?;
+    let client = matrix::build_client(matrix_cfg, &bridge).await?;
 
     // The call-active watch lives entirely between the sync loop (sender) and
     // the RTC loop (receiver) — created here, never exposed.
     let (call_active_tx, call_active_rx) = watch::channel(false);
 
     tokio::try_join!(
-        matrix::run(client.clone(), matrix_cfg, call_active_tx),
+        matrix::run(client.clone(), matrix_cfg, call_active_tx, bridge.clone()),
         rtc::run(
             client,
             livekit_cfg,
@@ -46,6 +47,7 @@ pub async fn run(
             call_active_rx,
             audio_rx,
             router,
+            bridge.clone(),
         ),
     )?;
 
