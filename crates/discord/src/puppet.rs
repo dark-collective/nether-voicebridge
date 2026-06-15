@@ -1,33 +1,33 @@
-//! Puppet pool — one Discord bot per Matrix call participant (Phase 7+).
+//! Shared puppet pool — a process-wide pool of Discord bots, dynamically
+//! allocated across all bridged channels.
 //!
-//! Each configured puppet token is a **separate** Discord bot. There is no
-//! dedicated listener bot: the pool owns the whole Discord side. The Matrix RTC
-//! side drives [`PlaybackRouter`] — `assign` on call membership (the bot joins,
-//! takes the participant's display name, present even if silent), `release` on
-//! leave, `set_muted` to mirror mute. One assigned puppet is elected the
-//! **anchor**: it captures all Discord speakers (Discord→Matrix) and plays the
-//! shared **overflow** mix. When members exceed the puppet count, the extras are
-//! mixed into that overflow (no audio lost) and the anchor is relabeled.
+//! Each configured token is a generic "voice worker" bot that can join any
+//! channel on demand. The Matrix side of each bridge drives a per-channel
+//! [`ChannelView`] (a [`PlaybackRouter`]): `assign` on call membership (a bot
+//! joins, takes the participant's display name), `release` on leave, `set_muted`
+//! to mirror mute. Per active channel, one bot is the **anchor**: it captures
+//! all Discord speakers (Discord→Matrix) and plays that channel's shared
+//! **overflow** mix. Speakers beyond the bots available to a channel are mixed
+//! into that overflow (no audio lost) and the anchor is relabeled.
 //!
-//! Lifecycle is on-demand *per participant*: a puppet joins/leaves voice only
-//! when a Matrix user joins/leaves the call, so nickname edits stay well within
-//! Discord's rate limits (no per-utterance churn).
+//! Allocation (single global lock, [`SharedPool::alloc`]):
+//! - A channel's first speaker takes a free bot as the anchor. If none is free,
+//!   a spare (non-anchor) bot is **stolen** from the channel with the most slack
+//!   (its most-recently-assigned dedicated speaker is demoted to overflow); if no
+//!   channel has slack, the channel waits until a bot frees (logged).
+//! - Within an active channel, extra speakers take free bots (dedicated puppets)
+//!   or fall to overflow; freed bots promote the oldest overflow speaker (FCFS).
 //!
-//! Echo prevention (constraint #5): each puppet registers its own SSRC into the
-//! shared [`SharedExclude`] set on `DriverConnect`, so the anchor — which hears
-//! every speaker in the channel, puppets included — never re-captures puppet
-//! playback and loops it back to Matrix.
+//! Echo prevention (constraint #5): each puppet registers its own SSRC into its
+//! channel's [`SharedExclude`] set on `DriverConnect`, so the anchor — which
+//! hears every speaker including the puppets' own playback — never re-captures it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError, RwLock};
 
 use anyhow::{anyhow, Result};
-use serenity::{
-    async_trait,
-    model::prelude::*,
-    prelude::*,
-};
+use serenity::{async_trait, model::prelude::*, prelude::*};
 use songbird::{
     driver::{DecodeConfig, DecodeMode},
     input::{Input, RawAdapter},
@@ -38,14 +38,14 @@ use tokio_util::sync::CancellationToken;
 
 use nvb_audio::mixer::PlaybackMixer;
 use nvb_audio::routing::{CaptureRouter, ParticipantSink, PlaybackRouter};
-use nvb_config::DiscordConfig;
+use nvb_config::PuppetsConfig;
 
 use crate::{
     BotIdSet, CaptureSink, ConnectionLogger, PlaybackSource, SpeakingLogger, SsrcMap, UserSinkMap,
     VoiceReceiver, PLAYBACK_CHANNELS, PLAYBACK_SAMPLE_RATE,
 };
 
-/// Sentinel for "no anchor currently elected" in [`PuppetPool::anchor`].
+/// Sentinel for "no anchor currently elected" in [`ChannelState::anchor`].
 const NO_ANCHOR: usize = usize::MAX;
 
 /// Nickname (before the configured prefix) shown on the overflow-host puppet while
@@ -69,109 +69,173 @@ fn build_nickname(prefix: &str, name: &str) -> String {
     nick
 }
 
-/// Shared, mutable set of bridge-owned SSRCs to exclude from capture.
-/// Owned by the pool; shared with every puppet.  Reads happen on the anchor's
-/// 50 Hz capture tick (one read-lock per tick), writes only on a puppet
-/// join/leave — so an `RwLock` keeps the hot path uncontended.
+/// Shared, mutable set of bridge-owned SSRCs to exclude from capture. One per
+/// channel (the anchor of that channel hears only that channel's bots). Reads
+/// happen on the anchor's 50 Hz capture tick; writes only on a puppet join/leave.
 pub type SharedExclude = Arc<RwLock<HashSet<u32>>>;
 
-/// Commands sent from the (sync) pool allocator to a puppet's async command loop.
+/// Everything a bot needs to operate in a given channel, bundled so a single
+/// [`PuppetCommand::Assign`] hands the bot's command loop its full context. The
+/// loop remembers the last `Assign`'s ctx and reuses it for subsequent commands
+/// (`BecomeAnchor`, `SetMuted`, `Release`, …) and for shutdown — so those
+/// commands carry no channel of their own.
+#[derive(Clone)]
+struct ChannelCtx {
+    bridge: Arc<str>,
+    guild_id: GuildId,
+    channel_id: ChannelId,
+    /// This channel's echo-exclusion SSRC set.
+    exclude: SharedExclude,
+    /// This channel's SSRC → Discord user id (anchor demux attribution).
+    ssrc_map: SsrcMap,
+    /// This channel's Discord user id → ghost sink (presence + demux target).
+    user_sinks: UserSinkMap,
+    /// This bridge's ghost router (Discord→Matrix); the anchor mints/retires ghosts.
+    capture_router: Arc<dyn CaptureRouter>,
+    /// Optional Phase-3 WAV capture (per bridge).
+    capture_sink: Option<Arc<CaptureSink>>,
+    /// Global puppet-bot-id set — never minted as ghosts.
+    bot_ids: BotIdSet,
+    /// This channel's anchor marker (slot index, or [`NO_ANCHOR`]). The anchor's
+    /// `VoiceReceiver` only captures while it equals its own idx.
+    anchor: Arc<AtomicUsize>,
+    /// This channel's shared overflow mix — played by the anchor.
+    overflow_mixer: Arc<PlaybackMixer>,
+}
+
+/// Commands sent from the (sync) allocator to a puppet's async command loop.
 enum PuppetCommand {
-    /// Join voice, start playback from this puppet's mixer, set the nickname.
-    Assign { display_name: String },
-    /// Become the capture **anchor**: register the Discord→Matrix capture handler
-    /// on this puppet's voice connection (it forwards all Discord speakers).
+    /// Join `ctx`'s channel, start playback from this bot's own mixer, set the
+    /// nickname. The loop stores `ctx` as its current channel.
+    Assign {
+        ctx: Box<ChannelCtx>,
+        display_name: String,
+    },
+    /// Become the capture **anchor** of the current channel: register the
+    /// Discord→Matrix capture handler + overflow playback, and seed ghosts for
+    /// members already present.
     BecomeAnchor,
-    /// Mirror the Matrix participant's mute state onto this bot's voice connection.
+    /// Mirror the Matrix participant's mute onto this bot's voice connection.
     SetMuted(bool),
-    /// Set this puppet's nickname (used to relabel the overflow host to/from the
-    /// overflow label). The configured prefix is applied by the puppet.
+    /// Set this bot's nickname (relabel the overflow host). Prefix applied here.
     SetNickname(String),
-    /// Reset the nickname, leave voice, drop the SSRC exclusion.
+    /// Reset the nickname, leave voice, drop the SSRC exclusion. Clears current ctx.
     Release,
     /// Like [`Release`](PuppetCommand::Release), but fire `done` once the puppet
-    /// has actually left voice + reset its nickname. Used by graceful shutdown to
-    /// **await** teardown completion (vs. fire-and-forget `Release`).
+    /// has actually left voice. Used by graceful shutdown to **await** teardown.
     ReleaseAndAck { done: oneshot::Sender<()> },
 }
 
-/// Where a participant's audio is currently routed.
+/// Where a participant's audio is currently routed within a channel. `seq` is a
+/// monotonic arrival order used for FCFS: promote the oldest overflow speaker,
+/// demote the newest dedicated speaker when stealing a bot.
 enum Assign {
-    /// A dedicated puppet (index into [`PuppetPool::slots`]).
-    Puppet(usize),
-    /// Overflow — mixed into the shared overflow mix that the anchor plays. Holds
-    /// the speaker's name + mute so they can be **promoted** into a freed slot
-    /// (their own named bot) later.
-    Overflow { name: String, muted: bool },
+    /// A dedicated puppet (index into [`SharedPool::slots`]).
+    Puppet { idx: usize, seq: u64 },
+    /// Overflow — mixed into the channel's overflow mix played by the anchor.
+    Overflow { name: String, muted: bool, seq: u64 },
 }
 
-/// One puppet's shared state.  `cmd_tx`/`cmd_rx` connect the sync allocator to
-/// the puppet's async serenity task; `mixer` is its single-participant playback
-/// buffer; `current_ssrc` remembers the SSRC inserted into the exclude set so it
-/// can be removed on release.
+/// One puppet bot's shared state. `cmd_tx`/`cmd_rx` connect the sync allocator to
+/// the bot's async serenity task; `mixer` is its single-participant playback
+/// buffer (reused across channels); `current_ssrc` remembers the SSRC inserted
+/// into its current channel's exclude set so it can be removed on release.
 struct PuppetSlot {
     token: String,
     mixer: Arc<PlaybackMixer>,
     cmd_tx: mpsc::Sender<PuppetCommand>,
-    /// Taken (once) by [`PuppetPool::run_puppets`] to drive this puppet's client.
+    /// Taken (once) by [`SharedPool::run`] to drive this puppet's client.
     cmd_rx: StdMutex<Option<mpsc::Receiver<PuppetCommand>>>,
     current_ssrc: Arc<StdMutex<Option<u32>>>,
-    /// This slot's current participant display name — used to restore the anchor's
-    /// nickname after it has been relabeled to the overflow label. Guarded by the
-    /// `assignments` lock.
+    /// Current participant display name — used to restore the anchor's nickname
+    /// after the overflow relabel, and to carry the name on a steal-demotion.
     name: StdMutex<Option<String>>,
-    /// The participant's intended mute state (mirrored from Matrix). Tracked even
-    /// when not currently *applied* — the anchor stays unmuted while it hosts the
-    /// overflow mix, and reapplies this once overflow clears.
+    /// The participant's intended mute (mirrored from Matrix). Tracked even when
+    /// not *applied* — the anchor stays unmuted while hosting overflow.
     muted: AtomicBool,
-    /// True while assigned to a participant.  Only mutated under the
-    /// `assignments` lock, so `Relaxed` ordering is sufficient.
+    /// True while allocated to some channel. Mutated only under the alloc lock.
     busy: AtomicBool,
-    /// Set true once this puppet's gateway `ready` has fired and its command
-    /// loop is live. The shutdown drain only awaits `ReleaseAndAck` from
-    /// connected puppets (a never-connected puppet has no loop to ack), and —
-    /// because the command channel is FIFO — that ack also confirms any earlier
-    /// racing fire-and-forget `Release` has been processed.
+    /// Guilds this bot is a member of (learned from `ready`/`guild_create`). The
+    /// allocator only assigns/steals a bot for a channel whose guild is in here,
+    /// so a partitioned pool (some bots per guild) works and a missing invite
+    /// surfaces as a clear "no puppet" warning instead of a silent join failure.
+    guilds: RwLock<HashSet<GuildId>>,
+    /// Set true once this puppet's gateway `ready` fired and its command loop is
+    /// live. The shutdown drain only awaits `ReleaseAndAck` from connected bots.
     connected: Arc<AtomicBool>,
 }
 
 /// A swappable audio route: the mixer a participant's frames currently flow into.
-/// The pool re-points this (under the `assignments` lock) when a participant is
-/// promoted from the overflow mix into a freed puppet slot; the held
-/// [`RoutedSink`] then pushes to the new mixer with no change on the matrix side.
+/// The pool re-points this (under the alloc lock) on promotion (overflow → freed
+/// slot) and demotion (slot → overflow, when stealing). The held [`RoutedSink`]
+/// then pushes to the new mixer with no change on the Matrix side.
 type Route = Arc<StdMutex<Arc<PlaybackMixer>>>;
 
-/// The puppet pool / playback router.
-pub struct PuppetPool {
-    /// Shared overflow mix — un-slotted speakers (members beyond the puppet
-    /// count). Played by the current anchor's `PlaybackSource`.
+/// Per-channel allocation + capture state. Lives inside [`AllocState`] behind the
+/// single pool lock; the `Arc` fields are also shared with the bots' command
+/// loops (via [`ChannelCtx`]) and songbird handlers.
+struct ChannelState {
+    bridge: Arc<str>,
+    guild_id: GuildId,
+    channel_id: ChannelId,
     overflow_mixer: Arc<PlaybackMixer>,
     exclude: SharedExclude,
+    ssrc_map: SsrcMap,
+    user_sinks: UserSinkMap,
+    capture_router: Arc<dyn CaptureRouter>,
+    capture_sink: Option<Arc<CaptureSink>>,
+    anchor: Arc<AtomicUsize>,
+    /// Participant key → routing. Source of truth for this channel's allocation.
+    assignments: HashMap<String, Assign>,
+    /// Participant key → swappable route handle (shared with the Matrix-side sink).
+    routes: HashMap<String, Route>,
+}
+
+impl ChannelState {
+    /// Count overflow participants (routed to the shared mix, no dedicated puppet).
+    fn overflow_count(&self) -> usize {
+        self.assignments
+            .values()
+            .filter(|a| matches!(a, Assign::Overflow { .. }))
+            .count()
+    }
+
+    /// Number of dedicated puppets currently serving this channel.
+    fn puppet_count(&self) -> usize {
+        self.assignments
+            .values()
+            .filter(|a| matches!(a, Assign::Puppet { .. }))
+            .count()
+    }
+}
+
+/// The global allocation state, guarded by [`SharedPool::alloc`].
+struct AllocState {
+    /// Channel key (bridge label) → its state.
+    channels: HashMap<String, ChannelState>,
+    /// Monotonic arrival counter for FCFS ordering.
+    next_seq: u64,
+}
+
+/// The shared puppet pool. Built once per process; every bridge's Discord side is
+/// a [`ChannelView`] into it.
+pub struct SharedPool {
     /// Prefix for puppet nicknames (e.g. `"[Matrix] "`; empty disables).
     nickname_prefix: Arc<str>,
     slots: Vec<PuppetSlot>,
-    /// Participant key → current routing.  The single source of truth for
-    /// allocation; guarded so `assign`/`release` stay race-free.
-    assignments: StdMutex<HashMap<String, Assign>>,
-    /// Participant key → its swappable audio route handle. The pool re-points a
-    /// route on promotion; the matrix-side [`RoutedSink`] holds the same handle.
-    /// Only touched under the `assignments` lock.
-    routes: StdMutex<HashMap<String, Route>>,
-    /// Slot index of the current capture **anchor** ([`NO_ANCHOR`] if none) — the
-    /// one puppet that captures Discord→Matrix. Shared with each anchor's
-    /// `VoiceReceiver`, which only forwards while this equals its own slot, so a
-    /// handoff is seamless (no doubled or dropped forwarding during the overlap).
-    /// Written only under the `assignments` lock.
-    anchor: Arc<AtomicUsize>,
+    /// All puppet bot user ids — never minted as ghosts (global; a bot is a bot
+    /// in every channel).
+    bot_ids: BotIdSet,
+    alloc: StdMutex<AllocState>,
 }
 
-impl PuppetPool {
-    /// Build the pool from config.  Cheap and synchronous — the serenity clients
-    /// are not started until [`run_puppets`](Self::run_puppets), so the returned
-    /// `Arc` can be handed to the Matrix side as a [`PlaybackRouter`] up front.
-    pub fn new(cfg: &DiscordConfig) -> Arc<Self> {
+impl SharedPool {
+    /// Build the pool from the shared `[puppets]` config. Cheap and synchronous —
+    /// clients are not started until [`run`](Self::run), so the returned `Arc` and
+    /// its [`ChannelView`]s can be handed to the Matrix side up front.
+    pub fn new(cfg: &PuppetsConfig) -> Arc<Self> {
         let slots = cfg
-            .puppet_tokens
+            .tokens
             .iter()
             .map(|tok| {
                 let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -184,34 +248,70 @@ impl PuppetPool {
                     name: StdMutex::new(None),
                     muted: AtomicBool::new(false),
                     busy: AtomicBool::new(false),
+                    guilds: RwLock::new(HashSet::new()),
                     connected: Arc::new(AtomicBool::new(false)),
                 }
             })
             .collect();
 
         Arc::new(Self {
-            overflow_mixer: Arc::new(PlaybackMixer::new()),
-            exclude: Arc::new(RwLock::new(HashSet::new())),
             nickname_prefix: Arc::from(cfg.nickname_prefix.as_str()),
             slots,
-            assignments: StdMutex::new(HashMap::new()),
-            routes: StdMutex::new(HashMap::new()),
-            anchor: Arc::new(AtomicUsize::new(NO_ANCHOR)),
+            bot_ids: Arc::new(RwLock::new(HashSet::new())),
+            alloc: StdMutex::new(AllocState {
+                channels: HashMap::new(),
+                next_seq: 0,
+            }),
         })
     }
 
-    /// Start every puppet's serenity client and drive them to completion.
-    /// Returns on the first client error.  Called once from `nvb_discord::run`.
-    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
-    pub async fn run_puppets(
+    /// Register a bridge's channel and return its [`PlaybackRouter`] view. Parses
+    /// the guild/channel ids and inserts a fresh [`ChannelState`]. The bridge label
+    /// is the channel key (config validation keeps store_path unique; labels fall
+    /// back to `bridge-{idx}`, so they are effectively unique).
+    pub fn register_channel(
         self: &Arc<Self>,
-        guild_id: GuildId,
-        channel_id: ChannelId,
         bridge: Arc<str>,
+        guild_id: &str,
+        channel_id: &str,
         capture_router: Arc<dyn CaptureRouter>,
         capture_sink: Option<Arc<CaptureSink>>,
-        shutdown: CancellationToken,
-    ) -> Result<()> {
+    ) -> Result<Arc<ChannelView>> {
+        let guild_id = GuildId::new(
+            guild_id
+                .parse()
+                .map_err(|_| anyhow!("invalid guild_id: {guild_id}"))?,
+        );
+        let channel_id = ChannelId::new(
+            channel_id
+                .parse()
+                .map_err(|_| anyhow!("invalid channel_id: {channel_id}"))?,
+        );
+        let state = ChannelState {
+            bridge: bridge.clone(),
+            guild_id,
+            channel_id,
+            overflow_mixer: Arc::new(PlaybackMixer::new()),
+            exclude: Arc::new(RwLock::new(HashSet::new())),
+            ssrc_map: Arc::new(RwLock::new(HashMap::new())),
+            user_sinks: Arc::new(RwLock::new(HashMap::new())),
+            capture_router,
+            capture_sink,
+            anchor: Arc::new(AtomicUsize::new(NO_ANCHOR)),
+            assignments: HashMap::new(),
+            routes: HashMap::new(),
+        };
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.channels.insert(bridge.to_string(), state);
+        Ok(Arc::new(ChannelView {
+            pool: self.clone(),
+            key: bridge,
+        }))
+    }
+
+    /// Start every puppet's serenity client and drive them to completion. Returns
+    /// on the first client error. Called once from `main`.
+    pub async fn run(self: &Arc<Self>, shutdown: CancellationToken) -> Result<()> {
         if self.slots.is_empty() {
             tracing::warn!("no puppet tokens configured — Discord side has no bots");
             return Ok(());
@@ -220,47 +320,15 @@ impl PuppetPool {
         let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
         let mut futs = Vec::with_capacity(self.slots.len());
 
-        // Shared Discord→Matrix (ghost) capture state, created once and cloned to
-        // every puppet handler: the anchor's `VoiceReceiver` demuxes per speaker
-        // using `ssrc_map` + `user_sinks`; the slot-0 voice-state handler drives
-        // ghost presence into `user_sinks` (skipping `bot_ids` — our own puppets).
-        let ssrc_map: SsrcMap = Arc::new(RwLock::new(HashMap::new()));
-        let user_sinks: UserSinkMap = Arc::new(RwLock::new(HashMap::new()));
-        let bot_ids: BotIdSet = Arc::new(RwLock::new(HashSet::new()));
-
         for (idx, slot) in self.slots.iter().enumerate() {
-            let rx = slot
-                .cmd_rx
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take()
-                .ok_or_else(|| anyhow!("puppet {idx} command receiver already taken"))?;
-
             let handler = PuppetHandler {
-                bridge: bridge.clone(),
+                pool: self.clone(),
                 idx,
-                guild_id,
-                channel_id,
-                mixer: slot.mixer.clone(),
-                exclude: self.exclude.clone(),
-                nickname_prefix: self.nickname_prefix.clone(),
-                capture_router: capture_router.clone(),
-                capture_sink: capture_sink.clone(),
-                ssrc_map: ssrc_map.clone(),
-                user_sinks: user_sinks.clone(),
-                bot_ids: bot_ids.clone(),
-                anchor: self.anchor.clone(),
-                overflow_mixer: self.overflow_mixer.clone(),
-                current_ssrc: slot.current_ssrc.clone(),
-                connected: slot.connected.clone(),
-                cmd_rx: StdMutex::new(Some(rx)),
             };
             let token = slot.token.clone();
-
             futs.push(async move {
-                // Puppets both PLAY their participant and (when elected anchor)
-                // CAPTURE Discord speakers, so they need Opus decode / DAVE-receive
-                // (`DecodeMode::Decode`) — any puppet can become the anchor.
+                // Puppets both PLAY their participant and (when anchor) CAPTURE
+                // Discord speakers, so they need Opus decode / DAVE-receive.
                 let sb_config = songbird::Config::default()
                     .decode_mode(DecodeMode::Decode(DecodeConfig::default()));
                 let mut client = Client::builder(&token, intents)
@@ -276,12 +344,6 @@ impl PuppetPool {
             });
         }
 
-        // Drive every puppet's serenity client. On a shutdown signal, gracefully
-        // drain (each assigned puppet leaves voice + resets its nickname) while
-        // the clients are *still polled* — `puppet_leave` needs the live gateway
-        // to send the voice-channel leave — then return, dropping the clients so
-        // the gateways close. A puppet client erroring on its own still ends the
-        // Discord side as before.
         let clients = futures_util::future::try_join_all(futs);
         tokio::pin!(clients);
 
@@ -292,8 +354,7 @@ impl PuppetPool {
 
         tracing::info!("Discord shutdown — draining puppets (leave voice, reset nicknames)");
         tokio::select! {
-            _ = self.shutdown() => tracing::info!("puppets drained"),
-            // Keep clients polled during the drain; if one dies, stop waiting.
+            _ = self.drain() => tracing::info!("puppets drained"),
             r = &mut clients => {
                 if let Err(e) = r {
                     tracing::warn!(error = %e, "a puppet client exited during drain");
@@ -304,17 +365,15 @@ impl PuppetPool {
     }
 
     /// Graceful teardown: ask every connected puppet to leave voice + reset its
-    /// nickname, and **await** confirmation, so shutdown leaves the Discord voice
-    /// channel at baseline. Driven off `connected` (not the `assignments` map):
-    /// on shutdown the Matrix side's per-track consumers and call-end teardown
-    /// fire their own (fire-and-forget) `release`s, which could empty that map
-    /// out from under us. Because the command channel is FIFO, the awaited
-    /// `ReleaseAndAck` ack also confirms any such earlier `Release` has run.
-    async fn shutdown(&self) {
+    /// nickname, and **await** confirmation. Driven off `connected` (not the
+    /// assignment maps): on shutdown the Matrix side's per-track teardown fires
+    /// its own fire-and-forget `release`s, which the FIFO command channel orders
+    /// ahead of this awaited `ReleaseAndAck`.
+    async fn drain(&self) {
         let mut acks = Vec::new();
         for slot in &self.slots {
             if !slot.connected.load(Ordering::Relaxed) {
-                continue; // never connected — no command loop to ack
+                continue;
             }
             let (tx, rx) = oneshot::channel();
             if slot
@@ -325,17 +384,73 @@ impl PuppetPool {
                 acks.push(rx);
             }
         }
-        // Await every connected puppet's confirmed leave. The outer shutdown
-        // timeout in `main` bounds this so a wedged puppet can't hang the process.
         futures_util::future::join_all(acks).await;
     }
 
+    /// Build the per-channel command context (clones the channel's `Arc` handles
+    /// plus the global bot-id set).
+    fn ctx_for(&self, ch: &ChannelState) -> ChannelCtx {
+        ChannelCtx {
+            bridge: ch.bridge.clone(),
+            guild_id: ch.guild_id,
+            channel_id: ch.channel_id,
+            exclude: ch.exclude.clone(),
+            ssrc_map: ch.ssrc_map.clone(),
+            user_sinks: ch.user_sinks.clone(),
+            capture_router: ch.capture_router.clone(),
+            capture_sink: ch.capture_sink.clone(),
+            bot_ids: self.bot_ids.clone(),
+            anchor: ch.anchor.clone(),
+            overflow_mixer: ch.overflow_mixer.clone(),
+        }
+    }
+
+    /// Look up the channel where bot `idx` is the current anchor and whose guild
+    /// matches `guild_id`, returning its [`ChannelCtx`]. Used by the presence
+    /// handler to attribute voice-state events to the right channel/room.
+    fn anchor_channel_ctx(&self, idx: usize, guild_id: GuildId) -> Option<ChannelCtx> {
+        let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let ch = guard.channels.values().find(|ch| {
+            ch.guild_id == guild_id && ch.anchor.load(Ordering::Relaxed) == idx
+        })?;
+        Some(self.ctx_for(ch))
+    }
+
+    // ── Allocation (all under `self.alloc`) ──────────────────────────────────
+
+    /// Claim the first idle bot that is a member of `guild`, marking it busy.
+    /// `None` if no capable bot is free. Called only under the alloc lock, so the
+    /// load-then-store on `busy` is race-free.
+    fn take_free_bot(&self, guild: GuildId) -> Option<usize> {
+        for (i, slot) in self.slots.iter().enumerate() {
+            if slot.busy.load(Ordering::Relaxed) {
+                continue;
+            }
+            if !slot
+                .guilds
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&guild)
+            {
+                continue;
+            }
+            slot.busy.store(true, Ordering::Relaxed);
+            return Some(i);
+        }
+        None
+    }
+
+    /// Whether bot `idx` is a member of `guild`.
+    fn bot_in_guild(&self, idx: usize, guild: GuildId) -> bool {
+        self.slots[idx]
+            .guilds
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&guild)
+    }
+
     /// Get or create the route handle for `key`, re-pointing it at `mixer`.
-    fn route_to(
-        routes: &mut HashMap<String, Route>,
-        key: &str,
-        mixer: Arc<PlaybackMixer>,
-    ) -> Route {
+    fn route_to(routes: &mut HashMap<String, Route>, key: &str, mixer: Arc<PlaybackMixer>) -> Route {
         match routes.get(key) {
             Some(r) => {
                 *r.lock().unwrap_or_else(PoisonError::into_inner) = mixer;
@@ -351,12 +466,12 @@ impl PuppetPool {
 
     /// Set the anchor's nickname to reflect overflow state: the overflow label
     /// while it hosts ≥1 overflow speaker, else its own participant's name.
-    fn reconcile_anchor_label(&self, map: &HashMap<String, Assign>) {
-        let anchor = self.anchor.load(Ordering::Relaxed);
+    fn reconcile_anchor_label(&self, ch: &ChannelState) {
+        let anchor = ch.anchor.load(Ordering::Relaxed);
         if anchor == NO_ANCHOR {
             return;
         }
-        let name = if overflow_count(map) > 0 {
+        let name = if ch.overflow_count() > 0 {
             OVERFLOW_LABEL.to_string()
         } else {
             self.slots[anchor]
@@ -373,27 +488,463 @@ impl PuppetPool {
 
     /// Apply the anchor's mute: forced **unmuted** while it hosts the overflow mix
     /// (so muting its own participant never silences the others), else its
-    /// participant's intended mute. (Bug-1 fix: the overflow host never self-mutes.)
-    fn reconcile_anchor_mute(&self, map: &HashMap<String, Assign>) {
-        let anchor = self.anchor.load(Ordering::Relaxed);
+    /// participant's intended mute.
+    fn reconcile_anchor_mute(&self, ch: &ChannelState) {
+        let anchor = ch.anchor.load(Ordering::Relaxed);
         if anchor == NO_ANCHOR {
             return;
         }
-        let applied = overflow_count(map) == 0 && self.slots[anchor].muted.load(Ordering::Relaxed);
+        let applied =
+            ch.overflow_count() == 0 && self.slots[anchor].muted.load(Ordering::Relaxed);
         let _ = self.slots[anchor]
             .cmd_tx
             .try_send(PuppetCommand::SetMuted(applied));
     }
+
+    /// Steal a spare bot for **activation** of a channel in `target_guild`: find
+    /// the channel with the most slack (most dedicated puppets) that has a
+    /// non-anchor dedicated bot **also a member of `target_guild`**, demote that
+    /// bot's (most-recently-assigned) speaker into the donor's overflow, and
+    /// return the freed bot (still marked busy — the caller repurposes it). The
+    /// bot is sent a `Release` so its loop leaves the donor channel first.
+    /// `None` if no donor has a guild-capable spare bot.
+    fn steal_for_activation(
+        &self,
+        guard: &mut AllocState,
+        exclude_key: &str,
+        target_guild: GuildId,
+    ) -> Option<usize> {
+        // For each candidate donor, the newest non-anchor dedicated speaker whose
+        // bot can join the target guild. Pick the donor with the most slack.
+        let pick = guard
+            .channels
+            .iter()
+            .filter(|(k, ch)| k.as_str() != exclude_key && ch.puppet_count() > 1)
+            .filter_map(|(k, ch)| {
+                let donor_anchor = ch.anchor.load(Ordering::Relaxed);
+                let victim = ch
+                    .assignments
+                    .iter()
+                    .filter_map(|(vk, a)| match a {
+                        Assign::Puppet { idx, seq }
+                            if *idx != donor_anchor && self.bot_in_guild(*idx, target_guild) =>
+                        {
+                            Some((vk.clone(), *idx, *seq))
+                        }
+                        _ => None,
+                    })
+                    .max_by_key(|(_, _, seq)| *seq)?;
+                Some((k.clone(), ch.puppet_count(), victim))
+            })
+            .max_by_key(|(_, slack, _)| *slack);
+
+        let (donor_key, _slack, (vkey, vidx, vseq)) = pick?;
+        let donor = guard.channels.get_mut(&donor_key)?;
+
+        // Demote the victim into the donor's overflow (route-swap = promotion in
+        // reverse). The Matrix side keeps pushing to the same RoutedSink.
+        let name = self.slots[vidx]
+            .name
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default();
+        let muted = self.slots[vidx].muted.load(Ordering::Relaxed);
+        donor
+            .assignments
+            .insert(vkey.clone(), Assign::Overflow { name, muted, seq: vseq });
+        Self::route_to(&mut donor.routes, &vkey, donor.overflow_mixer.clone());
+        self.slots[vidx].mixer.clear();
+        *self.slots[vidx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+
+        // The donor anchor now hosts ≥1 overflow speaker → relabel + unmute it.
+        let donor_ref = &guard.channels[&donor_key];
+        self.reconcile_anchor_label(donor_ref);
+        self.reconcile_anchor_mute(donor_ref);
+
+        // Send the bot away from the donor; the caller will Assign it elsewhere.
+        let _ = self.slots[vidx].cmd_tx.try_send(PuppetCommand::Release);
+        tracing::info!(
+            donor = %donor_key,
+            for_channel = exclude_key,
+            idx = vidx,
+            demoted = %vkey,
+            "stole bot from donor to activate channel"
+        );
+        Some(vidx)
+    }
+
+    /// After a bot frees, activate any channel that has waiting speakers but no
+    /// anchor (was left pending because the pool was exhausted): give it the bot
+    /// as its anchor, promoting the oldest waiting speaker.
+    fn service_pending(&self, guard: &mut AllocState) {
+        // Each pending channel needs a free bot *in its own guild*; try each once
+        // (activating one channel consumes one bot but creates no new pending).
+        let pending: Vec<(String, GuildId)> = guard
+            .channels
+            .iter()
+            .filter(|(_, ch)| {
+                ch.anchor.load(Ordering::Relaxed) == NO_ANCHOR && !ch.assignments.is_empty()
+            })
+            .map(|(k, ch)| (k.clone(), ch.guild_id))
+            .collect();
+        for (key, guild) in pending {
+            if let Some(idx) = self.take_free_bot(guild) {
+                self.activate_channel_with(guard, &key, idx);
+            }
+        }
+    }
+
+    /// Make bot `idx` the anchor of channel `key`, promoting that channel's oldest
+    /// waiting (overflow) speaker into it. Sends the bot Assign + BecomeAnchor.
+    fn activate_channel_with(&self, guard: &mut AllocState, key: &str, idx: usize) {
+        let ctx = {
+            let ch = match guard.channels.get_mut(key) {
+                Some(c) => c,
+                None => return,
+            };
+            // Oldest waiting speaker (lowest seq) becomes the anchor's participant.
+            let promote = ch
+                .assignments
+                .iter()
+                .filter_map(|(k, a)| match a {
+                    Assign::Overflow { name, muted, seq } => {
+                        Some((k.clone(), name.clone(), *muted, *seq))
+                    }
+                    _ => None,
+                })
+                .min_by_key(|(_, _, _, seq)| *seq);
+            let Some((pkey, pname, pmuted, pseq)) = promote else {
+                // No waiting speaker after all — return the bot to the pool.
+                self.slots[idx].busy.store(false, Ordering::Relaxed);
+                return;
+            };
+            ch.overflow_mixer.remove(&pkey);
+            self.slots[idx].mixer.clear();
+            Self::route_to(&mut ch.routes, &pkey, self.slots[idx].mixer.clone());
+            ch.assignments
+                .insert(pkey.clone(), Assign::Puppet { idx, seq: pseq });
+            *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = Some(pname);
+            self.slots[idx].muted.store(pmuted, Ordering::Relaxed);
+            ch.anchor.store(idx, Ordering::Relaxed);
+            self.ctx_for(ch)
+        };
+        let name = self.slots[idx]
+            .name
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default();
+        let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Assign {
+            ctx: Box::new(ctx),
+            display_name: name,
+        });
+        let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::BecomeAnchor);
+        // The promoted speaker is the anchor's own participant now; remaining
+        // overflow (if any) is reconciled by the caller's normal path.
+        let ch = &guard.channels[key];
+        self.reconcile_anchor_label(ch);
+        self.reconcile_anchor_mute(ch);
+        tracing::info!(channel = key, idx, "channel activated — anchor assigned");
+    }
+
+    fn assign(&self, bridge: &str, key: &str, display_name: &str) -> Arc<dyn ParticipantSink> {
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+
+        // Idempotent: a re-subscribe for the same participant reuses its route.
+        if let Some(ch) = guard.channels.get(bridge) {
+            if ch.assignments.contains_key(key) {
+                if let Some(r) = ch.routes.get(key) {
+                    return Arc::new(RoutedSink { route: r.clone(), key: key.to_owned() });
+                }
+            }
+        }
+
+        // The channel's guild scopes which bots can serve it.
+        let guild = match guard.channels.get(bridge) {
+            Some(ch) => ch.guild_id,
+            None => return Arc::new(NullSink),
+        };
+
+        let seq = {
+            guard.next_seq += 1;
+            guard.next_seq
+        };
+
+        // Try to claim a free bot (in this guild) for a dedicated puppet.
+        if let Some(idx) = self.take_free_bot(guild) {
+            let ctx = {
+                let Some(ch) = guard.channels.get_mut(bridge) else {
+                    self.slots[idx].busy.store(false, Ordering::Relaxed);
+                    return Arc::new(NullSink);
+                };
+                ch.assignments
+                    .insert(key.to_owned(), Assign::Puppet { idx, seq });
+                *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(display_name.to_owned());
+                self.slots[idx].muted.store(false, Ordering::Relaxed);
+                self.slots[idx].mixer.clear();
+                Self::route_to(&mut ch.routes, key, self.slots[idx].mixer.clone());
+                let elect = ch.anchor.load(Ordering::Relaxed) == NO_ANCHOR;
+                if elect {
+                    ch.anchor.store(idx, Ordering::Relaxed);
+                }
+                let ctx = self.ctx_for(ch);
+                (ctx, elect)
+            };
+            let (ctx, elect) = ctx;
+            let route = guard.channels[bridge].routes[key].clone();
+            let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Assign {
+                ctx: Box::new(ctx),
+                display_name: display_name.to_owned(),
+            });
+            tracing::info!(bridge, key, display_name, idx, "assigned participant to puppet");
+            if elect {
+                let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::BecomeAnchor);
+                tracing::info!(bridge, idx, "puppet elected capture anchor");
+            }
+            return Arc::new(RoutedSink { route, key: key.to_owned() });
+        }
+
+        // Pool exhausted. If this channel has no anchor yet, it MUST get a bot to
+        // function — try to steal one. Otherwise the speaker overflows.
+        let has_anchor = guard
+            .channels
+            .get(bridge)
+            .map(|ch| ch.anchor.load(Ordering::Relaxed) != NO_ANCHOR)
+            .unwrap_or(false);
+
+        if !has_anchor {
+            if let Some(idx) = self.steal_for_activation(&mut guard, bridge, guild) {
+                // Bot freed from a donor (Release already sent). Assign it here as
+                // the anchor for this participant.
+                let ctx = {
+                    let Some(ch) = guard.channels.get_mut(bridge) else {
+                        self.slots[idx].busy.store(false, Ordering::Relaxed);
+                        return Arc::new(NullSink);
+                    };
+                    ch.assignments
+                        .insert(key.to_owned(), Assign::Puppet { idx, seq });
+                    *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
+                        Some(display_name.to_owned());
+                    self.slots[idx].muted.store(false, Ordering::Relaxed);
+                    self.slots[idx].mixer.clear();
+                    Self::route_to(&mut ch.routes, key, self.slots[idx].mixer.clone());
+                    ch.anchor.store(idx, Ordering::Relaxed);
+                    self.ctx_for(ch)
+                };
+                let route = guard.channels[bridge].routes[key].clone();
+                let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Assign {
+                    ctx: Box::new(ctx),
+                    display_name: display_name.to_owned(),
+                });
+                let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::BecomeAnchor);
+                tracing::info!(bridge, key, idx, "stole bot to activate channel anchor");
+                return Arc::new(RoutedSink { route, key: key.to_owned() });
+            }
+            // No guild-capable spare bot anywhere — the channel can't be bridged
+            // yet. Record the speaker as overflow (no audio plays until a bot in
+            // this guild frees up; `service_pending` will then activate it).
+            tracing::warn!(
+                bridge,
+                key,
+                guild = %guild,
+                "no puppet available for this guild (pool exhausted / no bot in guild) — \
+                 channel waiting for a free bot (Matrix audio not yet playing)"
+            );
+        }
+
+        // Overflow into this channel's overflow mix (played by its anchor when it
+        // has one). On the first overflow speaker of an anchored channel, relabel
+        // the anchor and force it unmuted.
+        let Some(ch) = guard.channels.get_mut(bridge) else {
+            return Arc::new(NullSink);
+        };
+        let was_overflowing = ch.overflow_count() > 0;
+        ch.assignments.insert(
+            key.to_owned(),
+            Assign::Overflow { name: display_name.to_owned(), muted: false, seq },
+        );
+        let route = Self::route_to(&mut ch.routes, key, ch.overflow_mixer.clone());
+        tracing::info!(bridge, key, display_name, "overflow to anchor mix");
+        if !was_overflowing {
+            let ch = &guard.channels[bridge];
+            self.reconcile_anchor_label(ch);
+            self.reconcile_anchor_mute(ch);
+        }
+        Arc::new(RoutedSink { route, key: key.to_owned() })
+    }
+
+    fn set_muted(&self, bridge: &str, key: &str, muted: bool) {
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(ch) = guard.channels.get_mut(bridge) else { return };
+        match ch.assignments.get_mut(key) {
+            Some(Assign::Puppet { idx, .. }) => {
+                let idx = *idx;
+                self.slots[idx].muted.store(muted, Ordering::Relaxed);
+                if idx == ch.anchor.load(Ordering::Relaxed) {
+                    let ch = &guard.channels[bridge];
+                    self.reconcile_anchor_mute(ch);
+                } else {
+                    let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetMuted(muted));
+                }
+            }
+            Some(Assign::Overflow { muted: m, .. }) => *m = muted,
+            None => {}
+        }
+    }
+
+    fn release(&self, bridge: &str, key: &str) {
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        // Remove the assignment; act on what it was.
+        let removed = match guard.channels.get_mut(bridge) {
+            Some(ch) => ch.assignments.remove(key),
+            None => return,
+        };
+        match removed {
+            Some(Assign::Puppet { idx, .. }) => {
+                {
+                    let ch = guard.channels.get_mut(bridge).unwrap();
+                    ch.routes.remove(key);
+                }
+                // Promote the oldest overflow speaker (FCFS) into the freed slot.
+                let promote = {
+                    let ch = &guard.channels[bridge];
+                    ch.assignments
+                        .iter()
+                        .filter_map(|(k, a)| match a {
+                            Assign::Overflow { name, muted, seq } => {
+                                Some((k.clone(), name.clone(), *muted, *seq))
+                            }
+                            _ => None,
+                        })
+                        .min_by_key(|(_, _, _, seq)| *seq)
+                };
+                match promote {
+                    Some((yk, yname, ymuted, yseq)) => {
+                        let ch = guard.channels.get_mut(bridge).unwrap();
+                        ch.assignments
+                            .insert(yk.clone(), Assign::Puppet { idx, seq: yseq });
+                        ch.overflow_mixer.remove(&yk);
+                        self.slots[idx].mixer.clear();
+                        Self::route_to(&mut ch.routes, &yk, self.slots[idx].mixer.clone());
+                        *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
+                            Some(yname.clone());
+                        self.slots[idx].muted.store(ymuted, Ordering::Relaxed);
+                        let is_anchor = idx == ch.anchor.load(Ordering::Relaxed);
+                        let overflow_cleared = ch.overflow_count() == 0;
+                        tracing::info!(bridge, key, promoted = %yk, idx, "promoted overflow speaker into freed slot");
+                        if !is_anchor {
+                            let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetNickname(yname));
+                            let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetMuted(ymuted));
+                        }
+                        if overflow_cleared {
+                            let ch = &guard.channels[bridge];
+                            self.reconcile_anchor_label(ch);
+                            self.reconcile_anchor_mute(ch);
+                        }
+                    }
+                    None => {
+                        // No overflow waiting → free the bot.
+                        self.slots[idx].mixer.clear();
+                        self.slots[idx].busy.store(false, Ordering::Relaxed);
+                        *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                        let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Release);
+                        tracing::info!(bridge, key, idx, "released puppet");
+                        // Hand the anchor off to another puppet in this channel.
+                        let ch = guard.channels.get_mut(bridge).unwrap();
+                        if ch.anchor.load(Ordering::Relaxed) == idx {
+                            let next = ch.assignments.values().find_map(|a| match a {
+                                Assign::Puppet { idx, .. } => Some(*idx),
+                                Assign::Overflow { .. } => None,
+                            });
+                            match next {
+                                Some(new_idx) => {
+                                    ch.anchor.store(new_idx, Ordering::Relaxed);
+                                    let _ = self.slots[new_idx]
+                                        .cmd_tx
+                                        .try_send(PuppetCommand::BecomeAnchor);
+                                    tracing::info!(bridge, old = idx, new = new_idx, "capture anchor handed off");
+                                }
+                                None => {
+                                    ch.anchor.store(NO_ANCHOR, Ordering::Relaxed);
+                                    tracing::info!(bridge, idx, "capture anchor released — no puppets left");
+                                }
+                            }
+                        }
+                        // A freed bot can activate a channel waiting for an anchor.
+                        self.service_pending(&mut guard);
+                    }
+                }
+            }
+            Some(Assign::Overflow { .. }) => {
+                let ch = guard.channels.get_mut(bridge).unwrap();
+                ch.overflow_mixer.remove(key);
+                ch.routes.remove(key);
+                tracing::info!(bridge, key, "released overflow participant");
+                if ch.overflow_count() == 0 {
+                    let ch = &guard.channels[bridge];
+                    self.reconcile_anchor_label(ch);
+                    self.reconcile_anchor_mute(ch);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn release_all(&self, bridge: &str) {
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        {
+            let Some(ch) = guard.channels.get_mut(bridge) else { return };
+            for (_key, assign) in ch.assignments.drain() {
+                if let Assign::Puppet { idx, .. } = assign {
+                    self.slots[idx].mixer.clear();
+                    self.slots[idx].busy.store(false, Ordering::Relaxed);
+                    *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                    let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Release);
+                }
+            }
+            ch.routes.clear();
+            ch.anchor.store(NO_ANCHOR, Ordering::Relaxed);
+            ch.overflow_mixer.clear();
+        }
+        // The bots just freed can activate channels waiting for an anchor.
+        self.service_pending(&mut guard);
+    }
+
+    /// Record that bot `idx` is now a member of `guild` (from `ready`/
+    /// `guild_create`), then service any channel in that guild waiting for a bot
+    /// (covers the startup race where an assign arrives before membership is known).
+    fn note_bot_guild(&self, idx: usize, guild: GuildId) {
+        let added = self.slots[idx]
+            .guilds
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(guild);
+        if added {
+            let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+            self.service_pending(&mut guard);
+        }
+    }
+
+    /// Record that bot `idx` left `guild` (kicked / guild unavailable) so it is no
+    /// longer assigned there.
+    fn forget_bot_guild(&self, idx: usize, guild: GuildId) {
+        self.slots[idx]
+            .guilds
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&guild);
+    }
 }
 
-/// Count overflow participants (those routed to the shared mix, no dedicated puppet).
-fn overflow_count(map: &HashMap<String, Assign>) -> usize {
-    map.values()
-        .filter(|a| matches!(a, Assign::Overflow { .. }))
-        .count()
+/// A no-op sink for the (unreachable) case where a channel vanished mid-assign.
+struct NullSink;
+impl ParticipantSink for NullSink {
+    fn push(&self, _mono: &[i16]) {}
 }
 
-/// A [`ParticipantSink`] whose target mixer the pool can swap (for promotion).
+/// A [`ParticipantSink`] whose target mixer the pool can swap (for promotion/demotion).
 struct RoutedSink {
     route: Route,
     key: String,
@@ -401,390 +952,178 @@ struct RoutedSink {
 
 impl ParticipantSink for RoutedSink {
     fn push(&self, mono: &[i16]) {
-        let mixer = self
-            .route
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        let mixer = self.route.lock().unwrap_or_else(PoisonError::into_inner).clone();
         mixer.push(&self.key, mono);
     }
 }
 
-impl PlaybackRouter for PuppetPool {
+/// A per-bridge view into the [`SharedPool`], implementing [`PlaybackRouter`].
+/// All calls delegate to the pool scoped to this bridge's channel key.
+pub struct ChannelView {
+    pool: Arc<SharedPool>,
+    key: Arc<str>,
+}
+
+impl PlaybackRouter for ChannelView {
     fn assign(&self, key: &str, display_name: &str) -> Arc<dyn ParticipantSink> {
-        let mut map = self.assignments.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut routes = self.routes.lock().unwrap_or_else(PoisonError::into_inner);
-
-        // Idempotent: a re-subscribe for the same participant reuses its route.
-        if map.contains_key(key) {
-            if let Some(r) = routes.get(key) {
-                return Arc::new(RoutedSink { route: r.clone(), key: key.to_owned() });
-            }
-        }
-
-        // Claim the first free puppet (mutated under the lock → Relaxed is fine).
-        for (idx, slot) in self.slots.iter().enumerate() {
-            if !slot.busy.swap(true, Ordering::Relaxed) {
-                map.insert(key.to_owned(), Assign::Puppet(idx));
-                *slot.name.lock().unwrap_or_else(PoisonError::into_inner) =
-                    Some(display_name.to_owned());
-                slot.muted.store(false, Ordering::Relaxed);
-                if slot
-                    .cmd_tx
-                    .try_send(PuppetCommand::Assign { display_name: display_name.to_owned() })
-                    .is_err()
-                {
-                    tracing::warn!(idx, "puppet command channel full/closed on assign");
-                }
-                tracing::info!(key, display_name, idx, "assigned participant to puppet");
-                // Elect this puppet as the capture anchor if there isn't one.
-                if self.anchor.load(Ordering::Relaxed) == NO_ANCHOR {
-                    self.anchor.store(idx, Ordering::Relaxed);
-                    let _ = slot.cmd_tx.try_send(PuppetCommand::BecomeAnchor);
-                    tracing::info!(idx, "puppet elected capture anchor");
-                }
-                let route = Self::route_to(&mut routes, key, slot.mixer.clone());
-                return Arc::new(RoutedSink { route, key: key.to_owned() });
-            }
-        }
-
-        // Pool exhausted → overflow into the shared overflow mix (played by the
-        // anchor). On the first overflow speaker, relabel the anchor and force it
-        // unmuted (it must keep transmitting the overflow mix).
-        let was_overflowing = overflow_count(&map) > 0;
-        map.insert(
-            key.to_owned(),
-            Assign::Overflow { name: display_name.to_owned(), muted: false },
-        );
-        tracing::info!(key, display_name, "puppet pool exhausted — overflow to anchor mix");
-        let route = Self::route_to(&mut routes, key, self.overflow_mixer.clone());
-        if !was_overflowing {
-            self.reconcile_anchor_label(&map);
-            self.reconcile_anchor_mute(&map);
-        }
-        Arc::new(RoutedSink { route, key: key.to_owned() })
+        self.pool.assign(&self.key, key, display_name)
     }
-
     fn set_muted(&self, key: &str, muted: bool) {
-        let mut map = self.assignments.lock().unwrap_or_else(PoisonError::into_inner);
-        match map.get_mut(key) {
-            Some(Assign::Puppet(idx)) => {
-                let idx = *idx;
-                self.slots[idx].muted.store(muted, Ordering::Relaxed);
-                if idx == self.anchor.load(Ordering::Relaxed) {
-                    // The anchor's applied mute depends on whether it hosts overflow.
-                    self.reconcile_anchor_mute(&map);
-                } else {
-                    let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetMuted(muted));
-                }
-            }
-            // Overflow speaker has no dedicated bot yet — just remember the state
-            // so a later promotion applies it.
-            Some(Assign::Overflow { muted: m, .. }) => *m = muted,
-            None => {}
-        }
+        self.pool.set_muted(&self.key, key, muted)
     }
-
     fn release(&self, key: &str) {
-        let mut map = self.assignments.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut routes = self.routes.lock().unwrap_or_else(PoisonError::into_inner);
-        match map.remove(key) {
-            Some(Assign::Puppet(idx)) => {
-                routes.remove(key);
-                // If an overflow speaker is waiting, PROMOTE them into this freed
-                // slot (reuse the bot — no leave/rejoin) instead of releasing it.
-                let promote = map.iter().find_map(|(k, a)| match a {
-                    Assign::Overflow { name, muted } => Some((k.clone(), name.clone(), *muted)),
-                    _ => None,
-                });
-                match promote {
-                    Some((yk, yname, ymuted)) => {
-                        map.insert(yk.clone(), Assign::Puppet(idx));
-                        // Re-route Y from the overflow mix to this slot's mixer.
-                        self.overflow_mixer.remove(&yk);
-                        self.slots[idx].mixer.clear();
-                        Self::route_to(&mut routes, &yk, self.slots[idx].mixer.clone());
-                        *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
-                            Some(yname.clone());
-                        self.slots[idx].muted.store(ymuted, Ordering::Relaxed);
-                        tracing::info!(key, promoted = %yk, idx, "promoted overflow speaker into freed slot");
-                        let is_anchor = idx == self.anchor.load(Ordering::Relaxed);
-                        let overflow_cleared = overflow_count(&map) == 0;
-                        if is_anchor {
-                            // The anchor's name/mute are driven by reconcile (it may
-                            // still be hosting overflow); avoid a redundant edit.
-                            if overflow_cleared {
-                                self.reconcile_anchor_label(&map);
-                                self.reconcile_anchor_mute(&map);
-                            }
-                        } else {
-                            // A normal named puppet now: set its name + Y's mute.
-                            let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetNickname(yname));
-                            let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetMuted(ymuted));
-                            if overflow_cleared {
-                                self.reconcile_anchor_label(&map);
-                                self.reconcile_anchor_mute(&map);
-                            }
-                        }
-                    }
-                    None => {
-                        // No overflow waiting → free the slot.
-                        self.slots[idx].mixer.clear();
-                        self.slots[idx].busy.store(false, Ordering::Relaxed);
-                        *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
-                        let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Release);
-                        tracing::info!(key, idx, "released puppet");
-                        // Hand the anchor off to another busy puppet if needed.
-                        if self.anchor.load(Ordering::Relaxed) == idx {
-                            let next = map.values().find_map(|a| match a {
-                                Assign::Puppet(i) => Some(*i),
-                                Assign::Overflow { .. } => None,
-                            });
-                            match next {
-                                Some(new_idx) => {
-                                    self.anchor.store(new_idx, Ordering::Relaxed);
-                                    let _ = self.slots[new_idx]
-                                        .cmd_tx
-                                        .try_send(PuppetCommand::BecomeAnchor);
-                                    tracing::info!(old = idx, new = new_idx, "capture anchor handed off");
-                                    // Reached only with no overflow (else we'd have
-                                    // promoted), so the new anchor keeps its own name
-                                    // and already-applied mute — no reconcile needed.
-                                }
-                                None => {
-                                    self.anchor.store(NO_ANCHOR, Ordering::Relaxed);
-                                    tracing::info!(idx, "capture anchor released — no puppets left");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Some(Assign::Overflow { .. }) => {
-                self.overflow_mixer.remove(key);
-                routes.remove(key);
-                tracing::info!(key, "released overflow participant from overflow mix");
-                // Only relabel/unmute the anchor when overflow actually cleared
-                // (avoids spurious nickname edits while overflow is still active).
-                if overflow_count(&map) == 0 {
-                    self.reconcile_anchor_label(&map);
-                    self.reconcile_anchor_mute(&map);
-                }
-            }
-            None => {}
-        }
+        self.pool.release(&self.key, key)
     }
-
     fn release_all(&self) {
-        let mut map = self.assignments.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut routes = self.routes.lock().unwrap_or_else(PoisonError::into_inner);
-        for (_key, assign) in map.drain() {
-            if let Assign::Puppet(idx) = assign {
-                let slot = &self.slots[idx];
-                slot.mixer.clear();
-                slot.busy.store(false, Ordering::Relaxed);
-                *slot.name.lock().unwrap_or_else(PoisonError::into_inner) = None;
-                let _ = slot.cmd_tx.try_send(PuppetCommand::Release);
-            }
-        }
-        routes.clear();
-        self.anchor.store(NO_ANCHOR, Ordering::Relaxed);
-        self.overflow_mixer.clear();
+        self.pool.release_all(&self.key)
     }
 }
 
 // ─── Puppet serenity client ────────────────────────────────────────────────────
 
-/// Per-puppet gateway handler.  On `ready` it captures a live [`Context`] and
-/// spawns the command loop; it never auto-joins (joins are command-driven).
+/// Per-puppet gateway handler. On `ready` it captures a live [`Context`] and
+/// spawns the (channel-agnostic) command loop; it never auto-joins.
 struct PuppetHandler {
-    bridge: Arc<str>,
+    pool: Arc<SharedPool>,
     idx: usize,
-    guild_id: GuildId,
-    channel_id: ChannelId,
-    mixer: Arc<PlaybackMixer>,
-    exclude: SharedExclude,
-    nickname_prefix: Arc<str>,
-    /// Routes each Discord speaker to their Matrix ghost (Phase 8). The slot-0
-    /// handler drives presence (`assign`/`release`); the anchor demuxes audio
-    /// into the sinks it returns.
-    capture_router: Arc<dyn CaptureRouter>,
-    /// Optional WAV capture (used by the anchor's `VoiceReceiver`).
-    capture_sink: Option<Arc<CaptureSink>>,
-    /// SSRC → Discord user id (anchor demux attribution).
-    ssrc_map: SsrcMap,
-    /// Discord user id → ghost sink (presence + anchor demux target).
-    user_sinks: UserSinkMap,
-    /// Our own puppet bot ids — never minted as ghosts.
-    bot_ids: BotIdSet,
-    /// Shared current-anchor marker (gates this puppet's capture forwarding).
-    anchor: Arc<AtomicUsize>,
-    /// Shared overflow mix — the anchor also plays this (un-slotted speakers).
-    overflow_mixer: Arc<PlaybackMixer>,
-    current_ssrc: Arc<StdMutex<Option<u32>>>,
-    /// Shared with this puppet's slot; set true once the command loop is live so
-    /// the shutdown drain knows to await this puppet (see `PuppetPool::shutdown`).
-    connected: Arc<AtomicBool>,
-    cmd_rx: StdMutex<Option<mpsc::Receiver<PuppetCommand>>>,
 }
 
 #[async_trait]
 impl EventHandler for PuppetHandler {
-    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
+    #[tracing::instrument(parent = None, name = "puppet", skip_all, fields(idx = self.idx))]
     async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!(idx = self.idx, bot_user = %ready.user.name, "puppet connected");
 
-        // Record this puppet's own user id so it is never minted as a ghost
-        // (a bridge-owned bot in the channel is not a Discord human). Safe to
-        // re-insert on a reconnect `ready`.
-        self.bot_ids
+        // Record this bot's own user id so it is never minted as a ghost.
+        self.pool
+            .bot_ids
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(ready.user.id.get());
 
-        // `ready` can fire again on reconnect; only the first run takes the rx
-        // and owns the command loop.
-        let Some(rx) = self
-            .cmd_rx
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        else {
+        // Seed this bot's guild membership from the ready payload so the allocator
+        // knows which channels it can serve before any assign arrives.
+        for ug in &ready.guilds {
+            self.pool.note_bot_guild(self.idx, ug.id);
+        }
+
+        // `ready` can fire again on reconnect; only the first run takes the rx.
+        let slot = &self.pool.slots[self.idx];
+        let Some(rx) = slot.cmd_rx.lock().unwrap_or_else(PoisonError::into_inner).take() else {
             return;
         };
 
-        // Startup reset (first `ready` only — must NOT run on reconnect, which
-        // could kick an active puppet out of voice): clear any stale guild
-        // nickname and lingering voice session left by a previous crash/kill, so
-        // restarts don't leave confusing `[Matrix] …` zombie bots behind.
-        if let Err(e) = self.guild_id.edit_nickname(&ctx.http, None).await {
-            tracing::debug!(idx = self.idx, error = %e, "startup nickname reset failed (may already be clear)");
-        }
-        if let Some(manager) = songbird::get(&ctx).await {
-            let _ = manager.remove(self.guild_id).await;
-        }
-
         tokio::spawn(puppet_command_loop(
-            self.bridge.clone(),
             ctx,
             self.idx,
-            self.guild_id,
-            self.channel_id,
-            self.mixer.clone(),
-            self.exclude.clone(),
-            self.nickname_prefix.clone(),
-            self.capture_sink.clone(),
-            self.ssrc_map.clone(),
-            self.user_sinks.clone(),
-            self.anchor.clone(),
-            self.overflow_mixer.clone(),
-            self.current_ssrc.clone(),
+            slot.mixer.clone(),
+            slot.current_ssrc.clone(),
+            self.pool.nickname_prefix.clone(),
             rx,
         ));
-        // The command loop is live — the shutdown drain may now await this puppet.
-        self.connected.store(true, Ordering::Relaxed);
+        slot.connected.store(true, Ordering::Relaxed);
     }
 
-    /// Drive ghost **presence** off Discord voice-channel membership (Phase 8).
-    /// Only the slot-0 handler acts (voice-state events reach every puppet's
-    /// gateway, but presence must be decided once). A non-bot user joining the
-    /// target channel gets a ghost; leaving (or moving away) retires it.
-    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
+    /// Drive ghost **presence** off Discord voice-channel membership. Only the
+    /// anchor of the channel matching the event acts (voice-state events reach
+    /// every bot's gateway, but presence is decided once, by the anchor).
+    #[tracing::instrument(parent = None, name = "puppet", skip_all, fields(idx = self.idx))]
     async fn voice_state_update(&self, ctx: Context, _old: Option<VoiceState>, new: VoiceState) {
-        if self.idx != 0 || new.guild_id != Some(self.guild_id) {
-            return;
-        }
+        let Some(guild_id) = new.guild_id else { return };
+        let Some(channel) = self.pool.anchor_channel_ctx(self.idx, guild_id) else {
+            return; // this bot is not the anchor of any channel in this guild
+        };
         let user_id = new.user_id.get();
-        if new.channel_id == Some(self.channel_id) {
-            self.ensure_ghost(&ctx, user_id, new.member.as_ref()).await;
+        if new.channel_id == Some(channel.channel_id) {
+            ensure_ghost(&ctx, &channel, user_id, new.member.as_ref()).await;
         } else {
-            self.drop_ghost(user_id);
+            drop_ghost(&channel, user_id);
         }
     }
 
-    /// On (re)connect, seed ghosts for everyone **already** in the target voice
-    /// channel — `voice_state_update` only fires on later changes, so without this
-    /// users present before the bridge started would never get a ghost. Slot-0
-    /// only; idempotent (re-runs and reconnects are no-ops via `ensure_ghost`).
-    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
+    /// On (re)connect to a guild: record membership (the allocator may now use
+    /// this bot for that guild), and clear a stale nickname left by a previous
+    /// crash while this bot is idle (never clobber an active assignment).
+    #[tracing::instrument(parent = None, name = "puppet", skip_all, fields(idx = self.idx))]
     async fn guild_create(&self, ctx: Context, guild: serenity::model::guild::Guild, _is_new: Option<bool>) {
-        if self.idx != 0 || guild.id != self.guild_id {
+        self.pool.note_bot_guild(self.idx, guild.id);
+        if self.pool.slots[self.idx].busy.load(Ordering::Relaxed) {
             return;
         }
-        let present: Vec<u64> = guild
-            .voice_states
-            .iter()
-            .filter(|(_, vs)| vs.channel_id == Some(self.channel_id))
-            .map(|(uid, _)| uid.get())
-            .collect();
-        tracing::info!(count = present.len(), "guild_create: seeding ghosts for existing voice members");
-        for uid in present {
-            // voice_states carries no member object; ensure_ghost resolves the
-            // name (and bot check) via a member lookup when needed.
-            self.ensure_ghost(&ctx, uid, None).await;
+        if let Err(e) = guild.id.edit_nickname(&ctx.http, None).await {
+            tracing::debug!(idx = self.idx, guild = %guild.id, error = %e, "startup nickname reset failed (may already be clear)");
         }
+    }
+
+    /// The bot was removed from a guild (or it went unavailable): stop treating it
+    /// as serviceable there.
+    #[tracing::instrument(parent = None, name = "puppet", skip_all, fields(idx = self.idx))]
+    async fn guild_delete(
+        &self,
+        _ctx: Context,
+        incomplete: UnavailableGuild,
+        _full: Option<serenity::model::guild::Guild>,
+    ) {
+        self.pool.forget_bot_guild(self.idx, incomplete.id);
     }
 }
 
-impl PuppetHandler {
-    /// Mint a ghost for a Discord user in the target channel if they don't have
-    /// one yet. Skips bridge-owned puppets and any other bot. Resolves the
-    /// display name from the supplied `Member` if present, else via a lookup.
-    async fn ensure_ghost(&self, ctx: &Context, user_id: u64, member: Option<&Member>) {
-        if self
-            .bot_ids
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(&user_id)
-            || member.is_some_and(|m| m.user.bot)
-        {
-            return;
-        }
-        if self
-            .user_sinks
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(&user_id)
-        {
-            return; // already has a ghost
-        }
-
-        // Resolve display name + Discord avatar URL from the same Member (the one
-        // the event carried, or a lookup when absent — e.g. the guild_create path).
-        let (name, avatar_url) = match member {
-            Some(m) => (member_display_name(m), m.user.avatar_url()),
-            None => match self.guild_id.member(&ctx.http, UserId::new(user_id)).await {
-                Ok(m) if m.user.bot => return, // a bot discovered via lookup
-                Ok(m) => (member_display_name(&m), m.user.avatar_url()),
-                Err(e) => {
-                    tracing::debug!(user_id, error = %e, "member lookup failed; using id as name");
-                    (user_id.to_string(), None)
-                }
-            },
-        };
-
-        let sink =
-            self.capture_router
-                .assign(&user_id.to_string(), &name, avatar_url.as_deref());
-        self.user_sinks
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(user_id, sink);
-        tracing::info!(user_id, display_name = %name, "Discord user present — ghost assigned");
+/// Mint a ghost for a Discord user in the channel if they don't have one yet.
+/// Skips bridge-owned puppets and any other bot. Resolves the display name from
+/// the supplied `Member` if present, else via a lookup.
+async fn ensure_ghost(ctx: &Context, channel: &ChannelCtx, user_id: u64, member: Option<&Member>) {
+    if channel
+        .bot_ids
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&user_id)
+        || member.is_some_and(|m| m.user.bot)
+    {
+        return;
+    }
+    if channel
+        .user_sinks
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains_key(&user_id)
+    {
+        return; // already has a ghost
     }
 
-    /// Retire a user's ghost if they had one (left or moved out of the channel).
-    fn drop_ghost(&self, user_id: u64) {
-        let had = self
-            .user_sinks
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&user_id)
-            .is_some();
-        if had {
-            self.capture_router.release(&user_id.to_string());
-            tracing::info!(user_id, "Discord user left — ghost released");
-        }
+    let (name, avatar_url) = match member {
+        Some(m) => (member_display_name(m), m.user.avatar_url()),
+        None => match channel.guild_id.member(&ctx.http, UserId::new(user_id)).await {
+            Ok(m) if m.user.bot => return,
+            Ok(m) => (member_display_name(&m), m.user.avatar_url()),
+            Err(e) => {
+                tracing::debug!(user_id, error = %e, "member lookup failed; using id as name");
+                (user_id.to_string(), None)
+            }
+        },
+    };
+
+    let sink = channel
+        .capture_router
+        .assign(&user_id.to_string(), &name, avatar_url.as_deref());
+    channel
+        .user_sinks
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(user_id, sink);
+    tracing::info!(bridge = %channel.bridge, user_id, display_name = %name, "Discord user present — ghost assigned");
+}
+
+/// Retire a user's ghost if they had one (left or moved out of the channel).
+fn drop_ghost(channel: &ChannelCtx, user_id: u64) {
+    let had = channel
+        .user_sinks
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&user_id)
+        .is_some();
+    if had {
+        channel.capture_router.release(&user_id.to_string());
+        tracing::info!(bridge = %channel.bridge, user_id, "Discord user left — ghost released");
     }
 }
 
@@ -796,76 +1135,57 @@ fn member_display_name(m: &Member) -> String {
         .unwrap_or_else(|| m.user.name.clone())
 }
 
-/// Drain assign/release commands for one puppet, driving its voice connection.
-#[allow(clippy::too_many_arguments)]
-#[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
+/// Drain commands for one puppet, driving its voice connection. The loop is
+/// channel-agnostic: each `Assign` carries the channel context, which the loop
+/// remembers (`current`) for subsequent commands and shutdown.
 async fn puppet_command_loop(
-    bridge: Arc<str>,
     ctx: Context,
     idx: usize,
-    guild_id: GuildId,
-    channel_id: ChannelId,
     mixer: Arc<PlaybackMixer>,
-    exclude: SharedExclude,
-    nickname_prefix: Arc<str>,
-    capture_sink: Option<Arc<CaptureSink>>,
-    ssrc_map: SsrcMap,
-    user_sinks: UserSinkMap,
-    anchor: Arc<AtomicUsize>,
-    overflow_mixer: Arc<PlaybackMixer>,
     current_ssrc: Arc<StdMutex<Option<u32>>>,
+    nickname_prefix: Arc<str>,
     mut cmd_rx: mpsc::Receiver<PuppetCommand>,
 ) {
+    let mut current: Option<ChannelCtx> = None;
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
-            PuppetCommand::Assign { display_name } => {
-                puppet_join(
-                    &bridge,
-                    &ctx,
-                    idx,
-                    guild_id,
-                    channel_id,
-                    &mixer,
-                    &exclude,
-                    &ssrc_map,
-                    &nickname_prefix,
-                    &current_ssrc,
-                    &display_name,
-                )
-                .await;
+            PuppetCommand::Assign { ctx: chan, display_name } => {
+                let chan = *chan;
+                puppet_join(&chan, idx, &ctx, &mixer, &current_ssrc, &nickname_prefix, &display_name)
+                    .await;
+                current = Some(chan);
             }
             PuppetCommand::BecomeAnchor => {
-                puppet_become_anchor(
-                    &bridge,
-                    &ctx,
-                    idx,
-                    guild_id,
-                    &exclude,
-                    ssrc_map.clone(),
-                    user_sinks.clone(),
-                    capture_sink.clone(),
-                    anchor.clone(),
-                    &overflow_mixer,
-                )
-                .await;
+                if let Some(chan) = &current {
+                    puppet_become_anchor(chan, idx, &ctx).await;
+                } else {
+                    tracing::warn!(idx, "BecomeAnchor with no current channel");
+                }
             }
             PuppetCommand::SetMuted(muted) => {
-                puppet_set_muted(&ctx, idx, guild_id, muted).await;
+                if let Some(chan) = &current {
+                    puppet_set_muted(&ctx, idx, chan.guild_id, muted).await;
+                }
             }
             PuppetCommand::SetNickname(name) => {
-                let nick = build_nickname(&nickname_prefix, &name);
-                if let Err(e) = guild_id.edit_nickname(&ctx.http, Some(nick.as_str())).await {
-                    tracing::warn!(idx, error = %e, "failed to relabel puppet nickname");
-                } else {
-                    tracing::info!(idx, nick = %nick, "puppet relabeled");
+                if let Some(chan) = &current {
+                    let nick = build_nickname(&nickname_prefix, &name);
+                    if let Err(e) = chan.guild_id.edit_nickname(&ctx.http, Some(nick.as_str())).await {
+                        tracing::warn!(idx, error = %e, "failed to relabel puppet nickname");
+                    } else {
+                        tracing::info!(idx, nick = %nick, "puppet relabeled");
+                    }
                 }
             }
             PuppetCommand::Release => {
-                puppet_leave(&ctx, idx, guild_id, &exclude, &current_ssrc).await;
+                if let Some(chan) = current.take() {
+                    puppet_leave(&ctx, idx, &chan, &current_ssrc).await;
+                }
             }
             PuppetCommand::ReleaseAndAck { done } => {
-                puppet_leave(&ctx, idx, guild_id, &exclude, &current_ssrc).await;
-                // Signal the drain that this puppet has fully left voice.
+                if let Some(chan) = current.take() {
+                    puppet_leave(&ctx, idx, &chan, &current_ssrc).await;
+                }
                 let _ = done.send(());
             }
         }
@@ -873,67 +1193,61 @@ async fn puppet_command_loop(
     tracing::info!(idx, "puppet command loop exited");
 }
 
-/// Register the Discord→Matrix capture handlers on this puppet's voice connection
-/// (it has become the anchor). The `VoiceReceiver` demuxes each non-excluded
-/// Discord speaker into their ghost sink; only one puppet holds these at a time.
-/// If this puppet hasn't joined voice yet, the command is dropped — the pool only
-/// elects an anchor among assigned puppets, which join on `Assign`.
-#[allow(clippy::too_many_arguments)]
-async fn puppet_become_anchor(
-    bridge: &Arc<str>,
-    ctx: &Context,
-    idx: usize,
-    guild_id: GuildId,
-    exclude: &SharedExclude,
-    ssrc_map: SsrcMap,
-    user_sinks: UserSinkMap,
-    capture_sink: Option<Arc<CaptureSink>>,
-    anchor: Arc<AtomicUsize>,
-    overflow_mixer: &Arc<PlaybackMixer>,
-) {
-    let Some(manager) = songbird::get(ctx).await else {
-        return;
-    };
-    let Some(call_lock) = manager.get(guild_id) else {
+/// Register the Discord→Matrix capture handlers + overflow playback on this bot's
+/// voice connection (it has become the anchor), then seed ghosts for members
+/// already present in the channel.
+async fn puppet_become_anchor(channel: &ChannelCtx, idx: usize, ctx: &Context) {
+    let Some(manager) = songbird::get(ctx).await else { return };
+    let Some(call_lock) = manager.get(channel.guild_id) else {
         tracing::warn!(idx, "anchor command but puppet not in voice yet");
         return;
     };
-    let mut call = call_lock.lock().await;
-    // The VoiceReceiver only captures while `anchor == idx`, so even if a previous
-    // anchor's handler is still briefly registered during handoff, exactly one
-    // puppet captures at a time.
-    call.add_global_event(
-        CoreEvent::VoiceTick.into(),
-        VoiceReceiver::new(
-            bridge.clone(),
-            exclude.clone(),
-            ssrc_map.clone(),
-            user_sinks,
-            capture_sink,
-            anchor,
-            idx,
-        ),
-    );
-    // The anchor also plays the shared overflow mix (un-slotted speakers), in
-    // addition to its own participant — so overflow audio is never lost. Silent
-    // when nobody is overflowed.
-    let overflow_src = PlaybackSource::new(overflow_mixer.clone());
-    let overflow_input =
-        Input::from(RawAdapter::new(overflow_src, PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS));
-    let _overflow_handle = call.play_input(overflow_input);
-    // NOTE: `SpeakingLogger` (SSRC→user map) and `ConnectionLogger` are registered
-    // in `puppet_join` *before* the connection, not here — Discord emits speaking
-    // announcements around connect, so a handler attached after join misses them
-    // (the same "register before join" lesson as the DriverConnect SSRC registrar).
-    tracing::info!(idx, "anchor capture active — Discord→Matrix demux from this puppet");
+    {
+        let mut call = call_lock.lock().await;
+        call.add_global_event(
+            CoreEvent::VoiceTick.into(),
+            VoiceReceiver::new(
+                channel.bridge.clone(),
+                channel.exclude.clone(),
+                channel.ssrc_map.clone(),
+                channel.user_sinks.clone(),
+                channel.capture_sink.clone(),
+                channel.anchor.clone(),
+                idx,
+            ),
+        );
+        // The anchor also plays the channel's overflow mix (un-slotted speakers).
+        let overflow_src = PlaybackSource::new(channel.overflow_mixer.clone());
+        let overflow_input =
+            Input::from(RawAdapter::new(overflow_src, PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS));
+        let _overflow_handle = call.play_input(overflow_input);
+    }
+    tracing::info!(idx, bridge = %channel.bridge, "anchor capture active — Discord→Matrix demux from this puppet");
+
+    // Seed ghosts for everyone already in the voice channel — voice_state_update
+    // only fires on later changes. Read the cached voice states (populated via the
+    // GUILD_VOICE_STATES intent); ensure_ghost is idempotent.
+    let present: Vec<u64> = match ctx.cache.guild(channel.guild_id) {
+        Some(guild) => guild
+            .voice_states
+            .iter()
+            .filter(|(_, vs)| vs.channel_id == Some(channel.channel_id))
+            .map(|(uid, _)| uid.get())
+            .collect(),
+        None => Vec::new(),
+    };
+    if !present.is_empty() {
+        tracing::info!(count = present.len(), bridge = %channel.bridge, "seeding ghosts for existing voice members");
+    }
+    for uid in present {
+        ensure_ghost(ctx, channel, uid, None).await;
+    }
 }
 
 /// Self-mute/unmute this puppet's voice connection to mirror the Matrix
 /// participant's mute state (shows as muted in the Discord client).
 async fn puppet_set_muted(ctx: &Context, idx: usize, guild_id: GuildId, muted: bool) {
-    let Some(manager) = songbird::get(ctx).await else {
-        return;
-    };
+    let Some(manager) = songbird::get(ctx).await else { return };
     if let Some(call_lock) = manager.get(guild_id) {
         let mut call = call_lock.lock().await;
         if let Err(e) = call.mute(muted).await {
@@ -944,18 +1258,13 @@ async fn puppet_set_muted(ctx: &Context, idx: usize, guild_id: GuildId, muted: b
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn puppet_join(
-    bridge: &Arc<str>,
-    ctx: &Context,
+    channel: &ChannelCtx,
     idx: usize,
-    guild_id: GuildId,
-    channel_id: ChannelId,
+    ctx: &Context,
     mixer: &Arc<PlaybackMixer>,
-    exclude: &SharedExclude,
-    ssrc_map: &SsrcMap,
-    nickname_prefix: &str,
     current_ssrc: &Arc<StdMutex<Option<u32>>>,
+    nickname_prefix: &str,
     display_name: &str,
 ) {
     let Some(manager) = songbird::get(ctx).await else {
@@ -963,96 +1272,82 @@ async fn puppet_join(
         return;
     };
 
-    // Register handlers and start the playback source on the Call *before*
-    // connecting. Two events fire *during* `manager.join().await` and are missed
-    // if a handler is attached after the await returns:
-    //   - `DriverConnect` carries our own SSRC (echo-exclusion) — see Phase 7.
-    //   - `SpeakingStateUpdate` carries other users' SSRC→user_id; Discord emits
-    //     these around connect, so registering `SpeakingLogger` late loses the
-    //     initial batch and a Matrix listener can't hear already-present speakers
-    //     until they speak again (Phase 8 live-test fix).
-    // Events go to the driver's persistent event task, so pre-registration is
-    // safe; the Call from `get_or_insert` is the same one `join` connects. Every
-    // assigned puppet registers `SpeakingLogger`/`ConnectionLogger` (all are in
-    // the channel; they share `ssrc_map`, redundant writes are harmless).
-    let call_lock = manager.get_or_insert(guild_id);
+    // Register handlers and start playback on the Call *before* connecting: two
+    // events fire *during* `manager.join().await` and are missed if a handler is
+    // attached after the await — `DriverConnect` (our own SSRC, echo-exclusion)
+    // and `SpeakingStateUpdate` (others' SSRC→user; emitted around connect).
+    let call_lock = manager.get_or_insert(channel.guild_id);
     {
         let mut call = call_lock.lock().await;
         call.add_global_event(
             CoreEvent::DriverConnect.into(),
             PuppetSsrcRegistrar {
-                bridge: bridge.clone(),
+                bridge: channel.bridge.clone(),
                 idx,
-                exclude: exclude.clone(),
+                exclude: channel.exclude.clone(),
                 current_ssrc: current_ssrc.clone(),
             },
         );
         call.add_global_event(
             CoreEvent::SpeakingStateUpdate.into(),
-            SpeakingLogger::new(bridge.clone(), ssrc_map.clone()),
+            SpeakingLogger::new(channel.bridge.clone(), channel.ssrc_map.clone()),
         );
         for ev in [
             CoreEvent::DriverReconnect,
             CoreEvent::DriverDisconnect,
             CoreEvent::ClientDisconnect,
         ] {
-            call.add_global_event(ev.into(), ConnectionLogger::new(bridge.clone(), ssrc_map.clone()));
+            call.add_global_event(
+                ev.into(),
+                ConnectionLogger::new(channel.bridge.clone(), channel.ssrc_map.clone()),
+            );
         }
-        // Play this puppet's single-participant mixer into the channel.
         let source = PlaybackSource::new(mixer.clone());
         let input = Input::from(RawAdapter::new(source, PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS));
         let _handle = call.play_input(input);
     }
 
-    // Now connect. DriverConnect dispatches into the handler registered above.
-    if let Err(e) = manager.join(guild_id, channel_id).await {
+    if let Err(e) = manager.join(channel.guild_id, channel.channel_id).await {
         tracing::error!(idx, error = %e, "puppet failed to join voice channel");
         return;
     }
 
-    // Nickname = prefix + Matrix display name (needs CHANGE_NICKNAME perm),
-    // truncated to Discord's 32-char cap.
     let nick = build_nickname(nickname_prefix, display_name);
-    if let Err(e) = guild_id.edit_nickname(&ctx.http, Some(nick.as_str())).await {
+    if let Err(e) = channel.guild_id.edit_nickname(&ctx.http, Some(nick.as_str())).await {
         tracing::warn!(idx, error = %e, "failed to set puppet nickname");
     }
-    tracing::info!(idx, display_name, "puppet joined voice and assigned");
+    tracing::info!(idx, bridge = %channel.bridge, display_name, "puppet joined voice and assigned");
 }
 
 async fn puppet_leave(
     ctx: &Context,
     idx: usize,
-    guild_id: GuildId,
-    exclude: &SharedExclude,
+    channel: &ChannelCtx,
     current_ssrc: &Arc<StdMutex<Option<u32>>>,
 ) {
-    // Reset the nickname so the bot doesn't keep a departed user's name.
-    if let Err(e) = guild_id.edit_nickname(&ctx.http, None).await {
+    if let Err(e) = channel.guild_id.edit_nickname(&ctx.http, None).await {
         tracing::warn!(idx, error = %e, "failed to reset puppet nickname");
     }
-    // Leave voice — drops the Call and its playback source.
     if let Some(manager) = songbird::get(ctx).await {
-        if let Err(e) = manager.remove(guild_id).await {
+        if let Err(e) = manager.remove(channel.guild_id).await {
             tracing::warn!(idx, error = %e, "puppet failed to leave voice channel");
         }
     }
     // Stop excluding our (now-gone) SSRC so a recycled SSRC isn't wrongly muted.
-    let ssrc = current_ssrc
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take();
+    let ssrc = current_ssrc.lock().unwrap_or_else(PoisonError::into_inner).take();
     if let Some(s) = ssrc {
-        exclude
+        channel
+            .exclude
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&s);
         tracing::info!(idx, ssrc = s, "puppet SSRC removed from echo-exclusion");
     }
-    tracing::info!(idx, "puppet left voice and released");
+    tracing::info!(idx, bridge = %channel.bridge, "puppet left voice and released");
 }
 
-/// Songbird handler that records a puppet's own SSRC into the echo-exclusion set
-/// as soon as its voice driver connects.
+/// Songbird handler that records a puppet's own SSRC into its channel's
+/// echo-exclusion set as soon as its voice driver connects.
 struct PuppetSsrcRegistrar {
     bridge: Arc<str>,
     idx: usize,
@@ -1069,19 +1364,178 @@ impl SongbirdEventHandler for PuppetSsrcRegistrar {
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(c.ssrc);
-            *self
-                .current_ssrc
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(c.ssrc);
+            *self.current_ssrc.lock().unwrap_or_else(PoisonError::into_inner) = Some(c.ssrc);
             tracing::info!(idx = self.idx, ssrc = c.ssrc, "puppet SSRC registered for echo-exclusion");
         }
         None
     }
 }
 
+/// Test-only inspection of allocator state (commands are not consumed in unit
+/// tests — `run` is never called — so these assert on the bookkeeping directly).
+#[cfg(test)]
+impl SharedPool {
+    /// Slot index a participant is assigned to, if it has a dedicated puppet.
+    fn test_slot_of(&self, bridge: &str, key: &str) -> Option<usize> {
+        let g = self.alloc.lock().unwrap();
+        match g.channels.get(bridge)?.assignments.get(key)? {
+            Assign::Puppet { idx, .. } => Some(*idx),
+            Assign::Overflow { .. } => None,
+        }
+    }
+    fn test_is_overflow(&self, bridge: &str, key: &str) -> bool {
+        let g = self.alloc.lock().unwrap();
+        matches!(
+            g.channels.get(bridge).and_then(|c| c.assignments.get(key)),
+            Some(Assign::Overflow { .. })
+        )
+    }
+    fn test_anchor(&self, bridge: &str) -> Option<usize> {
+        let g = self.alloc.lock().unwrap();
+        let a = g.channels.get(bridge)?.anchor.load(Ordering::Relaxed);
+        (a != NO_ANCHOR).then_some(a)
+    }
+    fn test_free_count(&self) -> usize {
+        self.slots.iter().filter(|s| !s.busy.load(Ordering::Relaxed)).count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nvb_audio::routing::CaptureSink as GhostSink;
+
+    /// A no-op capture router for allocator tests (no ghosts are minted).
+    struct NoopCapture;
+    struct NoopCaptureSink;
+    impl GhostSink for NoopCaptureSink {
+        fn push(&self, _mono: &[i16]) {}
+    }
+    impl CaptureRouter for NoopCapture {
+        fn assign(&self, _k: &str, _n: &str, _a: Option<&str>) -> Arc<dyn GhostSink> {
+            Arc::new(NoopCaptureSink)
+        }
+        fn release(&self, _k: &str) {}
+        fn release_all(&self) {}
+    }
+
+    /// Build a pool of `n` bots with no channels registered yet.
+    fn pool(n: usize) -> Arc<SharedPool> {
+        let cfg = PuppetsConfig {
+            tokens: (0..n).map(|i| format!("Bot {i}")).collect(),
+            nickname_prefix: "[Matrix] ".to_string(),
+        };
+        SharedPool::new(&cfg)
+    }
+
+    /// Register a channel `label` at guild/channel ids derived from `g`/`c`, and
+    /// enroll every pool bot in guild `g` (in production this comes from the
+    /// gateway `ready`/`guild_create` events, which don't fire in unit tests).
+    fn channel(p: &Arc<SharedPool>, label: &str, g: u64, c: u64) {
+        p.register_channel(
+            Arc::from(label),
+            &g.to_string(),
+            &c.to_string(),
+            Arc::new(NoopCapture),
+            None,
+        )
+        .expect("register channel");
+        for slot in &p.slots {
+            slot.guilds
+                .write()
+                .unwrap()
+                .insert(GuildId::new(g));
+        }
+    }
+
+    #[test]
+    fn dedicated_until_full_then_overflow() {
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        p.assign("A", "bob", "Bob");
+        let sa = p.test_slot_of("A", "alice").unwrap();
+        let sb = p.test_slot_of("A", "bob").unwrap();
+        assert_ne!(sa, sb, "distinct puppets");
+        assert_eq!(p.test_anchor("A"), Some(sa), "first assigned is anchor");
+        assert_eq!(p.test_free_count(), 0);
+        // Pool exhausted → overflow.
+        p.assign("A", "carol", "Carol");
+        assert!(p.test_is_overflow("A", "carol"));
+    }
+
+    #[test]
+    fn release_promotes_oldest_overflow_fcfs() {
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        p.assign("A", "bob", "Bob");
+        p.assign("A", "carol", "Carol"); // overflow, older
+        p.assign("A", "dave", "Dave"); // overflow, newer
+        let sa = p.test_slot_of("A", "alice").unwrap();
+        p.release("A", "alice");
+        // Carol (oldest overflow) promoted into the freed slot; Dave still overflow.
+        assert_eq!(p.test_slot_of("A", "carol"), Some(sa));
+        assert!(p.test_is_overflow("A", "dave"));
+    }
+
+    #[test]
+    fn second_channel_waits_then_activates_when_bot_frees() {
+        let p = pool(1);
+        channel(&p, "A", 1, 10);
+        channel(&p, "B", 1, 20);
+        p.assign("A", "alice", "Alice"); // takes the only bot (A anchor)
+        assert_eq!(p.test_free_count(), 0);
+        // B has no anchor and no donor has slack (A has just its anchor) → pending.
+        p.assign("B", "bob", "Bob");
+        assert_eq!(p.test_anchor("B"), None, "B waiting for a bot");
+        assert!(p.test_is_overflow("B", "bob"));
+        // Free A's bot → B is activated with it.
+        p.release("A", "alice");
+        assert!(p.test_anchor("B").is_some(), "B activated");
+        assert!(p.test_slot_of("B", "bob").is_some(), "bob now has a puppet");
+    }
+
+    #[test]
+    fn steals_from_donor_with_slack_to_activate_new_channel() {
+        let p = pool(3);
+        channel(&p, "A", 1, 10);
+        channel(&p, "B", 2, 20); // different guild
+        p.assign("A", "a1", "A1");
+        p.assign("A", "a2", "A2");
+        p.assign("A", "a3", "A3"); // A uses all 3 bots
+        assert_eq!(p.test_free_count(), 0);
+        let anchor_a = p.test_anchor("A").unwrap();
+        // B activates by stealing A's newest non-anchor dedicated speaker (a3).
+        p.assign("B", "b1", "B1");
+        assert!(p.test_anchor("B").is_some(), "B got an anchor");
+        assert!(p.test_slot_of("B", "b1").is_some());
+        // a3 (newest) was demoted to A's overflow; A keeps its anchor + a2.
+        assert!(p.test_is_overflow("A", "a3"), "newest A speaker demoted");
+        assert_eq!(p.test_anchor("A"), Some(anchor_a), "A anchor unchanged");
+        assert!(p.test_slot_of("A", "a2").is_some());
+    }
+
+    #[test]
+    fn allocates_only_guild_capable_bots() {
+        // Partitioned pool: bot 0 only in guild 1, bot 1 only in guild 2.
+        let p = pool(2);
+        p.register_channel(Arc::from("A"), "1", "10", Arc::new(NoopCapture), None).unwrap();
+        p.register_channel(Arc::from("B"), "2", "20", Arc::new(NoopCapture), None).unwrap();
+        p.slots[0].guilds.write().unwrap().insert(GuildId::new(1));
+        p.slots[1].guilds.write().unwrap().insert(GuildId::new(2));
+
+        // Each channel can only use the bot that's in its guild.
+        p.assign("A", "a", "A");
+        p.assign("B", "b", "B");
+        assert_eq!(p.test_slot_of("A", "a"), Some(0), "A uses the guild-1 bot");
+        assert_eq!(p.test_slot_of("B", "b"), Some(1), "B uses the guild-2 bot");
+
+        // A second A speaker can't use bot 1 (wrong guild) and B has no slack to
+        // steal a guild-1 bot from → overflow.
+        p.assign("A", "a2", "A2");
+        assert!(p.test_is_overflow("A", "a2"));
+    }
 
     #[test]
     fn nickname_prefix_applied() {
@@ -1102,7 +1556,6 @@ mod tests {
 
     #[test]
     fn nickname_truncation_respects_char_boundaries() {
-        // Multibyte name; must not panic and must stay within the cap.
         let nick = build_nickname("[Matrix] ", &"é".repeat(40));
         assert!(nick.chars().count() <= 32);
         assert!(nick.starts_with("[Matrix] "));
@@ -1114,8 +1567,8 @@ mod tests {
     #[test]
     fn routed_sink_follows_swapped_mixer() {
         // A RoutedSink pushes to whatever mixer its route points at; swapping the
-        // route (as promotion does) redirects subsequent frames with no change on
-        // the matrix side.
+        // route (as promotion/demotion does) redirects subsequent frames with no
+        // change on the Matrix side.
         let a = Arc::new(PlaybackMixer::new());
         let b = Arc::new(PlaybackMixer::new());
         let route: Route = Arc::new(StdMutex::new(a.clone()));
@@ -1124,8 +1577,6 @@ mod tests {
         sink.push(&vec![100i16; PRIME]);
         assert!(a.pop_10ms_mixed().iter().all(|&s| s == 100), "frames went to A");
 
-        // Promote: swap the route to B. B was empty, so receiving the frames
-        // proves the swap redirected them (A keeps its own earlier buffer).
         *route.lock().unwrap() = b.clone();
         sink.push(&vec![80i16; PRIME]);
         assert!(b.pop_10ms_mixed().iter().all(|&s| s == 80), "frames follow to B after swap");

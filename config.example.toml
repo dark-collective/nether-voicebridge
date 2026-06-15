@@ -2,22 +2,43 @@
 # Copy to config.toml and fill in real values. NEVER commit config.toml.
 # Override the config path at runtime: CONFIG_PATH=/path/to/config.toml
 #
-# Config is a list of bridges. Each `[[bridge]]` block is ONE Discord voice
-# channel bridged to ONE Matrix/Element Call room, running as a fully independent
-# pipeline (its own Discord + Matrix clients, tokens, room, and audio). To bridge
-# more channel-pairs from a single process, add more `[[bridge]]` blocks (a second
-# one is shown, commented out, at the bottom).
+# Two top-level pieces:
+#   [puppets]  — ONE shared pool of Discord bot tokens, used by ALL bridges. Bots
+#                are allocated to channels dynamically as people speak.
+#   [[bridge]] — each block bridges ONE Discord voice channel ↔ ONE Matrix/
+#                Element Call room. Add more `[[bridge]]` blocks to bridge more
+#                channel-pairs from a single process; they share the puppet pool.
 #
-# Within a bridge, all fields are required to parse. You can leave later-phase
-# fields as placeholders until you reach that phase:
-#   Phases 1+  : [bridge.matrix] homeserver_url, room_id, bot_user_id, access_token
-#   Phases 2–3 : [bridge.discord] guild_id, channel_id
-#   Phase 4+   : [bridge.livekit] media_e2ee (URLs are auto-derived)
-#   Phase 7    : [bridge.discord] puppet_tokens (real values)
-#   Phase 8    : [bridge.matrix] appservice_id, appservice_token
+# How the shared pool works: each active channel reserves ONE bot as its capture
+# "anchor" (enough to bridge the channel by itself — it captures all Discord
+# speakers and plays a blended mix of all Matrix speakers). Extra bots become
+# dedicated, individually-named/mutable puppets for individual Matrix speakers.
+# When a brand-new channel needs an anchor and no bot is free, a spare bot is
+# moved from a channel that has slack; if none do, that channel waits (logged).
 #
 # IMPORTANT: each bridge needs its OWN matrix.store_path. Two matrix-sdk clients
 # sharing one store will lock/corrupt; startup validation rejects duplicates.
+
+[puppets]
+# One entry per puppet bot — each is a SEPARATE Discord application with its own
+# bot token, created deliberately at discord.com/developers/applications. This is
+# the WHOLE pool, shared across every [[bridge]]. Pool size = max number of
+# simultaneous dedicated Matrix speakers across all channels at once (plus one
+# anchor reserved per active channel). Allocation is guild-aware: a bot is only
+# used for a channel in a guild it has been invited to (with Connect, Speak, Use
+# Voice Activity, Change Nickname). Invite a bot to EVERY guild you want it to be
+# usable in — to share elastically across guilds, invite all bots to all guilds;
+# to partition, invite some bots to one guild and others to another. Store raw
+# tokens (no "Bot " prefix). Do NOT list a token twice.
+tokens = [
+    "YOUR_PUPPET_BOT_TOKEN_1",
+    "YOUR_PUPPET_BOT_TOKEN_2",
+]
+
+# Optional (default "[Matrix] "). Prefix prepended to puppet bot nicknames so
+# Discord users can tell which voices are bridged Matrix participants. Set to
+# "" to disable. Prefix + name is truncated to Discord's 32-char nickname cap.
+nickname_prefix = "[Matrix] "
 
 [[bridge]]
 # Optional label, used in logs/spans (the `bridge{name=...}` span prefix).
@@ -31,20 +52,6 @@ guild_id = "1234567890123456789"
 # Right-click the target voice channel → "Copy Channel ID"
 channel_id = "9876543210987654321"
 
-# One entry per puppet bot — each is a SEPARATE Discord application with its own
-# bot token, created deliberately at discord.com/developers/applications.
-# Pool size = max number of simultaneous Matrix speakers attributable on Discord.
-# There is NO dedicated listener bot: one puppet is auto-elected as the floating
-# capture "anchor" for Discord→Matrix audio. If you previously ran a separate
-# listener bot, just add its token to this list (and optionally rename that bot
-# in the Discord dev portal — a manual step). Each puppet must be invited to the
-# guild with: Connect, Speak, Use Voice Activity, Change Nickname. Store raw
-# tokens (no "Bot " prefix).
-puppet_tokens = [
-    "YOUR_PUPPET_BOT_TOKEN_1",
-    "YOUR_PUPPET_BOT_TOKEN_2",
-]
-
 # Optional (default false). When true, also write per-SSRC capture_<ssrc>.wav
 # files (the Phase 3 debugging artifact) alongside forwarding audio to Matrix.
 # Leave off in normal use — it writes unbounded files. Handy to A/B a fault:
@@ -52,11 +59,6 @@ puppet_tokens = [
 # capture. NOTE: filenames are not bridge-prefixed, so don't enable on two
 # bridges that might see the same SSRC at once.
 capture_wav = false
-
-# Optional (default "[Matrix] "). Prefix prepended to puppet bot nicknames so
-# Discord users can tell which voices are bridged Matrix participants. Set to
-# "" to disable. Prefix + name is truncated to Discord's 32-char nickname cap.
-nickname_prefix = "[Matrix] "
 
 [bridge.matrix]
 # Fixed: your Tuwunel homeserver.
@@ -109,7 +111,9 @@ media_e2ee = false
 
 # ─── A second bridge (different channel ↔ different room) ────────────────────
 # Uncomment and fill in to bridge a second pair from this same process. Note the
-# distinct `name` and `store_path`, and its own full set of Discord bot tokens.
+# distinct `name`, `store_path`, and `channel_id`. It does NOT carry its own bot
+# tokens — it draws from the shared [puppets] pool above (make sure those bots
+# are invited to this bridge's guild too).
 #
 # [[bridge]]
 # name = "gaming"
@@ -117,7 +121,6 @@ media_e2ee = false
 # [bridge.discord]
 # guild_id = "1234567890123456789"
 # channel_id = "1111111111111111111"
-# puppet_tokens = ["YOUR_SECOND_PUPPET_1", "YOUR_SECOND_PUPPET_2"]
 # capture_wav = false
 #
 # [bridge.matrix]

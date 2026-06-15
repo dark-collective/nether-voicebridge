@@ -7,7 +7,7 @@ use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
 use nvb_audio::routing::{CaptureRouter, PlaybackRouter};
-use nvb_discord::{CaptureSink, PuppetPool};
+use nvb_discord::{CaptureSink, SharedPool};
 use nvb_matrix_rtc::GhostPool;
 
 #[tokio::main]
@@ -38,16 +38,21 @@ async fn main() -> Result<()> {
         .with_context(|| format!("loading config from {config_path}"))?;
     cfg.validate().context("config validation failed")?;
     cfg.log_redacted_summary();
+    let nvb_config::Config { puppets, bridges } = cfg;
 
-    // One independent pipeline per bridge. Each owns its Discord/Matrix clients,
-    // tokens, room, and audio plumbing — nothing is shared across bridges except
-    // the process-global rustls/tracing init above. The per-bridge `run` futures
+    // The Discord puppet bots are a SHARED, process-wide pool: one set of gateway
+    // clients started once (`pool.run`), dynamically allocated across every
+    // bridge's channel. Each bridge registers its channel and gets a `ChannelView`
+    // (its `PlaybackRouter`). The Matrix/RTC side stays per-bridge.
+    let pool = SharedPool::new(&puppets);
+    // The pool's own shutdown root: Ctrl-C cancels it to drain every puppet.
+    let pool_shutdown = CancellationToken::new();
+
+    // One independent Matrix/RTC pipeline per bridge. The per-bridge `run` futures
     // are `!Send` (they hold `tracing` span guards across awaits), so they cannot
     // be `tokio::spawn`ed; instead we drive them concurrently on this task with
     // `join_all`. Each future swallows its own error (logging it), so one bridge
-    // failing ends *that* bridge only — the rest keep running. The real work
-    // (serenity clients, audio consumers) lives in their own internal spawned
-    // tasks and still runs across the threadpool.
+    // failing ends *that* bridge only — the rest keep running.
     let mut bridge_futs: Vec<futures_util::future::LocalBoxFuture<'static, ()>> = Vec::new();
     // Capture sinks (when `capture_wav` is on) are collected so the Ctrl-C
     // handler can finalise every bridge's WAV headers on shutdown.
@@ -58,13 +63,11 @@ async fn main() -> Result<()> {
     // baseline — replacing the old fire-and-forget release_all + fixed sleep.
     let mut bridge_roots: Vec<CancellationToken> = Vec::new();
 
-    for (idx, bridge) in cfg.bridges.into_iter().enumerate() {
-        // Owned + `'static` so it can move into the spawned task (unlike the old
-        // `try_join!`, `JoinSet::spawn` requires `'static`).
+    for (idx, bridge) in bridges.into_iter().enumerate() {
         let bridge = Arc::new(bridge);
-        // Shared bridge label: drives the `bridge{name=…}` span here AND is passed
-        // into each crate so its internal spawned tasks / library callbacks (which
-        // don't inherit this task's span) can re-establish per-bridge attribution.
+        // Shared bridge label: drives the `bridge{name=…}` span here, is the
+        // shared pool's channel key, AND is passed into each crate so its internal
+        // spawned tasks / library callbacks re-establish per-bridge attribution.
         let label: Arc<str> = Arc::from(
             bridge.name.clone().unwrap_or_else(|| format!("bridge-{idx}")).as_str(),
         );
@@ -76,48 +79,41 @@ async fn main() -> Result<()> {
             capture_sinks.push(sink.clone());
         }
 
-        // Matrix → Discord playback. The puppet pool routes each Matrix speaker to
-        // a dedicated, named puppet bot (Phase 7); overflow falls back to the
-        // shared listener mix. It is both the `PlaybackRouter` the Matrix side
-        // pushes into and the owner of the Discord-side puppet clients.
-        let pool = PuppetPool::new(&bridge.discord);
-        let router: Arc<dyn PlaybackRouter> = pool.clone();
-
         // Discord → Matrix attribution (Phase 8). The ghost pool mints one Matrix
         // appservice ghost per Discord speaker. Created once and shared: handed to
-        // the Discord side as the `CaptureRouter` it pushes per-speaker audio into,
-        // and back to the Matrix side (`run`) to be driven. Mirrors the puppet pool.
+        // the shared pool as this channel's `CaptureRouter` (the anchor pushes
+        // per-speaker audio into it), and to the Matrix side (`run`) to be driven.
         let ghost_pool = GhostPool::new(&bridge.matrix, &bridge.livekit)
             .context("building ghost pool")?;
         let capture_router: Arc<dyn CaptureRouter> = ghost_pool.clone();
 
-        // Per-bridge shutdown root, threaded into both sides.
+        // Register this bridge's channel with the shared pool → its PlaybackRouter.
+        let router: Arc<dyn PlaybackRouter> = pool
+            .register_channel(
+                label.clone(),
+                &bridge.discord.guild_id,
+                &bridge.discord.channel_id,
+                capture_router,
+                capture_sink,
+            )
+            .with_context(|| format!("registering channel for bridge '{label}'"))?;
+
+        // Per-bridge shutdown root, threaded into the Matrix side.
         let bridge_root = CancellationToken::new();
         bridge_roots.push(bridge_root.clone());
 
         let span = tracing::info_span!("bridge", name = %label);
         let bridge_task = bridge.clone();
         let fut = async move {
-            // try_join! *inside* the bridge future: a failure on either side ends
-            // this bridge only. Cross-bridge isolation is `join_all`'s job.
-            let result = tokio::try_join!(
-                nvb_matrix_rtc::run(
-                    &bridge_task.matrix,
-                    &bridge_task.livekit,
-                    router,
-                    ghost_pool,
-                    label.clone(),
-                    bridge_root.clone(),
-                ),
-                nvb_discord::run(
-                    &bridge_task.discord,
-                    capture_router,
-                    capture_sink,
-                    pool,
-                    label.clone(),
-                    bridge_root.clone(),
-                ),
-            );
+            let result = nvb_matrix_rtc::run(
+                &bridge_task.matrix,
+                &bridge_task.livekit,
+                router,
+                ghost_pool,
+                label.clone(),
+                bridge_root.clone(),
+            )
+            .await;
             match result {
                 // No reconnection yet (Phase 10); a clean exit is unexpected.
                 Ok(_) => tracing::warn!("bridge exited cleanly (no reconnect yet)"),
@@ -125,6 +121,21 @@ async fn main() -> Result<()> {
             }
         }
         .instrument(span);
+        bridge_futs.push(fut.boxed_local());
+    }
+
+    // Drive the shared puppet pool alongside the bridges. It's `!Send` (serenity
+    // clients hold non-Send state across awaits) so it runs `boxed_local` on this
+    // task too. On its `pool_shutdown`, it drains every puppet (leave voice, reset
+    // nicknames) before returning.
+    {
+        let pool = pool.clone();
+        let pool_shutdown = pool_shutdown.clone();
+        let fut = async move {
+            if let Err(e) = pool.run(pool_shutdown).await {
+                tracing::error!(error = %e, "puppet pool exited with error");
+            }
+        };
         bridge_futs.push(fut.boxed_local());
     }
 
@@ -147,6 +158,8 @@ async fn main() -> Result<()> {
             for root in &bridge_roots {
                 root.cancel();
             }
+            // Drain the shared puppet pool (every bot leaves voice + resets nick).
+            pool_shutdown.cancel();
             // Await graceful teardown, but never hang: a wedged puppet/ghost
             // can't keep the process alive past the timeout.
             match tokio::time::timeout(Duration::from_secs(10), &mut drain).await {

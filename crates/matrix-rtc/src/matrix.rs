@@ -236,6 +236,11 @@ pub(crate) async fn run(
     let participants: ParticipantSet = Arc::new(Mutex::new(HashSet::new()));
 
     // Register handler BEFORE sync so events during the initial round-trip are captured.
+    // Scope it to THIS bridge's room: `add_event_handler` is global across every
+    // joined room, so with multiple bridges sharing one Matrix account (the bot is
+    // a member of all their rooms) an unfiltered handler would react to other
+    // bridges' call membership and double-assign puppets. `add_room_event_handler`
+    // makes the SDK dispatch only this room's events.
     {
         let participants = participants.clone();
         let bot_user_id = bot_user_id.clone();
@@ -244,7 +249,7 @@ pub(crate) async fn run(
         // not inherit the bridge span — re-establish it for per-bridge logs.
         let bridge = bridge.clone();
         let router = router.clone();
-        client.add_event_handler(move |ev: SyncCallMemberEvent, room: Room| {
+        client.add_room_event_handler(&room_id, move |ev: SyncCallMemberEvent, room: Room| {
             let participants = participants.clone();
             let bot_user_id = bot_user_id.clone();
             let call_active_tx = call_active_tx.clone();

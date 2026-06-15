@@ -5,12 +5,17 @@ Guidance for Claude Code working on this repo. Read alongside
 
 ## What this is
 
-A bidirectional voice bridge between one Discord voice channel and one Matrix
-(MatrixRTC / Element Call) room call. **Single Rust binary, tokio runtime.**
-Matrix speakers appear on Discord as individually-controllable puppet bots;
-Discord speakers appear in Element Call as appservice ghosts. See the
-architecture doc for the full design; build the phases in order from the build
-plan, each with its acceptance test.
+A bidirectional voice bridge between Discord voice channels and Matrix
+(MatrixRTC / Element Call) room calls. **Single Rust binary, tokio runtime.**
+Each `[[bridge]]` pairs one Discord channel ↔ one Matrix room; multiple bridges
+run in one process. Matrix speakers appear on Discord as individually-controllable
+puppet bots, drawn from a **single shared pool** of bot applications that is
+allocated dynamically across all bridged channels (one bot per active channel is
+its capture "anchor"; the rest are dedicated puppets, with steal-for-activation
+and FCFS overflow — see `crates/discord/src/puppet.rs`). Discord speakers appear
+in Element Call as appservice ghosts. See the architecture doc for the full
+design; build the phases in order from the build plan, each with its acceptance
+test.
 
 ## Environment (do not re-architect)
 
@@ -23,10 +28,14 @@ plan, each with its acceptance test.
   publishes **plaintext** LiveKit frames; encrypting into this non-E2EE call
   makes peers hear static. Keep it off unless the room becomes encrypted — see
   constraint #3, which now applies only to that deferred encrypted-room branch.
-- Discord: a guild with a voice channel; a set of N puppet bot applications
-  (no dedicated listener — one puppet is auto-elected as the floating capture
-  **anchor**), each invited with Connect, Speak, Use Voice Activity,
-  Change Nickname.
+- Discord: one or more guilds/voice channels; a single shared pool of N puppet
+  bot applications (config `[puppets]`), dynamically allocated across all bridged
+  channels — no dedicated listener, one bot per active channel is the floating
+  capture **anchor**. Allocation is **guild-aware**: a bot only serves channels
+  in guilds it's been invited to (learned from `ready`/`guild_create`), so the
+  pool can be shared elastically (all bots in all guilds) or partitioned (some
+  bots per guild). Invite each bot — with Connect, Speak, Use Voice Activity,
+  Change Nickname — to every guild you want it usable in.
 
 ## Hard constraints (these cause silent failure if ignored)
 

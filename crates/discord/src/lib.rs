@@ -1,5 +1,4 @@
-use anyhow::Result;
-use serenity::{async_trait, model::prelude::*};
+use serenity::async_trait;
 use songbird::{
     input::core::io::MediaSource,
     model::payload::Speaking,
@@ -18,13 +17,12 @@ pub mod capture;
 pub use capture::CaptureSink;
 
 pub mod puppet;
-pub use puppet::{PuppetPool, SharedExclude};
+pub use puppet::{ChannelView, SharedExclude, SharedPool};
 
 // The Matrix-side ghost sink trait (one per Discord speaker). Aliased so it
 // doesn't clash with this crate's WAV-writing `capture::CaptureSink`.
-use nvb_audio::routing::{CaptureRouter, CaptureSink as GhostSink};
+use nvb_audio::routing::CaptureSink as GhostSink;
 use nvb_audio::{self as audio, mixer::PlaybackMixer};
-use nvb_config::DiscordConfig;
 
 // ─── Discord → Matrix (ghost) capture routing shared state (Phase 8) ───────────
 
@@ -369,42 +367,14 @@ impl SongbirdEventHandler for ConnectionLogger {
 }
 
 // The songbird capture handlers above (`VoiceReceiver` / `SpeakingLogger` /
-// `ConnectionLogger`) are now registered by the puppet pool's **anchor** puppet
-// (see `puppet.rs`), not by a dedicated listener. There is no listener `Handler`.
-
-// ─── Entry point ─────────────────────────────────────────────────────────────
-
-#[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
-pub async fn run(
-    cfg: &DiscordConfig,
-    capture_router: Arc<dyn CaptureRouter>,
-    capture_sink: Option<Arc<CaptureSink>>,
-    pool: Arc<PuppetPool>,
-    bridge: Arc<str>,
-    shutdown: tokio_util::sync::CancellationToken,
-) -> Result<()> {
-    let guild_id: u64 = cfg
-        .guild_id
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid guild_id: {}", cfg.guild_id))?;
-    let channel_id: u64 = cfg
-        .channel_id
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid channel_id: {}", cfg.channel_id))?;
-    let guild_id = GuildId::new(guild_id);
-    let channel_id = ChannelId::new(channel_id);
-
-    // There is no dedicated listener bot anymore: the puppet pool owns the whole
-    // Discord side. One puppet is elected the "anchor" and captures Discord→Matrix
-    // audio, demuxed per speaker into their ghost via `capture_router`; the rest
-    // just play their Matrix participant. `capture_router` + `capture_sink` go to
-    // the pool so the anchor can attribute and the voice-state handler can drive
-    // ghost presence.
-    tracing::info!("starting Discord gateway (puppet pool)");
-    pool.run_puppets(guild_id, channel_id, bridge, capture_router, capture_sink, shutdown)
-        .await?;
-    Ok(())
-}
+// `ConnectionLogger`) are registered by a channel's **anchor** puppet (see
+// `puppet.rs`), not by a dedicated listener. There is no listener `Handler`.
+//
+// The Discord side has no per-bridge entry point anymore: the shared
+// [`SharedPool`] owns every puppet gateway and is started once from `main`
+// (`SharedPool::run`); each bridge registers its channel via
+// `SharedPool::register_channel` and drives playback through the returned
+// [`ChannelView`].
 
 #[cfg(test)]
 mod playback_tests {

@@ -18,13 +18,38 @@ pub enum ConfigError {
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    /// One entry per bridged channel-pair. TOML `[[bridge]]` blocks map here.
-    /// Each bridge is a fully independent pipeline (its own Discord/Matrix
-    /// clients, tokens, room, and audio plumbing). Defaults to empty so a
-    /// bridge-less config surfaces the friendly `validate()` error rather than a
+    /// The process-wide pool of Discord puppet bots, shared across all bridges.
+    /// Bots are dynamically allocated to channels on demand (one mandatory
+    /// "anchor" per active channel + dedicated puppets for individual Matrix
+    /// speakers). TOML `[puppets]` maps here. Defaults to empty so a
+    /// puppet-less config surfaces the friendly `validate()` error rather than a
     /// raw serde "missing field" parse failure.
+    #[serde(default)]
+    pub puppets: PuppetsConfig,
+    /// One entry per bridged channel-pair. TOML `[[bridge]]` blocks map here.
+    /// Each bridge is an independent Matrix/RTC pipeline (its own Matrix client,
+    /// room, ghosts, and audio plumbing); the Discord puppet bots are shared
+    /// from the `[puppets]` pool above. Defaults to empty so a bridge-less
+    /// config surfaces the friendly `validate()` error rather than a raw serde
+    /// "missing field" parse failure.
     #[serde(rename = "bridge", default)]
     pub bridges: Vec<BridgeConfig>,
+}
+
+/// The shared Discord puppet bot pool (process-wide, not per-bridge).
+#[derive(Debug, Deserialize, Default)]
+pub struct PuppetsConfig {
+    /// One entry per puppet bot — each a SEPARATE Discord application with its
+    /// own bot token. Pool size = max simultaneous dedicated Matrix speakers
+    /// (across all channels); one bot per active channel is reserved as its
+    /// capture anchor. Each bot must be invited to every guild it may serve.
+    #[serde(default)]
+    pub tokens: Vec<String>,
+    /// Prefix prepended to puppet nicknames so Discord users can tell which
+    /// participants are bridged from Matrix. Default `"[Matrix] "`; set to `""`
+    /// to disable. Prefix + name is truncated to Discord's 32-char nickname cap.
+    #[serde(default = "default_nickname_prefix")]
+    pub nickname_prefix: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,17 +66,11 @@ pub struct BridgeConfig {
 pub struct DiscordConfig {
     pub guild_id: String,
     pub channel_id: String,
-    pub puppet_tokens: Vec<String>,
     /// When true, also write per-SSRC `capture_<ssrc>.wav` files (the Phase 3
     /// debugging artifact) alongside forwarding audio to Matrix. Off in
     /// production to avoid unbounded file growth.
     #[serde(default)]
     pub capture_wav: bool,
-    /// Prefix prepended to puppet nicknames so Discord users can tell which
-    /// participants are bridged from Matrix. Default `"[Matrix] "`; set to `""`
-    /// to disable. Prefix + name is truncated to Discord's 32-char nickname cap.
-    #[serde(default = "default_nickname_prefix")]
-    pub nickname_prefix: String,
 }
 
 fn default_nickname_prefix() -> String {
@@ -120,6 +139,14 @@ impl Config {
             ));
         }
 
+        // Hard: the shared pool must have at least one bot — every active
+        // channel needs an anchor, so a pool of zero can bridge nothing.
+        if self.puppets.tokens.is_empty() {
+            return Err(ConfigError::Validation(
+                "config must define at least one puppet token in [puppets]".to_string(),
+            ));
+        }
+
         // Hard: distinct store_path per bridge. NOTE: build_client currently uses
         // an in-memory matrix-sdk store and does not read store_path, so this is
         // forward-looking — but the moment the SQLite store is wired up, two
@@ -150,18 +177,30 @@ impl Config {
             }
         }
 
-        // Soft: two bridges sharing a Discord bot token would fight over one
-        // gateway connection.
+        // Soft: a Discord bot token listed twice in the shared pool would build
+        // two gateway connections for one bot identity, which Discord rejects.
         let mut seen_tokens = std::collections::HashMap::new();
+        for (i, tok) in self.puppets.tokens.iter().enumerate() {
+            if let Some(j) = seen_tokens.insert(tok.as_str(), i) {
+                tracing::warn!(
+                    index = i,
+                    other = j,
+                    "duplicate Discord token in [puppets] pool"
+                );
+            }
+        }
+
+        // Soft: same Discord voice channel bridged twice (a bot can only be in
+        // one VC per guild — two bridges on one channel would fight over bots).
+        let mut seen_channels = std::collections::HashMap::new();
         for (i, b) in self.bridges.iter().enumerate() {
-            for tok in b.discord.puppet_tokens.iter() {
-                if let Some(j) = seen_tokens.insert(tok.clone(), i) {
-                    tracing::warn!(
-                        bridge = i,
-                        other = j,
-                        "duplicate Discord token reused across bridges"
-                    );
-                }
+            let key = (b.discord.guild_id.as_str(), b.discord.channel_id.as_str());
+            if let Some(j) = seen_channels.insert(key, i) {
+                tracing::warn!(
+                    bridge = i,
+                    other = j,
+                    "duplicate Discord (guild, channel) across bridges"
+                );
             }
         }
 
@@ -169,7 +208,12 @@ impl Config {
     }
 
     pub fn log_redacted_summary(&self) {
-        tracing::info!(bridge_count = self.bridges.len(), "config loaded");
+        tracing::info!(
+            bridge_count = self.bridges.len(),
+            puppet_pool_size = self.puppets.tokens.len(),
+            nickname_prefix = %self.puppets.nickname_prefix,
+            "config loaded"
+        );
         for b in &self.bridges {
             b.log_redacted_summary();
         }
@@ -187,7 +231,6 @@ impl BridgeConfig {
             bridge = %self.label(),
             discord_guild_id = %self.discord.guild_id,
             discord_channel_id = %self.discord.channel_id,
-            discord_puppet_count = self.discord.puppet_tokens.len(),
             matrix_homeserver_url = %self.matrix.homeserver_url,
             matrix_room_id = %self.matrix.room_id,
             matrix_bot_user_id = %self.matrix.bot_user_id,
@@ -207,12 +250,22 @@ impl BridgeConfig {
 mod tests {
     use super::*;
 
-    /// One `[[bridge]]` block. `store` lets each test pick a distinct store_path
+    /// A shared `[puppets]` pool block. `tokens` are emitted verbatim.
+    fn puppets_block(tokens: &[&str]) -> String {
+        let toks = tokens
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("[puppets]\ntokens = [{toks}]\n\n")
+    }
+
+    /// One `[[bridge]]` block. `store`/`chan` let each test pick distinct values
     /// so multi-bridge tests pass validation; `name` is emitted only when `Some`.
-    /// `puppet` is the first puppet token (lets token-reuse tests collide).
     /// `[bridge.livekit]` deliberately omits the optional `lk_jwt_url`/`url`
-    /// overrides so the default derive (`None`) path is exercised.
-    fn bridge_block(name: Option<&str>, room: &str, store: &str, puppet: &str) -> String {
+    /// overrides so the default derive (`None`) path is exercised. Puppet tokens
+    /// live in the shared `[puppets]` block, not here.
+    fn bridge_block(name: Option<&str>, room: &str, store: &str, chan: &str) -> String {
         let name_line = match name {
             Some(n) => format!("name = \"{n}\"\n"),
             None => String::new(),
@@ -221,8 +274,7 @@ mod tests {
             r#"[[bridge]]
 {name_line}[bridge.discord]
 guild_id = "111"
-channel_id = "222"
-puppet_tokens = ["{puppet}", "Bot ghi"]
+channel_id = "{chan}"
 
 [bridge.matrix]
 homeserver_url = "https://nether.im"
@@ -241,13 +293,18 @@ media_e2ee = false
     }
 
     #[test]
-    fn parses_single_bridge_array() {
-        let raw = bridge_block(Some("general"), "!room:nether.im", "./s1", "Bot abc");
+    fn parses_pool_and_single_bridge() {
+        let raw = format!(
+            "{}{}",
+            puppets_block(&["Bot abc", "Bot ghi"]),
+            bridge_block(Some("general"), "!room:nether.im", "./s1", "222"),
+        );
         let cfg: Config = toml::from_str(&raw).expect("parse failed");
+        assert_eq!(cfg.puppets.tokens.len(), 2);
+        assert_eq!(cfg.puppets.nickname_prefix, "[Matrix] ");
         assert_eq!(cfg.bridges.len(), 1);
         let b = &cfg.bridges[0];
         assert_eq!(b.name.as_deref(), Some("general"));
-        assert_eq!(b.discord.puppet_tokens.len(), 2);
         assert_eq!(b.matrix.homeserver_url, "https://nether.im");
         // Optional override URLs absent ⇒ derive-by-default path.
         assert_eq!(b.livekit.lk_jwt_url, None);
@@ -258,9 +315,10 @@ media_e2ee = false
     #[test]
     fn parses_two_bridges() {
         let raw = format!(
-            "{}\n{}",
-            bridge_block(Some("a"), "!a:nether.im", "./sa", "Bot a"),
-            bridge_block(Some("b"), "!b:nether.im", "./sb", "Bot b"),
+            "{}{}\n{}",
+            puppets_block(&["Bot a", "Bot b"]),
+            bridge_block(Some("a"), "!a:nether.im", "./sa", "222"),
+            bridge_block(Some("b"), "!b:nether.im", "./sb", "333"),
         );
         let cfg: Config = toml::from_str(&raw).expect("parse failed");
         assert_eq!(cfg.bridges.len(), 2);
@@ -271,7 +329,11 @@ media_e2ee = false
 
     #[test]
     fn name_is_optional() {
-        let raw = bridge_block(None, "!room:nether.im", "./s1", "Bot abc");
+        let raw = format!(
+            "{}{}",
+            puppets_block(&["Bot a"]),
+            bridge_block(None, "!room:nether.im", "./s1", "222"),
+        );
         let cfg: Config = toml::from_str(&raw).expect("parse failed");
         assert!(cfg.bridges[0].name.is_none());
         assert_eq!(cfg.bridges[0].label(), "unnamed");
@@ -279,17 +341,26 @@ media_e2ee = false
 
     #[test]
     fn rejects_empty_bridges() {
-        // No `[[bridge]]` at all → empty Vec → validation error.
-        let cfg: Config = toml::from_str("").expect("empty parses to zero bridges");
+        // A pool but no `[[bridge]]` → empty Vec → validation error.
+        let cfg: Config = toml::from_str(&puppets_block(&["Bot a"])).expect("parses");
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn rejects_empty_puppet_pool() {
+        // Bridges but no puppet tokens → validation error (no anchors possible).
+        let raw = bridge_block(Some("a"), "!a:nether.im", "./sa", "222");
+        let cfg: Config = toml::from_str(&raw).expect("parses");
         assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
     }
 
     #[test]
     fn rejects_duplicate_store_path() {
         let raw = format!(
-            "{}\n{}",
-            bridge_block(Some("a"), "!a:nether.im", "./dup", "Bot a"),
-            bridge_block(Some("b"), "!b:nether.im", "./dup", "Bot b"),
+            "{}{}\n{}",
+            puppets_block(&["Bot a"]),
+            bridge_block(Some("a"), "!a:nether.im", "./dup", "222"),
+            bridge_block(Some("b"), "!b:nether.im", "./dup", "333"),
         );
         let cfg: Config = toml::from_str(&raw).expect("parse failed");
         assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
@@ -297,11 +368,12 @@ media_e2ee = false
 
     #[test]
     fn duplicate_room_and_token_are_warnings_not_errors() {
-        // Same room_id and same puppet token across bridges → Ok (warn only).
+        // Same room_id across bridges + a duplicate pool token → Ok (warn only).
         let raw = format!(
-            "{}\n{}",
-            bridge_block(Some("a"), "!same:nether.im", "./sa", "Bot same"),
-            bridge_block(Some("b"), "!same:nether.im", "./sb", "Bot same"),
+            "{}{}\n{}",
+            puppets_block(&["Bot dup", "Bot dup"]),
+            bridge_block(Some("a"), "!same:nether.im", "./sa", "222"),
+            bridge_block(Some("b"), "!same:nether.im", "./sb", "333"),
         );
         let cfg: Config = toml::from_str(&raw).expect("parse failed");
         cfg.validate().expect("dupes are warnings, not errors");
@@ -315,7 +387,6 @@ media_e2ee = false
 [bridge.discord]
 guild_id = "111"
 channel_id = "222"
-puppet_tokens = []
 "#;
         assert!(toml::from_str::<Config>(raw).is_err());
     }
@@ -323,11 +394,13 @@ puppet_tokens = []
     #[test]
     fn livekit_override_urls_parse_when_present() {
         // When set, the optional override URLs are honored (Some).
-        let raw = r#"[[bridge]]
+        let raw = r#"[puppets]
+tokens = ["Bot abc"]
+
+[[bridge]]
 [bridge.discord]
 guild_id = "111"
 channel_id = "222"
-puppet_tokens = ["Bot abc"]
 
 [bridge.matrix]
 homeserver_url = "https://nether.im"
