@@ -25,6 +25,13 @@ use crate::rtc::well_known::LivekitFocusInfo;
 /// `user_id` — the bridge bot's MXID
 /// `device_id` — the bridge bot's Matrix device id
 /// `focus`  — the LiveKit SFU focus discovered from `.well-known`
+///
+/// Currently UNUSED: the bridge bot is a subscribe-only LiveKit participant and
+/// deliberately posts no `m.call.member`, so it stays out of Element Call's
+/// roster (see `rtc::run`). Kept compiling as the easy revert if the SFU ever
+/// requires membership to forward tracks. Ghosts post membership via the raw
+/// CS-API in `rtc::ghost`, not this.
+#[allow(dead_code)]
 pub async fn join(
     room: &Room,
     user_id: &OwnedUserId,
@@ -69,7 +76,9 @@ pub async fn join(
 /// Post an empty membership (leave) for the bridge bot.
 ///
 /// Element Call removes the participant from the call view when it receives
-/// an Empty (or expired) membership for their state key.
+/// an Empty (or expired) membership for their state key. UNUSED for the same
+/// reason as [`join`] — the subscriber posts no membership.
+#[allow(dead_code)]
 pub async fn leave(
     room: &Room,
     user_id: &OwnedUserId,

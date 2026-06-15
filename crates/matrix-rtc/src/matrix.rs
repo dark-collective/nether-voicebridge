@@ -131,6 +131,52 @@ async fn apply_member_event(
     }
 }
 
+/// Retract any stale `m.call.member` the bridge bot itself left in the room.
+///
+/// The bridge bot is a *hidden subscriber* (Phase 8): it joins LiveKit to receive
+/// audio but never posts its own call membership, so it shouldn't appear in
+/// Element Call's roster. But a process killed mid-call (no clean leave) leaves
+/// the bot's membership live in room state until its ~4h expiry. This clears any
+/// such leftover at startup, for every `device_id` it may have used, so the
+/// subscriber stays invisible. Ghosts are unaffected (different senders).
+pub(crate) async fn retract_self_call_membership(
+    client: &Client,
+    room_id: &RoomId,
+    bot_user_id: &UserId,
+) {
+    let Some(room) = client.get_room(room_id) else { return };
+    let raws = match room.get_state_events_static::<CallMemberEventContent>().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read call memberships for self-cleanup");
+            return;
+        }
+    };
+    for raw in raws {
+        let Ok(ev) = raw.deserialize() else { continue };
+        let orig = match ev {
+            SyncOrStrippedState::Sync(SyncStateEvent::Original(o)) => o,
+            _ => continue,
+        };
+        if orig.sender.as_str() != bot_user_id.as_str() {
+            continue;
+        }
+        if matches!(orig.content, CallMemberEventContent::Empty(_)) {
+            continue; // already retracted
+        }
+        match room
+            .send_state_event_for_key(&orig.state_key, CallMemberEventContent::new_empty(None))
+            .await
+        {
+            Ok(_) => tracing::info!(
+                state_key = %orig.state_key.as_ref(),
+                "retracted stale bridge-bot call membership (subscriber stays hidden)"
+            ),
+            Err(e) => tracing::warn!(error = %e, "failed to retract stale self membership"),
+        }
+    }
+}
+
 /// Build and authenticate a Matrix client from config. Joins the target room,
 /// runs one sync round to populate the local state store, and returns the
 /// ready client.

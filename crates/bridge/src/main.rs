@@ -50,6 +50,11 @@ async fn main() -> Result<()> {
     // Capture sinks (when `capture_wav` is on) are collected so the Ctrl-C
     // handler can finalise every bridge's WAV headers on shutdown.
     let mut capture_sinks: Vec<Arc<CaptureSink>> = Vec::new();
+    // Pools collected so the Ctrl-C handler can release puppets (leave voice,
+    // reset nicknames) and retire ghosts (retract m.call.member) before exit —
+    // otherwise a killed process leaves zombie bots/ghosts behind.
+    let mut shutdown_puppets: Vec<Arc<PuppetPool>> = Vec::new();
+    let mut shutdown_ghosts: Vec<Arc<GhostPool>> = Vec::new();
 
     for (idx, bridge) in cfg.bridges.into_iter().enumerate() {
         // Owned + `'static` so it can move into the spawned task (unlike the old
@@ -75,6 +80,7 @@ async fn main() -> Result<()> {
         // pushes into and the owner of the Discord-side puppet clients.
         let pool = PuppetPool::new(&bridge.discord);
         let router: Arc<dyn PlaybackRouter> = pool.clone();
+        shutdown_puppets.push(pool.clone());
 
         // Discord → Matrix attribution (Phase 8). The ghost pool mints one Matrix
         // appservice ghost per Discord speaker. Created once and shared: handed to
@@ -83,6 +89,7 @@ async fn main() -> Result<()> {
         let ghost_pool = GhostPool::new(&bridge.matrix, &bridge.livekit)
             .context("building ghost pool")?;
         let capture_router: Arc<dyn CaptureRouter> = ghost_pool.clone();
+        shutdown_ghosts.push(ghost_pool.clone());
 
         let span = tracing::info_span!("bridge", name = %label);
         let bridge_task = bridge.clone();
@@ -115,16 +122,29 @@ async fn main() -> Result<()> {
         bridge_futs.push(fut.boxed_local());
     }
 
-    // Ctrl-C handler: finalise every bridge's WAV files (if capturing) so headers
-    // are correct, then exit the whole process.
+    // Ctrl-C handler: release puppets (leave voice, reset nicknames) and retire
+    // ghosts (retract m.call.member), finalise WAV headers, then exit. The
+    // release calls only *enqueue* async work (puppet command loops / ghost
+    // driver), so we give it a short drain window before exiting.
     {
         let capture_sinks = capture_sinks.clone();
+        let shutdown_puppets = shutdown_puppets.clone();
+        let shutdown_ghosts = shutdown_ghosts.clone();
         tokio::spawn(async move {
             if let Err(e) = tokio::signal::ctrl_c().await {
                 tracing::warn!(error = %e, "ctrl_c signal handler failed");
                 return;
             }
-            tracing::info!("shutting down");
+            tracing::info!("shutting down — releasing puppets and ghosts");
+            for pool in &shutdown_puppets {
+                pool.release_all();
+            }
+            for ghost_pool in &shutdown_ghosts {
+                ghost_pool.release_all();
+            }
+            // Let the puppet command loops / ghost driver run their teardown
+            // (leave voice, reset nickname, post m.call.member leave) before exit.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             for sink in &capture_sinks {
                 tracing::info!("finalising WAV files");
                 sink.finalize_all();

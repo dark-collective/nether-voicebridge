@@ -77,7 +77,10 @@ pub trait CaptureRouter: Send + Sync {
     /// Bind a Discord speaker (`key` — a stable per-speaker id, e.g. the Discord
     /// user id) to a ghost and return its sink.  Idempotent: calling again with
     /// the same `key` returns a sink for the same ghost without re-minting.
-    fn assign(&self, key: &str, display_name: &str) -> Arc<dyn CaptureSink>;
+    /// `avatar_url`, when present, is the speaker's Discord avatar URL; the
+    /// implementation mirrors it onto the ghost's Matrix profile.
+    fn assign(&self, key: &str, display_name: &str, avatar_url: Option<&str>)
+        -> Arc<dyn CaptureSink>;
 
     /// Retire the speaker's ghost (they left the voice channel).  A no-op for an
     /// unknown `key`.
@@ -163,7 +166,12 @@ mod tests {
         }
     }
     impl CaptureRouter for StubRouter {
-        fn assign(&self, key: &str, _display_name: &str) -> Arc<dyn CaptureSink> {
+        fn assign(
+            &self,
+            key: &str,
+            _display_name: &str,
+            _avatar_url: Option<&str>,
+        ) -> Arc<dyn CaptureSink> {
             self.sinks
                 .lock()
                 .unwrap()
@@ -182,15 +190,15 @@ mod tests {
     #[test]
     fn capture_router_demuxes_per_speaker() {
         let router = StubRouter::default();
-        let alice = router.assign("alice", "Alice");
-        let bob = router.assign("bob", "Bob");
+        let alice = router.assign("alice", "Alice", None);
+        let bob = router.assign("bob", "Bob", None);
 
         alice.push(&[1, 1, 1]);
         bob.push(&[2, 2]);
         alice.push(&[3]);
 
         // Re-assign returns the *same* sink (idempotent): its history is intact.
-        router.assign("alice", "Alice").push(&[4]);
+        router.assign("alice", "Alice", None).push(&[4]);
 
         assert_eq!(router.recorded("alice"), vec![vec![1, 1, 1], vec![3], vec![4]]);
         assert_eq!(router.recorded("bob"), vec![vec![2, 2]]);
@@ -199,12 +207,12 @@ mod tests {
     #[test]
     fn capture_router_release_drops_the_sink() {
         let router = StubRouter::default();
-        router.assign("alice", "Alice");
+        router.assign("alice", "Alice", None);
         assert_eq!(router.len(), 1);
         router.release("alice");
         assert_eq!(router.len(), 0);
-        router.assign("a", "A");
-        router.assign("b", "B");
+        router.assign("a", "A", None);
+        router.assign("b", "B", None);
         router.release_all();
         assert_eq!(router.len(), 0);
     }

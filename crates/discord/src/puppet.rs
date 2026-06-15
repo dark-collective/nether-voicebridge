@@ -586,6 +586,17 @@ impl EventHandler for PuppetHandler {
             return;
         };
 
+        // Startup reset (first `ready` only — must NOT run on reconnect, which
+        // could kick an active puppet out of voice): clear any stale guild
+        // nickname and lingering voice session left by a previous crash/kill, so
+        // restarts don't leave confusing `[Matrix] …` zombie bots behind.
+        if let Err(e) = self.guild_id.edit_nickname(&ctx.http, None).await {
+            tracing::debug!(idx = self.idx, error = %e, "startup nickname reset failed (may already be clear)");
+        }
+        if let Some(manager) = songbird::get(&ctx).await {
+            let _ = manager.remove(self.guild_id).await;
+        }
+
         tokio::spawn(puppet_command_loop(
             self.bridge.clone(),
             ctx,
@@ -610,67 +621,110 @@ impl EventHandler for PuppetHandler {
     /// gateway, but presence must be decided once). A non-bot user joining the
     /// target channel gets a ghost; leaving (or moving away) retires it.
     #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
-    async fn voice_state_update(&self, _ctx: Context, _old: Option<VoiceState>, new: VoiceState) {
-        if self.idx != 0 {
-            return;
-        }
-        // Only this bridge's guild.
-        if new.guild_id != Some(self.guild_id) {
+    async fn voice_state_update(&self, ctx: Context, _old: Option<VoiceState>, new: VoiceState) {
+        if self.idx != 0 || new.guild_id != Some(self.guild_id) {
             return;
         }
         let user_id = new.user_id.get();
-        // Skip bots — our own puppets (definitively, via `bot_ids`) and any other
-        // bot in the channel (no ghost for a non-human).
-        let is_bot = new.member.as_ref().is_some_and(|m| m.user.bot)
-            || self
-                .bot_ids
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .contains(&user_id);
-        if is_bot {
+        if new.channel_id == Some(self.channel_id) {
+            self.ensure_ghost(&ctx, user_id, new.member.as_ref()).await;
+        } else {
+            self.drop_ghost(user_id);
+        }
+    }
+
+    /// On (re)connect, seed ghosts for everyone **already** in the target voice
+    /// channel — `voice_state_update` only fires on later changes, so without this
+    /// users present before the bridge started would never get a ghost. Slot-0
+    /// only; idempotent (re-runs and reconnects are no-ops via `ensure_ghost`).
+    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
+    async fn guild_create(&self, ctx: Context, guild: serenity::model::guild::Guild, _is_new: Option<bool>) {
+        if self.idx != 0 || guild.id != self.guild_id {
             return;
         }
+        let present: Vec<u64> = guild
+            .voice_states
+            .iter()
+            .filter(|(_, vs)| vs.channel_id == Some(self.channel_id))
+            .map(|(uid, _)| uid.get())
+            .collect();
+        tracing::info!(count = present.len(), "guild_create: seeding ghosts for existing voice members");
+        for uid in present {
+            // voice_states carries no member object; ensure_ghost resolves the
+            // name (and bot check) via a member lookup when needed.
+            self.ensure_ghost(&ctx, uid, None).await;
+        }
+    }
+}
 
-        let in_channel = new.channel_id == Some(self.channel_id);
-        let key = user_id.to_string();
-        let known = self
+impl PuppetHandler {
+    /// Mint a ghost for a Discord user in the target channel if they don't have
+    /// one yet. Skips bridge-owned puppets and any other bot. Resolves the
+    /// display name from the supplied `Member` if present, else via a lookup.
+    async fn ensure_ghost(&self, ctx: &Context, user_id: u64, member: Option<&Member>) {
+        if self
+            .bot_ids
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&user_id)
+            || member.is_some_and(|m| m.user.bot)
+        {
+            return;
+        }
+        if self
             .user_sinks
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(&user_id);
+            .contains_key(&user_id)
+        {
+            return; // already has a ghost
+        }
 
-        match (in_channel, known) {
-            (true, false) => {
-                // Joined (or moved into) the channel → mint a ghost.
-                let name = new
-                    .member
-                    .as_ref()
-                    .and_then(|m| {
-                        m.nick
-                            .clone()
-                            .or_else(|| m.user.global_name.clone())
-                            .or_else(|| Some(m.user.name.clone()))
-                    })
-                    .unwrap_or_else(|| key.clone());
-                let sink = self.capture_router.assign(&key, &name);
-                self.user_sinks
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(user_id, sink);
-                tracing::info!(user_id, display_name = %name, "Discord user joined — ghost assigned");
-            }
-            (false, true) => {
-                // Left or moved away → retire the ghost.
-                self.user_sinks
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&user_id);
-                self.capture_router.release(&key);
-                tracing::info!(user_id, "Discord user left — ghost released");
-            }
-            _ => {}
+        // Resolve display name + Discord avatar URL from the same Member (the one
+        // the event carried, or a lookup when absent — e.g. the guild_create path).
+        let (name, avatar_url) = match member {
+            Some(m) => (member_display_name(m), m.user.avatar_url()),
+            None => match self.guild_id.member(&ctx.http, UserId::new(user_id)).await {
+                Ok(m) if m.user.bot => return, // a bot discovered via lookup
+                Ok(m) => (member_display_name(&m), m.user.avatar_url()),
+                Err(e) => {
+                    tracing::debug!(user_id, error = %e, "member lookup failed; using id as name");
+                    (user_id.to_string(), None)
+                }
+            },
+        };
+
+        let sink =
+            self.capture_router
+                .assign(&user_id.to_string(), &name, avatar_url.as_deref());
+        self.user_sinks
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(user_id, sink);
+        tracing::info!(user_id, display_name = %name, "Discord user present — ghost assigned");
+    }
+
+    /// Retire a user's ghost if they had one (left or moved out of the channel).
+    fn drop_ghost(&self, user_id: u64) {
+        let had = self
+            .user_sinks
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&user_id)
+            .is_some();
+        if had {
+            self.capture_router.release(&user_id.to_string());
+            tracing::info!(user_id, "Discord user left — ghost released");
         }
     }
+}
+
+/// Resolve a Discord member's display name: server nick → global name → username.
+fn member_display_name(m: &Member) -> String {
+    m.nick
+        .clone()
+        .or_else(|| m.user.global_name.clone())
+        .unwrap_or_else(|| m.user.name.clone())
 }
 
 /// Drain assign/release commands for one puppet, driving its voice connection.
@@ -704,6 +758,7 @@ async fn puppet_command_loop(
                     channel_id,
                     &mixer,
                     &exclude,
+                    &ssrc_map,
                     &nickname_prefix,
                     &current_ssrc,
                     &display_name,
@@ -792,18 +847,10 @@ async fn puppet_become_anchor(
     let overflow_input =
         Input::from(RawAdapter::new(overflow_src, PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS));
     let _overflow_handle = call.play_input(overflow_input);
-    call.add_global_event(
-        CoreEvent::SpeakingStateUpdate.into(),
-        SpeakingLogger::new(bridge.clone(), ssrc_map.clone()),
-    );
-    for ev in [
-        CoreEvent::DriverConnect,
-        CoreEvent::DriverReconnect,
-        CoreEvent::DriverDisconnect,
-        CoreEvent::ClientDisconnect,
-    ] {
-        call.add_global_event(ev.into(), ConnectionLogger::new(bridge.clone(), ssrc_map.clone()));
-    }
+    // NOTE: `SpeakingLogger` (SSRC→user map) and `ConnectionLogger` are registered
+    // in `puppet_join` *before* the connection, not here — Discord emits speaking
+    // announcements around connect, so a handler attached after join misses them
+    // (the same "register before join" lesson as the DriverConnect SSRC registrar).
     tracing::info!(idx, "anchor capture active — Discord→Matrix demux from this puppet");
 }
 
@@ -832,6 +879,7 @@ async fn puppet_join(
     channel_id: ChannelId,
     mixer: &Arc<PlaybackMixer>,
     exclude: &SharedExclude,
+    ssrc_map: &SsrcMap,
     nickname_prefix: &str,
     current_ssrc: &Arc<StdMutex<Option<u32>>>,
     display_name: &str,
@@ -841,13 +889,18 @@ async fn puppet_join(
         return;
     };
 
-    // Register the SSRC-exclusion handler and start the playback source on the
-    // Call *before* connecting. `DriverConnect` (which carries our SSRC) fires
-    // *during* `manager.join().await` — registering after the await returns
-    // misses it entirely, so the puppet's SSRC never lands in the exclude set
-    // and the listener loops our playback back to Matrix as an echo. Events go
-    // to the driver's persistent event task, so pre-registration is safe; the
-    // Call from `get_or_insert` is the same one `join` connects.
+    // Register handlers and start the playback source on the Call *before*
+    // connecting. Two events fire *during* `manager.join().await` and are missed
+    // if a handler is attached after the await returns:
+    //   - `DriverConnect` carries our own SSRC (echo-exclusion) — see Phase 7.
+    //   - `SpeakingStateUpdate` carries other users' SSRC→user_id; Discord emits
+    //     these around connect, so registering `SpeakingLogger` late loses the
+    //     initial batch and a Matrix listener can't hear already-present speakers
+    //     until they speak again (Phase 8 live-test fix).
+    // Events go to the driver's persistent event task, so pre-registration is
+    // safe; the Call from `get_or_insert` is the same one `join` connects. Every
+    // assigned puppet registers `SpeakingLogger`/`ConnectionLogger` (all are in
+    // the channel; they share `ssrc_map`, redundant writes are harmless).
     let call_lock = manager.get_or_insert(guild_id);
     {
         let mut call = call_lock.lock().await;
@@ -860,6 +913,17 @@ async fn puppet_join(
                 current_ssrc: current_ssrc.clone(),
             },
         );
+        call.add_global_event(
+            CoreEvent::SpeakingStateUpdate.into(),
+            SpeakingLogger::new(bridge.clone(), ssrc_map.clone()),
+        );
+        for ev in [
+            CoreEvent::DriverReconnect,
+            CoreEvent::DriverDisconnect,
+            CoreEvent::ClientDisconnect,
+        ] {
+            call.add_global_event(ev.into(), ConnectionLogger::new(bridge.clone(), ssrc_map.clone()));
+        }
         // Play this puppet's single-participant mixer into the channel.
         let source = PlaybackSource::new(mixer.clone());
         let input = Input::from(RawAdapter::new(source, PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS));

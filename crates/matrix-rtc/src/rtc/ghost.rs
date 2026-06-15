@@ -111,6 +111,7 @@ enum GhostCommand {
     Assign {
         key: String,
         display_name: String,
+        avatar_url: Option<String>,
         frame_rx: mpsc::Receiver<Vec<i16>>,
     },
     /// Retire the ghost for `key`.
@@ -192,7 +193,7 @@ impl GhostPool {
 
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
-                GhostCommand::Assign { key, display_name, frame_rx } => {
+                GhostCommand::Assign { key, display_name, avatar_url, frame_rx } => {
                     if ghosts.contains_key(&key) {
                         // Idempotent: a duplicate assign reuses the existing
                         // ghost (the sink was already returned by `assign`).
@@ -218,7 +219,7 @@ impl GhostPool {
                     let cfg = self.cfg.clone();
                     let focus = focus.clone().expect("focus set above");
                     tokio::spawn(
-                        run_ghost(cfg, focus, key, display_name, frame_rx, cancel)
+                        run_ghost(cfg, focus, key, display_name, avatar_url, frame_rx, cancel)
                             .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
                     );
                 }
@@ -240,7 +241,7 @@ impl GhostPool {
 }
 
 impl CaptureRouter for GhostPool {
-    fn assign(&self, key: &str, display_name: &str) -> Arc<dyn CaptureSink> {
+    fn assign(&self, key: &str, display_name: &str, avatar_url: Option<&str>) -> Arc<dyn CaptureSink> {
         let mut sinks = self.sinks.lock().unwrap_or_else(PoisonError::into_inner);
         // Idempotent: a re-join for the same Discord user reuses its sink/ghost.
         if let Some(sink) = sinks.get(key) {
@@ -254,6 +255,7 @@ impl CaptureRouter for GhostPool {
             .send(GhostCommand::Assign {
                 key: key.to_owned(),
                 display_name: display_name.to_owned(),
+                avatar_url: avatar_url.map(str::to_owned),
                 frame_rx,
             })
             .is_err()
@@ -287,11 +289,13 @@ impl CaptureRouter for GhostPool {
 /// One ghost's full lifecycle: register/join/connect/publish, post call
 /// membership, then publish the speaker's audio until cancelled, retracting
 /// membership and disconnecting on the way out.
+#[allow(clippy::too_many_arguments)]
 async fn run_ghost(
     cfg: GhostConfig,
     focus: LivekitFocusInfo,
     key: String,
     display_name: String,
+    avatar_url: Option<String>,
     frame_rx: mpsc::Receiver<Vec<i16>>,
     cancel: CancellationToken,
 ) {
@@ -317,6 +321,14 @@ async fn run_ghost(
         }
         if let Err(e) = set_displayname(&cfg, &ghost_mxid, &display_name).await {
             tracing::warn!(error = %e, "ghost set_displayname failed (continuing)");
+        }
+        // Mirror the Discord avatar onto the ghost's Matrix profile (best-effort;
+        // never blocks the ghost going live). Re-set on each assign — cheap, and
+        // it tracks avatar changes across rejoins.
+        if let Some(url) = avatar_url.as_deref() {
+            if let Err(e) = set_avatar(&cfg, &ghost_mxid, url).await {
+                tracing::warn!(error = %e, "ghost set_avatar failed (continuing)");
+            }
         }
         // 2. Join the room (required before posting m.call.member).
         if let Err(e) = join_room(&cfg, &ghost_mxid).await {
@@ -451,21 +463,27 @@ async fn connect_and_publish(
 
 // ─── Raw client-server API helpers (appservice masquerade) ──────────────────────
 
-/// Build a client-server API URL under `/_matrix/client/v3`, percent-encoding
-/// each path segment, with an optional `?user_id=` masquerade query.
-fn cs_url(homeserver: &str, segments: &[&str], masquerade: Option<&str>) -> Result<Url> {
+/// Build a Matrix HTTP API URL from full path segments, percent-encoding each,
+/// with an optional `?user_id=` masquerade query.
+fn matrix_url(homeserver: &str, segments: &[&str], masquerade: Option<&str>) -> Result<Url> {
     let mut url = Url::parse(homeserver).with_context(|| format!("parsing homeserver '{homeserver}'"))?;
     {
         let mut path = url
             .path_segments_mut()
             .map_err(|_| anyhow!("homeserver URL cannot be a base: {homeserver}"))?;
-        path.extend(["_matrix", "client", "v3"]);
         path.extend(segments);
     }
     if let Some(user_id) = masquerade {
         url.query_pairs_mut().append_pair("user_id", user_id);
     }
     Ok(url)
+}
+
+/// Build a client-server API URL under `/_matrix/client/v3` (the common case).
+fn cs_url(homeserver: &str, segments: &[&str], masquerade: Option<&str>) -> Result<Url> {
+    let mut full = vec!["_matrix", "client", "v3"];
+    full.extend_from_slice(segments);
+    matrix_url(homeserver, &full, masquerade)
 }
 
 /// Read an error response body for logging (bearer tokens are never in bodies).
@@ -524,6 +542,83 @@ async fn set_displayname(cfg: &GhostConfig, ghost_mxid: &str, name: &str) -> Res
         return Err(anyhow!("set displayname failed: {}", err_body(resp).await));
     }
     Ok(())
+}
+
+/// Mirror a Discord avatar onto the ghost: download it from Discord's CDN, upload
+/// it to the homeserver media repo (masqueraded), and set the ghost's avatar_url.
+async fn set_avatar(cfg: &GhostConfig, ghost_mxid: &str, discord_avatar_url: &str) -> Result<()> {
+    // 1. Download from the Discord CDN (public, no auth).
+    let resp = cfg
+        .http
+        .get(discord_avatar_url)
+        .send()
+        .await
+        .context("GET discord avatar")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("discord avatar fetch returned {}", resp.status()));
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/png")
+        .to_owned();
+    let bytes = resp.bytes().await.context("reading discord avatar bytes")?;
+
+    // 2. Upload to the Matrix media repo as the ghost → mxc:// URI.
+    let mxc = upload_media(cfg, ghost_mxid, &content_type, bytes.to_vec()).await?;
+
+    // 3. Point the ghost's profile at it.
+    let url = cs_url(
+        &cfg.homeserver_url,
+        &["profile", ghost_mxid, "avatar_url"],
+        Some(ghost_mxid),
+    )?;
+    let resp = cfg
+        .http
+        .put(url)
+        .bearer_auth(&cfg.as_token)
+        .json(&serde_json::json!({ "avatar_url": mxc }))
+        .send()
+        .await
+        .context("PUT /profile/avatar_url")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("set avatar_url failed: {}", err_body(resp).await));
+    }
+    tracing::info!(mxc = %mxc, "ghost avatar set");
+    Ok(())
+}
+
+/// Upload bytes to the homeserver media repo masqueraded as the ghost; returns
+/// the `mxc://` content URI.
+async fn upload_media(
+    cfg: &GhostConfig,
+    ghost_mxid: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+) -> Result<String> {
+    let url = matrix_url(
+        &cfg.homeserver_url,
+        &["_matrix", "media", "v3", "upload"],
+        Some(ghost_mxid),
+    )?;
+    let resp = cfg
+        .http
+        .post(url)
+        .bearer_auth(&cfg.as_token)
+        .header(reqwest::header::CONTENT_TYPE, content_type)
+        .body(bytes)
+        .send()
+        .await
+        .context("POST /_matrix/media/v3/upload")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("media upload failed: {}", err_body(resp).await));
+    }
+    let v: serde_json::Value = resp.json().await.context("parsing media upload response")?;
+    v.get("content_uri")
+        .and_then(|x| x.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("media upload response missing content_uri"))
 }
 
 /// Join the call room as the ghost (masqueraded). Idempotent on the server.

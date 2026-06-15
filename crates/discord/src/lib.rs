@@ -300,12 +300,19 @@ impl SpeakingLogger {
 impl SongbirdEventHandler for SpeakingLogger {
     #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        if let EventContext::SpeakingStateUpdate(Speaking { ssrc, user_id: Some(uid), .. }) = ctx {
-            self.ssrc_map
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(*ssrc, uid.0);
-            tracing::info!(ssrc, user_id = uid.0, "SSRC → Discord user mapping");
+        if let EventContext::SpeakingStateUpdate(Speaking { ssrc, user_id, speaking, .. }) = ctx {
+            match user_id {
+                Some(uid) => {
+                    self.ssrc_map
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(*ssrc, uid.0);
+                    tracing::info!(ssrc, user_id = uid.0, ?speaking, "SSRC → Discord user mapping");
+                }
+                // Diagnostic: an update with no user_id can't be attributed. Seeing
+                // these (vs. nothing) tells us the event fires but lacks the id.
+                None => tracing::debug!(ssrc, ?speaking, "speaking-state update without user_id"),
+            }
         }
         None
     }

@@ -141,16 +141,16 @@ pub(crate) async fn run(
     }
 
     // ── Static fields derived from config/client ──────────────────────────────
-    let user_id = client
-        .user_id()
-        .ok_or_else(|| anyhow::anyhow!("Matrix client not authenticated"))?
-        .to_owned();
-    let device_id = client
-        .device_id()
-        .ok_or_else(|| anyhow::anyhow!("Matrix client has no device id"))?
-        .to_owned();
     let room_id = RoomId::parse(&mx_cfg.room_id)?;
     let room_id_str = mx_cfg.room_id.clone();
+
+    // The bridge bot is a hidden subscriber and never posts its own call
+    // membership — but a prior process killed mid-call may have left one behind.
+    // Retract any stale self-membership at startup so the bot stays out of EC's
+    // roster (the puppets/ghosts are the visible identities).
+    if let Some(uid) = client.user_id() {
+        crate::matrix::retract_self_call_membership(&client, &room_id, uid).await;
+    }
 
     let mut active_session: Option<ActiveSession> = None;
     let mut joined = false;
@@ -160,19 +160,16 @@ pub(crate) async fn run(
 
         match (joined, is_active) {
             (false, true) => {
-                // A human appeared — post membership and connect (subscribe-only).
-                tracing::info!("call became active — joining");
+                // A human appeared — connect as a subscribe-only LiveKit
+                // participant. NOTE: the subscriber deliberately does NOT post an
+                // m.call.member event. Element Call builds its participant roster
+                // from m.call.member, so skipping it keeps the silent, non-
+                // publishing bridge bot out of the call UI — it still receives
+                // every Matrix speaker's track (the LiveKit JWT is authorized by
+                // the OpenID token, not by membership). Ghosts post their own
+                // membership (they must be seen); only this listener is hidden.
+                tracing::info!("call became active — connecting subscriber (no membership)");
 
-                // 1. Post m.call.member join first so EC maps our identity.
-                if let Some(room) = client.get_room(&room_id) {
-                    if let Err(e) = membership::join(&room, &user_id, &device_id, &focus).await {
-                        tracing::error!(error = %e, "failed to post call membership");
-                    }
-                } else {
-                    tracing::warn!("room not in local state");
-                }
-
-                // 2–3. Connect LiveKit and subscribe to remote tracks.
                 match join_livekit(
                     &client,
                     &http,
@@ -193,23 +190,14 @@ pub(crate) async fn run(
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "failed to start LiveKit session");
-                        // Retract the membership we just posted.
-                        if let Some(room) = client.get_room(&room_id) {
-                            let _ = membership::leave(&room, &user_id, &device_id).await;
-                        }
                     }
                 }
             }
 
             (true, false) => {
-                // All humans left — tear down.
-                tracing::info!("call ended — leaving");
+                // All humans left — tear down (no membership to retract).
+                tracing::info!("call ended — disconnecting subscriber");
                 teardown(&mut active_session, &shared_provider, &router).await;
-                if let Some(room) = client.get_room(&room_id) {
-                    if let Err(e) = membership::leave(&room, &user_id, &device_id).await {
-                        tracing::error!(error = %e, "failed to post call leave");
-                    }
-                }
                 joined = false;
             }
 
@@ -221,12 +209,9 @@ pub(crate) async fn run(
         }
     }
 
-    // Cleanup on shutdown.
+    // Cleanup on shutdown (no membership to retract — subscriber never posts one).
     if joined {
         teardown(&mut active_session, &shared_provider, &router).await;
-        if let Some(room) = client.get_room(&room_id) {
-            let _ = membership::leave(&room, &user_id, &device_id).await;
-        }
     }
 
     tracing::info!("RTC task exiting");
