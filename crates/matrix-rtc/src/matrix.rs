@@ -15,6 +15,7 @@ use matrix_sdk::{
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{Mutex, watch};
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use nvb_audio::routing::PlaybackRouter;
@@ -228,6 +229,7 @@ pub(crate) async fn run(
     call_active_tx: watch::Sender<bool>,
     router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     let bot_user_id: OwnedUserId = cfg.bot_user_id.parse()?;
     let room_id = RoomId::parse(&cfg.room_id)?;
@@ -307,16 +309,27 @@ pub(crate) async fn run(
     // Retry on transient network errors (connection resets, timeouts) with a
     // short back-off so the bridge survives long idles.
     loop {
-        match client.sync(SyncSettings::default()).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                let msg = e.to_string();
-                // 401/403 are auth failures — propagate immediately.
-                if msg.contains("401") || msg.contains("403") || msg.contains("M_UNKNOWN_TOKEN") {
-                    return Err(anyhow::anyhow!("Matrix sync fatal auth error: {e}"));
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                tracing::info!("Matrix sync stopping (shutdown)");
+                return Ok(());
+            }
+            res = client.sync(SyncSettings::default()) => match res {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    // 401/403 are auth failures — propagate immediately.
+                    if msg.contains("401") || msg.contains("403") || msg.contains("M_UNKNOWN_TOKEN") {
+                        return Err(anyhow::anyhow!("Matrix sync fatal auth error: {e}"));
+                    }
+                    tracing::warn!(error = %e, "Matrix sync error — retrying in 5 s");
+                    // Make the back-off interruptible by shutdown too.
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return Ok(()),
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    }
                 }
-                tracing::warn!(error = %e, "Matrix sync error — retrying in 5 s");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         }
     }

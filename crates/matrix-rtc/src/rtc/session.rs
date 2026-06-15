@@ -91,6 +91,7 @@ pub fn decode_jwt_claims(jwt: &str) -> Result<(String, Option<String>)> {
 /// When `use_e2ee` is true, configures HKDF/GCM frame encryption and returns
 /// a `KeyProvider` in the session. When false (the common case for deployments
 /// that run EC without media E2EE), connects plainly — no frame encryption.
+#[allow(clippy::too_many_arguments)]
 pub async fn connect(
     url: &str,
     jwt: &str,
@@ -99,6 +100,7 @@ pub async fn connect(
     room_id: OwnedRoomId,
     router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
+    parent_cancel: CancellationToken,
 ) -> Result<LiveSession> {
     let span = tracing::info_span!("rtc.session", sfu_url = %url, use_e2ee);
     let _guard = span.enter();
@@ -151,7 +153,9 @@ pub async fn connect(
 
     // Drain room events in a background task so the channel doesn't fill up.
     // The same task routes inbound audio tracks to per-participant puppet outputs.
-    let cancel = CancellationToken::new();
+    // Child of the bridge shutdown token, so a process-wide shutdown also closes
+    // this session's event task + per-track consumers.
+    let cancel = parent_cancel.child_token();
     let event_task = tokio::spawn(
         handle_room_events(events, client, room_id, router, cancel.clone(), bridge.clone())
             .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),

@@ -381,6 +381,7 @@ pub async fn run(
     capture_sink: Option<Arc<CaptureSink>>,
     pool: Arc<PuppetPool>,
     bridge: Arc<str>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let guild_id: u64 = cfg
         .guild_id
@@ -400,7 +401,7 @@ pub async fn run(
     // the pool so the anchor can attribute and the voice-state handler can drive
     // ghost presence.
     tracing::info!("starting Discord gateway (puppet pool)");
-    pool.run_puppets(guild_id, channel_id, bridge, capture_router, capture_sink)
+    pool.run_puppets(guild_id, channel_id, bridge, capture_router, capture_sink, shutdown)
         .await?;
     Ok(())
 }

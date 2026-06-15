@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use futures_util::future::{join_all, FutureExt};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
@@ -50,11 +52,11 @@ async fn main() -> Result<()> {
     // Capture sinks (when `capture_wav` is on) are collected so the Ctrl-C
     // handler can finalise every bridge's WAV headers on shutdown.
     let mut capture_sinks: Vec<Arc<CaptureSink>> = Vec::new();
-    // Pools collected so the Ctrl-C handler can release puppets (leave voice,
-    // reset nicknames) and retire ghosts (retract m.call.member) before exit —
-    // otherwise a killed process leaves zombie bots/ghosts behind.
-    let mut shutdown_puppets: Vec<Arc<PuppetPool>> = Vec::new();
-    let mut shutdown_ghosts: Vec<Arc<GhostPool>> = Vec::new();
+    // One cancellation root per bridge. Ctrl-C cancels all of them; each bridge's
+    // crates select! on it to leave voice / retract memberships / close LiveKit,
+    // and we then *await* (with a timeout) that the bridge futures unwind to
+    // baseline — replacing the old fire-and-forget release_all + fixed sleep.
+    let mut bridge_roots: Vec<CancellationToken> = Vec::new();
 
     for (idx, bridge) in cfg.bridges.into_iter().enumerate() {
         // Owned + `'static` so it can move into the spawned task (unlike the old
@@ -80,7 +82,6 @@ async fn main() -> Result<()> {
         // pushes into and the owner of the Discord-side puppet clients.
         let pool = PuppetPool::new(&bridge.discord);
         let router: Arc<dyn PlaybackRouter> = pool.clone();
-        shutdown_puppets.push(pool.clone());
 
         // Discord → Matrix attribution (Phase 8). The ghost pool mints one Matrix
         // appservice ghost per Discord speaker. Created once and shared: handed to
@@ -89,7 +90,10 @@ async fn main() -> Result<()> {
         let ghost_pool = GhostPool::new(&bridge.matrix, &bridge.livekit)
             .context("building ghost pool")?;
         let capture_router: Arc<dyn CaptureRouter> = ghost_pool.clone();
-        shutdown_ghosts.push(ghost_pool.clone());
+
+        // Per-bridge shutdown root, threaded into both sides.
+        let bridge_root = CancellationToken::new();
+        bridge_roots.push(bridge_root.clone());
 
         let span = tracing::info_span!("bridge", name = %label);
         let bridge_task = bridge.clone();
@@ -103,6 +107,7 @@ async fn main() -> Result<()> {
                     router,
                     ghost_pool,
                     label.clone(),
+                    bridge_root.clone(),
                 ),
                 nvb_discord::run(
                     &bridge_task.discord,
@@ -110,6 +115,7 @@ async fn main() -> Result<()> {
                     capture_sink,
                     pool,
                     label.clone(),
+                    bridge_root.clone(),
                 ),
             );
             match result {
@@ -122,40 +128,41 @@ async fn main() -> Result<()> {
         bridge_futs.push(fut.boxed_local());
     }
 
-    // Ctrl-C handler: release puppets (leave voice, reset nicknames) and retire
-    // ghosts (retract m.call.member), finalise WAV headers, then exit. The
-    // release calls only *enqueue* async work (puppet command loops / ghost
-    // driver), so we give it a short drain window before exiting.
-    {
-        let capture_sinks = capture_sinks.clone();
-        let shutdown_puppets = shutdown_puppets.clone();
-        let shutdown_ghosts = shutdown_ghosts.clone();
-        tokio::spawn(async move {
-            if let Err(e) = tokio::signal::ctrl_c().await {
+    // Drive all bridges. On Ctrl-C, cancel every bridge root and *await* (bounded
+    // by a timeout) that the bridge futures unwind — each side leaves voice,
+    // resets nicknames, retracts ghost m.call.member, and closes LiveKit before
+    // we return.
+    let mut drain = join_all(bridge_futs);
+    tokio::select! {
+        // All bridges ended on their own (errors already logged per bridge).
+        _ = &mut drain => {
+            tracing::warn!("all bridges have exited");
+        }
+        // Operator shutdown.
+        sig = tokio::signal::ctrl_c() => {
+            if let Err(e) = sig {
                 tracing::warn!(error = %e, "ctrl_c signal handler failed");
-                return;
             }
-            tracing::info!("shutting down — releasing puppets and ghosts");
-            for pool in &shutdown_puppets {
-                pool.release_all();
+            tracing::info!("shutting down — cancelling bridges and draining to baseline");
+            for root in &bridge_roots {
+                root.cancel();
             }
-            for ghost_pool in &shutdown_ghosts {
-                ghost_pool.release_all();
+            // Await graceful teardown, but never hang: a wedged puppet/ghost
+            // can't keep the process alive past the timeout.
+            match tokio::time::timeout(Duration::from_secs(10), &mut drain).await {
+                Ok(_) => tracing::info!("all bridges drained cleanly"),
+                Err(_) => tracing::warn!(
+                    "teardown timed out after 10 s — exiting (some bots/ghosts may linger)"
+                ),
             }
-            // Let the puppet command loops / ghost driver run their teardown
-            // (leave voice, reset nickname, post m.call.member leave) before exit.
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            for sink in &capture_sinks {
-                tracing::info!("finalising WAV files");
-                sink.finalize_all();
-            }
-            std::process::exit(0);
-        });
+        }
     }
 
-    // Stay alive while any bridge runs; returns once all have ended.
-    join_all(bridge_futs).await;
-    tracing::warn!("all bridges have exited");
+    // Finalise WAV headers after teardown (no-op unless capture_wav is on).
+    for sink in &capture_sinks {
+        tracing::info!("finalising WAV files");
+        sink.finalize_all();
+    }
 
     Ok(())
 }

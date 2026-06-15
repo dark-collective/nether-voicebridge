@@ -3106,6 +3106,7 @@ dependencies = [
  "nvb-matrix-rtc",
  "rustls 0.23.40",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3279,6 +3280,7 @@ dependencies = [
  "songbird",
  "symphonia",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

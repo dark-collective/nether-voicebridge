@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use nvb_audio::routing::PlaybackRouter;
 use nvb_config::{LiveKitConfig, MatrixConfig};
@@ -38,9 +39,18 @@ pub async fn run(
     router: Arc<dyn PlaybackRouter>,
     ghost_pool: Arc<GhostPool>,
     bridge: Arc<str>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     // Build the client first (surfaces login/restore errors before the loops).
     let client = matrix::build_client(matrix_cfg, &bridge).await?;
+
+    // Clear any ghost m.call.member left by a prior crashed run before the
+    // subscriber joins, so Element Call starts from a clean roster (the bridge
+    // bot's own stale membership is retracted separately in `rtc::run`). Reads
+    // state with the now-synced client; best-effort.
+    if let Err(e) = ghost_pool.sweep_stale_ghosts(&client).await {
+        tracing::warn!(error = %e, "stale-ghost sweep failed (continuing)");
+    }
 
     // The call-active watch lives entirely between the sync loop (sender) and
     // the RTC loop (receiver) — created here, never exposed.
@@ -53,6 +63,7 @@ pub async fn run(
             call_active_tx,
             router.clone(),
             bridge.clone(),
+            shutdown.clone(),
         ),
         rtc::run(
             client,
@@ -61,8 +72,9 @@ pub async fn run(
             call_active_rx,
             router,
             bridge.clone(),
+            shutdown.clone(),
         ),
-        ghost_pool.run(bridge.clone()),
+        ghost_pool.run(bridge.clone(), shutdown.clone()),
     )?;
 
     Ok(())

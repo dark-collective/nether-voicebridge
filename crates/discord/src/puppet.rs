@@ -33,7 +33,8 @@ use songbird::{
     input::{Input, RawAdapter},
     CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler, SerenityInit,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use nvb_audio::mixer::PlaybackMixer;
 use nvb_audio::routing::{CaptureRouter, ParticipantSink, PlaybackRouter};
@@ -88,6 +89,10 @@ enum PuppetCommand {
     SetNickname(String),
     /// Reset the nickname, leave voice, drop the SSRC exclusion.
     Release,
+    /// Like [`Release`](PuppetCommand::Release), but fire `done` once the puppet
+    /// has actually left voice + reset its nickname. Used by graceful shutdown to
+    /// **await** teardown completion (vs. fire-and-forget `Release`).
+    ReleaseAndAck { done: oneshot::Sender<()> },
 }
 
 /// Where a participant's audio is currently routed.
@@ -122,6 +127,12 @@ struct PuppetSlot {
     /// True while assigned to a participant.  Only mutated under the
     /// `assignments` lock, so `Relaxed` ordering is sufficient.
     busy: AtomicBool,
+    /// Set true once this puppet's gateway `ready` has fired and its command
+    /// loop is live. The shutdown drain only awaits `ReleaseAndAck` from
+    /// connected puppets (a never-connected puppet has no loop to ack), and —
+    /// because the command channel is FIFO — that ack also confirms any earlier
+    /// racing fire-and-forget `Release` has been processed.
+    connected: Arc<AtomicBool>,
 }
 
 /// A swappable audio route: the mixer a participant's frames currently flow into.
@@ -173,6 +184,7 @@ impl PuppetPool {
                     name: StdMutex::new(None),
                     muted: AtomicBool::new(false),
                     busy: AtomicBool::new(false),
+                    connected: Arc::new(AtomicBool::new(false)),
                 }
             })
             .collect();
@@ -198,6 +210,7 @@ impl PuppetPool {
         bridge: Arc<str>,
         capture_router: Arc<dyn CaptureRouter>,
         capture_sink: Option<Arc<CaptureSink>>,
+        shutdown: CancellationToken,
     ) -> Result<()> {
         if self.slots.is_empty() {
             tracing::warn!("no puppet tokens configured — Discord side has no bots");
@@ -239,6 +252,7 @@ impl PuppetPool {
                 anchor: self.anchor.clone(),
                 overflow_mixer: self.overflow_mixer.clone(),
                 current_ssrc: slot.current_ssrc.clone(),
+                connected: slot.connected.clone(),
                 cmd_rx: StdMutex::new(Some(rx)),
             };
             let token = slot.token.clone();
@@ -262,8 +276,58 @@ impl PuppetPool {
             });
         }
 
-        futures_util::future::try_join_all(futs).await?;
+        // Drive every puppet's serenity client. On a shutdown signal, gracefully
+        // drain (each assigned puppet leaves voice + resets its nickname) while
+        // the clients are *still polled* — `puppet_leave` needs the live gateway
+        // to send the voice-channel leave — then return, dropping the clients so
+        // the gateways close. A puppet client erroring on its own still ends the
+        // Discord side as before.
+        let clients = futures_util::future::try_join_all(futs);
+        tokio::pin!(clients);
+
+        tokio::select! {
+            r = &mut clients => return r.map(|_| ()),
+            _ = shutdown.cancelled() => {}
+        }
+
+        tracing::info!("Discord shutdown — draining puppets (leave voice, reset nicknames)");
+        tokio::select! {
+            _ = self.shutdown() => tracing::info!("puppets drained"),
+            // Keep clients polled during the drain; if one dies, stop waiting.
+            r = &mut clients => {
+                if let Err(e) = r {
+                    tracing::warn!(error = %e, "a puppet client exited during drain");
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Graceful teardown: ask every connected puppet to leave voice + reset its
+    /// nickname, and **await** confirmation, so shutdown leaves the Discord voice
+    /// channel at baseline. Driven off `connected` (not the `assignments` map):
+    /// on shutdown the Matrix side's per-track consumers and call-end teardown
+    /// fire their own (fire-and-forget) `release`s, which could empty that map
+    /// out from under us. Because the command channel is FIFO, the awaited
+    /// `ReleaseAndAck` ack also confirms any such earlier `Release` has run.
+    async fn shutdown(&self) {
+        let mut acks = Vec::new();
+        for slot in &self.slots {
+            if !slot.connected.load(Ordering::Relaxed) {
+                continue; // never connected — no command loop to ack
+            }
+            let (tx, rx) = oneshot::channel();
+            if slot
+                .cmd_tx
+                .try_send(PuppetCommand::ReleaseAndAck { done: tx })
+                .is_ok()
+            {
+                acks.push(rx);
+            }
+        }
+        // Await every connected puppet's confirmed leave. The outer shutdown
+        // timeout in `main` bounds this so a wedged puppet can't hang the process.
+        futures_util::future::join_all(acks).await;
     }
 
     /// Get or create the route handle for `key`, re-pointing it at `mixer`.
@@ -558,6 +622,9 @@ struct PuppetHandler {
     /// Shared overflow mix — the anchor also plays this (un-slotted speakers).
     overflow_mixer: Arc<PlaybackMixer>,
     current_ssrc: Arc<StdMutex<Option<u32>>>,
+    /// Shared with this puppet's slot; set true once the command loop is live so
+    /// the shutdown drain knows to await this puppet (see `PuppetPool::shutdown`).
+    connected: Arc<AtomicBool>,
     cmd_rx: StdMutex<Option<mpsc::Receiver<PuppetCommand>>>,
 }
 
@@ -614,6 +681,8 @@ impl EventHandler for PuppetHandler {
             self.current_ssrc.clone(),
             rx,
         ));
+        // The command loop is live — the shutdown drain may now await this puppet.
+        self.connected.store(true, Ordering::Relaxed);
     }
 
     /// Drive ghost **presence** off Discord voice-channel membership (Phase 8).
@@ -793,6 +862,11 @@ async fn puppet_command_loop(
             }
             PuppetCommand::Release => {
                 puppet_leave(&ctx, idx, guild_id, &exclude, &current_ssrc).await;
+            }
+            PuppetCommand::ReleaseAndAck { done } => {
+                puppet_leave(&ctx, idx, guild_id, &exclude, &current_ssrc).await;
+                // Signal the drain that this puppet has fully left voice.
+                let _ = done.send(());
             }
         }
     }

@@ -37,12 +37,19 @@ use anyhow::{anyhow, Context, Result};
 use livekit::webrtc::audio_frame::AudioFrame;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::{Room, RoomOptions};
-use matrix_sdk::ruma::{
-    events::call::member::{
-        ActiveFocus, ActiveLivekitFocus, Application, CallApplicationContent,
-        CallMemberEventContent, CallMemberStateKey, CallScope, Focus, LivekitFocus,
+use matrix_sdk::{
+    deserialized_responses::SyncOrStrippedState,
+    ruma::{
+        events::{
+            SyncStateEvent,
+            call::member::{
+                ActiveFocus, ActiveLivekitFocus, Application, CallApplicationContent,
+                CallMemberEventContent, CallMemberStateKey, CallScope, Focus, LivekitFocus,
+            },
+        },
+        OwnedDeviceId, OwnedUserId, RoomId, UserId,
     },
-    OwnedDeviceId, OwnedUserId, UserId,
+    Client,
 };
 use reqwest::Url;
 use std::borrow::Cow;
@@ -120,6 +127,15 @@ enum GhostCommand {
     ReleaseAll,
 }
 
+/// A running ghost's control handle, held by the driver. `cancel` signals the
+/// `run_ghost` task to tear down (retract membership, close LiveKit); `join`
+/// lets the driver **await** that teardown so a late `post_membership(leave)`
+/// can never clobber a same-key re-assign or outlive a shutdown drain.
+struct GhostHandle {
+    cancel: CancellationToken,
+    join: tokio::task::JoinHandle<()>,
+}
+
 /// The ghost pool / capture router. Cheap to construct; the appservice work
 /// happens in the driver started by [`GhostPool::run`].
 pub struct GhostPool {
@@ -174,10 +190,66 @@ impl GhostPool {
         }))
     }
 
+    /// Retract any **ghost** `m.call.member` left in the room by a prior crashed
+    /// run, so Element Call starts from a clean roster before new ghosts mint.
+    /// The mirror of the bridge bot's `retract_self_call_membership`, but for
+    /// `@discord_*` senders, retracted via the appservice masquerade.
+    ///
+    /// Reads room state with the bridge bot's joined client (the appservice
+    /// sender is not necessarily in the room, so a raw `as_token` GET could
+    /// 403); writes the retraction masqueraded as each ghost. Best-effort: logs
+    /// and continues so startup is never blocked.
+    pub async fn sweep_stale_ghosts(&self, client: &Client) -> Result<()> {
+        let room_id = RoomId::parse(&self.cfg.room_id)
+            .with_context(|| format!("parsing room_id '{}'", self.cfg.room_id))?;
+        let Some(room) = client.get_room(&room_id) else {
+            tracing::warn!("ghost sweep: room not in local state — skipping");
+            return Ok(());
+        };
+        let raws = room
+            .get_state_events_static::<CallMemberEventContent>()
+            .await
+            .context("reading call memberships for ghost sweep")?;
+        let mut retracted = 0usize;
+        for raw in raws {
+            let Ok(ev) = raw.deserialize() else { continue };
+            let orig = match ev {
+                SyncOrStrippedState::Sync(SyncStateEvent::Original(o)) => o,
+                _ => continue,
+            };
+            // Only our ghosts; skip the bridge bot and real users.
+            if !is_ghost_identity(orig.sender.as_str()) {
+                continue;
+            }
+            // Already retracted — nothing to do.
+            if matches!(orig.content, CallMemberEventContent::Empty(_)) {
+                continue;
+            }
+            let state_key: &str = orig.state_key.as_ref();
+            match retract_membership_raw(&self.cfg, orig.sender.as_str(), state_key).await {
+                Ok(()) => {
+                    retracted += 1;
+                    tracing::info!(
+                        ghost = %orig.sender,
+                        state_key,
+                        "retracted stale ghost call membership"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(ghost = %orig.sender, error = %e, "ghost sweep: retract failed");
+                }
+            }
+        }
+        if retracted > 0 {
+            tracing::info!(retracted, "stale-ghost sweep complete");
+        }
+        Ok(())
+    }
+
     /// Drive the ghost lifecycle. Spawned/awaited from `lib::run` alongside the
     /// Matrix sync and RTC loops. Returns when the command channel closes.
     #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
-    pub async fn run(self: Arc<Self>, bridge: Arc<str>) -> Result<()> {
+    pub async fn run(self: Arc<Self>, bridge: Arc<str>, shutdown: CancellationToken) -> Result<()> {
         let mut cmd_rx = self
             .cmd_rx
             .lock()
@@ -189,15 +261,44 @@ impl GhostPool {
         // the first assign (avoids a startup round-trip when no Discord users
         // are present).
         let mut focus: Option<LivekitFocusInfo> = None;
-        let mut ghosts: HashMap<String, CancellationToken> = HashMap::new();
+        let mut ghosts: HashMap<String, GhostHandle> = HashMap::new();
 
-        while let Some(cmd) = cmd_rx.recv().await {
+        loop {
+            let cmd = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    // Drain every ghost to baseline: cancel + await teardown so all
+                    // `post_membership(leave)` PUTs land before the driver returns.
+                    tracing::info!(count = ghosts.len(), "ghost pool draining (shutdown)");
+                    let draining: Vec<_> = ghosts.drain().collect();
+                    for (_key, handle) in &draining {
+                        handle.cancel.cancel();
+                    }
+                    futures_util::future::join_all(
+                        draining.into_iter().map(|(_key, handle)| handle.join),
+                    )
+                    .await;
+                    tracing::info!("ghost pool drained — teardown complete");
+                    return Ok(());
+                }
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(cmd) => cmd,
+                    None => break,
+                },
+            };
             match cmd {
                 GhostCommand::Assign { key, display_name, avatar_url, frame_rx } => {
-                    if ghosts.contains_key(&key) {
-                        // Idempotent: a duplicate assign reuses the existing
-                        // ghost (the sink was already returned by `assign`).
-                        continue;
+                    // Race fix: if a ghost for this key is still tearing down
+                    // (rapid leave→rejoin), cancel it and **await** its teardown
+                    // — including `post_membership(leave)` — before minting the
+                    // replacement. The deterministic state_key (`D{key}`) is
+                    // shared, so a stale leave PUT landing after the fresh join
+                    // would otherwise hide the rejoined ghost from Element Call.
+                    // The driver is single-task, so awaiting here serializes
+                    // teardown-vs-respawn for free.
+                    if let Some(old) = ghosts.remove(&key) {
+                        old.cancel.cancel();
+                        let _ = old.join.await;
                     }
                     if focus.is_none() {
                         match well_known::discover_livekit_focus(
@@ -215,23 +316,35 @@ impl GhostPool {
                         }
                     }
                     let cancel = CancellationToken::new();
-                    ghosts.insert(key.clone(), cancel.clone());
                     let cfg = self.cfg.clone();
                     let focus = focus.clone().expect("focus set above");
-                    tokio::spawn(
-                        run_ghost(cfg, focus, key, display_name, avatar_url, frame_rx, cancel)
+                    let join = tokio::spawn(
+                        run_ghost(cfg, focus, key.clone(), display_name, avatar_url, frame_rx, cancel.clone())
                             .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
                     );
+                    ghosts.insert(key, GhostHandle { cancel, join });
                 }
                 GhostCommand::Release { key } => {
-                    if let Some(cancel) = ghosts.remove(&key) {
-                        cancel.cancel();
+                    // Await the teardown inline so the leave PUT is guaranteed to
+                    // land before the entry is forgotten (the driver is the sole
+                    // owner; blocking it briefly on a control-plane release is
+                    // fine and keeps releases ordered).
+                    if let Some(handle) = ghosts.remove(&key) {
+                        handle.cancel.cancel();
+                        let _ = handle.join.await;
                     }
                 }
                 GhostCommand::ReleaseAll => {
-                    for (_key, cancel) in ghosts.drain() {
-                        cancel.cancel();
+                    let draining: Vec<_> = ghosts.drain().collect();
+                    for (_key, handle) in &draining {
+                        handle.cancel.cancel();
                     }
+                    // Await every ghost's teardown so all leave PUTs land before
+                    // the driver moves on (used by shutdown drain).
+                    futures_util::future::join_all(
+                        draining.into_iter().map(|(_key, handle)| handle.join),
+                    )
+                    .await;
                 }
             }
         }
@@ -686,12 +799,22 @@ async fn post_membership(
     } else {
         build_membership(&device, focus)
     };
-    let body = serde_json::to_value(&content).context("serializing m.call.member content")?;
+    put_call_member_state(cfg, ghost_mxid, state_key.as_ref(), &content).await
+}
 
-    let state_key_str: &str = state_key.as_ref();
+/// PUT a ghost's `m.call.member` state event (masqueraded as the ghost). The
+/// low-level primitive shared by [`post_membership`] (which builds a fresh
+/// state_key) and [`retract_membership_raw`] (which reuses an observed one).
+async fn put_call_member_state(
+    cfg: &GhostConfig,
+    ghost_mxid: &str,
+    state_key: &str,
+    content: &CallMemberEventContent,
+) -> Result<()> {
+    let body = serde_json::to_value(content).context("serializing m.call.member content")?;
     let url = cs_url(
         &cfg.homeserver_url,
-        &["rooms", &cfg.room_id, "state", CALL_MEMBER_EVENT_TYPE, state_key_str],
+        &["rooms", &cfg.room_id, "state", CALL_MEMBER_EVENT_TYPE, state_key],
         Some(ghost_mxid),
     )?;
     let resp = cfg
@@ -703,13 +826,22 @@ async fn post_membership(
         .await
         .context("PUT /rooms/.../state/m.call.member")?;
     if !resp.status().is_success() {
-        return Err(anyhow!(
-            "post m.call.member ({}) failed: {}",
-            if leave { "leave" } else { "join" },
-            err_body(resp).await
-        ));
+        return Err(anyhow!("put m.call.member failed: {}", err_body(resp).await));
     }
     Ok(())
+}
+
+/// Retract a ghost membership at an **observed** state_key (from room state),
+/// masqueraded as the ghost. Used by the startup sweep: it clears the exact
+/// leftover key a crashed run wrote, even if our key-derivation has since
+/// changed (it does not rebuild `D{key}`).
+async fn retract_membership_raw(
+    cfg: &GhostConfig,
+    ghost_mxid: &str,
+    state_key: &str,
+) -> Result<()> {
+    let content = CallMemberEventContent::new_empty(None);
+    put_call_member_state(cfg, ghost_mxid, state_key, &content).await
 }
 
 /// Build the ghost's `m.call.member` join content — mirrors `rtc::membership::join`.

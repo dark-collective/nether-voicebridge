@@ -36,6 +36,7 @@ use livekit::e2ee::key_provider::KeyProvider;
 use matrix_sdk::{Client, ruma::RoomId};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use nvb_audio::routing::PlaybackRouter;
@@ -70,6 +71,7 @@ pub(crate) async fn run(
     mut call_active_rx: watch::Receiver<bool>,
     router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     // Build a dedicated HTTP client on rustls.
     let http = reqwest::Client::builder().use_rustls_tls().build()?;
@@ -181,6 +183,7 @@ pub(crate) async fn run(
                     lk_cfg.media_e2ee,
                     router.clone(),
                     bridge.clone(),
+                    shutdown.clone(),
                 )
                 .await
                 {
@@ -195,26 +198,38 @@ pub(crate) async fn run(
             }
 
             (true, false) => {
-                // All humans left — tear down (no membership to retract).
+                // All humans left — tear down (no membership to retract). This is
+                // a normal call-end, so release the puppets too (they leave voice).
                 tracing::info!("call ended — disconnecting subscriber");
-                teardown(&mut active_session, &shared_provider, &router).await;
+                teardown(&mut active_session, &shared_provider, &router, true).await;
                 joined = false;
             }
 
             _ => {}
         }
 
-        if call_active_rx.changed().await.is_err() {
-            break;
+        // Wait for the next call-active transition, or a process shutdown.
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            changed = call_active_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
         }
     }
 
-    // Cleanup on shutdown (no membership to retract — subscriber never posts one).
+    // Cleanup on shutdown: close only our LiveKit subscriber. Puppet release is
+    // owned by the Discord side's *awaited* shutdown drain — calling
+    // `router.release_all()` here would be fire-and-forget and could empty the
+    // assignment map out from under that drain (losing the await guarantee), so
+    // we pass `release_routes = false`.
     if joined {
-        teardown(&mut active_session, &shared_provider, &router).await;
+        teardown(&mut active_session, &shared_provider, &router, false).await;
     }
 
-    tracing::info!("RTC task exiting");
+    tracing::info!("RTC task exiting — teardown complete");
     Ok(())
 }
 
@@ -234,6 +249,7 @@ async fn join_livekit(
     use_e2ee: bool,
     router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
+    shutdown: CancellationToken,
 ) -> Result<ActiveSession> {
     let openid_token = openid::get_openid_token(client).await?;
 
@@ -254,6 +270,7 @@ async fn join_livekit(
         room_id.to_owned(),
         router,
         bridge,
+        shutdown,
     )
     .await?;
 
@@ -272,19 +289,25 @@ async fn join_livekit(
     Ok(ActiveSession { lk_session })
 }
 
-/// Tear down an active session, clearing the shared provider and releasing all
-/// participant routes (puppets returned to the pool) so the next call starts clean.
+/// Tear down an active session, clearing the shared provider. When
+/// `release_routes` is set (a normal call-end), also release all participant
+/// routes so puppets return to the pool and the next call starts clean. On a
+/// process shutdown this is `false`: the Discord side awaits its own puppet
+/// drain, and a fire-and-forget `release_all()` here would race it.
 async fn teardown(
     active_session: &mut Option<ActiveSession>,
     shared_provider: &Arc<Mutex<Option<KeyProvider>>>,
     router: &Arc<dyn PlaybackRouter>,
+    release_routes: bool,
 ) {
     if let Some(sess) = active_session.take() {
         sess.close().await;
     }
-    // Per-track consumers release their own routes on cancel; release_all() is
-    // belt-and-suspenders in case a consumer was mid-push during teardown.
-    router.release_all();
+    if release_routes {
+        // Per-track consumers release their own routes on cancel; release_all()
+        // is belt-and-suspenders in case a consumer was mid-push during teardown.
+        router.release_all();
+    }
     let mut guard = shared_provider.lock().expect("provider mutex poisoned");
     *guard = None;
 }

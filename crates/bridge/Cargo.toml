@@ -13,6 +13,7 @@ nvb-audio = { workspace = true }
 nvb-discord = { workspace = true }
 nvb-matrix-rtc = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync"] }
+tokio-util = { workspace = true }
 anyhow = { workspace = true }
 futures-util = { workspace = true }
 tracing = { workspace = true }
