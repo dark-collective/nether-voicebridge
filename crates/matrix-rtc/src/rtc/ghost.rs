@@ -159,6 +159,11 @@ struct GhostConfig {
     /// MXID server part (e.g. `nether.im`), derived from the bridge bot's MXID.
     server_name: String,
     media_e2ee: bool,
+    /// Optional config overrides, mirroring the subscriber path. `None` ⇒ derive
+    /// the lk-jwt endpoint from the focus and the SFU ws URL from the lk-jwt
+    /// response. Set only to override (non-Nether deploy / no `rtc_foci`).
+    lk_jwt_url: Option<String>,
+    lk_url: Option<String>,
 }
 
 impl GhostPool {
@@ -186,6 +191,8 @@ impl GhostPool {
                 as_token: matrix_cfg.appservice_token.clone(),
                 server_name: bot_user.server_name().as_str().to_owned(),
                 media_e2ee: livekit_cfg.media_e2ee,
+                lk_jwt_url: livekit_cfg.lk_jwt_url.clone(),
+                lk_url: livekit_cfg.url.clone(),
             },
         }))
     }
@@ -528,7 +535,7 @@ async fn connect_and_publish(
     let openid_token = fetch_openid_token(cfg, ghost_mxid).await?;
     let jwt_resp = lk_jwt::fetch_livekit_token(
         &cfg.http,
-        &focus.service_url,
+        cfg.lk_jwt_url.as_deref().unwrap_or(&focus.service_url),
         &cfg.room_id,
         device_id,
         &openid_token,
@@ -543,9 +550,13 @@ async fn connect_and_publish(
     // this, N ghosts would each receive the whole call — needless bandwidth.
     let mut room_opts = RoomOptions::default();
     room_opts.auto_subscribe = false;
-    let (room, events) = Room::connect(&jwt_resp.url, &jwt_resp.jwt, room_opts)
-        .await
-        .context("ghost LiveKit Room::connect")?;
+    let (room, events) = Room::connect(
+        cfg.lk_url.as_deref().unwrap_or(&jwt_resp.url),
+        &jwt_resp.jwt,
+        room_opts,
+    )
+    .await
+    .context("ghost LiveKit Room::connect")?;
     let source = publish::publish(&room).await?;
 
     // Move the room + events into a drain task: it keeps the connection alive,

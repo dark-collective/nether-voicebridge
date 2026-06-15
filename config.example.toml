@@ -11,8 +11,8 @@
 # Within a bridge, all fields are required to parse. You can leave later-phase
 # fields as placeholders until you reach that phase:
 #   Phases 1+  : [bridge.matrix] homeserver_url, room_id, bot_user_id, access_token
-#   Phases 2–3 : [bridge.discord] guild_id, channel_id, listener_token
-#   Phase 4+   : [bridge.livekit] lk_jwt_url, url
+#   Phases 2–3 : [bridge.discord] guild_id, channel_id
+#   Phase 4+   : [bridge.livekit] media_e2ee (URLs are auto-derived)
 #   Phase 7    : [bridge.discord] puppet_tokens (real values)
 #   Phase 8    : [bridge.matrix] appservice_id, appservice_token
 #
@@ -21,7 +21,7 @@
 
 [[bridge]]
 # Optional label, used in logs/spans (the `bridge{name=...}` span prefix).
-name = "general"
+name = "test"
 
 [bridge.discord]
 # Right-click the server icon → "Copy Server ID"
@@ -31,16 +31,15 @@ guild_id = "1234567890123456789"
 # Right-click the target voice channel → "Copy Channel ID"
 channel_id = "9876543210987654321"
 
-# discord.com/developers/applications → your listener app → Bot → Reset Token
-# Store the raw token (no "Bot " prefix); the exact form is confirmed in Phase 2.
-# This bot must be invited to the guild with: Connect, Speak, Use Voice Activity,
-# Change Nickname.
-listener_token = "YOUR_LISTENER_BOT_TOKEN_HERE"
-
 # One entry per puppet bot — each is a SEPARATE Discord application with its own
 # bot token, created deliberately at discord.com/developers/applications.
 # Pool size = max number of simultaneous Matrix speakers attributable on Discord.
-# Each puppet must be invited with the same permissions as the listener bot.
+# There is NO dedicated listener bot: one puppet is auto-elected as the floating
+# capture "anchor" for Discord→Matrix audio. If you previously ran a separate
+# listener bot, just add its token to this list (and optionally rename that bot
+# in the Discord dev portal — a manual step). Each puppet must be invited to the
+# guild with: Connect, Speak, Use Voice Activity, Change Nickname. Store raw
+# tokens (no "Bot " prefix).
 puppet_tokens = [
     "YOUR_PUPPET_BOT_TOKEN_1",
     "YOUR_PUPPET_BOT_TOKEN_2",
@@ -92,19 +91,14 @@ appservice_token = "your_appservice_hs_token_here"
 store_path = "./nether-store/general"
 
 [bridge.livekit]
-# URL of the lk-jwt-service deployed on nether-red alongside LiveKit.
-# This service mints LiveKit JWTs from Matrix OpenID tokens — it's what the
-# bridge calls to join the LiveKit room as each participant.
-lk_jwt_url = "https://lk-jwt.nether.im"
-
-# LiveKit WebSocket URL (the LiveKit container on nether-red).
-url = "wss://livekit.nether.im"
-
-# From the LiveKit server config (livekit.yaml, keys: section) on nether-red.
-# Note: the RTC-join path uses lk-jwt tokens, so api_key/api_secret may only
-# be needed if you call the LiveKit server API directly (e.g. room management).
-api_key = "your_api_key"
-api_secret = "your_api_secret_here"
+# The lk-jwt-service endpoint and the LiveKit SFU WebSocket URL are BOTH
+# auto-derived at runtime — the bridge reads the homeserver's
+# `.well-known/matrix/client` (MSC4143 `rtc_foci`) for the lk-jwt endpoint and
+# takes the SFU ws URL from the lk-jwt response. You normally need NEITHER of
+# the two fields below. Uncomment one only to override the derived value (e.g. a
+# homeserver without `rtc_foci`, or a non-Nether deploy):
+#   lk_jwt_url = "https://lk-jwt.nether.im"   # override lk-jwt-service endpoint
+#   url        = "wss://livekit.nether.im"    # override SFU WebSocket URL
 
 # Element Call media frame E2EE (AES-GCM, HKDF). Leave FALSE unless the EC
 # deployment actually runs per-frame encryption (typically only for ENCRYPTED
@@ -123,7 +117,6 @@ media_e2ee = false
 # [bridge.discord]
 # guild_id = "1234567890123456789"
 # channel_id = "1111111111111111111"
-# listener_token = "YOUR_SECOND_LISTENER_BOT_TOKEN"
 # puppet_tokens = ["YOUR_SECOND_PUPPET_1", "YOUR_SECOND_PUPPET_2"]
 # capture_wav = false
 #
@@ -138,8 +131,5 @@ media_e2ee = false
 # store_path = "./nether-store/gaming"   # MUST differ from the first bridge
 #
 # [bridge.livekit]
-# lk_jwt_url = "https://lk-jwt.nether.im"
-# url = "wss://livekit.nether.im"
-# api_key = "your_api_key"
-# api_secret = "your_api_secret_here"
 # media_e2ee = false
+# # lk_jwt_url / url are auto-derived; uncomment only to override (see above).

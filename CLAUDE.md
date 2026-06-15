@@ -23,8 +23,9 @@ plan, each with its acceptance test.
   publishes **plaintext** LiveKit frames; encrypting into this non-E2EE call
   makes peers hear static. Keep it off unless the room becomes encrypted — see
   constraint #3, which now applies only to that deferred encrypted-room branch.
-- Discord: a guild with a voice channel; a set of bot applications (one
-  listener + N puppets), each invited with Connect, Speak, Use Voice Activity,
+- Discord: a guild with a voice channel; a set of N puppet bot applications
+  (no dedicated listener — one puppet is auto-elected as the floating capture
+  **anchor**), each invited with Connect, Speak, Use Voice Activity,
   Change Nickname.
 
 ## Hard constraints (these cause silent failure if ignored)
@@ -47,8 +48,9 @@ plan, each with its acceptance test.
    exist. Set the per-guild **nickname** per user; avatars are static per
    puppet (or pre-baked per known regular). Do not attempt runtime avatar
    swapping.
-5. **Echo/loop prevention is correctness-critical.** The listener bot hears the
-   puppets' playback; the LiveKit subscriber sees the ghosts' tracks. Maintain
+5. **Echo/loop prevention is correctness-critical.** The capture anchor puppet
+   hears the other puppets' playback; the LiveKit subscriber sees the ghosts'
+   tracks. Maintain
    a set of bridge-owned identities (puppet user IDs on Discord, ghost
    identities on Matrix) and exclude them from capture/forward on both sides.
    Build this into the AudioRouter from the start.
@@ -64,10 +66,12 @@ plan, each with its acceptance test.
   boundary. No `unwrap`/`expect` in audio or runtime hot paths.
 - **Logging:** `tracing` only (never `println!`). Use spans per bridge and per
   participant.
-- **Config:** TOML via `serde`. Secrets (bot tokens, LiveKit key/secret,
-  appservice token) come from the config file or env, **never committed**.
-- **Async:** one tokio task per long-lived connection (listener, each puppet,
-  subscriber, each ghost). Wire tasks with `tokio::sync::mpsc`; use
+- **Config:** TOML via `serde`. Secrets (bot tokens, Matrix access/appservice
+  tokens) come from the config file or env, **never committed**. The LiveKit
+  endpoint/SFU URLs are auto-derived from the homeserver's `.well-known`
+  `rtc_foci` and the lk-jwt response — not configured.
+- **Async:** one tokio task per long-lived connection (each puppet, subscriber,
+  each ghost). Wire tasks with `tokio::sync::mpsc`; use
   `CancellationToken` for shutdown.
 - **Audio core:** keep it in PCM and **decoupled from the live SDKs** so it can
   be unit-tested with the wav file-in/out harness. The two clocks (Discord vs

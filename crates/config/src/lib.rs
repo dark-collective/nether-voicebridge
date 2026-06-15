@@ -41,7 +41,6 @@ pub struct BridgeConfig {
 pub struct DiscordConfig {
     pub guild_id: String,
     pub channel_id: String,
-    pub listener_token: String,
     pub puppet_tokens: Vec<String>,
     /// When true, also write per-SSRC `capture_<ssrc>.wav` files (the Phase 3
     /// debugging artifact) alongside forwarding audio to Matrix. Off in
@@ -85,10 +84,17 @@ fn default_media_e2ee() -> bool {
 
 #[derive(Debug, Deserialize)]
 pub struct LiveKitConfig {
-    pub lk_jwt_url: String,
-    pub url: String,
-    pub api_key: String,
-    pub api_secret: String,
+    /// Optional override for the lk-jwt-service endpoint. When absent (the
+    /// default), it is auto-derived from the homeserver's `.well-known`
+    /// MSC4143 `rtc_foci` (`focus.service_url`). Set this only to override that
+    /// — e.g. a homeserver without `rtc_foci` or a non-Nether deploy.
+    #[serde(default)]
+    pub lk_jwt_url: Option<String>,
+    /// Optional override for the LiveKit SFU WebSocket URL. When absent (the
+    /// default), it is taken from the lk-jwt response (`jwt_resp.url`). Set this
+    /// only to override that.
+    #[serde(default)]
+    pub url: Option<String>,
     /// Enable Element Call media E2EE (HKDF key exchange via to-device).
     /// Set to true only when the EC deployment uses frame encryption.
     /// Default: false (most deployments run without media E2EE).
@@ -148,9 +154,7 @@ impl Config {
         // gateway connection.
         let mut seen_tokens = std::collections::HashMap::new();
         for (i, b) in self.bridges.iter().enumerate() {
-            for tok in std::iter::once(&b.discord.listener_token)
-                .chain(b.discord.puppet_tokens.iter())
-            {
+            for tok in b.discord.puppet_tokens.iter() {
                 if let Some(j) = seen_tokens.insert(tok.clone(), i) {
                     tracing::warn!(
                         bridge = i,
@@ -183,7 +187,6 @@ impl BridgeConfig {
             bridge = %self.label(),
             discord_guild_id = %self.discord.guild_id,
             discord_channel_id = %self.discord.channel_id,
-            discord_listener_token = "[redacted]",
             discord_puppet_count = self.discord.puppet_tokens.len(),
             matrix_homeserver_url = %self.matrix.homeserver_url,
             matrix_room_id = %self.matrix.room_id,
@@ -193,10 +196,8 @@ impl BridgeConfig {
             matrix_access_token = "[redacted]",
             matrix_appservice_id = %self.matrix.appservice_id,
             matrix_appservice_token = "[redacted]",
-            livekit_lk_jwt_url = %self.livekit.lk_jwt_url,
-            livekit_url = %self.livekit.url,
-            livekit_api_key = %self.livekit.api_key,
-            livekit_api_secret = "[redacted]",
+            livekit_lk_jwt_url = ?self.livekit.lk_jwt_url,
+            livekit_url = ?self.livekit.url,
             "bridge config loaded"
         );
     }
@@ -208,7 +209,10 @@ mod tests {
 
     /// One `[[bridge]]` block. `store` lets each test pick a distinct store_path
     /// so multi-bridge tests pass validation; `name` is emitted only when `Some`.
-    fn bridge_block(name: Option<&str>, room: &str, store: &str, listener: &str) -> String {
+    /// `puppet` is the first puppet token (lets token-reuse tests collide).
+    /// `[bridge.livekit]` deliberately omits the optional `lk_jwt_url`/`url`
+    /// overrides so the default derive (`None`) path is exercised.
+    fn bridge_block(name: Option<&str>, room: &str, store: &str, puppet: &str) -> String {
         let name_line = match name {
             Some(n) => format!("name = \"{n}\"\n"),
             None => String::new(),
@@ -218,8 +222,7 @@ mod tests {
 {name_line}[bridge.discord]
 guild_id = "111"
 channel_id = "222"
-listener_token = "{listener}"
-puppet_tokens = ["Bot def", "Bot ghi"]
+puppet_tokens = ["{puppet}", "Bot ghi"]
 
 [bridge.matrix]
 homeserver_url = "https://nether.im"
@@ -232,10 +235,7 @@ appservice_token = "hs_tok"
 store_path = "{store}"
 
 [bridge.livekit]
-lk_jwt_url = "https://lk-jwt.nether.im"
-url = "wss://livekit.nether.im"
-api_key = "key"
-api_secret = "secret"
+media_e2ee = false
 "#
         )
     }
@@ -249,7 +249,9 @@ api_secret = "secret"
         assert_eq!(b.name.as_deref(), Some("general"));
         assert_eq!(b.discord.puppet_tokens.len(), 2);
         assert_eq!(b.matrix.homeserver_url, "https://nether.im");
-        assert_eq!(b.livekit.api_key, "key");
+        // Optional override URLs absent ⇒ derive-by-default path.
+        assert_eq!(b.livekit.lk_jwt_url, None);
+        assert_eq!(b.livekit.url, None);
         cfg.validate().expect("should validate");
     }
 
@@ -295,7 +297,7 @@ api_secret = "secret"
 
     #[test]
     fn duplicate_room_and_token_are_warnings_not_errors() {
-        // Same room_id and same listener token across bridges → Ok (warn only).
+        // Same room_id and same puppet token across bridges → Ok (warn only).
         let raw = format!(
             "{}\n{}",
             bridge_block(Some("a"), "!same:nether.im", "./sa", "Bot same"),
@@ -313,9 +315,37 @@ api_secret = "secret"
 [bridge.discord]
 guild_id = "111"
 channel_id = "222"
-listener_token = "Bot abc"
 puppet_tokens = []
 "#;
         assert!(toml::from_str::<Config>(raw).is_err());
+    }
+
+    #[test]
+    fn livekit_override_urls_parse_when_present() {
+        // When set, the optional override URLs are honored (Some).
+        let raw = r#"[[bridge]]
+[bridge.discord]
+guild_id = "111"
+channel_id = "222"
+puppet_tokens = ["Bot abc"]
+
+[bridge.matrix]
+homeserver_url = "https://nether.im"
+room_id = "!r:nether.im"
+bot_user_id = "@bridge:nether.im"
+device_id = "BRIDGE01"
+access_token = "syt_tok"
+appservice_id = "voicebridge"
+appservice_token = "hs_tok"
+store_path = "./s1"
+
+[bridge.livekit]
+lk_jwt_url = "https://lk-jwt.example.org"
+url = "wss://livekit.example.org"
+"#;
+        let cfg: Config = toml::from_str(raw).expect("parse failed");
+        let lk = &cfg.bridges[0].livekit;
+        assert_eq!(lk.lk_jwt_url.as_deref(), Some("https://lk-jwt.example.org"));
+        assert_eq!(lk.url.as_deref(), Some("wss://livekit.example.org"));
     }
 }

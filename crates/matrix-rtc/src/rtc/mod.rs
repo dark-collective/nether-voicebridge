@@ -181,6 +181,8 @@ pub(crate) async fn run(
                     mx_cfg.device_id.as_str(),
                     &shared_provider,
                     lk_cfg.media_e2ee,
+                    lk_cfg.lk_jwt_url.as_deref(),
+                    lk_cfg.url.as_deref(),
                     router.clone(),
                     bridge.clone(),
                     shutdown.clone(),
@@ -247,6 +249,10 @@ async fn join_livekit(
     device_id: &str,
     shared_provider: &Arc<Mutex<Option<KeyProvider>>>,
     use_e2ee: bool,
+    // Optional config overrides; when `None` the values are auto-derived from
+    // the focus (lk-jwt endpoint) and the lk-jwt response (SFU ws URL).
+    lk_jwt_url_override: Option<&str>,
+    url_override: Option<&str>,
     router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
     shutdown: CancellationToken,
@@ -255,7 +261,7 @@ async fn join_livekit(
 
     let jwt_resp = lk_jwt::fetch_livekit_token(
         http,
-        &focus.service_url,
+        lk_jwt_url_override.unwrap_or(&focus.service_url),
         room_id_str,
         device_id,
         &openid_token,
@@ -263,7 +269,7 @@ async fn join_livekit(
     .await?;
 
     let lk_session = session::connect(
-        &jwt_resp.url,
+        url_override.unwrap_or(&jwt_resp.url),
         &jwt_resp.jwt,
         use_e2ee,
         client.clone(),

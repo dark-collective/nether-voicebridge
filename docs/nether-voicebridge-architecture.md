@@ -83,8 +83,8 @@ tasks and channels.
 
 ## Echo / loop prevention (correctness-critical)
 
-The listener bot hears **everything** in the Discord channel, including the
-puppets' own playback. The LiveKit subscriber sees **all** tracks, including
+The capture anchor puppet hears **everything** in the Discord channel, including
+the other puppets' own playback. The LiveKit subscriber sees **all** tracks, including
 the ghosts the bridge itself publishes. Without filtering you get audio loops
 and users hearing themselves.
 
@@ -105,8 +105,8 @@ count as humans.
 
 - Discord membership comes from gateway Voice State Updates.
 - Matrix membership comes from `m.call` membership state events in the room.
-- Open: join listener bot to channel; establish subscriber participant +
-  bridge's own MatrixRTC membership.
+- Open: join puppet pool to channel (one auto-elected as the capture anchor);
+  establish subscriber participant + bridge's own MatrixRTC membership.
 - Per participant: allocate puppet (Matrix human) / mint ghost (Discord human).
 - Close: tear down all connections, return puppets to pool, retire ghosts,
   drop memberships. No leaked connections (test this explicitly).
@@ -129,8 +129,9 @@ Handle room tombstones (follow upgrades) and call-end events.
 
 ## E2EE specifics
 
-- **Discord (DAVE):** mandatory since March 2026. Each puppet and the listener
-  are legitimate MLS group members and get ratcheted sender keys — decryption
+- **Discord (DAVE):** mandatory since March 2026. Each puppet (including the
+  capture anchor) is a legitimate MLS group member and gets ratcheted sender
+  keys — decryption
   works because they're real participants. `songbird` handles the MLS dance;
   pin a DAVE-capable release. (DAVE receive across member join/leave was verified
   working in Phase 5 testing — a capture-death once blamed on DAVE epochs turned
@@ -163,7 +164,7 @@ nether-voicebridge/
 ├── crates/
 │   ├── config/               # TOML config (serde)
 │   ├── audio/                # PCM types, reframe, mix, resample, jitter buffer
-│   ├── discord/              # serenity + songbird: listener + puppet pool
+│   ├── discord/              # serenity + songbird: puppet pool (one as anchor)
 │   ├── matrix-rtc/           # vendored/adapted from matrix-jukebox:
 │   │                         #   membership, lk-jwt, to-device keys, EC HKDF,
 │   │                         #   livekit-rust participant
