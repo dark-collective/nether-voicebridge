@@ -16,18 +16,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU (for arm64 cross-build)
-        uses: docker/setup-qemu-action@v3
+      # arm64 is disabled for now (emulated build is very slow). To restore
+      # multi-arch: uncomment this step and add linux/arm64 to `platforms` below.
+      # - name: Set up QEMU (for arm64 cross-build)
+      #   uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Auth with a token that has package-write to the `dark` registry namespace.
+      # The automatic GITHUB_TOKEN authenticates but lacks package-write here
+      # (401 reqPackageAccess on push). REGISTRY_TOKEN is a robocub access token
+      # (write:package) stored as a repo Actions secret — value lives only in
+      # Forgejo's secret store, never in this file.
       - name: Log in to the Forgejo container registry
         uses: docker/login-action@v3
         with:
           registry: nether.codes
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: robocub
+          password: ${{ secrets.REGISTRY_TOKEN }}
 
       # push (non-tag) -> :latest ; tag push (v0.0.1) -> that exact tag.
       - name: Determine image tag
@@ -44,7 +51,9 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # amd64-only for now (see the commented QEMU step above to restore
+          # multi-arch: `platforms: linux/amd64,linux/arm64`).
+          platforms: linux/amd64
           push: true
           tags: nether.codes/${{ github.repository }}:${{ steps.vars.outputs.tag }}
           cache-from: type=registry,ref=nether.codes/${{ github.repository }}:buildcache
