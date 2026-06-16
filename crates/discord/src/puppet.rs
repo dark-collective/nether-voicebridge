@@ -25,6 +25,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError, RwLock};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use serenity::{async_trait, model::prelude::*, prelude::*};
@@ -47,6 +48,10 @@ use crate::{
 
 /// Sentinel for "no anchor currently elected" in [`ChannelState::anchor`].
 const NO_ANCHOR: usize = usize::MAX;
+
+/// How long a bot stays quarantined (skipped by the allocator) after its
+/// `manager.join` timed out, before a recovery timer makes it eligible again.
+const QUARANTINE_COOLDOWN: Duration = Duration::from_secs(120);
 
 /// Nickname (before the configured prefix) shown on the overflow-host puppet while
 /// it is carrying more than one Matrix speaker (members beyond the puppet count).
@@ -163,6 +168,11 @@ struct PuppetSlot {
     /// Set true once this puppet's gateway `ready` fired and its command loop is
     /// live. The shutdown drain only awaits `ReleaseAndAck` from connected bots.
     connected: Arc<AtomicBool>,
+    /// Set true when this bot's `manager.join` timed out (a stuck voice gateway —
+    /// seen after hopping channels in one guild). The allocator skips an unhealthy
+    /// bot so failover picks a different one; a recovery timer clears it after
+    /// `QUARANTINE_COOLDOWN` so the bot becomes eligible again.
+    unhealthy: Arc<AtomicBool>,
 }
 
 /// A swappable audio route: the mixer a participant's frames currently flow into.
@@ -250,6 +260,7 @@ impl SharedPool {
                     busy: AtomicBool::new(false),
                     guilds: RwLock::new(HashSet::new()),
                     connected: Arc::new(AtomicBool::new(false)),
+                    unhealthy: Arc::new(AtomicBool::new(false)),
                 }
             })
             .collect();
@@ -424,6 +435,11 @@ impl SharedPool {
     fn take_free_bot(&self, guild: GuildId) -> Option<usize> {
         for (i, slot) in self.slots.iter().enumerate() {
             if slot.busy.load(Ordering::Relaxed) {
+                continue;
+            }
+            // Skip bots quarantined after a join timeout — picking one of those
+            // would just fail to join again. A recovery timer clears the flag.
+            if slot.unhealthy.load(Ordering::Relaxed) {
                 continue;
             }
             if !slot
@@ -639,7 +655,9 @@ impl SharedPool {
             ctx: Box::new(ctx),
             display_name: name,
         });
-        let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::BecomeAnchor);
+        // Anchor activation is deferred to `on_join_succeeded` (sent once the bot's
+        // `manager.join` actually completes), so a join timeout can fail over
+        // instead of falsely reporting the anchor live.
         // The promoted speaker is the anchor's own participant now; remaining
         // overflow (if any) is reconciled by the caller's normal path.
         let ch = &guard.channels[key];
@@ -700,8 +718,9 @@ impl SharedPool {
             });
             tracing::info!(bridge, key, display_name, idx, "assigned participant to puppet");
             if elect {
-                let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::BecomeAnchor);
-                tracing::info!(bridge, idx, "puppet elected capture anchor");
+                // Elected, but `BecomeAnchor` is deferred to `on_join_succeeded` so
+                // the anchor only goes live after the join actually completes.
+                tracing::info!(bridge, idx, "puppet elected capture anchor (activates after join)");
             }
             return Arc::new(RoutedSink { route, key: key.to_owned() });
         }
@@ -738,7 +757,7 @@ impl SharedPool {
                     ctx: Box::new(ctx),
                     display_name: display_name.to_owned(),
                 });
-                let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::BecomeAnchor);
+                // `BecomeAnchor` deferred to `on_join_succeeded` (see assign above).
                 tracing::info!(bridge, key, idx, "stole bot to activate channel anchor");
                 return Arc::new(RoutedSink { route, key: key.to_owned() });
             }
@@ -773,6 +792,143 @@ impl SharedPool {
             self.reconcile_anchor_mute(ch);
         }
         Arc::new(RoutedSink { route, key: key.to_owned() })
+    }
+
+    /// Called by a puppet's command loop after `manager.join` SUCCEEDS. If this bot
+    /// is the elected anchor of the channel it now serves, activate capture — this
+    /// is deferred from the assign paths so a timed-out join never falsely reports
+    /// the anchor live.
+    fn on_join_succeeded(&self, idx: usize) {
+        let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        for ch in guard.channels.values() {
+            let serves = ch
+                .assignments
+                .values()
+                .any(|a| matches!(a, Assign::Puppet { idx: i, .. } if *i == idx));
+            if serves && ch.anchor.load(Ordering::Relaxed) == idx {
+                let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::BecomeAnchor);
+                tracing::info!(bridge = %ch.bridge, idx, "puppet joined — activating capture anchor");
+                return;
+            }
+        }
+    }
+
+    /// Called by a puppet's command loop after `manager.join` FAILS (e.g. the voice
+    /// gateway timed out after a channel hop). Quarantine the stuck bot so the
+    /// allocator skips it, then fail the participant over to a healthy free bot in
+    /// the same guild — re-pointing its EXISTING route so the Matrix side follows
+    /// with no re-subscribe, and re-electing the anchor if the failed bot was it.
+    /// If no healthy bot is free, the participant drops to overflow and the channel
+    /// degrades to no-anchor with a loud error — an honest state, not a silent
+    /// fake-live anchor. The caller schedules a recovery timer (`recover_bot`).
+    fn on_join_failed(&self, idx: usize) {
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+
+        // Quarantine the stuck bot regardless (cleared after QUARANTINE_COOLDOWN).
+        self.slots[idx].unhealthy.store(true, Ordering::Relaxed);
+
+        // Locate the (bridge, key) this bot was serving.
+        let found = guard.channels.iter().find_map(|(bk, ch)| {
+            ch.assignments.iter().find_map(|(k, a)| match a {
+                Assign::Puppet { idx: i, .. } if *i == idx => Some((bk.clone(), k.clone())),
+                _ => None,
+            })
+        });
+        let Some((bridge, key)) = found else {
+            // Participant already left during the join — just free the bot.
+            self.slots[idx].mixer.clear();
+            self.slots[idx].busy.store(false, Ordering::Relaxed);
+            *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            tracing::warn!(idx, "puppet join failed; assignment already gone — quarantined");
+            return;
+        };
+
+        let display_name = self.slots[idx]
+            .name
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default();
+        let (guild, was_anchor) = {
+            let ch = &guard.channels[&bridge];
+            (ch.guild_id, ch.anchor.load(Ordering::Relaxed) == idx)
+        };
+
+        // Free the stuck bot (its route entry is kept — we re-point it below) and
+        // tell it to leave voice so its songbird Call is reset.
+        self.slots[idx].mixer.clear();
+        self.slots[idx].busy.store(false, Ordering::Relaxed);
+        *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Release);
+        if was_anchor {
+            guard
+                .channels
+                .get_mut(&bridge)
+                .unwrap()
+                .anchor
+                .store(NO_ANCHOR, Ordering::Relaxed);
+        }
+        tracing::warn!(bridge = %bridge, key = %key, idx, was_anchor, "puppet join failed — bot quarantined; failing over");
+
+        let seq = {
+            guard.next_seq += 1;
+            guard.next_seq
+        };
+
+        // Fail over to a healthy free bot in the same guild.
+        if let Some(new_idx) = self.take_free_bot(guild) {
+            let ctx = {
+                let ch = guard.channels.get_mut(&bridge).unwrap();
+                ch.assignments
+                    .insert(key.clone(), Assign::Puppet { idx: new_idx, seq });
+                *self.slots[new_idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(display_name.clone());
+                self.slots[new_idx].muted.store(false, Ordering::Relaxed);
+                self.slots[new_idx].mixer.clear();
+                Self::route_to(&mut ch.routes, &key, self.slots[new_idx].mixer.clone());
+                if was_anchor {
+                    ch.anchor.store(new_idx, Ordering::Relaxed);
+                }
+                self.ctx_for(ch)
+            };
+            let _ = self.slots[new_idx].cmd_tx.try_send(PuppetCommand::Assign {
+                ctx: Box::new(ctx),
+                display_name,
+            });
+            // BecomeAnchor (if new_idx is the anchor) is deferred to its own
+            // on_join_succeeded — same as the normal assign paths.
+            tracing::info!(bridge = %bridge, key = %key, old = idx, new = new_idx, "failed over to replacement puppet");
+        } else {
+            // No healthy bot free: drop the participant to overflow (its anchor, if
+            // any, plays the overflow mix) and let service_pending re-anchor once a
+            // bot recovers/frees. Degraded but honest.
+            let ch = guard.channels.get_mut(&bridge).unwrap();
+            ch.assignments.insert(
+                key.clone(),
+                Assign::Overflow { name: display_name, muted: false, seq },
+            );
+            Self::route_to(&mut ch.routes, &key, ch.overflow_mixer.clone());
+            let ch = &guard.channels[&bridge];
+            self.reconcile_anchor_label(ch);
+            self.reconcile_anchor_mute(ch);
+            self.service_pending(&mut guard);
+            tracing::error!(
+                bridge = %bridge,
+                key = %key,
+                guild = %guild,
+                "puppet join failed and no healthy pool bot free — channel DEGRADED \
+                 (capture anchor down / audio via overflow until a bot recovers)"
+            );
+        }
+    }
+
+    /// Clear a bot's join-timeout quarantine (after `QUARANTINE_COOLDOWN`) and try
+    /// to activate any channel left without an anchor while it was unavailable.
+    fn recover_bot(&self, idx: usize) {
+        self.slots[idx].unhealthy.store(false, Ordering::Relaxed);
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        self.service_pending(&mut guard);
+        tracing::info!(idx, "puppet join-timeout quarantine cleared — eligible again");
     }
 
     fn set_muted(&self, bridge: &str, key: &str, muted: bool) {
@@ -1091,6 +1247,7 @@ impl EventHandler for PuppetHandler {
             slot.mixer.clone(),
             slot.current_ssrc.clone(),
             self.pool.nickname_prefix.clone(),
+            self.pool.clone(),
             rx,
         ));
         slot.connected.store(true, Ordering::Relaxed);
@@ -1222,6 +1379,7 @@ async fn puppet_command_loop(
     mixer: Arc<PlaybackMixer>,
     current_ssrc: Arc<StdMutex<Option<u32>>>,
     nickname_prefix: Arc<str>,
+    pool: Arc<SharedPool>,
     mut cmd_rx: mpsc::Receiver<PuppetCommand>,
 ) {
     let mut current: Option<ChannelCtx> = None;
@@ -1229,9 +1387,23 @@ async fn puppet_command_loop(
         match cmd {
             PuppetCommand::Assign { ctx: chan, display_name } => {
                 let chan = *chan;
-                puppet_join(&chan, idx, &ctx, &mixer, &current_ssrc, &nickname_prefix, &display_name)
-                    .await;
+                let joined =
+                    puppet_join(&chan, idx, &ctx, &mixer, &current_ssrc, &nickname_prefix, &display_name)
+                        .await;
                 current = Some(chan);
+                if joined {
+                    // Activate this bot as anchor iff the allocator elected it.
+                    pool.on_join_succeeded(idx);
+                } else {
+                    // Quarantine this bot + fail the participant over to another,
+                    // then schedule the bot's recovery after the cooldown.
+                    pool.on_join_failed(idx);
+                    let pool = pool.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(QUARANTINE_COOLDOWN).await;
+                        pool.recover_bot(idx);
+                    });
+                }
             }
             PuppetCommand::BecomeAnchor => {
                 if let Some(chan) = &current {
@@ -1336,6 +1508,9 @@ async fn puppet_set_muted(ctx: &Context, idx: usize, guild_id: GuildId, muted: b
     }
 }
 
+/// Returns `true` if the bot actually joined the voice channel. `false` on a join
+/// failure (e.g. the gateway timed out after a channel hop) — the caller fails the
+/// participant over to another pool bot.
 async fn puppet_join(
     channel: &ChannelCtx,
     idx: usize,
@@ -1344,10 +1519,10 @@ async fn puppet_join(
     current_ssrc: &Arc<StdMutex<Option<u32>>>,
     nickname_prefix: &str,
     display_name: &str,
-) {
+) -> bool {
     let Some(manager) = songbird::get(ctx).await else {
         tracing::error!(idx, "songbird not registered on puppet client");
-        return;
+        return false;
     };
 
     // Register handlers and start playback on the Call *before* connecting: two
@@ -1387,7 +1562,10 @@ async fn puppet_join(
 
     if let Err(e) = manager.join(channel.guild_id, channel.channel_id).await {
         tracing::error!(idx, error = %e, "puppet failed to join voice channel");
-        return;
+        // Reset the (possibly half-open) Call so a later reuse of this bot starts
+        // clean once it recovers from quarantine.
+        let _ = manager.remove(channel.guild_id).await;
+        return false;
     }
 
     let nick = build_nickname(nickname_prefix, display_name);
@@ -1395,6 +1573,7 @@ async fn puppet_join(
         tracing::warn!(idx, error = %e, "failed to set puppet nickname");
     }
     tracing::info!(idx, bridge = %channel.bridge, display_name, "puppet joined voice and assigned");
+    true
 }
 
 async fn puppet_leave(
@@ -1475,6 +1654,9 @@ impl SharedPool {
     }
     fn test_free_count(&self) -> usize {
         self.slots.iter().filter(|s| !s.busy.load(Ordering::Relaxed)).count()
+    }
+    fn test_is_unhealthy(&self, idx: usize) -> bool {
+        self.slots[idx].unhealthy.load(Ordering::Relaxed)
     }
 }
 
@@ -1592,6 +1774,40 @@ mod tests {
         assert!(p.test_is_overflow("A", "a3"), "newest A speaker demoted");
         assert_eq!(p.test_anchor("A"), Some(anchor_a), "A anchor unchanged");
         assert!(p.test_slot_of("A", "a2").is_some());
+    }
+
+    #[test]
+    fn join_failure_quarantines_and_fails_over_anchor() {
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        let sa = p.test_slot_of("A", "alice").unwrap();
+        assert_eq!(p.test_anchor("A"), Some(sa));
+        // The anchor bot's join times out → fail over to the other pool bot.
+        p.on_join_failed(sa);
+        assert!(p.test_is_unhealthy(sa), "stuck bot quarantined");
+        let sb = p.test_slot_of("A", "alice").expect("alice re-assigned");
+        assert_ne!(sb, sa, "moved to a different bot");
+        assert_eq!(p.test_anchor("A"), Some(sb), "anchor handed to replacement");
+        assert!(!p.test_is_unhealthy(sb));
+    }
+
+    #[test]
+    fn join_failure_with_no_spare_degrades_then_recovers() {
+        let p = pool(1);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        let sa = p.test_slot_of("A", "alice").unwrap();
+        // Sole bot's join times out, no spare → degrade to overflow + no anchor.
+        p.on_join_failed(sa);
+        assert!(p.test_is_unhealthy(sa));
+        assert!(p.test_is_overflow("A", "alice"), "dropped to overflow");
+        assert_eq!(p.test_anchor("A"), None, "channel has no anchor (degraded)");
+        // Quarantine clears → service_pending re-activates the channel on that bot.
+        p.recover_bot(sa);
+        assert!(!p.test_is_unhealthy(sa));
+        assert_eq!(p.test_anchor("A"), Some(sa), "re-anchored after recovery");
+        assert_eq!(p.test_slot_of("A", "alice"), Some(sa));
     }
 
     #[test]
