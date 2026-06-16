@@ -149,12 +149,8 @@ pub struct MatrixConfig {
     pub bot_avatar_path: Option<String>,
 }
 
-fn default_media_e2ee() -> bool {
-    false
-}
-
 /// How a ghost delivers its LiveKit frame key to the call's human members.
-/// Only meaningful when `media_e2ee = true`.
+/// Only meaningful when `media_e2ee` resolves to true.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyTransport {
@@ -167,10 +163,6 @@ pub enum KeyTransport {
     /// cannot read the key. Each ghost becomes a full crypto-capable Matrix client
     /// (its own device + persistent crypto store). Use this for an encrypted room.
     Olm,
-}
-
-fn default_key_transport() -> KeyTransport {
-    KeyTransport::Plaintext
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,17 +178,42 @@ pub struct LiveKitConfig {
     /// only to override that.
     #[serde(default)]
     pub url: Option<String>,
-    /// Enable Element Call media E2EE (HKDF key exchange via to-device).
-    /// Set to true only when the EC deployment uses frame encryption.
-    /// Default: false (most deployments run without media E2EE).
-    #[serde(default = "default_media_e2ee")]
-    pub media_e2ee: bool,
-    /// How ghosts deliver their media key when `media_e2ee` is on. `"plaintext"`
-    /// (default) keeps the homeserver-readable Path 2 transport — correct for an
-    /// unencrypted room. `"olm"` upgrades to true per-ghost Olm E2EE (Path 3) for
-    /// an encrypted room. Ignored when `media_e2ee = false`.
-    #[serde(default = "default_key_transport")]
-    pub key_transport: KeyTransport,
+    /// Element Call media E2EE (HKDF frame encryption). **Optional override.**
+    /// When omitted (the default), it is auto-detected from the room's
+    /// `m.room.encryption` state at startup (`encrypted ⇒ true`). Set it
+    /// explicitly only to force a value — e.g. `false` to keep a bridge plaintext
+    /// even in an encrypted room. See `resolved_media_e2ee`.
+    #[serde(default)]
+    pub media_e2ee: Option<bool>,
+    /// How ghosts deliver their media key when media E2EE is on. **Optional
+    /// override.** When omitted it is auto-selected from the resolved
+    /// `media_e2ee`: an encrypted room defaults to `"olm"` (true per-ghost E2EE,
+    /// Path 3); otherwise `"plaintext"` (homeserver-readable Path 2). Set it to
+    /// pin a transport. Ignored when media E2EE resolves to false. See
+    /// `resolved_key_transport`.
+    #[serde(default)]
+    pub key_transport: Option<KeyTransport>,
+}
+
+impl LiveKitConfig {
+    /// Resolve the effective media-E2EE setting: the explicit config override if
+    /// present, else the value auto-detected from the room's `m.room.encryption`
+    /// state (`detected`).
+    pub fn resolved_media_e2ee(&self, detected: bool) -> bool {
+        self.media_e2ee.unwrap_or(detected)
+    }
+
+    /// Resolve the effective key transport given the already-resolved
+    /// `media_e2ee`: the explicit override if present, else auto — an encrypted
+    /// (media-E2EE) room wants its key delivered E2EE too, so default to `Olm`;
+    /// otherwise the homeserver-readable `Plaintext` (moot when E2EE is off).
+    pub fn resolved_key_transport(&self, media_e2ee: bool) -> KeyTransport {
+        self.key_transport.unwrap_or(if media_e2ee {
+            KeyTransport::Olm
+        } else {
+            KeyTransport::Plaintext
+        })
+    }
 }
 
 impl Config {
@@ -253,9 +270,9 @@ impl Config {
             ));
         }
 
-        // Hard: distinct store_path per bridge. `build_client` opens a persistent
-        // SQLite crypto store at `store_path` when `media_e2ee` is set, and with
-        // Olm key transport each bridge's ghosts nest their own stores under it
+        // Hard: distinct store_path per bridge. `build_client` always opens a
+        // persistent SQLite store at `store_path`, and with Olm key transport each
+        // bridge's ghosts nest their own stores under it
         // (`<store_path>/ghosts/<localpart>`); two bridges sharing one path would
         // lock/corrupt. Auto-derivation (`resolve_store_paths`) already gives each
         // bridge a distinct `<data_dir>/<bridge>` path, so this normally only fires
@@ -290,15 +307,18 @@ impl Config {
             }
         }
 
-        // Soft: `key_transport = "olm"` has no effect without `media_e2ee = true`
-        // (it only governs how the media key is delivered once E2EE is on). Flag the
-        // likely mistake rather than silently ignoring the operator's intent.
+        // Soft: explicitly pinning `key_transport = "olm"` while explicitly
+        // forcing `media_e2ee = false` is contradictory — Olm transport is ignored
+        // with E2EE off. (Both are now auto by default; only flag the deliberate
+        // both-set-and-conflicting case, not the auto path.)
         for b in &self.bridges {
-            if b.livekit.key_transport == KeyTransport::Olm && !b.livekit.media_e2ee {
+            if b.livekit.key_transport == Some(KeyTransport::Olm)
+                && b.livekit.media_e2ee == Some(false)
+            {
                 tracing::warn!(
                     room_id = %b.matrix.room_id,
                     "key_transport = \"olm\" set but media_e2ee = false — Olm key transport \
-                     is ignored; set media_e2ee = true to enable Path 3 E2EE"
+                     is ignored; remove the media_e2ee override (auto-detect) or set it true"
                 );
             }
         }
@@ -644,6 +664,84 @@ media_e2ee = false
         assert_eq!(cfg.bridges[0].matrix.store_path, "./nether-store/dup");
         assert_eq!(cfg.bridges[1].matrix.store_path, "./nether-store/dup");
         assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+    }
+
+    fn livekit(media_e2ee: Option<bool>, key_transport: Option<KeyTransport>) -> LiveKitConfig {
+        LiveKitConfig {
+            lk_jwt_url: None,
+            url: None,
+            media_e2ee,
+            key_transport,
+        }
+    }
+
+    #[test]
+    fn resolved_media_e2ee_override_beats_detection() {
+        // None → follow detection; Some → force regardless of detection.
+        assert!(livekit(None, None).resolved_media_e2ee(true));
+        assert!(!livekit(None, None).resolved_media_e2ee(false));
+        assert!(!livekit(Some(false), None).resolved_media_e2ee(true)); // force off in enc room
+        assert!(livekit(Some(true), None).resolved_media_e2ee(false)); // force on in unenc room
+    }
+
+    #[test]
+    fn resolved_key_transport_auto_and_override() {
+        // Unset: auto — Olm when E2EE on, Plaintext when off.
+        assert_eq!(livekit(None, None).resolved_key_transport(true), KeyTransport::Olm);
+        assert_eq!(
+            livekit(None, None).resolved_key_transport(false),
+            KeyTransport::Plaintext
+        );
+        // Explicit override is honored regardless of media_e2ee.
+        assert_eq!(
+            livekit(None, Some(KeyTransport::Plaintext)).resolved_key_transport(true),
+            KeyTransport::Plaintext
+        );
+        assert_eq!(
+            livekit(None, Some(KeyTransport::Olm)).resolved_key_transport(true),
+            KeyTransport::Olm
+        );
+    }
+
+    #[test]
+    fn media_e2ee_and_key_transport_are_optional() {
+        // An EMPTY [bridge.livekit] (no override lines) → None/None (auto path).
+        let raw = format!(
+            r#"{}[[bridge]]
+name = "g"
+[bridge.discord]
+guild_id = "111"
+channel_id = "222"
+
+[bridge.matrix]
+homeserver_url = "https://nether.im"
+room_id = "!r:nether.im"
+bot_user_id = "@bridge:nether.im"
+device_id = "BRIDGE01"
+access_token = "syt_tok"
+appservice_id = "voicebridge"
+appservice_token = "hs_tok"
+store_path = "./s"
+
+[bridge.livekit]
+"#,
+            puppets_block(&["Bot a"]),
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse failed");
+        assert_eq!(cfg.bridges[0].livekit.media_e2ee, None);
+        assert_eq!(cfg.bridges[0].livekit.key_transport, None);
+    }
+
+    #[test]
+    fn explicit_media_e2ee_parses_to_some() {
+        // The fixtures set `media_e2ee = false` → Some(false), an explicit override.
+        let raw = format!(
+            "{}{}",
+            puppets_block(&["Bot a"]),
+            bridge_block(Some("g"), "!r:nether.im", "./s", "222"),
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse failed");
+        assert_eq!(cfg.bridges[0].livekit.media_e2ee, Some(false));
     }
 
     #[test]

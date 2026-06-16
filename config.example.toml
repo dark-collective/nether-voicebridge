@@ -135,26 +135,29 @@ appservice_token = "your_appservice_hs_token_here"
 #   lk_jwt_url = "https://lk-jwt.nether.im"   # override lk-jwt-service endpoint
 #   url        = "wss://livekit.nether.im"    # override SFU WebSocket URL
 
-# Element Call media frame E2EE (AES-GCM, HKDF). Set TRUE for an ENCRYPTED Matrix
-# room (where EC runs per-frame encryption); FALSE for an unencrypted room
-# (encrypting into a non-E2EE call makes peers hear static). When true the bridge
-# does Olm via a persistent crypto store and posts m.call.member to receive media
-# keys — pair it with appservice-auth (omit access_token above) for a clean,
-# self-provisioned device identity. Works BOTH directions (Matrix→Discord receive
-# and Discord→Matrix ghost publishing). Default: false.
-media_e2ee = false
+# Element Call media frame E2EE (AES-GCM, HKDF). OPTIONAL — by default this is
+# AUTO-DETECTED from the room's `m.room.encryption` state at startup: an encrypted
+# room ⇒ on, an unencrypted room ⇒ off. (Encryption is a one-way latch, so the
+# detected value is stable.) Getting it right matters — encrypting into a non-E2EE
+# call makes peers hear static, and not encrypting into an E2EE call means they
+# can't decrypt — which is exactly why auto-detect is the default. When it resolves
+# on, the bridge does Olm via a persistent crypto store and posts m.call.member to
+# receive media keys — pair it with appservice-auth (omit access_token above) for a
+# clean, self-provisioned device identity. Works BOTH directions. Set this only to
+# FORCE a value (e.g. media_e2ee = false to keep a bridge plaintext in an encrypted
+# room); leave it commented to auto-detect.
+# media_e2ee = false
 
-# How ghost media keys reach the call's humans when media_e2ee = true (ignored
-# otherwise):
-#   "plaintext" (default) — an unencrypted to-device key send. The homeserver can
-#     read the key; correct for an unencrypted room, where EC has no media-E2EE
-#     security model anyway.
+# How ghost media keys reach the call's humans (only when media E2EE resolves on).
+# OPTIONAL — auto-selected from the resolved media_e2ee: an encrypted room defaults
+# to "olm", otherwise "plaintext". Set this only to pin a transport.
+#   "plaintext" — an unencrypted to-device key send. The homeserver can read the
+#     key; fine where EC has no media-E2EE security model.
 #   "olm" — true end-to-end: each ghost becomes a full crypto client (its own
 #     device + a persistent store nested under matrix.store_path) and Olm-encrypts
-#     its key per recipient device. Use this for a genuinely ENCRYPTED room so the
-#     homeserver never sees the frame key. Heavier (one sync per active Discord
-#     speaker) — see the architecture doc.
-# key_transport = "plaintext"
+#     its key per recipient device, so the homeserver never sees the frame key.
+#     Heavier (one sync per active Discord speaker) — see the architecture doc.
+# key_transport = "olm"
 
 # ─── A second bridge (different channel ↔ different room) ────────────────────
 # Uncomment and fill in to bridge a second pair from this same process. Note the
@@ -181,5 +184,5 @@ media_e2ee = false
 # store_path = "./nether-store/gaming"   # OPTIONAL — auto-derives to <data_dir>/<name>
 #
 # [bridge.livekit]
-# media_e2ee = false
+# # media_e2ee / key_transport auto-detect from room encryption; set only to force.
 # # lk_jwt_url / url are auto-derived; uncomment only to override (see above).

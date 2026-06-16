@@ -35,12 +35,21 @@ test.
   calls" shows *"Default"* both when unset (→ `state_default` 50) and when an
   explicit `0` override is present — so it's unreliable; check the RAW
   `m.room.power_levels`.
-- **Per-room media E2EE is opt-in.** An *unencrypted* room must run
-  `media_e2ee = false` (verified 2026-06-14): EC runs frame E2EE off there, so
-  encrypting into it makes peers hear static. An *encrypted* room runs
-  `media_e2ee = true`. The media key then reaches the call's humans by one of two
-  transports, set per bridge via `livekit.key_transport`:
-  - `"plaintext"` (default) — homeserver-readable to-device key send (Path 2).
+- **Per-room media E2EE is auto-detected (opt-out override).** By default the
+  bridge reads the room's `m.room.encryption` state at startup and resolves
+  `media_e2ee` from it (encrypted ⇒ on, unencrypted ⇒ off) — `livekit.media_e2ee`
+  is now an `Option<bool>` override, set only to force a value. The matching matters
+  (verified 2026-06-14): EC runs frame E2EE off in an unencrypted room, so
+  encrypting into it makes peers hear static; not encrypting into an E2EE call
+  means peers can't decrypt — hence auto-detect. Resolution lives in
+  `nvb_config::LiveKitConfig::resolved_media_e2ee/_key_transport` +
+  `matrix::detect_room_encryption`, threaded from `matrix-rtc/src/lib.rs::run`.
+  Because the persistent store is now opened unconditionally (detection can only run
+  *after* the first sync, but the store must be ready *before* it), an unencrypted
+  bridge also keeps a store. The media key then reaches the call's humans by one of
+  two transports (`livekit.key_transport`, also an `Option` — auto-selects `olm`
+  for an encrypted room, else `plaintext`):
+  - `"plaintext"` — homeserver-readable to-device key send (Path 2).
   - `"olm"` — **true E2EE (Path 3)**: each ghost becomes its own crypto client and
     Olm-encrypts the key per recipient device via
     `Encryption::encrypt_and_send_raw_to_device`. **Implemented + live-verified
@@ -48,8 +57,10 @@ test.
     recipient's **stale/offline** devices (no one-time keys) show as
     `unreachable` — delivery to their *live* device still succeeds; only a
     `reached NO recipient devices` WARN means an actual failure.
+  A room can only go unencrypted→encrypted (one-way latch); if that happens at
+  runtime the bridge logs loudly and tears down (restart re-detects E2EE-on).
   See constraint #3 (livekit's KDF mismatch) — it applies whenever `media_e2ee`
-  is on, both transports.
+  resolves on, both transports.
 - Discord: one or more guilds/voice channels; a single shared pool of N puppet
   bot applications (config `[puppets]`), dynamically allocated across all bridged
   channels — no dedicated listener, one bot per active channel is the floating

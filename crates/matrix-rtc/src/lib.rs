@@ -20,7 +20,8 @@ mod rtc;
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use matrix_sdk::ruma::RoomId;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -46,10 +47,32 @@ pub async fn run(
     bridge: Arc<str>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    // Build the client first (surfaces login/restore errors before the loops).
-    // Pass media_e2ee so the client gets a persistent Olm crypto store when the
-    // bridged room is encrypted.
-    let client = matrix::build_client(matrix_cfg, livekit_cfg.media_e2ee, &bridge).await?;
+    // Build the client first (surfaces login/restore errors before the loops). It
+    // always opens the persistent store and does the initial sync, so room state
+    // (incl. `m.room.encryption`) is local by the time it returns.
+    let client = matrix::build_client(matrix_cfg, &bridge).await?;
+
+    // Resolve media-E2EE for this bridge (#14): auto-detect from the room's
+    // `m.room.encryption` state, unless the config pins an override. An encrypted
+    // room also defaults the key transport to Olm (true E2EE). These resolved
+    // values — not the raw config Options — drive every E2EE decision below.
+    let room_id = RoomId::parse(&matrix_cfg.room_id)
+        .with_context(|| format!("parsing room_id '{}'", matrix_cfg.room_id))?;
+    let detected = matrix::detect_room_encryption(&client, &room_id);
+    let media_e2ee = livekit_cfg.resolved_media_e2ee(detected);
+    let key_transport = livekit_cfg.resolved_key_transport(media_e2ee);
+    tracing::info!(
+        detected_encrypted = detected,
+        media_e2ee,
+        ?key_transport,
+        override_media_e2ee = ?livekit_cfg.media_e2ee,
+        "resolved media E2EE for bridge"
+    );
+    // The bot is a visible roster member (named + avatared) only with E2EE on, so
+    // EC/Commet can target it with media keys. Done here now that detection has run.
+    if media_e2ee {
+        matrix::apply_bot_profile(&client, matrix_cfg).await;
+    }
 
     // Clear any ghost m.call.member left by a prior crashed run before the
     // subscriber joins, so Element Call starts from a clean roster (the bridge
@@ -73,6 +96,7 @@ pub async fn run(
         matrix::run(
             client.clone(),
             matrix_cfg,
+            media_e2ee,
             call_active_tx,
             members_gen_tx,
             router.clone(),
@@ -83,12 +107,20 @@ pub async fn run(
             client.clone(),
             livekit_cfg,
             matrix_cfg,
+            media_e2ee,
             call_active_rx,
             router,
             bridge.clone(),
             shutdown.clone(),
         ),
-        ghost_pool.run(client, members_gen_rx, bridge.clone(), shutdown.clone()),
+        ghost_pool.run(
+            client,
+            media_e2ee,
+            key_transport,
+            members_gen_rx,
+            bridge.clone(),
+            shutdown.clone()
+        ),
     )?;
 
     Ok(())

@@ -69,10 +69,15 @@ impl ActiveSession {
 /// * `mx_cfg`  — Matrix config (bot user_id + device_id + room_id)
 /// * `call_active_rx` — watch receiver: `true` when humans are in the call
 #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     client: Client,
     lk_cfg: &LiveKitConfig,
     mx_cfg: &MatrixConfig,
+    // Resolved media-E2EE for this bridge (#14: auto-detected/overridden in
+    // `lib::run`), NOT the raw `lk_cfg.media_e2ee` Option. Gates the subscriber's
+    // `m.call.member` post and LiveKit frame-decrypt setup.
+    media_e2ee: bool,
     mut call_active_rx: watch::Receiver<bool>,
     router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
@@ -194,7 +199,7 @@ pub(crate) async fn run(
                     &room_id_str,
                     mx_cfg.device_id.as_str(),
                     &shared_provider,
-                    lk_cfg.media_e2ee,
+                    media_e2ee,
                     lk_cfg.lk_jwt_url.as_deref(),
                     lk_cfg.url.as_deref(),
                     router.clone(),
@@ -211,7 +216,7 @@ pub(crate) async fn run(
                         // provider is shared (inside join_livekit) so a fast
                         // incoming key has a live provider to land in. Retried until
                         // it lands (self-heals a transient/room-PL failure).
-                        if lk_cfg.media_e2ee {
+                        if media_e2ee {
                             let mc = shutdown.child_token();
                             membership_cancel = Some(mc.clone());
                             membership_handle = Some(tokio::spawn(
@@ -248,7 +253,7 @@ pub(crate) async fn run(
                     let _ = h.await;
                 }
                 // Retract the E2EE roster membership we posted on join.
-                if lk_cfg.media_e2ee {
+                if media_e2ee {
                     retract_membership(&client, &room_id, &bot_user_id, &device_id).await;
                 }
             }
@@ -283,7 +288,7 @@ pub(crate) async fn run(
         }
         // Retract the E2EE roster membership so the bot doesn't linger in the
         // call view after the process exits.
-        if lk_cfg.media_e2ee {
+        if media_e2ee {
             retract_membership(&client, &room_id, &bot_user_id, &device_id).await;
         }
     }

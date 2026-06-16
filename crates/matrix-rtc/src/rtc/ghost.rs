@@ -245,8 +245,12 @@ impl GhostPool {
                 as_token: matrix_cfg.appservice_token.clone(),
                 server_name: bot_user.server_name().as_str().to_owned(),
                 bot_user_id: bot_user.as_str().to_owned(),
-                media_e2ee: livekit_cfg.media_e2ee,
-                key_transport: livekit_cfg.key_transport,
+                // Placeholders. The real media_e2ee / key_transport are resolved
+                // (auto-detected from room encryption) only after the client syncs,
+                // which happens after this synchronous `new`. `GhostPool::run`
+                // overwrites both per ghost from its resolved arguments (#14).
+                media_e2ee: false,
+                key_transport: KeyTransportMode::Plaintext,
                 store_path: matrix_cfg.store_path.clone(),
                 lk_jwt_url: livekit_cfg.lk_jwt_url.clone(),
                 lk_url: livekit_cfg.url.clone(),
@@ -343,6 +347,11 @@ impl GhostPool {
     pub async fn run(
         self: Arc<Self>,
         client: Client,
+        // Resolved E2EE settings (#14: auto-detected/overridden in `lib::run`),
+        // applied to every ghost minted below. Overrides the `new`-time placeholders
+        // in `self.cfg` because room encryption is only known after the client syncs.
+        media_e2ee: bool,
+        key_transport: KeyTransportMode,
         members_gen_rx: watch::Receiver<u64>,
         bridge: Arc<str>,
         shutdown: CancellationToken,
@@ -413,7 +422,11 @@ impl GhostPool {
                         }
                     }
                     let cancel = CancellationToken::new();
-                    let cfg = self.cfg.clone();
+                    let mut cfg = self.cfg.clone();
+                    // Apply the resolved E2EE settings (the `new`-time fields are
+                    // placeholders — see `GhostPool::new`).
+                    cfg.media_e2ee = media_e2ee;
+                    cfg.key_transport = key_transport;
                     let focus = focus.clone().expect("focus set above");
                     let join = tokio::spawn(
                         run_ghost(cfg, focus, client.clone(), members_gen_rx.clone(), key.clone(), display_name, avatar_url, frame_rx, cancel.clone())

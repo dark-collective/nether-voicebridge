@@ -9,6 +9,7 @@ use matrix_sdk::{
         events::{
             SyncStateEvent,
             call::member::{CallMemberEventContent, SyncCallMemberEvent},
+            room::encryption::SyncRoomEncryptionEvent,
         },
     },
 };
@@ -275,19 +276,17 @@ pub(crate) async fn retract_self_call_membership(
 /// This is kept separate from `run()` so the crate's `run()` can clone the
 /// client into the RTC task before starting the perpetual sync loop.
 #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
-pub(crate) async fn build_client(
-    cfg: &MatrixConfig,
-    media_e2ee: bool,
-    bridge: &str,
-) -> Result<Client> {
-    let mut builder = Client::builder().homeserver_url(&cfg.homeserver_url);
-    if media_e2ee {
-        // Persistent Olm crypto store (per-bridge `store_path`, validated unique
-        // in config). Required so this device's keys/OTKs survive restarts and so
-        // the SDK can decrypt the Olm-encrypted media keys EC/Commet send in an
-        // encrypted room. Unencrypted bridges keep the default in-memory store.
-        builder = builder.sqlite_store(&cfg.store_path, None);
-    }
+pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Client> {
+    // Always open the persistent SQLite store at the (auto-derived, validated
+    // unique) `store_path`. It must be ready BEFORE the first sync — but whether
+    // the room is encrypted can only be read AFTER the sync (see
+    // `detect_room_encryption`), so we can't gate the store on E2EE. Persisting it
+    // unconditionally is harmless for an unencrypted room (just state + a device
+    // identity) and required for an encrypted one (Olm keys/OTKs must survive
+    // restarts so the SDK can decrypt the media keys EC/Commet send).
+    let builder = Client::builder()
+        .homeserver_url(&cfg.homeserver_url)
+        .sqlite_store(&cfg.store_path, None);
     let client = builder.build().await?;
 
     let bot_user_id: OwnedUserId = cfg.bot_user_id.parse()?;
@@ -352,16 +351,27 @@ pub(crate) async fn build_client(
         }
     }
 
-    if media_e2ee {
-        // Observable gate: by here the first sync has uploaded device keys/OTKs.
-        tracing::info!(device_id = %cfg.device_id, "crypto store ready (e2e on)");
-        // The bot is a visible roster member only with E2EE on — give it the
-        // configured (or default) display name + avatar so it reads as an
-        // intentional service rather than a stray user.
-        apply_bot_profile(&client, cfg).await;
-    }
-
     Ok(client)
+}
+
+/// Whether the room is end-to-end encrypted, read from local state after the
+/// initial sync. Drives the per-bridge `media_e2ee` auto-detection (#14). The
+/// `m.room.encryption` state event is a one-way latch (a room never un-encrypts),
+/// so this decision is stable for the life of the bridge.
+///
+/// Reads the raw `m.room.encryption` state event (mirrors the `CallMemberEvent`
+/// pattern used elsewhere) rather than a version-specific helper: a present,
+/// deserializable original event ⇒ encrypted. A missing room or no event ⇒ false.
+pub(crate) fn detect_room_encryption(client: &Client, room_id: &RoomId) -> bool {
+    let Some(room) = client.get_room(room_id) else {
+        tracing::warn!(%room_id, "encryption detect: room not in local state — assuming unencrypted");
+        return false;
+    };
+    let state = room.encryption_state();
+    if state.is_unknown() {
+        tracing::warn!(%room_id, "encryption state unknown after sync — assuming unencrypted");
+    }
+    state.is_encrypted()
 }
 
 /// Set the bridge bot's Matrix display name and avatar (best-effort — never blocks
@@ -369,7 +379,7 @@ pub(crate) async fn build_client(
 /// is uploaded only when the account has none yet (it then persists as an `mxc://`,
 /// so it isn't re-uploaded each restart): from `bot_avatar_path` if set, else the
 /// embedded [`DEFAULT_AVATAR_PNG`].
-async fn apply_bot_profile(client: &Client, cfg: &MatrixConfig) {
+pub(crate) async fn apply_bot_profile(client: &Client, cfg: &MatrixConfig) {
     let name = cfg.bot_display_name.as_deref().unwrap_or(DEFAULT_DISPLAY_NAME);
     if let Err(e) = client.account().set_display_name(Some(name)).await {
         tracing::warn!(error = %e, "failed to set bridge-bot display name");
@@ -503,9 +513,11 @@ pub(crate) async fn appservice_login_as(
 /// call-active signals through `call_active_tx` when the first human
 /// joins or the last human leaves.
 #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     client: Client,
     cfg: &MatrixConfig,
+    media_e2ee: bool,
     call_active_tx: watch::Sender<bool>,
     members_gen_tx: watch::Sender<u64>,
     router: Arc<dyn PlaybackRouter>,
@@ -604,6 +616,33 @@ pub(crate) async fn run(
         tracing::info!("initial call snapshot loaded");
     } else {
         tracing::warn!(room_id = %room_id, "room not in local state after sync_once");
+    }
+
+    // Live encryption-latch watcher (#14). `m.room.encryption` is one-way: a room
+    // can only go unencrypted→encrypted. If THIS bridge started unencrypted
+    // (`media_e2ee == false`) and the room becomes encrypted at runtime, we must
+    // not keep publishing plaintext frames into a now-E2EE call (peers would hear
+    // static) — tear the bridge down cleanly and log loudly; a restart re-detects
+    // and comes back E2EE-on. When we already started encrypted, there's nothing to
+    // react to. (Auto-rebuild / hot-switch is future work.)
+    if !media_e2ee {
+        let shutdown = shutdown.clone();
+        let bridge = bridge.clone();
+        client.add_room_event_handler(&room_id, move |_ev: SyncRoomEncryptionEvent, room: Room| {
+            let shutdown = shutdown.clone();
+            let bridge = bridge.clone();
+            let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
+            async move {
+                tracing::error!(
+                    room_id = %room.room_id(),
+                    "room became ENCRYPTED while the bridge is running unencrypted — \
+                     tearing down to avoid pumping plaintext audio into an E2EE call; \
+                     restart the bridge to re-detect and enable media E2EE"
+                );
+                shutdown.cancel();
+            }
+            .instrument(span)
+        });
     }
 
     // Run sync forever — drives the event handler registered above and feeds
