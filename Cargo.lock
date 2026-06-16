@@ -3659,10 +3659,12 @@ name = "nvb-matrix-rtc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "futures-util",
  "livekit",
  "matrix-sdk",
+ "matrix-sdk-crypto",
  "mime",
  "nvb-audio",
  "nvb-config",

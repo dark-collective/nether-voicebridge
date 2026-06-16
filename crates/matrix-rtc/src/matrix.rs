@@ -417,13 +417,33 @@ fn guess_image_mime(path: &str) -> mime::Mime {
 /// the persistent crypto store stays valid across restarts. Mirrors the
 /// `as_token` HTTP pattern the ghosts use in `rtc::ghost`.
 async fn appservice_login(cfg: &MatrixConfig, localpart: &str) -> Result<String> {
+    appservice_login_as(
+        &cfg.homeserver_url,
+        &cfg.appservice_token,
+        localpart,
+        &cfg.device_id,
+    )
+    .await
+}
+
+/// Parameterized appservice login: register (idempotent) + mint a device/token for
+/// `localpart`, asserting `device_id`. The bot path calls this via
+/// [`appservice_login`]; ghosts call it directly to become crypto-capable clients
+/// (each with its own stable device id), reusing the exact, proven flow rather
+/// than reimplementing it. Authenticated with the appservice `as_token`.
+pub(crate) async fn appservice_login_as(
+    homeserver_url: &str,
+    appservice_token: &str,
+    localpart: &str,
+    device_id: &str,
+) -> Result<String> {
     let http = reqwest::Client::builder().use_rustls_tls().build()?;
-    let base = cfg.homeserver_url.trim_end_matches('/');
+    let base = homeserver_url.trim_end_matches('/');
 
     // Idempotent register — tolerate an already-registered user (M_USER_IN_USE).
     let reg = http
         .post(format!("{base}/_matrix/client/v3/register"))
-        .bearer_auth(&cfg.appservice_token)
+        .bearer_auth(appservice_token)
         .json(&serde_json::json!({
             "type": "m.login.application_service",
             "username": localpart,
@@ -442,11 +462,11 @@ async fn appservice_login(cfg: &MatrixConfig, localpart: &str) -> Result<String>
     // Mint device + token, asserting our stable device_id (MSC4326).
     let resp = http
         .post(format!("{base}/_matrix/client/v3/login"))
-        .bearer_auth(&cfg.appservice_token)
+        .bearer_auth(appservice_token)
         .json(&serde_json::json!({
             "type": "m.login.application_service",
             "identifier": { "type": "m.id.user", "user": localpart },
-            "device_id": cfg.device_id,
+            "device_id": device_id,
         }))
         .send()
         .await
@@ -467,14 +487,14 @@ async fn appservice_login(cfg: &MatrixConfig, localpart: &str) -> Result<String>
         .ok_or_else(|| anyhow::anyhow!("appservice login response missing access_token"))?
         .to_owned();
     if let Some(returned) = json["device_id"].as_str() {
-        if returned != cfg.device_id {
+        if returned != device_id {
             tracing::warn!(
-                asserted = %cfg.device_id, returned = %returned,
+                asserted = %device_id, returned = %returned,
                 "homeserver returned a different device_id than asserted — crypto store may not match"
             );
         }
     }
-    tracing::info!(user = %localpart, device_id = %cfg.device_id, "appservice login succeeded (self-provisioned device)");
+    tracing::info!(user = %localpart, device_id = %device_id, "appservice login succeeded (self-provisioned device)");
     Ok(access_token)
 }
 

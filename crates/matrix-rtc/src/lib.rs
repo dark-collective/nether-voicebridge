@@ -1,3 +1,8 @@
+// matrix-sdk's `Client::sync` future is deeply nested; proving `Send` for it (so a
+// per-ghost crypto sync can be `tokio::spawn`ed) overflows the default 128-deep
+// trait-recursion limit. The compiler itself suggests raising it.
+#![recursion_limit = "256"]
+
 //! The Matrix side of the bridge.
 //!
 //! Two internal modules: [`matrix`] (matrix-sdk client login/sync and
