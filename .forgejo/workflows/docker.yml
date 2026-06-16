@@ -57,5 +57,8 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: nether.codes/${{ github.repository }}:${{ steps.vars.outputs.tag }}
-          cache-from: type=registry,ref=nether.codes/${{ github.repository }}:buildcache
-          cache-to: type=registry,ref=nether.codes/${{ github.repository }}:buildcache,mode=max
+          # No registry buildcache: cache-to mode=max pushes the huge cargo-chef
+          # dependency layer, which exceeds Cloudflare's ~100 MB upload cap (413),
+          # and cache-from never resolved it anyway. Cold builds are ~12 min amd64.
+          # If incremental caching is wanted later, use a non-Cloudflare backend
+          # (e.g. type=gha — the runner's actions cache is enabled).
