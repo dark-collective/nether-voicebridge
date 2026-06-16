@@ -1,0 +1,23 @@
+services:
+  voicebridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nether-voicebridge:latest
+    restart: unless-stopped
+    volumes:
+      # config.toml holds all secrets — never baked into the image.
+      # Copy config.example.toml to config.toml, fill it in, and keep it here.
+      - ./config.toml:/app/config.toml:ro
+      # Persistent matrix-sdk SQLite store. Set store_path = "/app/data/<name>"
+      # in config.toml (not a relative path — relative paths write inside the
+      # container and are lost on restart).
+      - voicebridge-data:/app/data
+    environment:
+      # Log filter: global default "info", with the binary crate itself bumped
+      # to "debug". Matches scripts/dev-run.sh's convention. Raise further
+      # (e.g. "nether_voicebridge=debug,debug") when diagnosing audio issues.
+      RUST_LOG: "nether_voicebridge=debug,info"
+
+volumes:
+  voicebridge-data:

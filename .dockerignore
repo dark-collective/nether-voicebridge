@@ -1,0 +1,6 @@
+target/
+.git/
+config.toml
+*.log
+*.wav
+nether-store/

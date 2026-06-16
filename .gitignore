@@ -13,3 +13,5 @@ config.local.toml
 
 # Per-SSRC capture WAVs written when [discord] capture_wav = true (debug only).
 capture_*.wav
+
+/dev/
