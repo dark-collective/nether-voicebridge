@@ -40,18 +40,28 @@ pub(crate) struct FailedRecipient {
     pub device_id: OwnedDeviceId,
 }
 
+/// Outcome of one key send. `delivered` is how many recipient devices got the key;
+/// `failed` is the ones that didn't. The two together let the caller tell a working
+/// partial send (delivered > 0, some stale/offline devices skipped — normal) apart
+/// from a real failure (delivered == 0).
+#[derive(Debug, Default)]
+pub(crate) struct KeySendOutcome {
+    pub delivered: usize,
+    pub failed: Vec<FailedRecipient>,
+}
+
 /// Delivers a ghost's 16-byte LiveKit frame key to the call's human members.
 #[async_trait]
 pub(crate) trait KeyTransport: Send + Sync {
-    /// Deliver `key` (index `key_index`) to all `recipients`. `Ok(failed)` lists
-    /// recipient devices that could not be reached (the caller may keep bursting);
-    /// `Err` is a hard send failure (nothing delivered).
+    /// Deliver `key` (index `key_index`) to all `recipients`. `Ok(outcome)` reports
+    /// how many devices got it and which didn't (the caller may keep bursting for the
+    /// failures); `Err` is a hard send failure (nothing delivered).
     async fn send_key(
         &self,
         recipients: &[OwnedUserId],
         key: &[u8; 16],
         key_index: u8,
-    ) -> Result<Vec<FailedRecipient>>;
+    ) -> Result<KeySendOutcome>;
 
     /// Short label for logs ("plaintext" / "olm").
     fn kind(&self) -> &'static str;
@@ -102,9 +112,9 @@ impl KeyTransport for PlaintextTransport {
         recipients: &[OwnedUserId],
         key: &[u8; 16],
         key_index: u8,
-    ) -> Result<Vec<FailedRecipient>> {
+    ) -> Result<KeySendOutcome> {
         if recipients.is_empty() {
-            return Ok(Vec::new());
+            return Ok(KeySendOutcome::default());
         }
         let content = keys::build_key_content(
             &self.room_id,
@@ -142,8 +152,13 @@ impl KeyTransport for PlaintextTransport {
         if !resp.status().is_success() {
             return Err(anyhow!("sendToDevice failed: {}", err_body(resp).await));
         }
-        // A plaintext PUT is all-or-nothing per request — no per-device failures.
-        Ok(Vec::new())
+        // A plaintext PUT is all-or-nothing per request — the server fans it out to
+        // every recipient device (`*`), so on success all recipients are "delivered"
+        // and there are no per-device failures.
+        Ok(KeySendOutcome {
+            delivered: recipients.len(),
+            failed: Vec::new(),
+        })
     }
 
     fn kind(&self) -> &'static str {
@@ -180,9 +195,9 @@ impl KeyTransport for OlmTransport {
         recipients: &[OwnedUserId],
         key: &[u8; 16],
         key_index: u8,
-    ) -> Result<Vec<FailedRecipient>> {
+    ) -> Result<KeySendOutcome> {
         if recipients.is_empty() {
-            return Ok(Vec::new());
+            return Ok(KeySendOutcome::default());
         }
         let content = keys::build_key_content(
             &self.room_id,
@@ -215,6 +230,7 @@ impl KeyTransport for OlmTransport {
         }
 
         let device_refs: Vec<&Device> = devices.iter().collect();
+        let attempted = device_refs.len();
         // CollectStrategy::AllDevices matches Path 2's "send to *" semantics: we do
         // not verify devices, and a stricter strategy would silently drop unverified
         // recipients → they would hear static. Olm session setup + OTK claiming +
@@ -231,10 +247,14 @@ impl KeyTransport for OlmTransport {
             .await
             .context("encrypt_and_send_raw_to_device")?;
 
-        Ok(failed
+        let failed: Vec<FailedRecipient> = failed
             .into_iter()
             .map(|(user_id, device_id)| FailedRecipient { user_id, device_id })
-            .collect())
+            .collect();
+        Ok(KeySendOutcome {
+            delivered: attempted.saturating_sub(failed.len()),
+            failed,
+        })
     }
 
     fn kind(&self) -> &'static str {

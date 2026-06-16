@@ -992,21 +992,41 @@ async fn distribute_key_loop(
                     keyed.clear();
                 } else {
                     match transport.send_key(&current, &key, 0).await {
-                        Ok(failed) if failed.is_empty() => tracing::info!(
+                        // Every targeted device got the key.
+                        Ok(o) if o.failed.is_empty() => tracing::info!(
                             recipients = ?current.iter().map(|u| u.as_str()).collect::<Vec<_>>(),
                             transport = transport.kind(),
+                            delivered = o.delivered,
                             burst,
                             "ghost media key sent"
                         ),
-                        // Some recipient devices were unreachable (not yet tracked,
-                        // or out of one-time keys). Logged for observability; the
-                        // burst/heartbeat cadence re-sends, so a transient gap closes
-                        // on its own once the ghost's sync catches up or OTKs refill.
-                        Ok(failed) => tracing::warn!(
+                        // Partial success — the key reached the live device(s); the
+                        // unreachable ones are almost always stale/offline sessions
+                        // with no one-time keys (can't be fixed from the bridge). This
+                        // is the normal, healthy case, so it's INFO not WARN. The
+                        // per-device id list is DEBUG to keep the default log quiet;
+                        // burst/heartbeat keeps retrying in case any are transient.
+                        Ok(o) if o.delivered > 0 => {
+                            tracing::info!(
+                                transport = transport.kind(),
+                                delivered = o.delivered,
+                                unreachable = o.failed.len(),
+                                burst,
+                                "ghost media key delivered (some recipient devices unreachable — likely stale/offline sessions)"
+                            );
+                            tracing::debug!(
+                                unreachable_devices = ?o.failed.iter().map(|f| format!("{}:{}", f.user_id, f.device_id)).collect::<Vec<_>>(),
+                                "ghost media key: unreachable devices"
+                            );
+                        }
+                        // Reached NO devices — the real failure (e.g. the live device
+                        // is out of one-time keys, or the ghost's sync hasn't tracked
+                        // anyone yet). Burst/heartbeat retries; surfaced loudly.
+                        Ok(o) => tracing::warn!(
                             transport = transport.kind(),
+                            unreachable = o.failed.len(),
                             burst,
-                            failed = ?failed.iter().map(|f| format!("{}:{}", f.user_id, f.device_id)).collect::<Vec<_>>(),
-                            "ghost media key: some recipient devices unreachable — will retry"
+                            "ghost media key reached NO recipient devices — nobody can decrypt this ghost (will retry)"
                         ),
                         Err(e) => tracing::warn!(
                             error = %e,
@@ -1505,7 +1525,7 @@ mod tests {
 
     // ── distribute_key_loop, driven with mock transport + recipient source ──────
 
-    use super::super::key_transport::FailedRecipient;
+    use super::super::key_transport::KeySendOutcome;
 
     /// Records the recipient lists passed to each `send_key`.
     #[derive(Default)]
@@ -1520,9 +1540,12 @@ mod tests {
             recipients: &[OwnedUserId],
             _key: &[u8; 16],
             _key_index: u8,
-        ) -> Result<Vec<FailedRecipient>> {
+        ) -> Result<KeySendOutcome> {
             self.sends.lock().unwrap().push(recipients.to_vec());
-            Ok(Vec::new())
+            Ok(KeySendOutcome {
+                delivered: recipients.len(),
+                failed: Vec::new(),
+            })
         }
         fn kind(&self) -> &'static str {
             "mock"
@@ -1606,8 +1629,9 @@ mod tests {
             "@nether-voicebridge_1:nether.im".into(),
             "D1".into(),
         );
-        let failed = t.send_key(&[], &[0u8; 16], 0).await.unwrap();
-        assert!(failed.is_empty());
+        let outcome = t.send_key(&[], &[0u8; 16], 0).await.unwrap();
+        assert!(outcome.failed.is_empty());
+        assert_eq!(outcome.delivered, 0);
         assert_eq!(t.kind(), "plaintext");
     }
 }

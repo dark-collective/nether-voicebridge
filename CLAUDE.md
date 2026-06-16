@@ -35,11 +35,21 @@ test.
   calls" shows *"Default"* both when unset (→ `state_default` 50) and when an
   explicit `0` override is present — so it's unreliable; check the RAW
   `m.room.power_levels`.
-- **The call room is *unencrypted* and Element Call runs media frame E2EE
-  *off*** (verified 2026-06-14). The bridge runs `media_e2ee = false` and
-  publishes **plaintext** LiveKit frames; encrypting into this non-E2EE call
-  makes peers hear static. Keep it off unless the room becomes encrypted — see
-  constraint #3, which now applies only to that deferred encrypted-room branch.
+- **Per-room media E2EE is opt-in.** An *unencrypted* room must run
+  `media_e2ee = false` (verified 2026-06-14): EC runs frame E2EE off there, so
+  encrypting into it makes peers hear static. An *encrypted* room runs
+  `media_e2ee = true`. The media key then reaches the call's humans by one of two
+  transports, set per bridge via `livekit.key_transport`:
+  - `"plaintext"` (default) — homeserver-readable to-device key send (Path 2).
+  - `"olm"` — **true E2EE (Path 3)**: each ghost becomes its own crypto client and
+    Olm-encrypts the key per recipient device via
+    `Encryption::encrypt_and_send_raw_to_device`. **Implemented + live-verified
+    2026-06-16** on the encrypted "Light Voice" bridge. Expected log noise: a
+    recipient's **stale/offline** devices (no one-time keys) show as
+    `unreachable` — delivery to their *live* device still succeeds; only a
+    `reached NO recipient devices` WARN means an actual failure.
+  See constraint #3 (livekit's KDF mismatch) — it applies whenever `media_e2ee`
+  is on, both transports.
 - Discord: one or more guilds/voice channels; a single shared pool of N puppet
   bot applications (config `[puppets]`), dynamically allocated across all bridged
   channels — no dedicated listener, one bot per active channel is the floating
