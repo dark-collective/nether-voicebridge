@@ -161,9 +161,16 @@ appservice_token = "your_appservice_hs_token_here"
 
 # ─── A second bridge (different channel ↔ different room) ────────────────────
 # Uncomment and fill in to bridge a second pair from this same process. Note the
-# distinct `name`, `store_path`, and `channel_id`. It does NOT carry its own bot
-# tokens — it draws from the shared [puppets] pool above (make sure those bots
-# are invited to this bridge's guild too).
+# distinct `name` and `channel_id` (`store_path` auto-derives from `name`). It
+# does NOT carry its own bot tokens — it draws from the shared [puppets] pool
+# above (make sure those bots are invited to this bridge's guild too).
+#
+# Reusing ONE Matrix account across bridges: use appservice-auth (omit
+# `access_token`) and give each bridge a DISTINCT `device_id`. The appservice
+# self-provisions a separate device per bridge, so the same `bot_user_id` can back
+# many bridges safely. An `access_token`, by contrast, pins one token to one
+# device — two bridges sharing a token (or a device_id) makes their crypto clients
+# collide and breaks E2EE. So: same appservice user is fine, same device_id is not.
 #
 # [[bridge]]
 # name = "gaming"
