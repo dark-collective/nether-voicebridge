@@ -529,7 +529,7 @@ async fn run_ghost(
         // forbid) the invite, and the bare join below would still succeed — so a
         // failed invite must not block the ghost. `join_room` is the sole fatal gate:
         // if the room really was restricted, it fails there with a clear 403.
-        if let Err(e) = invite_ghost(&cfg, &ghost_mxid).await {
+        if let Err(e) = invite_ghost(&client, &cfg.room_id, &ghost_mxid).await {
             tracing::warn!(
                 error = %e,
                 bot = %cfg.bot_user_id,
@@ -1100,38 +1100,29 @@ async fn upload_media(
         .ok_or_else(|| anyhow!("media upload response missing content_uri"))
 }
 
-/// Invite the ghost to the call room, masqueraded as the **bridge bot** (which is
-/// already a room member). Required for **restricted** rooms (MSC3083): a ghost's
-/// bare `/join` is refused there unless it was invited. Idempotent — treats an
-/// "already in the room" rejection as success, mirroring [`register_ghost`]'s
-/// tolerance of `M_USER_IN_USE`.
-async fn invite_ghost(cfg: &GhostConfig, ghost_mxid: &str) -> Result<()> {
-    let url = cs_url(
-        &cfg.homeserver_url,
-        &["rooms", &cfg.room_id, "invite"],
-        Some(&cfg.bot_user_id),
-    )?;
-    let resp = cfg
-        .http
-        .post(url)
-        .bearer_auth(&cfg.as_token)
-        .json(&serde_json::json!({ "user_id": ghost_mxid }))
-        .send()
-        .await
-        .context("POST /invite")?;
-    if resp.status().is_success() {
-        tracing::debug!(ghost = %ghost_mxid, "ghost invited to room");
-        return Ok(());
+/// Invite the ghost to the call room **as the bridge bot**, via its matrix-sdk
+/// `Client` (NOT the `as_token` masquerade — that only works for the appservice's
+/// own namespace users, so it fails `M_EXCLUSIVE` for a regular-account bot like an
+/// unencrypted bridge's). Required for **restricted** rooms (MSC3083): a ghost's
+/// bare `/join` is refused there unless invited. Idempotent — skips when the ghost
+/// is already joined/invited.
+async fn invite_ghost(client: &Client, room_id: &str, ghost_mxid: &str) -> Result<()> {
+    let rid = RoomId::parse(room_id).with_context(|| format!("parsing room_id '{room_id}'"))?;
+    let Some(room) = client.get_room(&rid) else {
+        return Err(anyhow!("bridge bot is not in room {room_id} — cannot invite ghost"));
+    };
+    let ghost: OwnedUserId =
+        UserId::parse(ghost_mxid).with_context(|| format!("parsing ghost mxid '{ghost_mxid}'"))?;
+    // Already joined/invited → nothing to do (avoids needless invites + log noise).
+    if let Ok(Some(member)) = room.get_member_no_sync(&ghost).await {
+        use matrix_sdk::ruma::events::room::member::MembershipState;
+        if matches!(member.membership(), MembershipState::Join | MembershipState::Invite) {
+            return Ok(());
+        }
     }
-    // Already a member (or already invited) → nothing to do. Tuwunel/Synapse both
-    // return 403 M_FORBIDDEN with an "already in the room" message in that case.
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if text.contains("already in the room") || text.contains("already joined") {
-        tracing::debug!(ghost = %ghost_mxid, "ghost already a room member — invite skipped");
-        return Ok(());
-    }
-    Err(anyhow!("invite ghost failed: {status}: {text}"))
+    room.invite_user_by_id(&ghost).await.context("inviting ghost to room")?;
+    tracing::debug!(ghost = %ghost_mxid, "ghost invited to room");
+    Ok(())
 }
 
 /// Join the call room as the ghost (masqueraded). Idempotent on the server.

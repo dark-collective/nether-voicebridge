@@ -23,6 +23,18 @@ test.
   works** here — lk-jwt-service + a LiveKit container are deployed on nether-red
   and calls function. Do not redesign the homeserver or the RTC infra; this bot
   is just another participant.
+- **Room requirement (per bridged room):** the Matrix room must allow **power
+  level 0** for the `org.matrix.msc3401.call.member` state event — the standard
+  Element Call setup. Otherwise ghosts (and the E2EE subscriber) can't post their
+  `m.call.member` and won't appear in the call → Discord→Matrix fails with a 403
+  *"not enough power for org.matrix.msc3401.call.member"*. Starting a proper
+  Element Call in the room configures this (or set it via /devtools →
+  `m.room.power_levels`, `events["org.matrix.msc3401.call.member"] = 0`). Verified
+  2026-06-16: a room left at the default state PL (50) silently breaks the ghost
+  direction. **Gotcha:** Element's friendly "Roles & Permissions → Join Element
+  calls" shows *"Default"* both when unset (→ `state_default` 50) and when an
+  explicit `0` override is present — so it's unreliable; check the RAW
+  `m.room.power_levels`.
 - **The call room is *unencrypted* and Element Call runs media frame E2EE
   *off*** (verified 2026-06-14). The bridge runs `media_e2ee = false` and
   publishes **plaintext** LiveKit frames; encrypting into this non-E2EE call
