@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use matrix_sdk::{
     Client, Room, SessionMeta,
     authentication::{SessionTokens, matrix::MatrixSession},
@@ -14,6 +14,7 @@ use matrix_sdk::{
 };
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -185,13 +186,31 @@ pub(crate) async fn retract_self_call_membership(
 /// This is kept separate from `run()` so the crate's `run()` can clone the
 /// client into the RTC task before starting the perpetual sync loop.
 #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
-pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Client> {
-    let client = Client::builder()
-        .homeserver_url(&cfg.homeserver_url)
-        .build()
-        .await?;
+pub(crate) async fn build_client(
+    cfg: &MatrixConfig,
+    media_e2ee: bool,
+    bridge: &str,
+) -> Result<Client> {
+    let mut builder = Client::builder().homeserver_url(&cfg.homeserver_url);
+    if media_e2ee {
+        // Persistent Olm crypto store (per-bridge `store_path`, validated unique
+        // in config). Required so this device's keys/OTKs survive restarts and so
+        // the SDK can decrypt the Olm-encrypted media keys EC/Commet send in an
+        // encrypted room. Unencrypted bridges keep the default in-memory store.
+        builder = builder.sqlite_store(&cfg.store_path, None);
+    }
+    let client = builder.build().await?;
 
     let bot_user_id: OwnedUserId = cfg.bot_user_id.parse()?;
+
+    // Two auth modes. With a config `access_token`, use it (regular account).
+    // Without one, self-provision a device + token via appservice login — no
+    // password needed (the homeserver may use SSO), and it yields a clean,
+    // un-pinned device identity. `bot_user_id` must then be an appservice user.
+    let access_token = match cfg.access_token.as_deref() {
+        Some(tok) if !tok.is_empty() => tok.to_owned(),
+        _ => appservice_login(cfg, bot_user_id.localpart()).await?,
+    };
 
     let session = MatrixSession {
         meta: SessionMeta {
@@ -199,7 +218,7 @@ pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Cli
             device_id: cfg.device_id.as_str().into(),
         },
         tokens: SessionTokens {
-            access_token: cfg.access_token.clone(),
+            access_token,
             refresh_token: None,
         },
     };
@@ -207,15 +226,116 @@ pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Cli
     tracing::info!(user_id = %bot_user_id, "Matrix session restored");
 
     let room_id = RoomId::parse(&cfg.room_id)?;
-    // Join the room (idempotent if already a member).
-    client.join_room_by_id(&room_id).await?;
-    tracing::info!(room_id = %room_id, "joined Matrix room");
+    // Join the room (idempotent if already a member). Bound it: a restricted-room
+    // 403 (or a wedged homeserver) otherwise hangs startup silently for minutes.
+    match tokio::time::timeout(Duration::from_secs(30), client.join_room_by_id(&room_id)).await {
+        Ok(Ok(_)) => tracing::info!(room_id = %room_id, "joined Matrix room"),
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            if msg.contains("403") || msg.contains("M_FORBIDDEN") {
+                tracing::error!(
+                    room_id = %room_id, error = %e,
+                    "Matrix join forbidden (403) — is the bot invited/joined to the room (and its space, if restricted)?"
+                );
+            } else {
+                tracing::error!(room_id = %room_id, error = %e, "Matrix join failed");
+            }
+            return Err(anyhow::anyhow!("join_room_by_id failed: {e}"));
+        }
+        Err(_) => {
+            tracing::error!(room_id = %room_id, "Matrix join timed out after 30 s — homeserver unreachable or wedged");
+            return Err(anyhow::anyhow!("join_room_by_id timed out after 30 s"));
+        }
+    }
 
-    // One sync round to populate the local state store.
-    client.sync_once(SyncSettings::default()).await?;
-    tracing::info!("initial Matrix sync complete");
+    // One sync round to populate the local state store — and, with e2e on, upload
+    // this device's Olm keys + one-time keys so peers can establish Olm sessions.
+    // Bounded for the same reason as the join.
+    match tokio::time::timeout(Duration::from_secs(60), client.sync_once(SyncSettings::default())).await {
+        Ok(Ok(_)) => tracing::info!("initial Matrix sync complete"),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "initial Matrix sync failed");
+            return Err(anyhow::anyhow!("initial sync_once failed: {e}"));
+        }
+        Err(_) => {
+            tracing::error!("initial Matrix sync timed out after 60 s");
+            return Err(anyhow::anyhow!("initial sync_once timed out after 60 s"));
+        }
+    }
+
+    if media_e2ee {
+        // Observable gate: by here the first sync has uploaded device keys/OTKs.
+        tracing::info!(device_id = %cfg.device_id, "crypto store ready (e2e on)");
+    }
 
     Ok(client)
+}
+
+/// Mint a real device + access token for an appservice-namespace user via
+/// `m.login.application_service`, authenticated with the appservice token (no
+/// password — the homeserver may use SSO). A stable `device_id` is asserted so
+/// the persistent crypto store stays valid across restarts. Mirrors the
+/// `as_token` HTTP pattern the ghosts use in `rtc::ghost`.
+async fn appservice_login(cfg: &MatrixConfig, localpart: &str) -> Result<String> {
+    let http = reqwest::Client::builder().use_rustls_tls().build()?;
+    let base = cfg.homeserver_url.trim_end_matches('/');
+
+    // Idempotent register — tolerate an already-registered user (M_USER_IN_USE).
+    let reg = http
+        .post(format!("{base}/_matrix/client/v3/register"))
+        .bearer_auth(&cfg.appservice_token)
+        .json(&serde_json::json!({
+            "type": "m.login.application_service",
+            "username": localpart,
+        }))
+        .send()
+        .await
+        .context("appservice register request")?;
+    if !reg.status().is_success() {
+        let status = reg.status();
+        let body = reg.text().await.unwrap_or_default();
+        if !body.contains("M_USER_IN_USE") {
+            tracing::warn!(%status, "appservice register non-success (continuing to login)");
+        }
+    }
+
+    // Mint device + token, asserting our stable device_id (MSC4326).
+    let resp = http
+        .post(format!("{base}/_matrix/client/v3/login"))
+        .bearer_auth(&cfg.appservice_token)
+        .json(&serde_json::json!({
+            "type": "m.login.application_service",
+            "identifier": { "type": "m.id.user", "user": localpart },
+            "device_id": cfg.device_id,
+        }))
+        .send()
+        .await
+        .context("appservice login request")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        tracing::error!(
+            %status, body = %body,
+            "appservice login failed — does this homeserver accept m.login.application_service for the appservice user?"
+        );
+        return Err(anyhow::anyhow!("appservice login failed: {status}: {body}"));
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(&body).context("parsing appservice login response")?;
+    let access_token = json["access_token"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("appservice login response missing access_token"))?
+        .to_owned();
+    if let Some(returned) = json["device_id"].as_str() {
+        if returned != cfg.device_id {
+            tracing::warn!(
+                asserted = %cfg.device_id, returned = %returned,
+                "homeserver returned a different device_id than asserted — crypto store may not match"
+            );
+        }
+    }
+    tracing::info!(user = %localpart, device_id = %cfg.device_id, "appservice login succeeded (self-provisioned device)");
+    Ok(access_token)
 }
 
 /// Run the Matrix sync loop. Must be called with a client produced by

@@ -42,7 +42,9 @@ pub async fn run(
     shutdown: CancellationToken,
 ) -> Result<()> {
     // Build the client first (surfaces login/restore errors before the loops).
-    let client = matrix::build_client(matrix_cfg, &bridge).await?;
+    // Pass media_e2ee so the client gets a persistent Olm crypto store when the
+    // bridged room is encrypted.
+    let client = matrix::build_client(matrix_cfg, livekit_cfg.media_e2ee, &bridge).await?;
 
     // Clear any ghost m.call.member left by a prior crashed run before the
     // subscriber joins, so Element Call starts from a clean roster (the bridge

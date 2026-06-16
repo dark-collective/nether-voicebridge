@@ -71,21 +71,27 @@ room_id = "!yourroomid:nether.im"
 # MXID of the bridge bot account you created on nether.im.
 bot_user_id = "@voicebridge:nether.im"
 
-# Device ID associated with the access token below.
-# To find it: Element (logged in as the bot) → Settings → Help & About → "Session ID",
-# or call GET /_matrix/client/v3/account/whoami (returns { device_id: "..." }).
-# Must match the token — matrix-sdk uses this to restore the session correctly.
+# Device ID for the bot's matrix-sdk session. In access_token mode it must match
+# the device the token was minted for (Element → Settings → Help & About →
+# "Session ID", or GET /_matrix/client/v3/account/whoami). In appservice-auth
+# mode (no access_token, see below) it is any STABLE id we assert via appservice
+# login — keep it fixed so the persistent crypto store stays valid.
 device_id = "ABCDEFGHIJ"
 
-# Access token for the bot account.
-# Element (logged in as the bot): Settings → Help & About → Access Token
-# Or via the Matrix /_matrix/client/v3/login API.
+# Access token for the bot account. TWO modes:
+#  • Provide it  → regular-account auth (Element → Settings → Help & About →
+#    Access Token, or the /login API). `bot_user_id` is your real bot account.
+#  • OMIT it     → appservice-auth: the bridge self-provisions a device + token
+#    via m.login.application_service (no password — good for SSO homeservers, and
+#    it yields a clean crypto identity). `bot_user_id` must then be an appservice
+#    user (e.g. the registration's sender_localpart, "@voicebridge_as:..."),
+#    invited to the room/space like any participant. Recommended for media_e2ee.
 access_token = "syt_your_access_token_here"
 
 # These two fields come from the appservice registration YAML you install on
-# Tuwunel. They are only needed starting in Phase 8 (Discord→Matrix ghosts).
-# The id is whatever name you chose when registering the appservice;
-# the appservice_token is the as_token from that registration file.
+# Tuwunel. Needed for Phase 8 ghosts AND for appservice-auth mode above (the
+# appservice_token is the as_token used to mint/masquerade). The id is whatever
+# name you chose when registering the appservice.
 appservice_id = "voicebridge"
 appservice_token = "your_appservice_hs_token_here"
 
@@ -102,11 +108,13 @@ store_path = "./nether-store/general"
 #   lk_jwt_url = "https://lk-jwt.nether.im"   # override lk-jwt-service endpoint
 #   url        = "wss://livekit.nether.im"    # override SFU WebSocket URL
 
-# Element Call media frame E2EE (AES-GCM, HKDF). Leave FALSE unless the EC
-# deployment actually runs per-frame encryption (typically only for ENCRYPTED
-# Matrix rooms). nether.im's room is unencrypted and EC runs the call without
-# media E2EE, so the bridge must NOT encrypt — encrypting into a non-E2EE call
-# makes peers hear the bridge's ciphertext as static. Default: false.
+# Element Call media frame E2EE (AES-GCM, HKDF). Set TRUE for an ENCRYPTED Matrix
+# room (where EC runs per-frame encryption); FALSE for an unencrypted room
+# (encrypting into a non-E2EE call makes peers hear static). When true the bridge
+# does Olm via a persistent crypto store and posts m.call.member to receive media
+# keys — pair it with appservice-auth (omit access_token above) for a clean,
+# self-provisioned device identity. RECEIVE only (Matrix→Discord); Discord→Matrix
+# ghost publishing into an encrypted room is not yet supported. Default: false.
 media_e2ee = false
 
 # ─── A second bridge (different channel ↔ different room) ────────────────────
