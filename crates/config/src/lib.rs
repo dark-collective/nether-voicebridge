@@ -26,6 +26,14 @@ pub struct Config {
     /// raw serde "missing field" parse failure.
     #[serde(default)]
     pub puppets: PuppetsConfig,
+    /// Named homeserver/appservice profiles, keyed by label. TOML `[server.<name>]`
+    /// blocks map here. A bridge sets `server = "<name>"` to inherit this profile's
+    /// `homeserver_url` / `bot_user_id` / `appservice_id` / `appservice_token` /
+    /// `access_token` instead of repeating them — any field a bridge sets explicitly
+    /// still wins. Defaults to empty (bridges may instead spell everything out
+    /// inline in `[bridge.matrix]`).
+    #[serde(rename = "server", default)]
+    pub servers: std::collections::HashMap<String, ServerProfile>,
     /// One entry per bridged channel-pair. TOML `[[bridge]]` blocks map here.
     /// Each bridge is an independent Matrix/RTC pipeline (its own Matrix client,
     /// room, ghosts, and audio plumbing); the Discord puppet bots are shared
@@ -60,13 +68,47 @@ pub struct PuppetsConfig {
     pub nickname_prefix: String,
 }
 
+/// A reusable homeserver + appservice identity, referenced by bridges via
+/// `server = "<name>"`. Bundles the fields that are normally identical across every
+/// bridge on one homeserver so they're written once. Each field can still be
+/// overridden per bridge in `[bridge.matrix]`.
+#[derive(Debug, Deserialize)]
+pub struct ServerProfile {
+    pub homeserver_url: String,
+    /// The bot's MXID. In appservice mode (no `access_token`) its localpart must be
+    /// an appservice-namespace user (e.g. the registration's `sender_localpart`) —
+    /// distinct from `appservice_id`, so it can't be auto-derived.
+    pub bot_user_id: String,
+    /// Optional regular-account token shared by all bridges using this profile. When
+    /// absent, those bridges self-provision via appservice login.
+    #[serde(default)]
+    pub access_token: Option<String>,
+    pub appservice_id: String,
+    pub appservice_token: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct BridgeConfig {
-    /// Optional human label, used in logs/spans. Falls back to the index.
+    /// Optional human label, used in logs/spans. Falls back to the index. Also the
+    /// source for the auto-derived `matrix.device_id` and `store_path` leaf (slug).
     #[serde(default)]
     pub name: Option<String>,
+    /// Name of the `[server.<name>]` profile to inherit Matrix/appservice settings
+    /// from. Omit to spell everything out inline in `[bridge.matrix]`.
+    #[serde(default)]
+    pub server: Option<String>,
+    /// The bridged Matrix room — genuinely per-bridge, so it lives at the bridge
+    /// level. Accepted here (preferred) or inside `[bridge.matrix]` (back-compat);
+    /// this bridge-level value wins and is copied into the resolved `matrix.room_id`.
+    #[serde(default)]
+    pub room_id: String,
     pub discord: DiscordConfig,
+    /// Per-bridge Matrix settings: anything not set here is filled from the `server`
+    /// profile (`resolve_servers`), then `device_id`/`store_path` auto-derive. May be
+    /// omitted entirely when the profile + bridge-level `room_id` supply everything.
+    #[serde(default)]
     pub matrix: MatrixConfig,
+    #[serde(default)]
     pub livekit: LiveKitConfig,
 }
 
@@ -112,15 +154,27 @@ fn slugify(name: &str) -> String {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct MatrixConfig {
+    /// Inherited from the `[server.<name>]` profile when omitted. Empty string is the
+    /// "not set" sentinel that `resolve_servers` fills.
+    #[serde(default)]
     pub homeserver_url: String,
+    /// Genuinely per-bridge; normally set at the bridge level (copied here by
+    /// `resolve_servers`). Empty = "not set".
+    #[serde(default)]
     pub room_id: String,
+    /// Inherited from the `[server.<name>]` profile when omitted. Empty = "not set".
+    #[serde(default)]
     pub bot_user_id: String,
     /// The device ID for the bot's matrix-sdk session. In access_token mode this
     /// must match the device the token was minted for; in appservice-auth mode
     /// (no `access_token`) it is a stable device id we assert via appservice
     /// login, reused every start so the persistent crypto store stays valid.
+    /// Optional: when omitted it auto-derives from the bridge `name` (slug, same
+    /// leaf as `store_path`) via `resolve_device_ids` — stable per bridge and
+    /// distinct across bridges. Empty = "not set".
+    #[serde(default)]
     pub device_id: String,
     /// Regular-account access token. When omitted, the bridge self-provisions a
     /// device + token via appservice login (`m.login.application_service`,
@@ -128,7 +182,11 @@ pub struct MatrixConfig {
     /// appservice-namespace user (e.g. the registration's `sender_localpart`).
     #[serde(default)]
     pub access_token: Option<String>,
+    /// Inherited from the `[server.<name>]` profile when omitted. Empty = "not set".
+    #[serde(default)]
     pub appservice_id: String,
+    /// Inherited from the `[server.<name>]` profile when omitted. Empty = "not set".
+    #[serde(default)]
     pub appservice_token: String,
     /// Path to the matrix-sdk SQLite store (Olm crypto + state). Optional: when
     /// omitted it is auto-derived at load time as `<data_dir>/<bridge>` (see
@@ -165,7 +223,7 @@ pub enum KeyTransport {
     Olm,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct LiveKitConfig {
     /// Optional override for the lk-jwt-service endpoint. When absent (the
     /// default), it is auto-derived from the homeserver's `.well-known`
@@ -223,11 +281,69 @@ impl Config {
             source,
         })?;
         let mut cfg: Config = toml::from_str(&content).map_err(ConfigError::Parse)?;
+        // Merge each bridge's referenced `[server.<name>]` profile + bridge-level
+        // room_id into its `matrix` block BEFORE the per-bridge auto-derivations,
+        // so inherited fields are in place when device_id/store_path resolve.
+        cfg.resolve_servers();
+        cfg.resolve_device_ids();
         // `NVB_DATA_DIR` (set to `/app/data` by the Docker image) overrides the
         // configured `data_dir`; fall back to it otherwise.
         let data_dir = std::env::var("NVB_DATA_DIR").unwrap_or_else(|_| cfg.data_dir.clone());
         cfg.resolve_store_paths(&data_dir);
         Ok(cfg)
+    }
+
+    /// Fill each bridge's empty `matrix` fields from its referenced `[server.<name>]`
+    /// profile, and copy the bridge-level `room_id` into `matrix.room_id`. An explicit
+    /// per-bridge value (non-empty) always wins over the profile. A bridge with no
+    /// `server` (or an unknown one — caught later by `validate`) is left as-is, so a
+    /// fully-inline `[bridge.matrix]` still works. Runs before the auto-derivations.
+    pub fn resolve_servers(&mut self) {
+        // Disjoint borrows: `servers` (read) and `bridges` (write) are distinct fields.
+        let servers = &self.servers;
+        for b in self.bridges.iter_mut() {
+            let m = &mut b.matrix;
+            // Bridge-level room_id is the preferred spelling; it wins over any
+            // `[bridge.matrix].room_id` only when the latter wasn't set.
+            if m.room_id.is_empty() && !b.room_id.is_empty() {
+                m.room_id = b.room_id.clone();
+            }
+            let Some(profile) = b.server.as_ref().and_then(|name| servers.get(name)) else {
+                continue;
+            };
+            if m.homeserver_url.is_empty() {
+                m.homeserver_url = profile.homeserver_url.clone();
+            }
+            if m.bot_user_id.is_empty() {
+                m.bot_user_id = profile.bot_user_id.clone();
+            }
+            if m.appservice_id.is_empty() {
+                m.appservice_id = profile.appservice_id.clone();
+            }
+            if m.appservice_token.is_empty() {
+                m.appservice_token = profile.appservice_token.clone();
+            }
+            if m.access_token.is_none() {
+                m.access_token = profile.access_token.clone();
+            }
+        }
+    }
+
+    /// Fill each bridge's omitted (empty) `matrix.device_id` from the bridge `name`
+    /// (slug, `bridge-<index>` when unnamed) — the SAME leaf as `store_path`, so a
+    /// bridge's device and store stay consistent and unique-by-name. The device id is
+    /// stable across restarts (tied to the name), which the crypto store + Element
+    /// Call identity mapping require. An explicit `device_id` is left as-is.
+    pub fn resolve_device_ids(&mut self) {
+        for (i, b) in self.bridges.iter_mut().enumerate() {
+            if !b.matrix.device_id.is_empty() {
+                continue;
+            }
+            b.matrix.device_id = match &b.name {
+                Some(name) => slugify(name),
+                None => format!("bridge-{i}"),
+            };
+        }
     }
 
     /// Fill each bridge's omitted (empty) `matrix.store_path` with a value derived
@@ -268,6 +384,70 @@ impl Config {
             return Err(ConfigError::Validation(
                 "config must define at least one puppet token in [puppets]".to_string(),
             ));
+        }
+
+        // Hard: a `server = "<name>"` reference must resolve to a defined
+        // `[server.<name>]` profile (otherwise the merge silently filled nothing).
+        for b in &self.bridges {
+            if let Some(name) = &b.server {
+                if !self.servers.contains_key(name) {
+                    return Err(ConfigError::Validation(format!(
+                        "bridge '{}': references unknown server profile '{name}' — \
+                         define a [server.{name}] block (or set the fields inline in \
+                         [bridge.matrix])",
+                        b.label()
+                    )));
+                }
+            }
+        }
+
+        // Hard: after profile-merge + auto-derive, every required Matrix field must be
+        // present. Empty here means the bridge neither inherited it (no/empty profile)
+        // nor set it inline.
+        for b in &self.bridges {
+            let m = &b.matrix;
+            let missing: Vec<&str> = [
+                ("homeserver_url", m.homeserver_url.is_empty()),
+                ("bot_user_id", m.bot_user_id.is_empty()),
+                ("room_id", m.room_id.is_empty()),
+                ("device_id", m.device_id.is_empty()),
+                ("appservice_id", m.appservice_id.is_empty()),
+                ("appservice_token", m.appservice_token.is_empty()),
+            ]
+            .into_iter()
+            .filter_map(|(field, empty)| empty.then_some(field))
+            .collect();
+            if !missing.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "bridge '{}': missing required matrix field(s): {} — set them in a \
+                     [server.<name>] profile (and reference it via server = \"…\") or \
+                     inline in [bridge.matrix]",
+                    b.label(),
+                    missing.join(", ")
+                )));
+            }
+        }
+
+        // Hard: distinct (homeserver_url, bot_user_id, device_id) per bridge — two
+        // matrix-sdk sessions on one device steal each other's to-device messages
+        // (the encrypted media key arrives once per device), silently breaking E2EE.
+        // Auto-derived device_ids are distinct-by-name; this catches explicit
+        // collisions (e.g. two bridges hand-set the same device_id on one bot).
+        let mut seen_devices = std::collections::HashSet::new();
+        for b in &self.bridges {
+            let m = &b.matrix;
+            if !seen_devices.insert((
+                m.homeserver_url.as_str(),
+                m.bot_user_id.as_str(),
+                m.device_id.as_str(),
+            )) {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate (homeserver_url, bot_user_id, device_id) across bridges \
+                     for bot '{}' device '{}' — each bridge needs its own device_id \
+                     (omit it to auto-derive a distinct one from the bridge name)",
+                    m.bot_user_id, m.device_id
+                )));
+            }
         }
 
         // Hard: distinct store_path per bridge. `build_client` always opens a
@@ -369,10 +549,22 @@ impl Config {
     pub fn log_redacted_summary(&self) {
         tracing::info!(
             bridge_count = self.bridges.len(),
+            server_profiles = self.servers.len(),
             puppet_pool_size = self.puppets.tokens.len(),
             nickname_prefix = %self.puppets.nickname_prefix,
             "config loaded"
         );
+        for (name, p) in &self.servers {
+            tracing::info!(
+                server = %name,
+                homeserver_url = %p.homeserver_url,
+                bot_user_id = %p.bot_user_id,
+                appservice_id = %p.appservice_id,
+                appservice_token = "[redacted]",
+                access_token = if p.access_token.is_some() { "[redacted]" } else { "none" },
+                "server profile loaded"
+            );
+        }
         for b in &self.bridges {
             b.log_redacted_summary();
         }
@@ -441,7 +633,7 @@ channel_id = "{chan}"
 homeserver_url = "https://nether.im"
 room_id = "{room}"
 bot_user_id = "@bridge:nether.im"
-device_id = "BRIDGE01"
+device_id = "DEV{chan}"
 access_token = "syt_tok"
 appservice_id = "voicebridge"
 appservice_token = "hs_tok"
@@ -541,15 +733,22 @@ media_e2ee = false
     }
 
     #[test]
-    fn rejects_missing_section() {
-        // A `[[bridge]]` missing its `[bridge.matrix]`/`[bridge.livekit]` sections.
-        let raw = r#"
-[[bridge]]
+    fn rejects_missing_matrix_fields() {
+        // `[bridge.matrix]`/`[bridge.livekit]` are now optional sections (a bridge can
+        // inherit everything from a `[server.<name>]` profile), so this PARSES — but
+        // with no profile and no inline fields, `validate()` flags the missing
+        // required Matrix fields rather than serde failing at parse time.
+        let raw = format!(
+            "{}{}",
+            puppets_block(&["Bot a"]),
+            r#"[[bridge]]
 [bridge.discord]
 guild_id = "111"
 channel_id = "222"
-"#;
-        assert!(toml::from_str::<Config>(raw).is_err());
+"#,
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parses (sections optional)");
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
     }
 
     /// A `[[bridge]]` block that OMITS `store_path` so the auto-derive path runs.
@@ -569,7 +768,7 @@ channel_id = "{chan}"
 homeserver_url = "https://nether.im"
 room_id = "{room}"
 bot_user_id = "@bridge:nether.im"
-device_id = "BRIDGE01"
+device_id = "DEV{chan}"
 access_token = "syt_tok"
 appservice_id = "voicebridge"
 appservice_token = "hs_tok"
@@ -782,5 +981,116 @@ url = "wss://livekit.example.org"
         let lk = &cfg.bridges[0].livekit;
         assert_eq!(lk.lk_jwt_url.as_deref(), Some("https://lk-jwt.example.org"));
         assert_eq!(lk.url.as_deref(), Some("wss://livekit.example.org"));
+    }
+
+    // ---- server/appservice profiles (named, referenced) ----
+
+    /// A `[server.<name>]` profile block.
+    fn server_block(name: &str) -> String {
+        format!(
+            r#"[server.{name}]
+homeserver_url = "https://nether.im"
+bot_user_id = "@voicebridge_as:nether.im"
+appservice_id = "voicebridge"
+appservice_token = "hs_tok"
+
+"#
+        )
+    }
+
+    /// Parse + run the same resolution chain `Config::load` does (server-merge,
+    /// device_id derive, store_path derive) so tests exercise the real pipeline.
+    fn loaded(raw: &str) -> Config {
+        let mut cfg: Config = toml::from_str(raw).expect("parse failed");
+        cfg.resolve_servers();
+        cfg.resolve_device_ids();
+        cfg.resolve_store_paths("./nether-store");
+        cfg
+    }
+
+    #[test]
+    fn server_profile_inherits_and_autoderives() {
+        // A bridge that references a profile and only sets room_id inherits every
+        // server field, auto-derives device_id (slug of name) + store_path, validates.
+        let raw = format!(
+            "{}{}[[bridge]]\nname = \"Dark Voice\"\nserver = \"nether\"\nroom_id = \"!d:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n",
+            puppets_block(&["Bot a"]),
+            server_block("nether"),
+        );
+        let cfg = loaded(&raw);
+        let m = &cfg.bridges[0].matrix;
+        assert_eq!(m.homeserver_url, "https://nether.im");
+        assert_eq!(m.bot_user_id, "@voicebridge_as:nether.im");
+        assert_eq!(m.appservice_id, "voicebridge");
+        assert_eq!(m.appservice_token, "hs_tok");
+        assert_eq!(m.room_id, "!d:nether.im"); // bridge-level room_id → matrix.room_id
+        assert_eq!(m.device_id, "dark-voice"); // auto-derived from name
+        assert_eq!(m.store_path, "./nether-store/dark-voice");
+        cfg.validate().expect("should validate");
+    }
+
+    #[test]
+    fn bridge_override_beats_profile() {
+        // Inline [bridge.matrix] values win over the referenced profile.
+        let raw = format!(
+            "{}{}[[bridge]]\nname = \"b\"\nserver = \"nether\"\nroom_id = \"!b:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n[bridge.matrix]\nbot_user_id = \"@special:nether.im\"\ndevice_id = \"PINNED\"\n",
+            puppets_block(&["Bot a"]),
+            server_block("nether"),
+        );
+        let cfg = loaded(&raw);
+        let m = &cfg.bridges[0].matrix;
+        assert_eq!(m.bot_user_id, "@special:nether.im"); // override
+        assert_eq!(m.device_id, "PINNED"); // explicit, not auto-derived
+        assert_eq!(m.appservice_token, "hs_tok"); // still inherited
+        cfg.validate().expect("should validate");
+    }
+
+    #[test]
+    fn unknown_server_reference_errors() {
+        let raw = format!(
+            "{}[[bridge]]\nname = \"b\"\nserver = \"ghost\"\nroom_id = \"!b:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n",
+            puppets_block(&["Bot a"]),
+        );
+        let cfg = loaded(&raw);
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn missing_room_id_after_merge_errors() {
+        // Profile supplies everything except the per-bridge room_id → validate flags it.
+        let raw = format!(
+            "{}{}[[bridge]]\nname = \"b\"\nserver = \"nether\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n",
+            puppets_block(&["Bot a"]),
+            server_block("nether"),
+        );
+        let cfg = loaded(&raw);
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn duplicate_explicit_device_id_errors() {
+        // Two bridges on one profile (same bot) hand-set the same device_id → reject.
+        let raw = format!(
+            "{}{}[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!a:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n[bridge.matrix]\ndevice_id = \"SAME\"\n\n[[bridge]]\nname = \"b\"\nserver = \"nether\"\nroom_id = \"!b:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"333\"\n[bridge.matrix]\ndevice_id = \"SAME\"\n",
+            puppets_block(&["Bot a"]),
+            server_block("nether"),
+        );
+        let cfg = loaded(&raw);
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn two_profile_bridges_get_distinct_derived_devices() {
+        // The real config shape: two bridges, one profile, device_ids auto-derive
+        // distinct from their names → no duplicate-device error.
+        let raw = format!(
+            "{}{}[[bridge]]\nname = \"Light Voice\"\nserver = \"nether\"\nroom_id = \"!l:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n\n[[bridge]]\nname = \"Dark Voice\"\nserver = \"nether\"\nroom_id = \"!d:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"333\"\n",
+            puppets_block(&["Bot a"]),
+            server_block("nether"),
+        );
+        let cfg = loaded(&raw);
+        assert_eq!(cfg.bridges[0].matrix.device_id, "light-voice");
+        assert_eq!(cfg.bridges[1].matrix.device_id, "dark-voice");
+        cfg.validate().expect("distinct derived devices → valid");
     }
 }

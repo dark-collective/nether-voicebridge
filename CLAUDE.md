@@ -116,7 +116,19 @@ test.
   `<data_dir>/<bridge>` (`data_dir` defaults to `./nether-store`, overridden by
   the `NVB_DATA_DIR` env — the Docker image sets it to `/app/data`). Resolution
   happens in `Config::resolve_store_paths` (`crates/config/src/lib.rs`); an
-  explicit `store_path` always wins.
+  explicit `store_path` always wins. **Server/appservice profiles:** the
+  homeserver/appservice fields shared across bridges (`homeserver_url`,
+  `bot_user_id`, `appservice_id`, `appservice_token`, optional `access_token`)
+  live once in a named `[server.<name>]` profile; a bridge sets `server =
+  "<name>"` + its own `room_id` (bridge-level) + `[bridge.discord]` and inherits
+  the rest (`Config::resolve_servers` — an explicit `[bridge.matrix]` value still
+  wins). `matrix.device_id` is also **optional**: when omitted it auto-derives
+  from the bridge `name` (same slug as `store_path`, so device + store stay
+  consistent and unique-per-bridge) via `Config::resolve_device_ids`.
+  `bot_user_id` stays required (its appservice localpart can't be derived from
+  `appservice_id`). `validate()` rejects unknown `server` references, any required
+  matrix field still empty after merge, and duplicate
+  `(homeserver_url, bot_user_id, device_id)` across bridges.
 - **Async:** one tokio task per long-lived connection (each puppet, subscriber,
   each ghost). Wire tasks with `tokio::sync::mpsc`; use
   `CancellationToken` for shutdown.
