@@ -347,7 +347,7 @@ async fn handle_room_events(
                 // Echo prevention (constraint #5): a ghost is a Discord speaker we
                 // ourselves publish into this call. Re-bridging its audio back to
                 // Discord would loop. Skip bridge-owned ghost identities.
-                if super::ghost::is_ghost_identity(&identity) {
+                if super::ghost::is_bridge_excluded_identity(&identity) {
                     tracing::debug!(from_identity = %identity, "skipping bridge-owned ghost track (echo prevention)");
                     continue;
                 }

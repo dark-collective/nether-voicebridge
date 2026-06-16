@@ -102,6 +102,16 @@ pub struct MatrixConfig {
     /// Path to the matrix-sdk SQLite store (Olm crypto + state). Defaults to ./nether-store.
     #[serde(default = "default_store_path")]
     pub store_path: String,
+    /// Override the bridge bot's Matrix display name (shown in the Element Call
+    /// roster when `media_e2ee` makes the subscriber a visible member). Defaults to
+    /// "Nether Voice Bridge".
+    #[serde(default)]
+    pub bot_display_name: Option<String>,
+    /// Override the bridge bot's avatar with a local image file. When absent, the
+    /// project's committed default avatar is used. Uploaded once (persists as an
+    /// `mxc://`), only if the bot has no avatar yet.
+    #[serde(default)]
+    pub bot_avatar_path: Option<String>,
 }
 
 fn default_media_e2ee() -> bool {
@@ -264,6 +274,8 @@ impl BridgeConfig {
             matrix_access_token = "[redacted]",
             matrix_appservice_id = %self.matrix.appservice_id,
             matrix_appservice_token = "[redacted]",
+            matrix_bot_display_name = ?self.matrix.bot_display_name,
+            matrix_bot_avatar_path = ?self.matrix.bot_avatar_path,
             livekit_lk_jwt_url = ?self.livekit.lk_jwt_url,
             livekit_url = ?self.livekit.url,
             "bridge config loaded"

@@ -2,7 +2,8 @@
 //!
 //! The mirror of the Discord side's `PuppetPool`: where a puppet gives a Matrix
 //! speaker a named Discord voice, a **ghost** gives a Discord speaker a named
-//! Matrix presence. Each ghost is an appservice user `@discord_<id>:server` that
+//! Matrix presence. Each ghost is an appservice user
+//! `@nether-voicebridge_<id>:server` that
 //! joins the MatrixRTC/LiveKit call as its own participant and publishes only
 //! that Discord speaker's audio, so Element Call shows each Discord user as a
 //! distinct, correctly-named participant.
@@ -30,10 +31,15 @@
 //! bot's subscriber skips ghost identities ([`is_ghost_identity`]) so it never
 //! re-bridges a ghost's audio back to Discord.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use anyhow::{anyhow, Context, Result};
+use livekit::e2ee::key_provider::{KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions};
+use livekit::e2ee::{E2eeOptions, EncryptionType};
+use livekit::id::ParticipantIdentity;
 use livekit::webrtc::audio_frame::AudioFrame;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::{Room, RoomOptions};
@@ -53,7 +59,7 @@ use matrix_sdk::{
 };
 use reqwest::Url;
 use std::borrow::Cow;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -61,15 +67,20 @@ use nvb_audio::jitter::JitterBuffer;
 use nvb_audio::routing::{CaptureRouter, CaptureSink};
 use nvb_config::{LiveKitConfig, MatrixConfig};
 
+use super::keys::{
+    self, CallEncryptionKeysEventContent, EncKeyEntry, EncKeyMember, EncKeySession,
+};
 use super::lk_jwt;
 use super::openid::OpenIdToken;
 use super::publish;
 use super::session::decode_jwt_claims;
 use super::well_known::{self, LivekitFocusInfo};
 
-/// Localpart prefix for ghost MXIDs (`@discord_<discord_user_id>:server`). Must
-/// match the appservice namespace regex (`@discord_.*`).
-const GHOST_LOCALPART_PREFIX: &str = "discord_";
+/// Localpart prefix for ghost MXIDs (`@nether-voicebridge_<discord_user_id>:server`).
+/// Must match the appservice namespace regex (`@nether-voicebridge_.*`). Note: this
+/// is deliberately NOT `discord_` — that namespace is owned by mautrix-discord, and
+/// sharing it on the same homeserver would collide.
+const GHOST_LOCALPART_PREFIX: &str = "nether-voicebridge_";
 
 /// MatrixRTC call-membership state event type (MSC3401). Matches what
 /// `rtc::membership` posts via ruma's typed `send_state_event_for_key`; here we
@@ -89,13 +100,42 @@ const FRAME_CHANNEL_DEPTH: usize = 50;
 
 /// Is this LiveKit participant identity one of our ghosts? Used by the bridge
 /// bot's subscriber to skip ghost tracks (echo prevention, constraint #5). The
-/// identity is `@discord_<id>:server[:device]`; the localpart is the segment
-/// between `@` and the first `:`.
+/// identity is `@nether-voicebridge_<id>:server[:device]`; the localpart is the
+/// segment between `@` and the first `:`.
 pub(crate) fn is_ghost_identity(identity: &str) -> bool {
     identity
         .strip_prefix('@')
         .and_then(|rest| rest.split(':').next())
         .is_some_and(|localpart| localpart.starts_with(GHOST_LOCALPART_PREFIX))
+}
+
+/// The prefix this bridge minted ghosts under *before* the rename to
+/// [`GHOST_LOCALPART_PREFIX`]. It collided with mautrix-discord, so we no longer
+/// own it — but stale `@discord_<id>` ghosts may linger in old room state.
+const LEGACY_GHOST_PREFIX: &str = "discord_";
+
+/// Is this identity a *legacy* ghost (`@discord_<digits>`) we minted before the
+/// rename? Matched only as `discord_` followed by an all-digits localpart (the
+/// Discord-user-id form we used) so a human `@discord_alice` is never caught.
+///
+/// Used for **exclusion only** ([`is_bridge_excluded_identity`]) — never for the
+/// appservice masquerade paths (register/key-send), which we no longer own for
+/// this namespace. mautrix-discord's own `@discord_<id>` ghosts match too, which
+/// is fine: they must never be counted as our call participants, and they never
+/// post `m.call.member` anyway.
+pub(crate) fn is_legacy_ghost_identity(identity: &str) -> bool {
+    identity
+        .strip_prefix('@')
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|localpart| localpart.strip_prefix(LEGACY_GHOST_PREFIX))
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Should this identity be excluded from call-participant counting, key recipients,
+/// and capture/forward? True for our current ghosts and for stale legacy ghosts.
+/// (Constraint #5 echo-prevention plus the post-rename leftover cleanup.)
+pub(crate) fn is_bridge_excluded_identity(identity: &str) -> bool {
+    is_ghost_identity(identity) || is_legacy_ghost_identity(identity)
 }
 
 /// A [`CaptureSink`] for one ghost: pushes a Discord speaker's 20 ms mono frames
@@ -158,6 +198,10 @@ struct GhostConfig {
     as_token: String,
     /// MXID server part (e.g. `nether.im`), derived from the bridge bot's MXID.
     server_name: String,
+    /// The bridge bot's full MXID (the subscriber). Excluded from ghost media-key
+    /// recipients: the subscriber skips ghost tracks (constraint #5) so it never
+    /// needs to decrypt them.
+    bot_user_id: String,
     media_e2ee: bool,
     /// Optional config overrides, mirroring the subscriber path. `None` ⇒ derive
     /// the lk-jwt endpoint from the focus and the SFU ws URL from the lk-jwt
@@ -190,6 +234,7 @@ impl GhostPool {
                 room_id: matrix_cfg.room_id.clone(),
                 as_token: matrix_cfg.appservice_token.clone(),
                 server_name: bot_user.server_name().as_str().to_owned(),
+                bot_user_id: bot_user.as_str().to_owned(),
                 media_e2ee: livekit_cfg.media_e2ee,
                 lk_jwt_url: livekit_cfg.lk_jwt_url.clone(),
                 lk_url: livekit_cfg.url.clone(),
@@ -199,8 +244,10 @@ impl GhostPool {
 
     /// Retract any **ghost** `m.call.member` left in the room by a prior crashed
     /// run, so Element Call starts from a clean roster before new ghosts mint.
-    /// The mirror of the bridge bot's `retract_self_call_membership`, but for
-    /// `@discord_*` senders, retracted via the appservice masquerade.
+    /// The mirror of the bridge bot's `retract_self_call_membership`. Current
+    /// `@nether-voicebridge_*` ghosts are retracted via the appservice masquerade;
+    /// stale legacy `@discord_*` ghosts (pre-rename, namespace no longer ours) are
+    /// retracted by writing Empty as the bot, with a masquerade fallback.
     ///
     /// Reads room state with the bridge bot's joined client (the appservice
     /// sender is not necessarily in the room, so a raw `as_token` GET could
@@ -224,28 +271,48 @@ impl GhostPool {
                 SyncOrStrippedState::Sync(SyncStateEvent::Original(o)) => o,
                 _ => continue,
             };
-            // Only our ghosts; skip the bridge bot and real users.
-            if !is_ghost_identity(orig.sender.as_str()) {
-                continue;
-            }
             // Already retracted — nothing to do.
             if matches!(orig.content, CallMemberEventContent::Empty(_)) {
                 continue;
             }
-            let state_key: &str = orig.state_key.as_ref();
-            match retract_membership_raw(&self.cfg, orig.sender.as_str(), state_key).await {
-                Ok(()) => {
-                    retracted += 1;
-                    tracing::info!(
-                        ghost = %orig.sender,
-                        state_key,
-                        "retracted stale ghost call membership"
-                    );
+            if is_ghost_identity(orig.sender.as_str()) {
+                // Current-prefix ghost: masquerade-retract (we own this namespace).
+                let state_key: &str = orig.state_key.as_ref();
+                match retract_membership_raw(&self.cfg, orig.sender.as_str(), state_key).await {
+                    Ok(()) => {
+                        retracted += 1;
+                        tracing::info!(ghost = %orig.sender, state_key, "retracted stale ghost call membership");
+                    }
+                    Err(e) => tracing::warn!(ghost = %orig.sender, error = %e, "ghost sweep: retract failed"),
                 }
-                Err(e) => {
-                    tracing::warn!(ghost = %orig.sender, error = %e, "ghost sweep: retract failed");
+            } else if is_legacy_ghost_identity(orig.sender.as_str()) {
+                // Legacy `@discord_*` leftover (pre-rename). We gave that namespace
+                // up, so we can't masquerade — retract by writing Empty as the bot
+                // (the underscore-format state_key is writable by a sufficiently
+                // powered member unless the homeserver enforces owned-state). Fall
+                // back to masquerade, which only works if `@discord_*` was reclaimed.
+                let empty = CallMemberEventContent::new_empty(None);
+                match room.send_state_event_for_key(&orig.state_key, empty).await {
+                    Ok(_) => {
+                        retracted += 1;
+                        tracing::info!(ghost = %orig.sender, "retracted stale legacy ghost membership (bot write)");
+                    }
+                    Err(e) => {
+                        let state_key: &str = orig.state_key.as_ref();
+                        match retract_membership_raw(&self.cfg, orig.sender.as_str(), state_key).await {
+                            Ok(()) => {
+                                retracted += 1;
+                                tracing::info!(ghost = %orig.sender, "retracted stale legacy ghost membership (masquerade)");
+                            }
+                            Err(e2) => tracing::warn!(
+                                ghost = %orig.sender, bot_write_error = %e, masquerade_error = %e2,
+                                "legacy ghost sweep: retract failed — reclaim the @discord_* namespace or redact via homeserver admin"
+                            ),
+                        }
+                    }
                 }
             }
+            // else: bridge bot or a real user — leave untouched.
         }
         if retracted > 0 {
             tracing::info!(retracted, "stale-ghost sweep complete");
@@ -255,8 +322,19 @@ impl GhostPool {
 
     /// Drive the ghost lifecycle. Spawned/awaited from `lib::run` alongside the
     /// Matrix sync and RTC loops. Returns when the command channel closes.
+    ///
+    /// `client` is the bridge bot's matrix-sdk client, used (E2EE only) to
+    /// enumerate the call's human members so each ghost can deliver its media key
+    /// to them — see [`distribute_key_loop`]. `members_gen_rx` is bumped by the
+    /// sync loop when a new human joins, waking those loops to re-key the joiner.
     #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
-    pub async fn run(self: Arc<Self>, bridge: Arc<str>, shutdown: CancellationToken) -> Result<()> {
+    pub async fn run(
+        self: Arc<Self>,
+        client: Client,
+        members_gen_rx: watch::Receiver<u64>,
+        bridge: Arc<str>,
+        shutdown: CancellationToken,
+    ) -> Result<()> {
         let mut cmd_rx = self
             .cmd_rx
             .lock()
@@ -326,7 +404,7 @@ impl GhostPool {
                     let cfg = self.cfg.clone();
                     let focus = focus.clone().expect("focus set above");
                     let join = tokio::spawn(
-                        run_ghost(cfg, focus, key.clone(), display_name, avatar_url, frame_rx, cancel.clone())
+                        run_ghost(cfg, focus, client.clone(), members_gen_rx.clone(), key.clone(), display_name, avatar_url, frame_rx, cancel.clone())
                             .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
                     );
                     ghosts.insert(key, GhostHandle { cancel, join });
@@ -413,19 +491,14 @@ impl CaptureRouter for GhostPool {
 async fn run_ghost(
     cfg: GhostConfig,
     focus: LivekitFocusInfo,
+    client: Client,
+    members_gen_rx: watch::Receiver<u64>,
     key: String,
     display_name: String,
     avatar_url: Option<String>,
     frame_rx: mpsc::Receiver<Vec<i16>>,
     cancel: CancellationToken,
 ) {
-    if cfg.media_e2ee {
-        // Ghost publish with EC media E2EE (per-ghost key generation + to-device
-        // distribution) is not implemented; the deployment runs E2EE off.
-        tracing::error!(key, "ghost publishing with media_e2ee=true is not supported — skipping ghost");
-        return;
-    }
-
     let ghost_mxid = format!("@{GHOST_LOCALPART_PREFIX}{key}:{}", cfg.server_name);
     let localpart = format!("{GHOST_LOCALPART_PREFIX}{key}");
     // Stable per-ghost device id; must agree between the lk-jwt identity and the
@@ -450,7 +523,21 @@ async fn run_ghost(
                 tracing::warn!(error = %e, "ghost set_avatar failed (continuing)");
             }
         }
-        // 2. Join the room (required before posting m.call.member).
+        // 2. Invite the ghost (as the bridge bot, already a room member) so it can
+        // join a *restricted* room — a bare /join is refused there without an invite
+        // (MSC3083). Best-effort: a public/non-restricted room may not need (or may
+        // forbid) the invite, and the bare join below would still succeed — so a
+        // failed invite must not block the ghost. `join_room` is the sole fatal gate:
+        // if the room really was restricted, it fails there with a clear 403.
+        if let Err(e) = invite_ghost(&cfg, &ghost_mxid).await {
+            tracing::warn!(
+                error = %e,
+                bot = %cfg.bot_user_id,
+                room = %cfg.room_id,
+                "ghost invite failed — trying join anyway (restricted rooms need the bot to have invite power)"
+            );
+        }
+        // 3. Join the room (required before posting m.call.member).
         if let Err(e) = join_room(&cfg, &ghost_mxid).await {
             tracing::error!(error = %e, "ghost join_room failed — skipping");
             return;
@@ -458,13 +545,14 @@ async fn run_ghost(
         // 3. OpenID → lk-jwt → connect + publish. The Room handle is moved into
         // the event-drain task, which keeps the connection up and closes it on
         // cancel; we keep only the source to feed.
-        let source = match connect_and_publish(&cfg, &focus, &ghost_mxid, &device_id, cancel.clone()).await {
-            Ok(source) => source,
-            Err(e) => {
-                tracing::error!(error = %e, "ghost LiveKit connect/publish failed — skipping");
-                return;
-            }
-        };
+        let (source, media_key) =
+            match connect_and_publish(&cfg, &focus, &ghost_mxid, &device_id, cancel.clone()).await {
+                Ok(out) => out,
+                Err(e) => {
+                    tracing::error!(error = %e, "ghost LiveKit connect/publish failed — skipping");
+                    return;
+                }
+            };
         // 4. Post m.call.member join so EC shows the ghost in the call.
         if let Err(e) = post_membership(&cfg, &ghost_mxid, &device_id, &focus, false).await {
             tracing::error!(error = %e, "ghost post_membership(join) failed — skipping");
@@ -474,6 +562,24 @@ async fn run_ghost(
             return;
         }
         tracing::info!(display_name = %display_name, "ghost live — publishing Discord speaker audio");
+
+        // 4b. E2EE only: distribute this ghost's media key to the call's humans so
+        // they can decrypt its encrypted frames. Plaintext to-device (Path 2),
+        // masqueraded as the ghost; runs until cancel (re-sends to catch joiners).
+        if let Some(media_key) = media_key {
+            tokio::spawn(
+                distribute_key_loop(
+                    client,
+                    cfg.clone(),
+                    ghost_mxid.clone(),
+                    device_id.clone(),
+                    media_key,
+                    members_gen_rx,
+                    cancel.clone(),
+                )
+                .instrument(tracing::Span::current()),
+            );
+        }
 
         // 5. Pump frames until cancelled.
         pump_audio(frame_rx, &source, &cancel).await;
@@ -522,16 +628,18 @@ async fn pump_audio(
     }
 }
 
-/// Connect the ghost to LiveKit (plaintext frames — media E2EE off), publish its
-/// audio track, and spawn the room-event drain. Returns the source to feed; the
-/// `Room` is owned by the drain task (kept up until `cancel`, then closed).
+/// Connect the ghost to LiveKit, publish its audio track, and spawn the
+/// room-event drain. Returns the source to feed and, when media E2EE is on, the
+/// 16-byte media key this ghost encrypts its frames under (to be distributed to
+/// the call's humans by [`distribute_key_loop`]). The `Room` is owned by the
+/// drain task (kept up until `cancel`, then closed).
 async fn connect_and_publish(
     cfg: &GhostConfig,
     focus: &LivekitFocusInfo,
     ghost_mxid: &str,
     device_id: &str,
     cancel: CancellationToken,
-) -> Result<NativeAudioSource> {
+) -> Result<(NativeAudioSource, Option<[u8; 16]>)> {
     let openid_token = fetch_openid_token(cfg, ghost_mxid).await?;
     let jwt_resp = lk_jwt::fetch_livekit_token(
         &cfg.http,
@@ -550,6 +658,36 @@ async fn connect_and_publish(
     // this, N ghosts would each receive the whole call — needless bandwidth.
     let mut room_opts = RoomOptions::default();
     room_opts.auto_subscribe = false;
+
+    // E2EE: configure HKDF/GCM frame encryption with the SAME key-provider options
+    // the subscriber uses (`rtc::session`), generate a per-ghost media key, and set
+    // it under this ghost's own LiveKit identity so its outbound frames encrypt
+    // under it. Element Call peers install the same key (under the same identity)
+    // from the to-device event `distribute_key_loop` sends → they can decrypt us.
+    let media_key = if cfg.media_e2ee {
+        let key_provider = KeyProvider::new(KeyProviderOptions {
+            ratchet_window_size: 16,
+            ratchet_salt: b"LKFrameEncryptionKey".to_vec(),
+            failure_tolerance: -1,
+            key_ring_size: 256,
+            key_derivation_algorithm: KeyDerivationAlgorithm::HKDF,
+        });
+        let key = keys::generate_key();
+        // The to-device `member.claimed_device_id` (= `device_id`) makes peers
+        // reconstruct exactly this identity (`{mxid}:{device_id}`); they must agree
+        // or peers install the key under the wrong identity and hear noise.
+        if !key_provider.set_key(&ParticipantIdentity::from(identity.clone()), 0, key.to_vec()) {
+            return Err(anyhow!("failed to set ghost media key on key provider"));
+        }
+        room_opts.encryption = Some(E2eeOptions {
+            encryption_type: EncryptionType::Gcm,
+            key_provider,
+        });
+        Some(key)
+    } else {
+        None
+    };
+
     let (room, events) = Room::connect(
         cfg.lk_url.as_deref().unwrap_or(&jwt_resp.url),
         &jwt_resp.jwt,
@@ -557,6 +695,10 @@ async fn connect_and_publish(
     )
     .await
     .context("ghost LiveKit Room::connect")?;
+    if media_key.is_some() {
+        room.e2ee_manager().set_enabled(true);
+        tracing::info!(identity = %identity, "ghost E2EE enabled — publishing encrypted frames");
+    }
     let source = publish::publish(&room).await?;
 
     // Move the room + events into a drain task: it keeps the connection alive,
@@ -582,7 +724,220 @@ async fn connect_and_publish(
         tracing::debug!("ghost LiveKit room closed");
     });
 
-    Ok(source)
+    Ok((source, media_key))
+}
+
+// ─── E2EE media-key distribution (Path 2: plaintext to-device) ──────────────────
+
+/// Number of key re-sends in the burst that follows a membership change.
+const KEY_BURST_COUNT: u32 = 6;
+/// Spacing between burst re-sends (~`COUNT * INTERVAL` = the covered window).
+const KEY_BURST_INTERVAL: Duration = Duration::from_secs(3);
+/// Steady-state re-send period once a burst is done — a slow safety net for a key
+/// dropped even by the burst. Mild (≈1/ghost/min) vs. the old 5s spam.
+const KEY_HEARTBEAT: Duration = Duration::from_secs(60);
+
+/// Distribute this ghost's media key to the call's humans until cancelled.
+///
+/// **Burst-on-change + slow heartbeat.** A one-shot send is fragile: a recipient
+/// whose Element Call client is still completing call setup drops the to-device key
+/// and (with naive "send only to new recipients") never gets re-keyed — so a Matrix
+/// listener can't hear ghosts that were already live when it joined. Instead, each
+/// membership change (a new human, or this ghost going live with humans present)
+/// triggers a short **burst** of re-sends to ALL current humans, covering that
+/// setup window; between bursts a slow **heartbeat** re-send is a backstop. The
+/// `members_gen` watch (bumped on each join) wakes the loop immediately, so a new
+/// joiner is keyed without waiting for the heartbeat, while a stable call only
+/// re-sends about once a minute.
+///
+/// **Path 2 — plaintext transport.** The key rides an unencrypted
+/// `io.element.call.encryption_keys` to-device event masqueraded as the ghost
+/// (`as_token` + `?user_id=`). Element Call accepts plaintext key sends today
+/// (its enforcement is gated on matrix-rust-sdk#4883; Commet has no check), so the
+/// homeserver can read the key — *not* true E2EE for ghost audio. The LiveKit
+/// frame-encryption, identity, and content shape are identical to Path 3; only
+/// this transport swaps to Olm there.
+async fn distribute_key_loop(
+    client: Client,
+    cfg: GhostConfig,
+    ghost_mxid: String,
+    device_id: String,
+    key: [u8; 16],
+    mut members_gen: watch::Receiver<u64>,
+    cancel: CancellationToken,
+) {
+    // Recipients keyed so far — used only to detect a NEW human (which restarts a
+    // burst); the sends themselves are not gated by it (we re-send to all current).
+    let mut keyed: HashSet<OwnedUserId> = HashSet::new();
+    // Burst re-sends still owed after the last membership change. >0 ⇒ wake fast.
+    let mut burst: u32 = 0;
+    let mut seq: u64 = 0;
+    loop {
+        match enumerate_key_recipients(&client, &cfg).await {
+            Ok(current) => {
+                // A newly-seen recipient (re)starts the burst to cover its client's
+                // call-setup window, during which it may drop the to-device key.
+                if current.iter().any(|u| !keyed.contains(u)) {
+                    burst = KEY_BURST_COUNT;
+                }
+                if current.is_empty() {
+                    keyed.clear();
+                } else {
+                    // Advance the txn id on every attempt so a retry can't collide
+                    // with a prior txn and be de-duped by the server. Duplicate
+                    // delivery is harmless — installing the same key twice is a no-op.
+                    let this_seq = seq;
+                    seq += 1;
+                    match send_encryption_key_raw(
+                        &cfg, &ghost_mxid, &device_id, &current, &key, 0, this_seq,
+                    )
+                    .await
+                    {
+                        Ok(()) => tracing::info!(
+                            recipients = ?current.iter().map(|u| u.as_str()).collect::<Vec<_>>(),
+                            burst,
+                            "ghost media key sent (plaintext to-device)"
+                        ),
+                        Err(e) => tracing::warn!(error = %e, "ghost media-key send failed"),
+                    }
+                    keyed = current.into_iter().collect();
+                    burst = burst.saturating_sub(1);
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "ghost media key: recipient enumeration failed"),
+        }
+        let wait = if burst > 0 { KEY_BURST_INTERVAL } else { KEY_HEARTBEAT };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            // A human joined (generation bumped) → re-evaluate and burst-key them.
+            res = members_gen.changed() => {
+                if res.is_err() {
+                    // Sender dropped (shutdown). cancel will fire imminently; wait
+                    // for it rather than busy-looping on a closed channel.
+                    cancel.cancelled().await;
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(wait) => {}
+        }
+    }
+    tracing::debug!("ghost media-key distribution stopped");
+}
+
+/// Enumerate the call's human members (key-send recipients), read via the bridge
+/// bot's joined client. Excludes our ghosts ([`is_ghost_identity`], which also
+/// drops *this* ghost) and the bridge bot itself (the subscriber skips ghost
+/// tracks, so it never needs ghost keys — constraint #5). Deduplicated by MXID.
+async fn enumerate_key_recipients(client: &Client, cfg: &GhostConfig) -> Result<Vec<OwnedUserId>> {
+    let room_id = RoomId::parse(&cfg.room_id)
+        .with_context(|| format!("parsing room_id '{}'", cfg.room_id))?;
+    let Some(room) = client.get_room(&room_id) else {
+        return Ok(Vec::new());
+    };
+    let raws = room
+        .get_state_events_static::<CallMemberEventContent>()
+        .await
+        .context("reading call memberships for key distribution")?;
+
+    let mut recipients: Vec<OwnedUserId> = Vec::new();
+    for raw in raws {
+        let Ok(ev) = raw.deserialize() else { continue };
+        let orig = match ev {
+            SyncOrStrippedState::Sync(SyncStateEvent::Original(o)) => o,
+            _ => continue,
+        };
+        // Skip retracted/expired memberships.
+        if orig.content.active_memberships(Some(orig.origin_server_ts)).is_empty() {
+            continue;
+        }
+        let sender = orig.sender;
+        if is_bridge_excluded_identity(sender.as_str()) || sender.as_str() == cfg.bot_user_id {
+            continue;
+        }
+        if !recipients.contains(&sender) {
+            recipients.push(sender);
+        }
+    }
+    Ok(recipients)
+}
+
+/// PUT a plaintext `io.element.call.encryption_keys` to-device event masqueraded
+/// as the ghost, delivering `key` (index `key_index`) to every `recipient`'s
+/// devices (`*`). `seq` makes the transaction id unique across re-sends.
+async fn send_encryption_key_raw(
+    cfg: &GhostConfig,
+    ghost_mxid: &str,
+    device_id: &str,
+    recipients: &[OwnedUserId],
+    key: &[u8; 16],
+    key_index: u8,
+    seq: u64,
+) -> Result<()> {
+    let content = build_key_content(&cfg.room_id, device_id, keys::encode_key(key), key_index, now_ms());
+    let content_json = serde_json::to_value(&content).context("serializing encryption key content")?;
+
+    // { messages: { "@user:hs": { "*": <content> } } }
+    let per_device = serde_json::json!({ "*": content_json });
+    let mut messages = serde_json::Map::new();
+    for recipient in recipients {
+        messages.insert(recipient.to_string(), per_device.clone());
+    }
+    let body = serde_json::json!({ "messages": serde_json::Value::Object(messages) });
+
+    // Per-ghost unique, deterministic txn id (no RNG): device + monotonic seq.
+    let txn = format!("{device_id}-key-{seq}");
+    let url = cs_url(
+        &cfg.homeserver_url,
+        &["sendToDevice", "io.element.call.encryption_keys", &txn],
+        Some(ghost_mxid),
+    )?;
+    let resp = cfg
+        .http
+        .put(url)
+        .bearer_auth(&cfg.as_token)
+        .json(&body)
+        .send()
+        .await
+        .context("PUT /sendToDevice (encryption_keys)")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("sendToDevice failed: {}", err_body(resp).await));
+    }
+    Ok(())
+}
+
+/// Build the `io.element.call.encryption_keys` to-device content for a ghost key.
+/// `member.id` (`{device_id}_m.call`) and `member.claimed_device_id` let Element
+/// Call peers reconstruct the ghost's LiveKit identity and attribute the key.
+fn build_key_content(
+    room_id: &str,
+    device_id: &str,
+    key_b64: String,
+    key_index: u8,
+    sent_ts: u64,
+) -> CallEncryptionKeysEventContent {
+    CallEncryptionKeysEventContent {
+        keys: EncKeyEntry { index: key_index, key: key_b64 },
+        room_id: room_id.to_owned(),
+        member: EncKeyMember {
+            claimed_device_id: device_id.to_owned(),
+            id: format!("{device_id}_m.call"),
+        },
+        session: EncKeySession {
+            call_id: String::new(),
+            application: "m.call".to_owned(),
+            scope: "m.room".to_owned(),
+        },
+        sent_ts,
+    }
+}
+
+/// Current Unix time in milliseconds (the `sent_ts` field).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 // ─── Raw client-server API helpers (appservice masquerade) ──────────────────────
@@ -745,6 +1100,40 @@ async fn upload_media(
         .ok_or_else(|| anyhow!("media upload response missing content_uri"))
 }
 
+/// Invite the ghost to the call room, masqueraded as the **bridge bot** (which is
+/// already a room member). Required for **restricted** rooms (MSC3083): a ghost's
+/// bare `/join` is refused there unless it was invited. Idempotent — treats an
+/// "already in the room" rejection as success, mirroring [`register_ghost`]'s
+/// tolerance of `M_USER_IN_USE`.
+async fn invite_ghost(cfg: &GhostConfig, ghost_mxid: &str) -> Result<()> {
+    let url = cs_url(
+        &cfg.homeserver_url,
+        &["rooms", &cfg.room_id, "invite"],
+        Some(&cfg.bot_user_id),
+    )?;
+    let resp = cfg
+        .http
+        .post(url)
+        .bearer_auth(&cfg.as_token)
+        .json(&serde_json::json!({ "user_id": ghost_mxid }))
+        .send()
+        .await
+        .context("POST /invite")?;
+    if resp.status().is_success() {
+        tracing::debug!(ghost = %ghost_mxid, "ghost invited to room");
+        return Ok(());
+    }
+    // Already a member (or already invited) → nothing to do. Tuwunel/Synapse both
+    // return 403 M_FORBIDDEN with an "already in the room" message in that case.
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if text.contains("already in the room") || text.contains("already joined") {
+        tracing::debug!(ghost = %ghost_mxid, "ghost already a room member — invite skipped");
+        return Ok(());
+    }
+    Err(anyhow!("invite ghost failed: {status}: {text}"))
+}
+
 /// Join the call room as the ghost (masqueraded). Idempotent on the server.
 async fn join_room(cfg: &GhostConfig, ghost_mxid: &str) -> Result<()> {
     let url = cs_url(&cfg.homeserver_url, &["join", &cfg.room_id], Some(ghost_mxid))?;
@@ -877,26 +1266,76 @@ mod tests {
 
     #[test]
     fn ghost_identity_detection() {
-        assert!(is_ghost_identity("@discord_12345:nether.im"));
-        assert!(is_ghost_identity("@discord_12345:nether.im:DEVICE"));
+        assert!(is_ghost_identity("@nether-voicebridge_12345:nether.im"));
+        assert!(is_ghost_identity("@nether-voicebridge_12345:nether.im:DEVICE"));
         assert!(!is_ghost_identity("@dark:nether.im"));
         assert!(!is_ghost_identity("@dark:nether.im:DEVICE"));
+        // mautrix-discord's namespace must NOT be detected as a *current* ghost.
+        assert!(!is_ghost_identity("@discord_12345:nether.im"));
         assert!(!is_ghost_identity("not-an-mxid"));
+    }
+
+    #[test]
+    fn legacy_ghost_identity_detection() {
+        // Our pre-rename ghosts were `@discord_<numeric-discord-id>`.
+        assert!(is_legacy_ghost_identity("@discord_996161727068643380:nether.im"));
+        assert!(is_legacy_ghost_identity("@discord_12345:nether.im:DEVICE"));
+        // A human/non-numeric localpart must NOT be caught.
+        assert!(!is_legacy_ghost_identity("@discord_alice:nether.im"));
+        assert!(!is_legacy_ghost_identity("@discord_:nether.im"));
+        assert!(!is_legacy_ghost_identity("@dark:nether.im"));
+        // Current-prefix ghosts are not "legacy".
+        assert!(!is_legacy_ghost_identity("@nether-voicebridge_123:nether.im"));
+
+        // The combined exclusion helper covers both current and legacy ghosts.
+        assert!(is_bridge_excluded_identity("@nether-voicebridge_123:nether.im"));
+        assert!(is_bridge_excluded_identity("@discord_996161727068643380:nether.im"));
+        assert!(!is_bridge_excluded_identity("@dark:nether.im"));
     }
 
     #[test]
     fn cs_url_encodes_segments_and_masquerade() {
         let url = cs_url(
             "https://nether.im",
-            &["profile", "@discord_1:nether.im", "displayname"],
-            Some("@discord_1:nether.im"),
+            &["profile", "@nether-voicebridge_1:nether.im", "displayname"],
+            Some("@nether-voicebridge_1:nether.im"),
         )
         .unwrap();
         let s = url.as_str();
         assert!(s.starts_with("https://nether.im/_matrix/client/v3/profile/"));
-        // Path segment is percent-encoded (@ → %40, : → %3A).
-        assert!(s.contains("%40discord_1%3Anether.im"));
+        // Path segment is percent-encoded (@ → %40, : → %3A; - and _ stay literal).
+        assert!(s.contains("%40nether-voicebridge_1%3Anether.im"));
         // Masquerade query is present and encoded.
-        assert!(s.contains("user_id=%40discord_1%3Anether.im"));
+        assert!(s.contains("user_id=%40nether-voicebridge_1%3Anether.im"));
+    }
+
+    #[test]
+    fn sendtodevice_url_targets_encryption_keys() {
+        let url = cs_url(
+            "https://nether.im",
+            &["sendToDevice", "io.element.call.encryption_keys", "D42-key-3"],
+            Some("@nether-voicebridge_42:nether.im"),
+        )
+        .unwrap();
+        let s = url.as_str();
+        assert!(s.contains("/_matrix/client/v3/sendToDevice/io.element.call.encryption_keys/D42-key-3"));
+        assert!(s.contains("user_id=%40nether-voicebridge_42%3Anether.im"));
+    }
+
+    #[test]
+    fn key_content_matches_ec_wire_shape() {
+        // The to-device content must carry the exact fields Element Call reads to
+        // map a key to the ghost's LiveKit identity. A regression here = peers
+        // install the key under the wrong identity → noise (constraint #3-adjacent).
+        let content = build_key_content("!room:nether.im", "D42", "AAAA".to_owned(), 0, 1234);
+        let v = serde_json::to_value(&content).unwrap();
+        assert_eq!(v["keys"]["index"], 0);
+        assert_eq!(v["keys"]["key"], "AAAA");
+        assert_eq!(v["room_id"], "!room:nether.im");
+        assert_eq!(v["member"]["claimed_device_id"], "D42");
+        assert_eq!(v["member"]["id"], "D42_m.call");
+        assert_eq!(v["session"]["application"], "m.call");
+        assert_eq!(v["session"]["scope"], "m.room");
+        assert_eq!(v["sent_ts"], 1234);
     }
 }

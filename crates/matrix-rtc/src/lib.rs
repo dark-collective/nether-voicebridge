@@ -58,17 +58,24 @@ pub async fn run(
     // the RTC loop (receiver) — created here, never exposed.
     let (call_active_tx, call_active_rx) = watch::channel(false);
 
+    // Membership-generation watch: the sync loop bumps it whenever a new human
+    // joins the call; each ghost's key-distribution loop waits on it to (re-)send
+    // its E2EE media key to the new member. A monotonic counter so a missed edge is
+    // still observed via the changed value (vs. a Notify's lost-wakeup risk).
+    let (members_gen_tx, members_gen_rx) = watch::channel(0u64);
+
     tokio::try_join!(
         matrix::run(
             client.clone(),
             matrix_cfg,
             call_active_tx,
+            members_gen_tx,
             router.clone(),
             bridge.clone(),
             shutdown.clone(),
         ),
         rtc::run(
-            client,
+            client.clone(),
             livekit_cfg,
             matrix_cfg,
             call_active_rx,
@@ -76,7 +83,7 @@ pub async fn run(
             bridge.clone(),
             shutdown.clone(),
         ),
-        ghost_pool.run(bridge.clone(), shutdown.clone()),
+        ghost_pool.run(client, members_gen_rx, bridge.clone(), shutdown.clone()),
     )?;
 
     Ok(())

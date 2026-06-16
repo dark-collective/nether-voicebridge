@@ -98,6 +98,12 @@ appservice_token = "your_appservice_hs_token_here"
 # matrix-sdk store (Olm crypto + state). MUST be unique per bridge.
 store_path = "./nether-store/general"
 
+# Bridge-bot identity in the Element Call roster (the subscriber is a visible
+# member only when media_e2ee = true). Both OPTIONAL — without them the project
+# default name "Nether Voice Bridge" and the committed default avatar are used.
+# bot_display_name = "Nether Voice Bridge"
+# bot_avatar_path  = "/path/to/your/avatar.png"   # uploaded once; persists as mxc://
+
 [bridge.livekit]
 # The lk-jwt-service endpoint and the LiveKit SFU WebSocket URL are BOTH
 # auto-derived at runtime — the bridge reads the homeserver's

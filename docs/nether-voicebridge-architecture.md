@@ -61,7 +61,7 @@ tasks and channels.
 1. Listener bot (songbird, receive on) captures per-SSRC Opus from every
    Discord speaker; DAVE-decrypts; decodes to PCM.
 2. For each *human* Discord speaker, the Coordinator has minted a **ghost**
-   (`@discord_<id>:nether.im`) which: posts its `m.call` membership state
+   (`@nether-voicebridge_<id>:nether.im`) which: posts its `m.call` membership state
    event, fetches a LiveKit JWT from lk-jwt-service for its identity, connects
    to the LiveKit room as a participant, and **publishes that speaker's PCM**
    as its own audio track.
@@ -142,16 +142,32 @@ Handle room tombstones (follow upgrades) and call-end events.
   (HKDF, mirroring `matrix-jukebox`) and feed raw keys to LiveKit's frame
   crypto; do **not** rely on livekit-rust's default key provider. This is the
   highest-risk module in the project.
-  - **Deployment reality (nether.im, verified 2026-06-14):** the call room is
-    *unencrypted* (`m.room.encryption` absent) and Element Call runs media frame
-    E2EE **off** for it. The bridge therefore runs with `media_e2ee = false` and
-    publishes **plaintext** frames — encrypting into this non-E2EE call makes
-    peers hear the bridge's ciphertext as static. The E2EE path above is built
-    but dormant behind the `media_e2ee` flag, for a future encrypted-room
-    deployment. Note for that branch: current EC distributes keys via
-    *Olm-encrypted* to-device (matrix-js-sdk ≥ v37.4.0), so enabling it requires
-    restoring Olm (`matrix-sdk` `e2e-encryption`+`sqlite`, `encrypt_and_send_raw_to_device`),
-    not the plaintext send currently in `keys.rs`.
+  - **Deployment reality (nether.im, verified 2026-06-14):** the *default* call
+    room is *unencrypted* (`m.room.encryption` absent) and Element Call runs media
+    frame E2EE **off** for it. With `media_e2ee = false` the bridge publishes
+    **plaintext** frames — encrypting into a non-E2EE call makes peers hear
+    ciphertext as static — so keep it off for that room.
+  - **Encrypted-room branch (`media_e2ee = true`).** Built and gated behind the
+    flag, for rooms where EC runs frame E2EE on. The asymmetry: EC distributes
+    keys via *Olm-encrypted* to-device, but both Element (enforcement gated on
+    matrix-rust-sdk#4883) and Commet still *accept* plaintext key sends today.
+    - **Receive (Matrix→Discord) — done, live-verified.** Needs real Olm:
+      `matrix-sdk` `e2e-encryption`+`sqlite`, the bot posts `m.call.member` to
+      enter the EC roster (keys go only to roster members), SDK auto-decrypts the
+      Olm to-device, and `keys::install_peer_key` feeds the raw key to the
+      subscriber's LiveKit KeyProvider. The subscriber self-provisions an
+      appservice device (fresh, un-pinned Olm identity).
+    - **Publish (Discord→Matrix) — Path 2 (plaintext key transport), staged
+      toward Path 3.** Each ghost configures HKDF/GCM frame encryption (same
+      `KeyProvider` options as the subscriber), generates a 16-byte media key,
+      sets it under its own LiveKit identity, and **distributes it plaintext**
+      via an `io.element.call.encryption_keys` to-device masqueraded as the ghost
+      (`rtc::ghost::distribute_key_loop`, re-sent every 5 s to reach late
+      joiners). Caveat: plaintext transport is **homeserver-readable** (not true
+      E2EE for ghost audio) and breaks if either client starts enforcing
+      encryption. **Path 3** swaps only the transport to per-ghost Olm (durable,
+      true E2EE) — the LiveKit encryption / identity / content shape are already
+      shared.
 
 ## Proposed crate layout
 

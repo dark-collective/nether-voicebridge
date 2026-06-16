@@ -12,7 +12,7 @@ use matrix_sdk::{
         },
     },
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, watch};
@@ -30,6 +30,25 @@ use nvb_config::MatrixConfig;
 /// the right entry when an Empty event arrives for a state_key, without needing
 /// to parse the state_key format.
 type ParticipantSet = Arc<Mutex<HashSet<(OwnedUserId, String)>>>;
+
+/// Grace period before a membership "leave" takes effect. Element Call memberships
+/// spuriously flap active→inactive→active (~2-3s gap, ~every 90s) due to
+/// expiry/heartbeat refresh (MSC4140 delayed events) — the member never really
+/// leaves. We defer the release this long and cancel it if the member reappears,
+/// so a flap no longer tears down the puppet, the capture anchor, or the
+/// subscriber. Far below the ~90s reflap period and EC's ~4h hard expiry.
+const LEAVE_GRACE: Duration = Duration::from_secs(12);
+
+/// Pending debounced leaves: MXID → cancel handle for its in-flight grace timer.
+/// A reappear cancels it; a fresh leave replaces it (one timer per MXID).
+type PendingLeaves = Arc<Mutex<HashMap<OwnedUserId, CancellationToken>>>;
+
+/// Default Matrix display name for the bridge bot (the visible roster participant
+/// in an E2EE call). Overridable per deployment via `matrix.bot_display_name`.
+const DEFAULT_DISPLAY_NAME: &str = "Nether Voice Bridge";
+/// Project default avatar (committed, downscaled), embedded so there is no runtime
+/// file dependency. Overridable per deployment via `matrix.bot_avatar_path`.
+const DEFAULT_AVATAR_PNG: &[u8] = include_bytes!("../assets/default-avatar.png");
 
 fn log_snapshot(set: &HashSet<(OwnedUserId, String)>) {
     let mut users: Vec<&str> = set
@@ -67,6 +86,10 @@ async fn apply_member_event(
     bot_user_id: &OwnedUserId,
     participants: &ParticipantSet,
     call_active_tx: &watch::Sender<bool>,
+    members_gen_tx: &watch::Sender<u64>,
+    pending_leaves: &PendingLeaves,
+    shutdown: &CancellationToken,
+    bridge: &Arc<str>,
     room: &Room,
     router: &Arc<dyn PlaybackRouter>,
 ) {
@@ -78,7 +101,10 @@ async fn apply_member_event(
     // participant — otherwise it would trip call-active and, worse, get a Discord
     // puppet (a self-duplicate of the Discord user). Ghosts are driven entirely by
     // the Discord side's voice-state handler, not by membership here.
-    if crate::rtc::ghost::is_ghost_identity(user_id.as_str()) {
+    // Excludes our current ghosts AND stale legacy `@discord_*` ghosts left in old
+    // room state (post-rename) — otherwise a leftover membership is miscounted as a
+    // real participant and gets a phantom Discord puppet.
+    if crate::rtc::ghost::is_bridge_excluded_identity(user_id.as_str()) {
         return;
     }
 
@@ -91,8 +117,12 @@ async fn apply_member_event(
     // per-state-key change: a user present on two devices/sessions has two
     // `(user_id, state_key)` entries, and dropping one must not release the puppet
     // while the other remains. (Periodic m.call.member refreshes are also no-ops.)
+    // The raw `participants` set always reflects current truth (we add/remove
+    // immediately). The *effects* of a leave (puppet release, `call_active=false`)
+    // are what we debounce — see the grace timer below.
     let appeared;
     let gone;
+    let became_nonempty;
     {
         let mut set = participants.lock().await;
         let prev_users = set.iter().map(|(u, _)| u).collect::<HashSet<_>>().len();
@@ -107,14 +137,7 @@ async fn apply_member_event(
         appeared = this_user_before == 0 && this_user_after > 0;
         gone = this_user_before > 0 && this_user_after == 0;
         let new_users = set.iter().map(|(u, _)| u).collect::<HashSet<_>>().len();
-
-        if prev_users == 0 && new_users > 0 {
-            tracing::info!("call active");
-            let _ = call_active_tx.send(true);
-        } else if prev_users > 0 && new_users == 0 {
-            tracing::info!("call ended");
-            let _ = call_active_tx.send(false);
-        }
+        became_nonempty = prev_users == 0 && new_users > 0;
         log_snapshot(&set);
     }
 
@@ -124,12 +147,78 @@ async fn apply_member_event(
     // keys on the same bare MXID — so the track device need not match the
     // membership state-key device.
     if appeared {
+        // Cancel any in-flight grace timer for this MXID: a reappear within the
+        // grace window means a spurious flap, not a real leave/rejoin.
+        let had_pending = {
+            let mut pending = pending_leaves.lock().await;
+            pending.remove(&user_id).map(|t| t.cancel()).is_some()
+        };
+        if had_pending {
+            // The puppet/subscriber were never torn down (we deferred the leave),
+            // so do NOT re-assign, re-key, or re-raise call-active.
+            tracing::info!(mxid = %user_id, "membership re-appeared within grace — cancelled pending release");
+            return;
+        }
+        // Genuinely new (or rejoining after a real, already-applied leave).
+        if became_nonempty {
+            tracing::info!("call active");
+            let _ = call_active_tx.send(true);
+        }
+        // A new human joined the call → each live ghost must (re-)deliver its media
+        // key so this user can decrypt the ghost's E2EE frames. Bump the
+        // membership-generation watch the ghost key-distribution loops wait on.
+        members_gen_tx.send_modify(|g| *g = g.wrapping_add(1));
         let name = resolve_member_name(room, &user_id).await;
         tracing::info!(mxid = %user_id, display_name = %name, "member joined — assigning puppet");
         router.assign(user_id.as_str(), &name);
     } else if gone {
-        tracing::info!(mxid = %user_id, "member left — releasing puppet");
-        router.release(user_id.as_str());
+        // Debounce: defer the release; a reappear within LEAVE_GRACE cancels it.
+        // Element Call memberships flap spuriously (expiry/heartbeat) — the member
+        // is usually still present, so an immediate release would needlessly tear
+        // down the puppet, the capture anchor, and the subscriber.
+        tracing::info!(mxid = %user_id, "membership gone — starting leave grace timer");
+        let token = CancellationToken::new();
+        {
+            let mut pending = pending_leaves.lock().await;
+            if let Some(old) = pending.insert(user_id.clone(), token.clone()) {
+                old.cancel(); // replace any earlier timer for this MXID
+            }
+        }
+        let router = router.clone();
+        let participants = participants.clone();
+        let pending_leaves = pending_leaves.clone();
+        let call_active_tx = call_active_tx.clone();
+        let shutdown = shutdown.clone();
+        let mxid = user_id.clone();
+        let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
+        tokio::spawn(
+            async move {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return, // teardown owns final release
+                    _ = token.cancelled() => return,    // reappeared within grace
+                    _ = tokio::time::sleep(LEAVE_GRACE) => {}
+                }
+                // Authoritative re-check under the lock: only release if still absent.
+                let (still_absent, now_empty) = {
+                    let set = participants.lock().await;
+                    (
+                        set.iter().filter(|(u, _)| u == &mxid).count() == 0,
+                        set.is_empty(),
+                    )
+                };
+                pending_leaves.lock().await.remove(&mxid);
+                if still_absent {
+                    tracing::info!(mxid = %mxid, "leave grace elapsed — releasing puppet");
+                    router.release(mxid.as_str());
+                    if now_empty {
+                        tracing::info!("call ended (after grace)");
+                        let _ = call_active_tx.send(false);
+                    }
+                }
+            }
+            .instrument(span),
+        );
     }
 }
 
@@ -266,9 +355,60 @@ pub(crate) async fn build_client(
     if media_e2ee {
         // Observable gate: by here the first sync has uploaded device keys/OTKs.
         tracing::info!(device_id = %cfg.device_id, "crypto store ready (e2e on)");
+        // The bot is a visible roster member only with E2EE on — give it the
+        // configured (or default) display name + avatar so it reads as an
+        // intentional service rather than a stray user.
+        apply_bot_profile(&client, cfg).await;
     }
 
     Ok(client)
+}
+
+/// Set the bridge bot's Matrix display name and avatar (best-effort — never blocks
+/// startup). Display name = `bot_display_name` or [`DEFAULT_DISPLAY_NAME`]. Avatar
+/// is uploaded only when the account has none yet (it then persists as an `mxc://`,
+/// so it isn't re-uploaded each restart): from `bot_avatar_path` if set, else the
+/// embedded [`DEFAULT_AVATAR_PNG`].
+async fn apply_bot_profile(client: &Client, cfg: &MatrixConfig) {
+    let name = cfg.bot_display_name.as_deref().unwrap_or(DEFAULT_DISPLAY_NAME);
+    if let Err(e) = client.account().set_display_name(Some(name)).await {
+        tracing::warn!(error = %e, "failed to set bridge-bot display name");
+    } else {
+        tracing::info!(display_name = name, "bridge-bot display name set");
+    }
+
+    match client.account().get_avatar_url().await {
+        Ok(Some(_)) => return, // already has one — don't re-upload on every restart
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read bridge-bot avatar; skipping avatar set");
+            return;
+        }
+    }
+
+    let (mime, bytes) = match cfg.bot_avatar_path.as_deref() {
+        Some(path) => match std::fs::read(path) {
+            Ok(bytes) => (guess_image_mime(path), bytes),
+            Err(e) => {
+                tracing::warn!(path, error = %e, "could not read configured bot_avatar_path; using default avatar");
+                (mime::IMAGE_PNG, DEFAULT_AVATAR_PNG.to_vec())
+            }
+        },
+        None => (mime::IMAGE_PNG, DEFAULT_AVATAR_PNG.to_vec()),
+    };
+    match client.account().upload_avatar(&mime, bytes).await {
+        Ok(mxc) => tracing::info!(mxc = %mxc, "bridge-bot avatar uploaded"),
+        Err(e) => tracing::warn!(error = %e, "failed to upload bridge-bot avatar"),
+    }
+}
+
+/// Best-effort image MIME from a file extension (defaults to PNG).
+fn guess_image_mime(path: &str) -> mime::Mime {
+    match path.rsplit('.').next().map(str::to_ascii_lowercase).as_deref() {
+        Some("jpg") | Some("jpeg") => mime::IMAGE_JPEG,
+        Some("gif") => mime::IMAGE_GIF,
+        _ => mime::IMAGE_PNG,
+    }
 }
 
 /// Mint a real device + access token for an appservice-namespace user via
@@ -347,6 +487,7 @@ pub(crate) async fn run(
     client: Client,
     cfg: &MatrixConfig,
     call_active_tx: watch::Sender<bool>,
+    members_gen_tx: watch::Sender<u64>,
     router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
     shutdown: CancellationToken,
@@ -354,6 +495,7 @@ pub(crate) async fn run(
     let bot_user_id: OwnedUserId = cfg.bot_user_id.parse()?;
     let room_id = RoomId::parse(&cfg.room_id)?;
     let participants: ParticipantSet = Arc::new(Mutex::new(HashSet::new()));
+    let pending_leaves: PendingLeaves = Arc::new(Mutex::new(HashMap::new()));
 
     // Register handler BEFORE sync so events during the initial round-trip are captured.
     // Scope it to THIS bridge's room: `add_event_handler` is global across every
@@ -363,16 +505,23 @@ pub(crate) async fn run(
     // makes the SDK dispatch only this room's events.
     {
         let participants = participants.clone();
+        let pending_leaves = pending_leaves.clone();
         let bot_user_id = bot_user_id.clone();
         let call_active_tx = call_active_tx.clone();
+        let members_gen_tx = members_gen_tx.clone();
+        let shutdown = shutdown.clone();
         // matrix-sdk dispatches this handler from its own sync task, which does
         // not inherit the bridge span — re-establish it for per-bridge logs.
         let bridge = bridge.clone();
         let router = router.clone();
         client.add_room_event_handler(&room_id, move |ev: SyncCallMemberEvent, room: Room| {
             let participants = participants.clone();
+            let pending_leaves = pending_leaves.clone();
             let bot_user_id = bot_user_id.clone();
             let call_active_tx = call_active_tx.clone();
+            let members_gen_tx = members_gen_tx.clone();
+            let shutdown = shutdown.clone();
+            let bridge = bridge.clone();
             let router = router.clone();
             let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
             async move {
@@ -388,6 +537,10 @@ pub(crate) async fn run(
                     &bot_user_id,
                     &participants,
                     &call_active_tx,
+                    &members_gen_tx,
+                    &pending_leaves,
+                    &shutdown,
+                    &bridge,
                     &room,
                     &router,
                 )
@@ -419,6 +572,10 @@ pub(crate) async fn run(
                 &bot_user_id,
                 &participants,
                 &call_active_tx,
+                &members_gen_tx,
+                &pending_leaves,
+                &shutdown,
+                &bridge,
                 &room,
                 &router,
             )
