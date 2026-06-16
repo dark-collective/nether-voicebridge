@@ -1,9 +1,11 @@
 # Nether Voice Bridge — Matrix appservice registration (Phase 8: ghosts)
 #
 # This registers the bridge's *ghost* namespace on the homeserver. Each Discord
-# speaker is mirrored into the Matrix call as a ghost user `@discord_<id>:server`
-# (one LiveKit participant per Discord speaker). The bridge masquerades as these
-# ghosts over the raw client-server API using `as_token` + `?user_id=` — it does
+# speaker is mirrored into the Matrix call as a ghost user
+# `@nether-voicebridge_<id>:server` (one LiveKit participant per Discord speaker).
+# The prefix is deliberately NOT `discord_` — that namespace belongs to
+# mautrix-discord and would collide on a shared homeserver. The bridge masquerades
+# as these ghosts over the raw client-server API using `as_token` + `?user_id=` — it does
 # NOT run an appservice HTTP endpoint, so `url` is null (push-only).
 #
 # ── Deploy on Tuwunel (manual; the bridge cannot do this itself) ───────────────
@@ -22,7 +24,8 @@
 # Notes:
 #   * `sender_localpart` reserves `@voicebridge_as:server`; it must NOT collide
 #     with the bridge bot's own `matrix.bot_user_id`.
-#   * The user namespace is `exclusive` so only this appservice owns `@discord_*`.
+#   * The user namespace is `exclusive` so only this appservice owns
+#     `@nether-voicebridge_*`.
 #   * If Tuwunel rejects a null `url`, set it to an unused localhost URL
 #     (e.g. http://localhost:0) — the bridge never serves transactions there.
 
@@ -34,7 +37,7 @@ sender_localpart: voicebridge_as
 namespaces:
   users:
     - exclusive: true
-      regex: "@discord_.*:nether\\.im"
+      regex: "@nether-voicebridge_.*:nether\\.im"
   aliases: []
   rooms: []
 rate_limited: false

@@ -26,12 +26,12 @@ use crate::rtc::well_known::LivekitFocusInfo;
 /// `device_id` — the bridge bot's Matrix device id
 /// `focus`  — the LiveKit SFU focus discovered from `.well-known`
 ///
-/// Currently UNUSED: the bridge bot is a subscribe-only LiveKit participant and
-/// deliberately posts no `m.call.member`, so it stays out of Element Call's
-/// roster (see `rtc::run`). Kept compiling as the easy revert if the SFU ever
-/// requires membership to forward tracks. Ghosts post membership via the raw
-/// CS-API in `rtc::ghost`, not this.
-#[allow(dead_code)]
+/// Used only when `media_e2ee = true`: in an encrypted room Element Call / Commet
+/// distribute per-sender media keys via to-device **only to roster members**, so
+/// the otherwise-hidden subscriber must appear in the roster (as a silent,
+/// non-publishing participant) to receive them. In the unencrypted case the
+/// subscriber posts no membership and stays out of the call UI (see `rtc::run`).
+/// Ghosts post membership via the raw CS-API in `rtc::ghost`, not this.
 pub async fn join(
     room: &Room,
     user_id: &OwnedUserId,
@@ -76,9 +76,8 @@ pub async fn join(
 /// Post an empty membership (leave) for the bridge bot.
 ///
 /// Element Call removes the participant from the call view when it receives
-/// an Empty (or expired) membership for their state key. UNUSED for the same
-/// reason as [`join`] — the subscriber posts no membership.
-#[allow(dead_code)]
+/// an Empty (or expired) membership for their state key. Used in the
+/// `media_e2ee = true` path to retract the membership posted by [`join`].
 pub async fn leave(
     room: &Room,
     user_id: &OwnedUserId,

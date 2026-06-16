@@ -86,15 +86,32 @@ pub struct MatrixConfig {
     pub homeserver_url: String,
     pub room_id: String,
     pub bot_user_id: String,
-    /// The device ID associated with the access_token (from /_matrix/client/v3/account/whoami
-    /// or recorded when the token was minted). Required by matrix-sdk to restore a session.
+    /// The device ID for the bot's matrix-sdk session. In access_token mode this
+    /// must match the device the token was minted for; in appservice-auth mode
+    /// (no `access_token`) it is a stable device id we assert via appservice
+    /// login, reused every start so the persistent crypto store stays valid.
     pub device_id: String,
-    pub access_token: String,
+    /// Regular-account access token. When omitted, the bridge self-provisions a
+    /// device + token via appservice login (`m.login.application_service`,
+    /// authenticated with `appservice_token`) — `bot_user_id` must then be an
+    /// appservice-namespace user (e.g. the registration's `sender_localpart`).
+    #[serde(default)]
+    pub access_token: Option<String>,
     pub appservice_id: String,
     pub appservice_token: String,
     /// Path to the matrix-sdk SQLite store (Olm crypto + state). Defaults to ./nether-store.
     #[serde(default = "default_store_path")]
     pub store_path: String,
+    /// Override the bridge bot's Matrix display name (shown in the Element Call
+    /// roster when `media_e2ee` makes the subscriber a visible member). Defaults to
+    /// "Nether Voice Bridge".
+    #[serde(default)]
+    pub bot_display_name: Option<String>,
+    /// Override the bridge bot's avatar with a local image file. When absent, the
+    /// project's committed default avatar is used. Uploaded once (persists as an
+    /// `mxc://`), only if the bot has no avatar yet.
+    #[serde(default)]
+    pub bot_avatar_path: Option<String>,
 }
 
 fn default_media_e2ee() -> bool {
@@ -160,6 +177,24 @@ impl Config {
                     "duplicate matrix store_path '{}' across bridges — each bridge \
                      needs its own store",
                     b.matrix.store_path
+                )));
+            }
+        }
+
+        // Hard: every bridge's bot needs a way to authenticate — either a
+        // regular-account access_token, or (when absent) appservice login, which
+        // requires a non-empty appservice_token.
+        for b in &self.bridges {
+            let has_access_token = b
+                .matrix
+                .access_token
+                .as_deref()
+                .is_some_and(|t| !t.is_empty());
+            if !has_access_token && b.matrix.appservice_token.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "bridge bot '{}': no access_token and no appservice_token — \
+                     cannot authenticate (provide one or the other)",
+                    b.matrix.bot_user_id
                 )));
             }
         }
@@ -239,6 +274,8 @@ impl BridgeConfig {
             matrix_access_token = "[redacted]",
             matrix_appservice_id = %self.matrix.appservice_id,
             matrix_appservice_token = "[redacted]",
+            matrix_bot_display_name = ?self.matrix.bot_display_name,
+            matrix_bot_avatar_path = ?self.matrix.bot_avatar_path,
             livekit_lk_jwt_url = ?self.livekit.lk_jwt_url,
             livekit_url = ?self.livekit.url,
             "bridge config loaded"

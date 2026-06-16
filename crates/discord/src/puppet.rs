@@ -845,7 +845,30 @@ impl SharedPool {
                         }
                     }
                     None => {
-                        // No overflow waiting → free the bot.
+                        // If this freed bot is the capture anchor and Discord
+                        // speakers are still present, KEEP it in the voice channel
+                        // as a capture-only anchor. Leaving would drop the songbird
+                        // session and reset SSRC→user mappings, cutting Discord→Matrix
+                        // audio for everyone until each speaker re-onsets — exactly the
+                        // churn a spurious Matrix membership flap would otherwise cause.
+                        let (is_anchor, speakers_present) = {
+                            let ch = &guard.channels[bridge];
+                            (
+                                ch.anchor.load(Ordering::Relaxed) == idx,
+                                !ch.user_sinks.read().unwrap_or_else(PoisonError::into_inner).is_empty(),
+                            )
+                        };
+                        if is_anchor && speakers_present {
+                            // Drop only its playback identity; keep busy + anchor so
+                            // it stays un-allocatable and still the elected anchor.
+                            self.slots[idx].mixer.clear();
+                            *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                            let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetNickname(String::new()));
+                            let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetMuted(false));
+                            tracing::info!(bridge, key, idx, "last puppet released but Discord speakers remain — keeping capture-only anchor (songbird/SSRC map preserved)");
+                            return;
+                        }
+                        // No overflow waiting, no capture need → free the bot.
                         self.slots[idx].mixer.clear();
                         self.slots[idx].busy.store(false, Ordering::Relaxed);
                         *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
@@ -896,19 +919,68 @@ impl SharedPool {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
         {
             let Some(ch) = guard.channels.get_mut(bridge) else { return };
+            let anchor = ch.anchor.load(Ordering::Relaxed);
+            let mut anchor_freed = false;
             for (_key, assign) in ch.assignments.drain() {
                 if let Assign::Puppet { idx, .. } = assign {
                     self.slots[idx].mixer.clear();
                     self.slots[idx].busy.store(false, Ordering::Relaxed);
                     *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
                     let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Release);
+                    if idx == anchor {
+                        anchor_freed = true;
+                    }
                 }
+            }
+            // A capture-only-held anchor has no Assign::Puppet of its own, so the
+            // drain above won't free it — release it explicitly so teardown returns
+            // to baseline (Phase 9 guarantee).
+            if anchor != NO_ANCHOR && !anchor_freed {
+                self.slots[anchor].mixer.clear();
+                self.slots[anchor].busy.store(false, Ordering::Relaxed);
+                *self.slots[anchor].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                let _ = self.slots[anchor].cmd_tx.try_send(PuppetCommand::Release);
             }
             ch.routes.clear();
             ch.anchor.store(NO_ANCHOR, Ordering::Relaxed);
             ch.overflow_mixer.clear();
         }
         // The bots just freed can activate channels waiting for an anchor.
+        self.service_pending(&mut guard);
+    }
+
+    /// Release a capture-only-held anchor once its channel is idle on BOTH sides:
+    /// no playback puppet assigned AND no Discord speakers left. Called when the
+    /// last Discord speaker leaves (see `drop_ghost`). No-op if there is no held
+    /// anchor or either side is still active.
+    fn maybe_release_idle_anchor(&self, bridge: &str) {
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let idx = {
+            let Some(ch) = guard.channels.get(bridge) else { return };
+            let anchor = ch.anchor.load(Ordering::Relaxed);
+            if anchor == NO_ANCHOR {
+                return;
+            }
+            let has_puppet = ch
+                .assignments
+                .values()
+                .any(|a| matches!(a, Assign::Puppet { .. }));
+            let speakers = !ch.user_sinks.read().unwrap_or_else(PoisonError::into_inner).is_empty();
+            if has_puppet || speakers {
+                return; // still in use on one side — keep the anchor
+            }
+            anchor
+        };
+        self.slots[idx].mixer.clear();
+        self.slots[idx].busy.store(false, Ordering::Relaxed);
+        *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Release);
+        {
+            let ch = guard.channels.get_mut(bridge).unwrap();
+            ch.anchor.store(NO_ANCHOR, Ordering::Relaxed);
+            ch.overflow_mixer.clear();
+        }
+        tracing::info!(bridge, idx, "channel idle (no puppets, no Discord speakers) — releasing capture-only anchor");
         self.service_pending(&mut guard);
     }
 
@@ -1036,8 +1108,10 @@ impl EventHandler for PuppetHandler {
         let user_id = new.user_id.get();
         if new.channel_id == Some(channel.channel_id) {
             ensure_ghost(&ctx, &channel, user_id, new.member.as_ref()).await;
-        } else {
-            drop_ghost(&channel, user_id);
+        } else if drop_ghost(&channel, user_id) {
+            // Last Discord speaker left → a capture-only anchor (one held with no
+            // playback puppet) is now idle and should leave the channel.
+            self.pool.maybe_release_idle_anchor(&channel.bridge);
         }
     }
 
@@ -1072,12 +1146,15 @@ impl EventHandler for PuppetHandler {
 /// Skips bridge-owned puppets and any other bot. Resolves the display name from
 /// the supplied `Member` if present, else via a lookup.
 async fn ensure_ghost(ctx: &Context, channel: &ChannelCtx, user_id: u64, member: Option<&Member>) {
+    // Exclude only OUR OWN puppet/anchor bots (echo prevention, constraint #5).
+    // Third-party bots (e.g. a TTS bot) ARE bridged — their audio is a legitimate
+    // Discord speaker to mirror into Matrix. Our bots are doubly protected: their
+    // SSRCs are also in the capture `excluded` set, registered on DriverConnect.
     if channel
         .bot_ids
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .contains(&user_id)
-        || member.is_some_and(|m| m.user.bot)
     {
         return;
     }
@@ -1093,7 +1170,6 @@ async fn ensure_ghost(ctx: &Context, channel: &ChannelCtx, user_id: u64, member:
     let (name, avatar_url) = match member {
         Some(m) => (member_display_name(m), m.user.avatar_url()),
         None => match channel.guild_id.member(&ctx.http, UserId::new(user_id)).await {
-            Ok(m) if m.user.bot => return,
             Ok(m) => (member_display_name(&m), m.user.avatar_url()),
             Err(e) => {
                 tracing::debug!(user_id, error = %e, "member lookup failed; using id as name");
@@ -1114,17 +1190,19 @@ async fn ensure_ghost(ctx: &Context, channel: &ChannelCtx, user_id: u64, member:
 }
 
 /// Retire a user's ghost if they had one (left or moved out of the channel).
-fn drop_ghost(channel: &ChannelCtx, user_id: u64) {
-    let had = channel
-        .user_sinks
-        .write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(&user_id)
-        .is_some();
-    if had {
-        channel.capture_router.release(&user_id.to_string());
-        tracing::info!(bridge = %channel.bridge, user_id, "Discord user left — ghost released");
-    }
+/// Remove a Discord speaker's ghost. Returns `true` iff this removed the **last**
+/// speaker (so the caller can release a now-idle capture-only anchor).
+fn drop_ghost(channel: &ChannelCtx, user_id: u64) -> bool {
+    let now_empty = {
+        let mut sinks = channel.user_sinks.write().unwrap_or_else(PoisonError::into_inner);
+        if sinks.remove(&user_id).is_none() {
+            return false; // wasn't a tracked speaker
+        }
+        sinks.is_empty()
+    };
+    channel.capture_router.release(&user_id.to_string());
+    tracing::info!(bridge = %channel.bridge, user_id, "Discord user left — ghost released");
+    now_empty
 }
 
 /// Resolve a Discord member's display name: server nick → global name → username.

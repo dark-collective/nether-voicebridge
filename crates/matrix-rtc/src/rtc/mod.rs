@@ -33,8 +33,12 @@ mod tone;
 
 use anyhow::Result;
 use livekit::e2ee::key_provider::KeyProvider;
-use matrix_sdk::{Client, ruma::RoomId};
+use matrix_sdk::{
+    Client,
+    ruma::{OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId},
+};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -89,9 +93,13 @@ pub(crate) async fn run(
     // subscriber can decrypt remote frames (only relevant when E2EE is on).
     let shared_provider: Arc<Mutex<Option<KeyProvider>>> = Arc::new(Mutex::new(None));
 
+    // Bridge-bot identity, used to post/retract call membership when E2EE is on.
+    let bot_user_id: OwnedUserId = mx_cfg.bot_user_id.parse()?;
+    let device_id: OwnedDeviceId = mx_cfg.device_id.as_str().into();
+
     // Register a handler to receive peers' media keys via to-device events.
-    // If the room has Olm sessions the SDK auto-decrypts before delivery; if not
-    // (unencrypted room) the event arrives in plaintext (_info is None).
+    // With e2e on (encrypted room) EC/Commet send these Olm-encrypted and the SDK
+    // auto-decrypts before delivery; in an unencrypted room they arrive in clear.
     {
         let provider_ref = shared_provider.clone();
         // Runs in matrix-sdk's sync task (no inherited span) — tag per bridge.
@@ -109,7 +117,8 @@ pub(crate) async fn run(
                     let key_b64 = content.keys.key.clone();
 
                     // Diagnostic: log all identity fields so we can verify EC's scheme.
-                    // Never log the key bytes. These arrive plaintext (unencrypted room).
+                    // Never log the key bytes. (Olm-decrypted by the SDK when the
+                    // room is encrypted; plaintext when it is not.)
                     tracing::info!(
                         sender = %sender,
                         claimed_device_id = %claimed_device_id,
@@ -118,7 +127,7 @@ pub(crate) async fn run(
                         session_scope = %content.session.scope,
                         session_call_id = %content.session.call_id,
                         key_index,
-                        "received io.element.call.encryption_keys to-device (plaintext)"
+                        "received io.element.call.encryption_keys to-device"
                     );
 
                     let guard = provider_ref.lock().expect("provider mutex poisoned");
@@ -156,6 +165,9 @@ pub(crate) async fn run(
 
     let mut active_session: Option<ActiveSession> = None;
     let mut joined = false;
+    // E2EE membership-retry task for the current activation (cancel + its handle).
+    let mut membership_cancel: Option<CancellationToken> = None;
+    let mut membership_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         let is_active = *call_active_rx.borrow_and_update();
@@ -163,14 +175,15 @@ pub(crate) async fn run(
         match (joined, is_active) {
             (false, true) => {
                 // A human appeared — connect as a subscribe-only LiveKit
-                // participant. NOTE: the subscriber deliberately does NOT post an
-                // m.call.member event. Element Call builds its participant roster
-                // from m.call.member, so skipping it keeps the silent, non-
-                // publishing bridge bot out of the call UI — it still receives
-                // every Matrix speaker's track (the LiveKit JWT is authorized by
-                // the OpenID token, not by membership). Ghosts post their own
-                // membership (they must be seen); only this listener is hidden.
-                tracing::info!("call became active — connecting subscriber (no membership)");
+                // participant. NOTE: in the UNENCRYPTED case the subscriber
+                // deliberately posts NO m.call.member, so the silent, non-
+                // publishing bridge bot stays out of the Element Call roster (it
+                // still receives every track — the LiveKit JWT is authorized by
+                // the OpenID token, not by membership). In the ENCRYPTED case it
+                // MUST post membership (below), because EC/Commet only send media
+                // keys to roster members — so there it becomes a visible, silent
+                // participant. Ghosts always post their own membership.
+                tracing::info!("call became active — connecting subscriber");
 
                 match join_livekit(
                     &client,
@@ -192,6 +205,26 @@ pub(crate) async fn run(
                     Ok(sess) => {
                         active_session = Some(sess);
                         joined = true;
+                        // E2EE only: become a roster member so EC/Commet target
+                        // us with Olm-encrypted media keys. Posted AFTER the key
+                        // provider is shared (inside join_livekit) so a fast
+                        // incoming key has a live provider to land in. Retried until
+                        // it lands (self-heals a transient/room-PL failure).
+                        if lk_cfg.media_e2ee {
+                            let mc = shutdown.child_token();
+                            membership_cancel = Some(mc.clone());
+                            membership_handle = Some(tokio::spawn(
+                                post_membership_until_joined(
+                                    client.clone(),
+                                    room_id.clone(),
+                                    bot_user_id.clone(),
+                                    device_id.clone(),
+                                    focus.clone(),
+                                    mc,
+                                )
+                                .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
+                            ));
+                        }
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "failed to start LiveKit session");
@@ -200,11 +233,23 @@ pub(crate) async fn run(
             }
 
             (true, false) => {
-                // All humans left — tear down (no membership to retract). This is
-                // a normal call-end, so release the puppets too (they leave voice).
+                // All humans left — tear down. This is a normal call-end, so
+                // release the puppets too (they leave voice).
                 tracing::info!("call ended — disconnecting subscriber");
                 teardown(&mut active_session, &shared_provider, &router, true).await;
                 joined = false;
+                // Stop the membership-retry task and await it before retracting, so
+                // a late retry-join can't race past the leave and linger.
+                if let Some(mc) = membership_cancel.take() {
+                    mc.cancel();
+                }
+                if let Some(h) = membership_handle.take() {
+                    let _ = h.await;
+                }
+                // Retract the E2EE roster membership we posted on join.
+                if lk_cfg.media_e2ee {
+                    retract_membership(&client, &room_id, &bot_user_id, &device_id).await;
+                }
             }
 
             _ => {}
@@ -229,10 +274,86 @@ pub(crate) async fn run(
     // we pass `release_routes = false`.
     if joined {
         teardown(&mut active_session, &shared_provider, &router, false).await;
+        if let Some(mc) = membership_cancel.take() {
+            mc.cancel();
+        }
+        if let Some(h) = membership_handle.take() {
+            let _ = h.await;
+        }
+        // Retract the E2EE roster membership so the bot doesn't linger in the
+        // call view after the process exits.
+        if lk_cfg.media_e2ee {
+            retract_membership(&client, &room_id, &bot_user_id, &device_id).await;
+        }
     }
 
     tracing::info!("RTC task exiting — teardown complete");
     Ok(())
+}
+
+/// Post the bridge bot's `m.call.member` (E2EE only). Returns `Err` so the caller's
+/// retry loop knows whether it landed — without membership EC/Commet send no media
+/// keys, so receive is dead until it succeeds.
+async fn post_membership(
+    client: &Client,
+    room_id: &RoomId,
+    bot_user_id: &OwnedUserId,
+    device_id: &OwnedDeviceId,
+    focus: &LivekitFocusInfo,
+) -> anyhow::Result<()> {
+    let room = client
+        .get_room(room_id)
+        .ok_or_else(|| anyhow::anyhow!("room not in local state — cannot post E2EE membership"))?;
+    membership::join(&room, bot_user_id, device_id, focus).await
+}
+
+/// Post the bridge bot's `m.call.member`, retrying with backoff until it lands or
+/// `cancel` fires (call-end / shutdown). Self-heals a transient failure (e.g. an
+/// encrypted room whose `org.matrix.msc3401.call.member` power level is wrong, then
+/// fixed) so receive recovers without a reconnect.
+async fn post_membership_until_joined(
+    client: Client,
+    room_id: OwnedRoomId,
+    bot_user_id: OwnedUserId,
+    device_id: OwnedDeviceId,
+    focus: LivekitFocusInfo,
+    cancel: CancellationToken,
+) {
+    let mut backoff = Duration::from_secs(2);
+    let max = Duration::from_secs(30);
+    loop {
+        match post_membership(&client, &room_id, &bot_user_id, &device_id, &focus).await {
+            Ok(()) => {
+                tracing::info!("bridge participant posted to call (E2EE key receipt enabled)");
+                return;
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                retry_in_s = backoff.as_secs(),
+                "failed to post bridge m.call.member — retrying (room may need m.call.member at PL 0); E2EE receive is down until it lands"
+            ),
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(max);
+    }
+}
+
+/// Retract the bridge bot's `m.call.member` (E2EE only). Best-effort.
+async fn retract_membership(
+    client: &Client,
+    room_id: &RoomId,
+    bot_user_id: &OwnedUserId,
+    device_id: &OwnedDeviceId,
+) {
+    if let Some(room) = client.get_room(room_id) {
+        if let Err(e) = membership::leave(&room, bot_user_id, device_id).await {
+            tracing::warn!(error = %e, "failed to retract bridge-bot m.call.member");
+        }
+    }
 }
 
 /// Fetch a fresh JWT, connect to LiveKit and subscribe to remote tracks. When

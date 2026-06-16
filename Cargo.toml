@@ -12,6 +12,14 @@ members = [
 # DAVE, livekit for E2EE/frame crypto — see CLAUDE.md constraint #7) live here so
 # every member resolves the exact same release. Per-crate manifests reference
 # these with `{ workspace = true }` and add only the features they need.
+#
+# matrix-sdk: `e2e-encryption` enables Olm so the bridge can decrypt the
+# Olm-encrypted media keys Element Call / Commet distribute in an ENCRYPTED room
+# (needed only for `media_e2ee = true` bridges; harmless for the others, where
+# the room is unencrypted and no Olm peers exist). `bundled-sqlite` provides the
+# persistent crypto store (`.sqlite_store`) and a hermetic build (no system
+# libsqlite3). The store is wired only when `media_e2ee` is set — see
+# `crates/matrix-rtc/src/matrix.rs`.
 [workspace.dependencies]
 tokio = { version = "1" }
 serde = { version = "1", features = ["derive"] }
@@ -24,7 +32,7 @@ serenity = { version = "0.12.5", default-features = false, features = ["client",
 songbird = { version = "0.6.0", features = ["serenity", "receive"] }
 hound = "3"
 async-trait = "0.1"
-matrix-sdk = { version = "0.18.0", default-features = false }
+matrix-sdk = { version = "0.18.0", default-features = false, features = ["e2e-encryption", "bundled-sqlite"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"

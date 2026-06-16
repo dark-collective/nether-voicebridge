@@ -79,13 +79,13 @@ pub struct CallEncryptionKeysEventContent {
 
 // ── Key generation ────────────────────────────────────────────────────────────
 //
-// These are the E2EE *publish-side* helpers (generate our key, encode it, send it
-// to peers). Dormant since Phase 8: the bridge bot is subscribe-only and ghosts
-// publish plaintext (deployment runs media E2EE off). Kept compiling for the
-// future encrypted-room branch — see the architecture doc's E2EE section.
+// E2EE *publish-side* helpers (generate a key, encode it, send it to peers).
+// `generate_key`/`encode_key` are used by the ghost publish path (`rtc::ghost`,
+// per-ghost media keys in encrypted rooms). `send_key` (the bridge-bot/matrix-sdk
+// variant) stays dormant: the bridge bot is subscribe-only, and ghosts send their
+// keys over the raw masqueraded CS-API, not via a matrix-sdk `Client`.
 
 /// Generate a fresh 16-byte random media key.
-#[allow(dead_code)]
 pub fn generate_key() -> [u8; 16] {
     let mut key = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut key);
@@ -93,7 +93,6 @@ pub fn generate_key() -> [u8; 16] {
 }
 
 /// Encode 16 raw key bytes as base64 standard with padding (matching JS-SDK output).
-#[allow(dead_code)]
 pub fn encode_key(key: &[u8]) -> String {
     general_purpose::STANDARD.encode(key)
 }
