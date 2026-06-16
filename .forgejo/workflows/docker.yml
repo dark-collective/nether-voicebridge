@@ -1,0 +1,51 @@
+name: Docker Build & Push
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker:
+    runs-on: docker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for arm64 cross-build)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the Forgejo container registry
+        uses: docker/login-action@v3
+        with:
+          registry: nether.codes
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # push (non-tag) -> :latest ; tag push (v0.0.1) -> that exact tag.
+      - name: Determine image tag
+        id: vars
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: nether.codes/${{ github.repository }}:${{ steps.vars.outputs.tag }}
+          cache-from: type=registry,ref=nether.codes/${{ github.repository }}:buildcache
+          cache-to: type=registry,ref=nether.codes/${{ github.repository }}:buildcache,mode=max
