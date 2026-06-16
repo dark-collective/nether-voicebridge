@@ -100,7 +100,12 @@ test.
 - **Config:** TOML via `serde`. Secrets (bot tokens, Matrix access/appservice
   tokens) come from the config file or env, **never committed**. The LiveKit
   endpoint/SFU URLs are auto-derived from the homeserver's `.well-known`
-  `rtc_foci` and the lk-jwt response — not configured.
+  `rtc_foci` and the lk-jwt response — not configured. Each bridge's
+  `matrix.store_path` is **optional**: when omitted it auto-derives to
+  `<data_dir>/<bridge>` (`data_dir` defaults to `./nether-store`, overridden by
+  the `NVB_DATA_DIR` env — the Docker image sets it to `/app/data`). Resolution
+  happens in `Config::resolve_store_paths` (`crates/config/src/lib.rs`); an
+  explicit `store_path` always wins.
 - **Async:** one tokio task per long-lived connection (each puppet, subscriber,
   each ghost). Wire tasks with `tokio::sync::mpsc`; use
   `CancellationToken` for shutdown.

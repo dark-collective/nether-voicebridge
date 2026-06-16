@@ -38,7 +38,11 @@ async fn main() -> Result<()> {
         .with_context(|| format!("loading config from {config_path}"))?;
     cfg.validate().context("config validation failed")?;
     cfg.log_redacted_summary();
-    let nvb_config::Config { puppets, bridges } = cfg;
+    // `data_dir` was already consumed by `load` to resolve each bridge's
+    // `store_path`; only the pool and bridges are needed past this point.
+    let nvb_config::Config {
+        puppets, bridges, ..
+    } = cfg;
 
     // The Discord puppet bots are a SHARED, process-wide pool: one set of gateway
     // clients started once (`pool.run`), dynamically allocated across every

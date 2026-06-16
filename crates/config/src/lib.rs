@@ -34,6 +34,14 @@ pub struct Config {
     /// "missing field" parse failure.
     #[serde(rename = "bridge", default)]
     pub bridges: Vec<BridgeConfig>,
+    /// Base directory under which each bridge's matrix-sdk store is auto-derived
+    /// (`<data_dir>/<bridge>`) when its `matrix.store_path` is omitted. Defaults
+    /// to `./nether-store`. Overridden at load time by the `NVB_DATA_DIR` env var
+    /// — the Docker image sets `NVB_DATA_DIR=/app/data` so stores land on the
+    /// persistent volume with no config. An explicit `matrix.store_path` always
+    /// wins over the derived value.
+    #[serde(default = "default_data_dir")]
+    pub data_dir: String,
 }
 
 /// The shared Discord puppet bot pool (process-wide, not per-bridge).
@@ -77,8 +85,31 @@ fn default_nickname_prefix() -> String {
     "[Matrix] ".to_string()
 }
 
-fn default_store_path() -> String {
+fn default_data_dir() -> String {
     "./nether-store".to_string()
+}
+
+/// Lowercase a bridge name into a filesystem-safe leaf: alphanumerics kept,
+/// every other run collapsed to a single `-`, and leading/trailing `-` trimmed.
+/// Empty result (e.g. a name of only punctuation) falls back to `"bridge"`.
+fn slugify(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "bridge".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,8 +130,12 @@ pub struct MatrixConfig {
     pub access_token: Option<String>,
     pub appservice_id: String,
     pub appservice_token: String,
-    /// Path to the matrix-sdk SQLite store (Olm crypto + state). Defaults to ./nether-store.
-    #[serde(default = "default_store_path")]
+    /// Path to the matrix-sdk SQLite store (Olm crypto + state). Optional: when
+    /// omitted it is auto-derived at load time as `<data_dir>/<bridge>` (see
+    /// `Config::resolve_store_paths`), so most configs never set it. An explicit
+    /// value here always wins. The empty-string serde default is the "omitted"
+    /// sentinel that `resolve_store_paths` fills in.
+    #[serde(default)]
     pub store_path: String,
     /// Override the bridge bot's Matrix display name (shown in the Element Call
     /// roster when `media_e2ee` makes the subscriber a visible member). Defaults to
@@ -170,7 +205,35 @@ impl Config {
             path: path.to_string(),
             source,
         })?;
-        toml::from_str(&content).map_err(ConfigError::Parse)
+        let mut cfg: Config = toml::from_str(&content).map_err(ConfigError::Parse)?;
+        // `NVB_DATA_DIR` (set to `/app/data` by the Docker image) overrides the
+        // configured `data_dir`; fall back to it otherwise.
+        let data_dir = std::env::var("NVB_DATA_DIR").unwrap_or_else(|_| cfg.data_dir.clone());
+        cfg.resolve_store_paths(&data_dir);
+        Ok(cfg)
+    }
+
+    /// Fill each bridge's omitted (empty) `matrix.store_path` with a value derived
+    /// from `data_dir` and the bridge's identity, so a multi-bridge config never
+    /// has to spell out per-bridge store paths (and never collides on the old
+    /// shared `./nether-store` default). An explicit `store_path` is left as-is.
+    ///
+    /// The derived leaf is the slug of the bridge `name` when set, else
+    /// `bridge-<index>` — both stable and unique per bridge. Two bridges sharing a
+    /// `name` derive the same path; `validate()`'s duplicate-store_path check then
+    /// turns that into a clear error pointing at the real mistake.
+    pub fn resolve_store_paths(&mut self, data_dir: &str) {
+        let base = data_dir.trim_end_matches('/');
+        for (i, b) in self.bridges.iter_mut().enumerate() {
+            if !b.matrix.store_path.is_empty() {
+                continue;
+            }
+            let leaf = match &b.name {
+                Some(name) => slugify(name),
+                None => format!("bridge-{i}"),
+            };
+            b.matrix.store_path = format!("{base}/{leaf}");
+        }
     }
 
     /// Validate cross-bridge invariants. Hard errors abort startup; softer
@@ -194,8 +257,10 @@ impl Config {
         // SQLite crypto store at `store_path` when `media_e2ee` is set, and with
         // Olm key transport each bridge's ghosts nest their own stores under it
         // (`<store_path>/ghosts/<localpart>`); two bridges sharing one path would
-        // lock/corrupt, and the `./nether-store` default makes that the collision a
-        // multi-bridge config falls into by omission. Enforce uniqueness.
+        // lock/corrupt. Auto-derivation (`resolve_store_paths`) already gives each
+        // bridge a distinct `<data_dir>/<bridge>` path, so this normally only fires
+        // for explicit collisions — e.g. two bridges sharing a `name` (identical
+        // derived path) or hand-set duplicate paths. Enforce uniqueness either way.
         let mut seen_stores = std::collections::HashSet::new();
         for b in &self.bridges {
             if !seen_stores.insert(b.matrix.store_path.as_str()) {
@@ -465,6 +530,129 @@ guild_id = "111"
 channel_id = "222"
 "#;
         assert!(toml::from_str::<Config>(raw).is_err());
+    }
+
+    /// A `[[bridge]]` block that OMITS `store_path` so the auto-derive path runs.
+    /// Mirrors `bridge_block` minus the `store_path = ...` line.
+    fn bridge_block_no_store(name: Option<&str>, room: &str, chan: &str) -> String {
+        let name_line = match name {
+            Some(n) => format!("name = \"{n}\"\n"),
+            None => String::new(),
+        };
+        format!(
+            r#"[[bridge]]
+{name_line}[bridge.discord]
+guild_id = "111"
+channel_id = "{chan}"
+
+[bridge.matrix]
+homeserver_url = "https://nether.im"
+room_id = "{room}"
+bot_user_id = "@bridge:nether.im"
+device_id = "BRIDGE01"
+access_token = "syt_tok"
+appservice_id = "voicebridge"
+appservice_token = "hs_tok"
+
+[bridge.livekit]
+media_e2ee = false
+"#
+        )
+    }
+
+    #[test]
+    fn store_path_defaults_empty_and_data_dir_defaults() {
+        // Omitted store_path parses to the empty sentinel; data_dir gets its default.
+        let raw = format!(
+            "{}{}",
+            puppets_block(&["Bot a"]),
+            bridge_block_no_store(Some("general"), "!r:nether.im", "222"),
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse failed");
+        assert_eq!(cfg.data_dir, "./nether-store");
+        assert_eq!(cfg.bridges[0].matrix.store_path, "");
+    }
+
+    #[test]
+    fn resolve_derives_store_path_from_name() {
+        let raw = format!(
+            "{}{}",
+            puppets_block(&["Bot a"]),
+            bridge_block_no_store(Some("General Voice"), "!r:nether.im", "222"),
+        );
+        let mut cfg: Config = toml::from_str(&raw).expect("parse failed");
+        cfg.resolve_store_paths("./nether-store");
+        // Slugged + lowercased; spaces collapse to a single dash.
+        assert_eq!(cfg.bridges[0].matrix.store_path, "./nether-store/general-voice");
+        cfg.validate().expect("should validate");
+    }
+
+    #[test]
+    fn resolve_respects_explicit_store_path() {
+        // An explicit path is never overwritten by derivation.
+        let raw = format!(
+            "{}{}",
+            puppets_block(&["Bot a"]),
+            bridge_block(Some("general"), "!r:nether.im", "/custom/store", "222"),
+        );
+        let mut cfg: Config = toml::from_str(&raw).expect("parse failed");
+        cfg.resolve_store_paths("/app/data");
+        assert_eq!(cfg.bridges[0].matrix.store_path, "/custom/store");
+    }
+
+    #[test]
+    fn resolve_uses_data_dir_override_and_trims_slash() {
+        // The Docker case: NVB_DATA_DIR=/app/data (passed here as the arg). A
+        // trailing slash on the base is normalised away.
+        let raw = format!(
+            "{}{}",
+            puppets_block(&["Bot a"]),
+            bridge_block_no_store(Some("gaming"), "!r:nether.im", "222"),
+        );
+        let mut cfg: Config = toml::from_str(&raw).expect("parse failed");
+        cfg.resolve_store_paths("/app/data/");
+        assert_eq!(cfg.bridges[0].matrix.store_path, "/app/data/gaming");
+    }
+
+    #[test]
+    fn resolve_unnamed_bridges_get_distinct_indexed_paths() {
+        let raw = format!(
+            "{}{}\n{}",
+            puppets_block(&["Bot a"]),
+            bridge_block_no_store(None, "!a:nether.im", "222"),
+            bridge_block_no_store(None, "!b:nether.im", "333"),
+        );
+        let mut cfg: Config = toml::from_str(&raw).expect("parse failed");
+        cfg.resolve_store_paths("./nether-store");
+        assert_eq!(cfg.bridges[0].matrix.store_path, "./nether-store/bridge-0");
+        assert_eq!(cfg.bridges[1].matrix.store_path, "./nether-store/bridge-1");
+        // Distinct → passes the uniqueness check.
+        cfg.validate().expect("should validate");
+    }
+
+    #[test]
+    fn resolve_same_named_bridges_collide_and_fail_validation() {
+        // Two bridges sharing a name derive the same path → duplicate-store error.
+        let raw = format!(
+            "{}{}\n{}",
+            puppets_block(&["Bot a"]),
+            bridge_block_no_store(Some("dup"), "!a:nether.im", "222"),
+            bridge_block_no_store(Some("dup"), "!b:nether.im", "333"),
+        );
+        let mut cfg: Config = toml::from_str(&raw).expect("parse failed");
+        cfg.resolve_store_paths("./nether-store");
+        assert_eq!(cfg.bridges[0].matrix.store_path, "./nether-store/dup");
+        assert_eq!(cfg.bridges[1].matrix.store_path, "./nether-store/dup");
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn slugify_handles_punctuation_and_empties() {
+        assert_eq!(slugify("General Voice"), "general-voice");
+        assert_eq!(slugify("  weird___name!! "), "weird-name");
+        assert_eq!(slugify("a/b\\c"), "a-b-c");
+        // All-punctuation → safe fallback rather than an empty leaf.
+        assert_eq!(slugify("!!!"), "bridge");
     }
 
     #[test]

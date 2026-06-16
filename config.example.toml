@@ -16,8 +16,15 @@
 # When a brand-new channel needs an anchor and no bot is free, a spare bot is
 # moved from a channel that has slack; if none do, that channel waits (logged).
 #
-# IMPORTANT: each bridge needs its OWN matrix.store_path. Two matrix-sdk clients
-# sharing one store will lock/corrupt; startup validation rejects duplicates.
+# Each bridge needs its OWN matrix.store_path. You normally DON'T set it: when
+# omitted, it is auto-derived as `<data_dir>/<bridge-name>` (a distinct path per
+# bridge). Set `matrix.store_path` only to override that. Two bridges sharing a
+# store will lock/corrupt; startup validation rejects duplicates.
+
+# Base directory for auto-derived store paths. Default "./nether-store".
+# Overridden at runtime by the NVB_DATA_DIR env var (the Docker image sets it to
+# /app/data so stores persist on the container's volume with no config change).
+# data_dir = "./nether-store"
 
 [puppets]
 # One entry per puppet bot — each is a SEPARATE Discord application with its own
@@ -107,8 +114,10 @@ access_token = "syt_your_access_token_here"
 appservice_id = "voicebridge"
 appservice_token = "your_appservice_hs_token_here"
 
-# matrix-sdk store (Olm crypto + state). MUST be unique per bridge.
-store_path = "./nether-store/general"
+# matrix-sdk store (Olm crypto + state). OPTIONAL — omit to auto-derive
+# `<data_dir>/<bridge-name>` (here: ./nether-store/general). Set it only to
+# override the location. Must be unique per bridge (validation enforces this).
+# store_path = "./nether-store/general"
 
 # Bridge-bot identity in the Element Call roster (the subscriber is a visible
 # member only when media_e2ee = true). Both OPTIONAL — without them the project
@@ -169,7 +178,7 @@ media_e2ee = false
 # access_token = "syt_your_access_token_here"
 # appservice_id = "voicebridge"
 # appservice_token = "your_appservice_hs_token_here"
-# store_path = "./nether-store/gaming"   # MUST differ from the first bridge
+# store_path = "./nether-store/gaming"   # OPTIONAL — auto-derives to <data_dir>/<name>
 #
 # [bridge.livekit]
 # media_e2ee = false

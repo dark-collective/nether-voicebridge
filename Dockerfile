@@ -50,8 +50,15 @@ COPY --from=builder /build/target/release/nether-voicebridge .
 # The binary reads CONFIG_PATH, falling back to ./config.toml.
 ENV CONFIG_PATH=/app/config.toml
 
+# Base dir for each bridge's auto-derived matrix-sdk store path. With this set,
+# bridges that omit `matrix.store_path` get `/app/data/<bridge>` automatically —
+# no per-bridge store config needed. Paired with the VOLUME below so the stores
+# (Olm crypto + state) survive container restarts. An explicit `store_path` in
+# config.toml still overrides this.
+ENV NVB_DATA_DIR=/app/data
+
 # matrix-sdk SQLite store lives here — must be a named/bind volume so it
-# survives container restarts. Set store_path = "/app/data/<name>" in config.toml.
+# survives container restarts.
 VOLUME ["/app/data"]
 
 ENTRYPOINT ["./nether-voicebridge"]

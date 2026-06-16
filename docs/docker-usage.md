@@ -14,23 +14,7 @@ cp config.example.toml config.toml
 
 Fill in `config.toml` with your credentials. See the comments in `config.example.toml` for where to find each value. **Do not commit `config.toml`** — it contains bot tokens and Matrix access tokens.
 
-One setting requires a change from the example defaults: every `[[bridge]]` block has a `store_path` that defaults to a relative path (`./nether-store/…`). Inside the container, relative paths are lost on restart. Set each one to an absolute path under `/app/data/`:
-
-```toml
-[bridge.matrix]
-# ...
-store_path = "/app/data/general"   # use a unique name per bridge
-```
-
-If you have multiple bridges, give each a distinct path:
-
-```toml
-# first [[bridge]]
-store_path = "/app/data/main"
-
-# second [[bridge]]
-store_path = "/app/data/gaming"
-```
+You do **not** need to set `store_path`. The image sets `NVB_DATA_DIR=/app/data`, so any bridge that omits `matrix.store_path` gets `/app/data/<bridge>` automatically — landing on the persistent volume (below) with a distinct path per bridge. Only set `store_path` explicitly if you want a custom location.
 
 ### 2. Build the image
 
@@ -83,3 +67,34 @@ docker buildx build \
 ```
 
 A plain `docker compose build` builds only for the host architecture.
+
+## CI image builds (Forgejo Actions)
+
+`.forgejo/workflows/docker.yml` builds and pushes the image to the
+`nether.codes` container registry on every push to `master` and on `v*` tags. It
+needs a Forgejo runner with a `docker` label and a reachable Docker daemon
+(socket-mounted into the job container). The first build is heavy — the WebRTC
+download plus a full release compile, doubled for the emulated arm64 leg.
+
+### Limiting runner resources
+
+A heavy build can starve the host the runner shares. Cap it with either (or both)
+of these levers:
+
+- **Hard ceiling on the runner container** (e.g. an Incus/LXC container) — protects
+  the host regardless of what the runner does:
+
+  ```bash
+  incus config set <runner-container> limits.cpu 4
+  incus config set <runner-container> limits.memory 8GiB
+  # softer alternative to pinning whole cores:
+  #   incus config set <runner-container> limits.cpu.allowance 50%
+  ```
+
+- **Per-job-container cap** in the runner's `config.yml` (docker-mode runners),
+  then restart the runner:
+
+  ```yaml
+  container:
+    options: "--cpus=4 --memory=8g"
+  ```
