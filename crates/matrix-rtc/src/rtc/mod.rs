@@ -35,9 +35,10 @@ use anyhow::Result;
 use livekit::e2ee::key_provider::KeyProvider;
 use matrix_sdk::{
     Client,
-    ruma::{OwnedDeviceId, OwnedUserId, RoomId},
+    ruma::{OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId},
 };
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -164,6 +165,9 @@ pub(crate) async fn run(
 
     let mut active_session: Option<ActiveSession> = None;
     let mut joined = false;
+    // E2EE membership-retry task for the current activation (cancel + its handle).
+    let mut membership_cancel: Option<CancellationToken> = None;
+    let mut membership_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         let is_active = *call_active_rx.borrow_and_update();
@@ -204,9 +208,22 @@ pub(crate) async fn run(
                         // E2EE only: become a roster member so EC/Commet target
                         // us with Olm-encrypted media keys. Posted AFTER the key
                         // provider is shared (inside join_livekit) so a fast
-                        // incoming key has a live provider to land in.
+                        // incoming key has a live provider to land in. Retried until
+                        // it lands (self-heals a transient/room-PL failure).
                         if lk_cfg.media_e2ee {
-                            post_membership(&client, &room_id, &bot_user_id, &device_id, &focus).await;
+                            let mc = shutdown.child_token();
+                            membership_cancel = Some(mc.clone());
+                            membership_handle = Some(tokio::spawn(
+                                post_membership_until_joined(
+                                    client.clone(),
+                                    room_id.clone(),
+                                    bot_user_id.clone(),
+                                    device_id.clone(),
+                                    focus.clone(),
+                                    mc,
+                                )
+                                .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
+                            ));
                         }
                     }
                     Err(e) => {
@@ -221,6 +238,14 @@ pub(crate) async fn run(
                 tracing::info!("call ended — disconnecting subscriber");
                 teardown(&mut active_session, &shared_provider, &router, true).await;
                 joined = false;
+                // Stop the membership-retry task and await it before retracting, so
+                // a late retry-join can't race past the leave and linger.
+                if let Some(mc) = membership_cancel.take() {
+                    mc.cancel();
+                }
+                if let Some(h) = membership_handle.take() {
+                    let _ = h.await;
+                }
                 // Retract the E2EE roster membership we posted on join.
                 if lk_cfg.media_e2ee {
                     retract_membership(&client, &room_id, &bot_user_id, &device_id).await;
@@ -249,6 +274,12 @@ pub(crate) async fn run(
     // we pass `release_routes = false`.
     if joined {
         teardown(&mut active_session, &shared_provider, &router, false).await;
+        if let Some(mc) = membership_cancel.take() {
+            mc.cancel();
+        }
+        if let Some(h) = membership_handle.take() {
+            let _ = h.await;
+        }
         // Retract the E2EE roster membership so the bot doesn't linger in the
         // call view after the process exits.
         if lk_cfg.media_e2ee {
@@ -260,21 +291,54 @@ pub(crate) async fn run(
     Ok(())
 }
 
-/// Post the bridge bot's `m.call.member` (E2EE only). Best-effort: a failure to
-/// post means EC/Commet won't send media keys, but the session is still up.
+/// Post the bridge bot's `m.call.member` (E2EE only). Returns `Err` so the caller's
+/// retry loop knows whether it landed — without membership EC/Commet send no media
+/// keys, so receive is dead until it succeeds.
 async fn post_membership(
     client: &Client,
     room_id: &RoomId,
     bot_user_id: &OwnedUserId,
     device_id: &OwnedDeviceId,
     focus: &LivekitFocusInfo,
+) -> anyhow::Result<()> {
+    let room = client
+        .get_room(room_id)
+        .ok_or_else(|| anyhow::anyhow!("room not in local state — cannot post E2EE membership"))?;
+    membership::join(&room, bot_user_id, device_id, focus).await
+}
+
+/// Post the bridge bot's `m.call.member`, retrying with backoff until it lands or
+/// `cancel` fires (call-end / shutdown). Self-heals a transient failure (e.g. an
+/// encrypted room whose `org.matrix.msc3401.call.member` power level is wrong, then
+/// fixed) so receive recovers without a reconnect.
+async fn post_membership_until_joined(
+    client: Client,
+    room_id: OwnedRoomId,
+    bot_user_id: OwnedUserId,
+    device_id: OwnedDeviceId,
+    focus: LivekitFocusInfo,
+    cancel: CancellationToken,
 ) {
-    if let Some(room) = client.get_room(room_id) {
-        if let Err(e) = membership::join(&room, bot_user_id, device_id, focus).await {
-            tracing::error!(error = %e, "failed to post bridge-bot m.call.member (E2EE key receipt may fail)");
+    let mut backoff = Duration::from_secs(2);
+    let max = Duration::from_secs(30);
+    loop {
+        match post_membership(&client, &room_id, &bot_user_id, &device_id, &focus).await {
+            Ok(()) => {
+                tracing::info!("bridge participant posted to call (E2EE key receipt enabled)");
+                return;
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                retry_in_s = backoff.as_secs(),
+                "failed to post bridge m.call.member — retrying (room may need m.call.member at PL 0); E2EE receive is down until it lands"
+            ),
         }
-    } else {
-        tracing::warn!("room not in local state — cannot post E2EE membership");
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(max);
     }
 }
 

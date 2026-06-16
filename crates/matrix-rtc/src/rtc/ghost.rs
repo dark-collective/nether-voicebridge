@@ -553,15 +553,23 @@ async fn run_ghost(
                     return;
                 }
             };
-        // 4. Post m.call.member join so EC shows the ghost in the call.
-        if let Err(e) = post_membership(&cfg, &ghost_mxid, &device_id, &focus, false).await {
-            tracing::error!(error = %e, "ghost post_membership(join) failed — skipping");
-            // We already connected + published; cancel so the drain task closes
-            // the room now rather than leaking a published-but-unmembered ghost.
-            cancel.cancel();
-            return;
-        }
-        tracing::info!(display_name = %display_name, "ghost live — publishing Discord speaker audio");
+        // 4. Post m.call.member join so EC shows the ghost in the call — retried
+        // until it lands (or the ghost is cancelled). The track is already
+        // published, so we keep going and publish immediately; EC subscribes the
+        // moment membership posts. Retrying self-heals a transient failure (e.g. the
+        // room's m.call.member power level being wrong then fixed) without needing
+        // the Discord user to rejoin.
+        let membership_handle = tokio::spawn(
+            post_membership_until_joined(
+                cfg.clone(),
+                ghost_mxid.clone(),
+                device_id.clone(),
+                focus.clone(),
+                cancel.clone(),
+            )
+            .instrument(tracing::Span::current()),
+        );
+        tracing::info!(display_name = %display_name, "ghost publishing Discord speaker audio (membership posting)");
 
         // 4b. E2EE only: distribute this ghost's media key to the call's humans so
         // they can decrypt its encrypted frames. Plaintext to-device (Path 2),
@@ -584,8 +592,11 @@ async fn run_ghost(
         // 5. Pump frames until cancelled.
         pump_audio(frame_rx, &source, &cancel).await;
 
-        // 6. Teardown: retract call membership (best-effort). The LiveKit room is
-        // closed by the event-drain task once `cancel` fires.
+        // 6. Teardown. Stop the membership-retry task first (it observes `cancel`)
+        // and await it so a late join can't race past the leave below and linger.
+        let _ = membership_handle.await;
+        // Retract call membership (best-effort; a no-op if we never joined). The
+        // LiveKit room is closed by the event-drain task once `cancel` fires.
         if let Err(e) = post_membership(&cfg, &ghost_mxid, &device_id, &focus, true).await {
             tracing::warn!(error = %e, "ghost post_membership(leave) failed");
         }
@@ -1167,6 +1178,40 @@ async fn fetch_openid_token(cfg: &GhostConfig, ghost_mxid: &str) -> Result<OpenI
         .await
         .context("parsing ghost openid response")?;
     Ok(token)
+}
+
+/// Post the ghost's `m.call.member` join, retrying with backoff until it lands or
+/// `cancel` fires. Self-heals a transient failure (e.g. a room whose
+/// `org.matrix.msc3401.call.member` power level is wrong, then fixed) without the
+/// Discord user having to rejoin. Bounded in practice by the ghost's lifetime.
+async fn post_membership_until_joined(
+    cfg: GhostConfig,
+    ghost_mxid: String,
+    device_id: String,
+    focus: LivekitFocusInfo,
+    cancel: CancellationToken,
+) {
+    let mut backoff = Duration::from_secs(2);
+    let max = Duration::from_secs(30);
+    loop {
+        match post_membership(&cfg, &ghost_mxid, &device_id, &focus, false).await {
+            Ok(()) => {
+                tracing::info!("ghost call membership posted — visible in call");
+                return;
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                retry_in_s = backoff.as_secs(),
+                "ghost post_membership failed — retrying (room may need m.call.member at PL 0)"
+            ),
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(max);
+    }
 }
 
 /// Post (or retract, when `leave`) the ghost's `m.call.member` state event,
