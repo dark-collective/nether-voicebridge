@@ -12,6 +12,8 @@ nvb-audio = { workspace = true }
 nvb-config = { workspace = true }
 serde = { workspace = true }
 matrix-sdk = { workspace = true }
+matrix-sdk-crypto = { workspace = true }
+async-trait = { workspace = true }
 livekit = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }

@@ -1,10 +1,10 @@
-//! Element Call media-key exchange via **plaintext** to-device events.
+//! Element Call media-key exchange: wire types, key generation, content building,
+//! and peer-key installation. The *transport* (how the content reaches recipients)
+//! lives in [`super::key_transport`] — plaintext to-device (Path 2) or Olm-encrypted
+//! to-device (Path 3); both carry the identical content built here.
 //!
-//! Wire protocol: `io.element.call.encryption_keys` (plaintext to-device).
-//! The room has no `m.room.encryption`, so EC sends and expects these events
-//! without Olm encryption. We use the raw Matrix `sendToDevice` endpoint.
-//!
-//! Content shape mirrors matrix-js-sdk `ToDeviceKeyTransport`:
+//! Wire protocol: `io.element.call.encryption_keys`. Content shape mirrors
+//! matrix-js-sdk `ToDeviceKeyTransport`:
 //!   { "keys": {"index": u8, "key": "<base64-std-padded 16 bytes>"},
 //!     "room_id": "...", "member": {"claimed_device_id": "...", "id": "..."},
 //!     "session": {"call_id": "", "application": "m.call", "scope": "m.room"},
@@ -12,32 +12,14 @@
 //!
 //! Keys are 16 random bytes. Element Call uses HKDF internally (done by LiveKit's
 //! KeyProvider) so we pass the raw bytes straight to `key_provider.set_key`.
-//!
-//! Receive direction is best-effort (well-behaved bridge); the critical direction
-//! for the acceptance test is SEND — humans need our key to decrypt our tone.
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose};
 use livekit::e2ee::key_provider::KeyProvider;
 use livekit::id::ParticipantIdentity;
-use matrix_sdk::{
-    Client, Room,
-    ruma::{
-        OwnedTransactionId, OwnedUserId, TransactionId,
-        api::client::to_device::send_event_to_device,
-        events::{
-            AnyToDeviceEventContent,
-            ToDeviceEventType,
-            call::member::CallMemberEventContent,
-            macros::EventContent,
-        },
-        serde::Raw,
-        to_device::DeviceIdOrAllDevices,
-    },
-};
+use matrix_sdk::ruma::events::macros::EventContent;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── Wire-format types ────────────────────────────────────────────────────────
@@ -79,11 +61,10 @@ pub struct CallEncryptionKeysEventContent {
 
 // ── Key generation ────────────────────────────────────────────────────────────
 //
-// E2EE *publish-side* helpers (generate a key, encode it, send it to peers).
-// `generate_key`/`encode_key` are used by the ghost publish path (`rtc::ghost`,
-// per-ghost media keys in encrypted rooms). `send_key` (the bridge-bot/matrix-sdk
-// variant) stays dormant: the bridge bot is subscribe-only, and ghosts send their
-// keys over the raw masqueraded CS-API, not via a matrix-sdk `Client`.
+// E2EE *publish-side* helpers used by the ghost publish path (`rtc::ghost` +
+// `rtc::key_transport`): generate a per-ghost media key, encode it, build the
+// to-device content. The transport that carries the content is chosen in
+// `key_transport` (plaintext or Olm).
 
 /// Generate a fresh 16-byte random media key.
 pub fn generate_key() -> [u8; 16] {
@@ -106,119 +87,42 @@ pub fn decode_key(s: &str) -> Result<Vec<u8>> {
         .context("decoding media key base64")
 }
 
-/// Current Unix timestamp in milliseconds.
-#[allow(dead_code)]
-fn now_ms() -> u64 {
+/// Current Unix timestamp in milliseconds (the `sent_ts` field).
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
-// ── Send our key to all current call members ──────────────────────────────────
+// ── Content building ──────────────────────────────────────────────────────────
 
-/// Send our media key to every other current call member via **plaintext** to-device.
-///
-/// The room has no `m.room.encryption`, so EC uses unencrypted to-device events
-/// for the `io.element.call.encryption_keys` exchange. Using Olm encryption here
-/// fails because OTK claims return nothing (no Olm sessions exist).
-///
-/// `our_user_id`   — the bridge bot's MXID (OwnedUserId)
-/// `our_device_id` — the bridge bot's Matrix device ID
-/// `room_id`       — the Matrix room ID string
-/// `key_index`     — 0 for initial key
-/// `key`           — 16 raw bytes
-#[allow(dead_code)]
-pub async fn send_key(
-    client: &Client,
-    room: &Room,
-    our_user_id: &OwnedUserId,
-    our_device_id: &str,
+/// Build the `io.element.call.encryption_keys` to-device content for a ghost key.
+/// `member.id` (`{device_id}_m.call`) and `member.claimed_device_id` let Element
+/// Call peers reconstruct the ghost's LiveKit identity and attribute the key. The
+/// shape is transport-independent: both [`super::key_transport`] impls send exactly
+/// this content (plaintext or Olm-wrapped).
+pub(crate) fn build_key_content(
     room_id: &str,
+    device_id: &str,
+    key_b64: String,
     key_index: u8,
-    key: &[u8; 16],
-) -> Result<()> {
-    let span = tracing::info_span!("rtc.keys.send", key_index, %room_id);
-    let _guard = span.enter();
-
-    // Collect active call members that are not us (deduplicated by user_id).
-    let raws = room
-        .get_state_events_static::<CallMemberEventContent>()
-        .await
-        .context("reading call member state events")?;
-
-    let mut recipient_users: Vec<OwnedUserId> = Vec::new();
-    for raw in raws {
-        let Ok(ev) = raw.deserialize() else { continue };
-        use matrix_sdk::deserialized_responses::SyncOrStrippedState;
-        use matrix_sdk::ruma::events::SyncStateEvent;
-        let orig = match ev {
-            SyncOrStrippedState::Sync(SyncStateEvent::Original(o)) => o,
-            _ => continue,
-        };
-        if &orig.sender == our_user_id {
-            continue;
-        }
-        let ts = orig.origin_server_ts;
-        if orig.content.active_memberships(Some(ts)).is_empty() {
-            continue;
-        }
-        if !recipient_users.contains(&orig.sender) {
-            recipient_users.push(orig.sender);
-        }
-    }
-
-    if recipient_users.is_empty() {
-        tracing::info!("no other call members to send key to");
-        return Ok(());
-    }
-
-    // Build the to-device content.
-    let content = CallEncryptionKeysEventContent {
-        keys: EncKeyEntry { index: key_index, key: encode_key(key) },
+    sent_ts: u64,
+) -> CallEncryptionKeysEventContent {
+    CallEncryptionKeysEventContent {
+        keys: EncKeyEntry { index: key_index, key: key_b64 },
         room_id: room_id.to_owned(),
         member: EncKeyMember {
-            claimed_device_id: our_device_id.to_owned(),
-            // member.id is the full session member-id suffix: "{device_id}_m.call"
-            // EC uses this to look up our membership and attribute the key.
-            id: format!("{our_device_id}_m.call"),
+            claimed_device_id: device_id.to_owned(),
+            id: format!("{device_id}_m.call"),
         },
         session: EncKeySession {
             call_id: String::new(),
             application: "m.call".to_owned(),
             scope: "m.room".to_owned(),
         },
-        sent_ts: now_ms(),
-    };
-
-    let json = serde_json::to_string(&content).context("serializing encryption key content")?;
-    let raw: Raw<AnyToDeviceEventContent> =
-        Raw::from_json_string(json).context("building Raw content")?;
-
-    // Send plaintext (unencrypted) to-device to all recipients.
-    // We send to "*" (all devices) matching EC behaviour.
-    let mut messages: BTreeMap<OwnedUserId, BTreeMap<DeviceIdOrAllDevices, Raw<AnyToDeviceEventContent>>> =
-        BTreeMap::new();
-    for user_id in &recipient_users {
-        let mut device_map: BTreeMap<DeviceIdOrAllDevices, Raw<AnyToDeviceEventContent>> =
-            BTreeMap::new();
-        device_map.insert(DeviceIdOrAllDevices::AllDevices, raw.clone());
-        messages.insert(user_id.clone(), device_map);
+        sent_ts,
     }
-
-    let event_type = ToDeviceEventType::from("io.element.call.encryption_keys");
-    let txn_id: OwnedTransactionId = TransactionId::new();
-    let request = send_event_to_device::v3::Request::new_raw(event_type, txn_id, messages);
-
-    client.send(request).await.context("send plaintext encryption_keys to-device")?;
-
-    tracing::info!(
-        recipients = ?recipient_users.iter().map(|u| u.as_str()).collect::<Vec<_>>(),
-        key_index,
-        "encryption key sent (plaintext to-device) to call members"
-    );
-
-    Ok(())
 }
 
 // ── Receive peers' keys and install into KeyProvider ──────────────────────────

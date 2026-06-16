@@ -118,6 +118,26 @@ fn default_media_e2ee() -> bool {
     false
 }
 
+/// How a ghost delivers its LiveKit frame key to the call's human members.
+/// Only meaningful when `media_e2ee = true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyTransport {
+    /// Path 2 — an unencrypted `io.element.call.encryption_keys` to-device event
+    /// masqueraded as the ghost. The homeserver can read the key; fine for an
+    /// unencrypted room (Element Call has no media-E2EE security model there).
+    Plaintext,
+    /// Path 3 — the same content, Olm-encrypted per recipient device via the SDK's
+    /// `encrypt_and_send_raw_to_device`. True end-to-end encryption: the homeserver
+    /// cannot read the key. Each ghost becomes a full crypto-capable Matrix client
+    /// (its own device + persistent crypto store). Use this for an encrypted room.
+    Olm,
+}
+
+fn default_key_transport() -> KeyTransport {
+    KeyTransport::Plaintext
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LiveKitConfig {
     /// Optional override for the lk-jwt-service endpoint. When absent (the
@@ -136,6 +156,12 @@ pub struct LiveKitConfig {
     /// Default: false (most deployments run without media E2EE).
     #[serde(default = "default_media_e2ee")]
     pub media_e2ee: bool,
+    /// How ghosts deliver their media key when `media_e2ee` is on. `"plaintext"`
+    /// (default) keeps the homeserver-readable Path 2 transport — correct for an
+    /// unencrypted room. `"olm"` upgrades to true per-ghost Olm E2EE (Path 3) for
+    /// an encrypted room. Ignored when `media_e2ee = false`.
+    #[serde(default = "default_key_transport")]
+    pub key_transport: KeyTransport,
 }
 
 impl Config {
@@ -164,12 +190,12 @@ impl Config {
             ));
         }
 
-        // Hard: distinct store_path per bridge. NOTE: build_client currently uses
-        // an in-memory matrix-sdk store and does not read store_path, so this is
-        // forward-looking — but the moment the SQLite store is wired up, two
-        // clients sharing one path would lock/corrupt, and the `./nether-store`
-        // default makes that the collision a multi-bridge config falls into by
-        // omission. Enforce uniqueness now so the config is correct ahead of time.
+        // Hard: distinct store_path per bridge. `build_client` opens a persistent
+        // SQLite crypto store at `store_path` when `media_e2ee` is set, and with
+        // Olm key transport each bridge's ghosts nest their own stores under it
+        // (`<store_path>/ghosts/<localpart>`); two bridges sharing one path would
+        // lock/corrupt, and the `./nether-store` default makes that the collision a
+        // multi-bridge config falls into by omission. Enforce uniqueness.
         let mut seen_stores = std::collections::HashSet::new();
         for b in &self.bridges {
             if !seen_stores.insert(b.matrix.store_path.as_str()) {
@@ -196,6 +222,19 @@ impl Config {
                      cannot authenticate (provide one or the other)",
                     b.matrix.bot_user_id
                 )));
+            }
+        }
+
+        // Soft: `key_transport = "olm"` has no effect without `media_e2ee = true`
+        // (it only governs how the media key is delivered once E2EE is on). Flag the
+        // likely mistake rather than silently ignoring the operator's intent.
+        for b in &self.bridges {
+            if b.livekit.key_transport == KeyTransport::Olm && !b.livekit.media_e2ee {
+                tracing::warn!(
+                    room_id = %b.matrix.room_id,
+                    "key_transport = \"olm\" set but media_e2ee = false — Olm key transport \
+                     is ignored; set media_e2ee = true to enable Path 3 E2EE"
+                );
             }
         }
 

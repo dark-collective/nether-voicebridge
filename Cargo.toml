@@ -19,7 +19,15 @@ members = [
 # the room is unencrypted and no Olm peers exist). `bundled-sqlite` provides the
 # persistent crypto store (`.sqlite_store`) and a hermetic build (no system
 # libsqlite3). The store is wired only when `media_e2ee` is set — see
-# `crates/matrix-rtc/src/matrix.rs`.
+# `crates/matrix-rtc/src/matrix.rs`. `experimental-send-custom-to-device` exposes
+# `Encryption::encrypt_and_send_raw_to_device` — the single SDK call ghosts use to
+# Olm-encrypt their media key per recipient device (Path 3, `key_transport = "olm"`);
+# it is the same API the SDK's own Element Call widget driver uses.
+#
+# matrix-sdk-crypto is pulled in transitively by matrix-sdk's `e2e-encryption`; we
+# name it directly ONLY to reference `CollectStrategy` (the device-selection policy
+# argument to `encrypt_and_send_raw_to_device`), which matrix-sdk does not re-export.
+# Pinned to the exact version matrix-sdk 0.18 resolves so the two never diverge.
 [workspace.dependencies]
 tokio = { version = "1" }
 serde = { version = "1", features = ["derive"] }
@@ -32,7 +40,8 @@ serenity = { version = "0.12.5", default-features = false, features = ["client",
 songbird = { version = "0.6.0", features = ["serenity", "receive"] }
 hound = "3"
 async-trait = "0.1"
-matrix-sdk = { version = "0.18.0", default-features = false, features = ["e2e-encryption", "bundled-sqlite"] }
+matrix-sdk = { version = "0.18.0", default-features = false, features = ["e2e-encryption", "bundled-sqlite", "experimental-send-custom-to-device"] }
+matrix-sdk-crypto = { version = "0.18.0", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"

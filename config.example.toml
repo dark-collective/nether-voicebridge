@@ -131,9 +131,21 @@ store_path = "./nether-store/general"
 # (encrypting into a non-E2EE call makes peers hear static). When true the bridge
 # does Olm via a persistent crypto store and posts m.call.member to receive media
 # keys — pair it with appservice-auth (omit access_token above) for a clean,
-# self-provisioned device identity. RECEIVE only (Matrix→Discord); Discord→Matrix
-# ghost publishing into an encrypted room is not yet supported. Default: false.
+# self-provisioned device identity. Works BOTH directions (Matrix→Discord receive
+# and Discord→Matrix ghost publishing). Default: false.
 media_e2ee = false
+
+# How ghost media keys reach the call's humans when media_e2ee = true (ignored
+# otherwise):
+#   "plaintext" (default) — an unencrypted to-device key send. The homeserver can
+#     read the key; correct for an unencrypted room, where EC has no media-E2EE
+#     security model anyway.
+#   "olm" — true end-to-end: each ghost becomes a full crypto client (its own
+#     device + a persistent store nested under matrix.store_path) and Olm-encrypts
+#     its key per recipient device. Use this for a genuinely ENCRYPTED room so the
+#     homeserver never sees the frame key. Heavier (one sync per active Discord
+#     speaker) — see the architecture doc.
+# key_transport = "plaintext"
 
 # ─── A second bridge (different channel ↔ different room) ────────────────────
 # Uncomment and fill in to bridge a second pair from this same process. Note the

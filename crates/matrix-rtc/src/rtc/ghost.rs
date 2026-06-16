@@ -34,9 +34,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use livekit::e2ee::key_provider::{KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions};
 use livekit::e2ee::{E2eeOptions, EncryptionType};
 use livekit::id::ParticipantIdentity;
@@ -44,6 +45,8 @@ use livekit::webrtc::audio_frame::AudioFrame;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::{Room, RoomOptions};
 use matrix_sdk::{
+    authentication::{matrix::MatrixSession, SessionTokens},
+    config::SyncSettings,
     deserialized_responses::SyncOrStrippedState,
     ruma::{
         events::{
@@ -55,7 +58,7 @@ use matrix_sdk::{
         },
         OwnedDeviceId, OwnedUserId, RoomId, UserId,
     },
-    Client,
+    Client, SessionMeta,
 };
 use reqwest::Url;
 use std::borrow::Cow;
@@ -65,11 +68,10 @@ use tracing::Instrument;
 
 use nvb_audio::jitter::JitterBuffer;
 use nvb_audio::routing::{CaptureRouter, CaptureSink};
-use nvb_config::{LiveKitConfig, MatrixConfig};
+use nvb_config::{KeyTransport as KeyTransportMode, LiveKitConfig, MatrixConfig};
 
-use super::keys::{
-    self, CallEncryptionKeysEventContent, EncKeyEntry, EncKeyMember, EncKeySession,
-};
+use super::key_transport::{KeyTransport, OlmTransport, PlaintextTransport};
+use super::keys;
 use super::lk_jwt;
 use super::openid::OpenIdToken;
 use super::publish;
@@ -203,6 +205,14 @@ struct GhostConfig {
     /// needs to decrypt them.
     bot_user_id: String,
     media_e2ee: bool,
+    /// How ghosts deliver their media key when `media_e2ee` is on (plaintext Path 2
+    /// or Olm Path 3). Mirrors `livekit.key_transport`.
+    key_transport: KeyTransportMode,
+    /// Base directory of the bridge's matrix-sdk store (`matrix.store_path`). Each
+    /// Olm-transport ghost nests its own persistent crypto store under
+    /// `<store_path>/ghosts/<localpart>` so Olm sessions + uploaded keys survive
+    /// rejoins (no OTK re-upload churn).
+    store_path: String,
     /// Optional config overrides, mirroring the subscriber path. `None` ⇒ derive
     /// the lk-jwt endpoint from the focus and the SFU ws URL from the lk-jwt
     /// response. Set only to override (non-Nether deploy / no `rtc_foci`).
@@ -236,6 +246,8 @@ impl GhostPool {
                 server_name: bot_user.server_name().as_str().to_owned(),
                 bot_user_id: bot_user.as_str().to_owned(),
                 media_e2ee: livekit_cfg.media_e2ee,
+                key_transport: livekit_cfg.key_transport,
+                store_path: matrix_cfg.store_path.clone(),
                 lk_jwt_url: livekit_cfg.lk_jwt_url.clone(),
                 lk_url: livekit_cfg.url.clone(),
             },
@@ -572,13 +584,16 @@ async fn run_ghost(
         tracing::info!(display_name = %display_name, "ghost publishing Discord speaker audio (membership posting)");
 
         // 4b. E2EE only: distribute this ghost's media key to the call's humans so
-        // they can decrypt its encrypted frames. Plaintext to-device (Path 2),
-        // masqueraded as the ghost; runs until cancel (re-sends to catch joiners).
+        // they can decrypt its encrypted frames. The transport (plaintext Path 2 vs
+        // Olm Path 3) is built inside the spawned task so audio pumping below is never
+        // blocked on crypto-client bootstrap. Runs until cancel (re-sends to catch
+        // joiners).
         if let Some(media_key) = media_key {
             tokio::spawn(
-                distribute_key_loop(
+                distribute_key_task(
                     client,
                     cfg.clone(),
+                    localpart.clone(),
                     ghost_mxid.clone(),
                     device_id.clone(),
                     media_key,
@@ -738,7 +753,7 @@ async fn connect_and_publish(
     Ok((source, media_key))
 }
 
-// ─── E2EE media-key distribution (Path 2: plaintext to-device) ──────────────────
+// ─── E2EE media-key distribution (Path 2 plaintext / Path 3 Olm) ────────────────
 
 /// Number of key re-sends in the burst that follows a membership change.
 const KEY_BURST_COUNT: u32 = 6;
@@ -748,7 +763,199 @@ const KEY_BURST_INTERVAL: Duration = Duration::from_secs(3);
 /// dropped even by the burst. Mild (≈1/ghost/min) vs. the old 5s spam.
 const KEY_HEARTBEAT: Duration = Duration::from_secs(60);
 
-/// Distribute this ghost's media key to the call's humans until cancelled.
+/// Olm crypto-client bootstrap attempts before giving up (no plaintext downgrade —
+/// see [`distribute_key_task`]).
+const OLM_BOOTSTRAP_ATTEMPTS: u32 = 3;
+/// Backoff between Olm bootstrap attempts.
+const OLM_BOOTSTRAP_RETRY: Duration = Duration::from_secs(5);
+
+/// Build the configured key transport, then run [`distribute_key_loop`]. Spawned so
+/// the (potentially slow) Olm crypto-client bootstrap never blocks the ghost's audio
+/// pump.
+///
+/// **No silent downgrade.** When `key_transport = "olm"` and bootstrap ultimately
+/// fails, we give up *without* falling back to plaintext: in an encrypted room a
+/// plaintext key send would leak the frame key to the homeserver, defeating the
+/// whole point of Path 3. The operator chooses plaintext explicitly via config; the
+/// bridge never chooses it for them at runtime.
+#[allow(clippy::too_many_arguments)]
+async fn distribute_key_task(
+    client: Client,
+    cfg: GhostConfig,
+    localpart: String,
+    ghost_mxid: String,
+    device_id: String,
+    key: [u8; 16],
+    members_gen: watch::Receiver<u64>,
+    cancel: CancellationToken,
+) {
+    let transport: Arc<dyn KeyTransport> = match cfg.key_transport {
+        KeyTransportMode::Plaintext => Arc::new(PlaintextTransport::new(
+            cfg.http.clone(),
+            cfg.homeserver_url.clone(),
+            cfg.as_token.clone(),
+            cfg.room_id.clone(),
+            ghost_mxid.clone(),
+            device_id.clone(),
+        )),
+        KeyTransportMode::Olm => {
+            match bootstrap_olm_transport(&cfg, &localpart, &ghost_mxid, &device_id, &cancel).await {
+                Some(t) => t,
+                None => return, // bootstrap failed or cancelled; already logged.
+            }
+        }
+    };
+    let source: Arc<dyn RecipientSource> = Arc::new(CallRecipients { client, cfg });
+    distribute_key_loop(source, key, transport, members_gen, cancel).await;
+}
+
+/// Source of the current key-send recipients (the call's human members). Abstracted
+/// from [`distribute_key_loop`] so the loop's burst/heartbeat policy is unit-testable
+/// without a live homeserver (tests supply a scripted source).
+#[async_trait]
+trait RecipientSource: Send + Sync {
+    async fn recipients(&self) -> Result<Vec<OwnedUserId>>;
+}
+
+/// Production source: reads call memberships via the bridge bot's joined client.
+struct CallRecipients {
+    client: Client,
+    cfg: GhostConfig,
+}
+
+#[async_trait]
+impl RecipientSource for CallRecipients {
+    async fn recipients(&self) -> Result<Vec<OwnedUserId>> {
+        enumerate_key_recipients(&self.client, &self.cfg).await
+    }
+}
+
+/// Bootstrap an [`OlmTransport`] with bounded retries. Returns `None` if cancelled
+/// or if every attempt fails (caller must NOT downgrade to plaintext).
+async fn bootstrap_olm_transport(
+    cfg: &GhostConfig,
+    localpart: &str,
+    ghost_mxid: &str,
+    device_id: &str,
+    cancel: &CancellationToken,
+) -> Option<Arc<dyn KeyTransport>> {
+    for attempt in 1..=OLM_BOOTSTRAP_ATTEMPTS {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        match build_ghost_crypto_client(cfg, localpart, ghost_mxid, device_id, cancel).await {
+            Ok(crypto_client) => {
+                tracing::info!("ghost Olm key transport ready (per-ghost crypto client)");
+                return Some(Arc::new(OlmTransport::new(
+                    crypto_client,
+                    cfg.room_id.clone(),
+                    device_id.to_owned(),
+                )));
+            }
+            Err(e) => {
+                tracing::warn!(attempt, error = %e, "ghost Olm transport bootstrap failed; retrying");
+                tokio::select! {
+                    _ = cancel.cancelled() => return None,
+                    _ = tokio::time::sleep(OLM_BOOTSTRAP_RETRY) => {}
+                }
+            }
+        }
+    }
+    tracing::error!(
+        attempts = OLM_BOOTSTRAP_ATTEMPTS,
+        "ghost Olm key transport bootstrap failed — media key NOT distributed (refusing to \
+         downgrade to plaintext in an encrypted room); this ghost is inaudible in Element Call \
+         until it reconnects"
+    );
+    None
+}
+
+/// Make a ghost a crypto-capable client: appservice-login it (asserting its stable
+/// `device_id`), open a persistent SQLite crypto store under
+/// `<store_path>/ghosts/<localpart>`, restore the session, sync once to upload its
+/// device keys + one-time keys, and spawn a background sync (cancelled with the
+/// ghost) so its device lists stay fresh for `encrypt_and_send_raw_to_device`.
+/// Mirrors the bridge bot's `build_client`; we add no crypto of our own. The store
+/// persists across rejoins so Olm sessions + uploaded keys are reused.
+async fn build_ghost_crypto_client(
+    cfg: &GhostConfig,
+    localpart: &str,
+    ghost_mxid: &str,
+    device_id: &str,
+    cancel: &CancellationToken,
+) -> Result<Client> {
+    let store_dir = format!("{}/ghosts/{}", cfg.store_path.trim_end_matches('/'), localpart);
+    tokio::fs::create_dir_all(&store_dir)
+        .await
+        .with_context(|| format!("creating ghost crypto store dir '{store_dir}'"))?;
+
+    let access_token =
+        crate::matrix::appservice_login_as(&cfg.homeserver_url, &cfg.as_token, localpart, device_id)
+            .await
+            .context("ghost appservice login")?;
+
+    let client = Client::builder()
+        .homeserver_url(&cfg.homeserver_url)
+        .sqlite_store(&store_dir, None)
+        .build()
+        .await
+        .context("building ghost crypto client")?;
+
+    let user_id: OwnedUserId = ghost_mxid
+        .parse()
+        .with_context(|| format!("parsing ghost mxid '{ghost_mxid}'"))?;
+    let session = MatrixSession {
+        meta: SessionMeta {
+            user_id,
+            device_id: device_id.into(),
+        },
+        tokens: SessionTokens {
+            access_token,
+            refresh_token: None,
+        },
+    };
+    client
+        .restore_session(session)
+        .await
+        .context("restoring ghost crypto session")?;
+
+    // First sync uploads this ghost's device keys + one-time keys so peers can
+    // Olm-encrypt to it and it can claim theirs. Bounded so a wedged homeserver
+    // can't hang key distribution forever.
+    match tokio::time::timeout(
+        Duration::from_secs(60),
+        client.sync_once(SyncSettings::default()),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(anyhow!("ghost initial sync failed: {e}")),
+        Err(_) => return Err(anyhow!("ghost initial sync timed out after 60s")),
+    }
+
+    // Perpetual sync for ongoing device-list tracking; dies with the ghost.
+    let sync_client = client.clone();
+    let sync_cancel = cancel.clone();
+    tokio::spawn(
+        async move {
+            tokio::select! {
+                _ = sync_cancel.cancelled() => {}
+                r = sync_client.sync(SyncSettings::default()) => {
+                    if let Err(e) = r {
+                        tracing::warn!(error = %e, "ghost crypto sync loop ended");
+                    }
+                }
+            }
+        }
+        .instrument(tracing::Span::current()),
+    );
+
+    tracing::info!(device_id, store = %store_dir, "ghost crypto client ready (device keys + OTKs uploaded)");
+    Ok(client)
+}
+
+/// Distribute this ghost's media key to the call's humans until cancelled, over the
+/// given [`KeyTransport`].
 ///
 /// **Burst-on-change + slow heartbeat.** A one-shot send is fragile: a recipient
 /// whose Element Call client is still completing call setup drops the to-device key
@@ -759,21 +966,12 @@ const KEY_HEARTBEAT: Duration = Duration::from_secs(60);
 /// setup window; between bursts a slow **heartbeat** re-send is a backstop. The
 /// `members_gen` watch (bumped on each join) wakes the loop immediately, so a new
 /// joiner is keyed without waiting for the heartbeat, while a stable call only
-/// re-sends about once a minute.
-///
-/// **Path 2 — plaintext transport.** The key rides an unencrypted
-/// `io.element.call.encryption_keys` to-device event masqueraded as the ghost
-/// (`as_token` + `?user_id=`). Element Call accepts plaintext key sends today
-/// (its enforcement is gated on matrix-rust-sdk#4883; Commet has no check), so the
-/// homeserver can read the key — *not* true E2EE for ghost audio. The LiveKit
-/// frame-encryption, identity, and content shape are identical to Path 3; only
-/// this transport swaps to Olm there.
+/// re-sends about once a minute. The transport is opaque here: plaintext (Path 2)
+/// and Olm (Path 3) share this exact retry policy.
 async fn distribute_key_loop(
-    client: Client,
-    cfg: GhostConfig,
-    ghost_mxid: String,
-    device_id: String,
+    source: Arc<dyn RecipientSource>,
     key: [u8; 16],
+    transport: Arc<dyn KeyTransport>,
     mut members_gen: watch::Receiver<u64>,
     cancel: CancellationToken,
 ) {
@@ -782,9 +980,8 @@ async fn distribute_key_loop(
     let mut keyed: HashSet<OwnedUserId> = HashSet::new();
     // Burst re-sends still owed after the last membership change. >0 ⇒ wake fast.
     let mut burst: u32 = 0;
-    let mut seq: u64 = 0;
     loop {
-        match enumerate_key_recipients(&client, &cfg).await {
+        match source.recipients().await {
             Ok(current) => {
                 // A newly-seen recipient (re)starts the burst to cover its client's
                 // call-setup window, during which it may drop the to-device key.
@@ -794,22 +991,48 @@ async fn distribute_key_loop(
                 if current.is_empty() {
                     keyed.clear();
                 } else {
-                    // Advance the txn id on every attempt so a retry can't collide
-                    // with a prior txn and be de-duped by the server. Duplicate
-                    // delivery is harmless — installing the same key twice is a no-op.
-                    let this_seq = seq;
-                    seq += 1;
-                    match send_encryption_key_raw(
-                        &cfg, &ghost_mxid, &device_id, &current, &key, 0, this_seq,
-                    )
-                    .await
-                    {
-                        Ok(()) => tracing::info!(
+                    match transport.send_key(&current, &key, 0).await {
+                        // Every targeted device got the key.
+                        Ok(o) if o.failed.is_empty() => tracing::info!(
                             recipients = ?current.iter().map(|u| u.as_str()).collect::<Vec<_>>(),
+                            transport = transport.kind(),
+                            delivered = o.delivered,
                             burst,
-                            "ghost media key sent (plaintext to-device)"
+                            "ghost media key sent"
                         ),
-                        Err(e) => tracing::warn!(error = %e, "ghost media-key send failed"),
+                        // Partial success — the key reached the live device(s); the
+                        // unreachable ones are almost always stale/offline sessions
+                        // with no one-time keys (can't be fixed from the bridge). This
+                        // is the normal, healthy case, so it's INFO not WARN. The
+                        // per-device id list is DEBUG to keep the default log quiet;
+                        // burst/heartbeat keeps retrying in case any are transient.
+                        Ok(o) if o.delivered > 0 => {
+                            tracing::info!(
+                                transport = transport.kind(),
+                                delivered = o.delivered,
+                                unreachable = o.failed.len(),
+                                burst,
+                                "ghost media key delivered (some recipient devices unreachable — likely stale/offline sessions)"
+                            );
+                            tracing::debug!(
+                                unreachable_devices = ?o.failed.iter().map(|f| format!("{}:{}", f.user_id, f.device_id)).collect::<Vec<_>>(),
+                                "ghost media key: unreachable devices"
+                            );
+                        }
+                        // Reached NO devices — the real failure (e.g. the live device
+                        // is out of one-time keys, or the ghost's sync hasn't tracked
+                        // anyone yet). Burst/heartbeat retries; surfaced loudly.
+                        Ok(o) => tracing::warn!(
+                            transport = transport.kind(),
+                            unreachable = o.failed.len(),
+                            burst,
+                            "ghost media key reached NO recipient devices — nobody can decrypt this ghost (will retry)"
+                        ),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            transport = transport.kind(),
+                            "ghost media-key send failed"
+                        ),
                     }
                     keyed = current.into_iter().collect();
                     burst = burst.saturating_sub(1);
@@ -873,83 +1096,6 @@ async fn enumerate_key_recipients(client: &Client, cfg: &GhostConfig) -> Result<
     Ok(recipients)
 }
 
-/// PUT a plaintext `io.element.call.encryption_keys` to-device event masqueraded
-/// as the ghost, delivering `key` (index `key_index`) to every `recipient`'s
-/// devices (`*`). `seq` makes the transaction id unique across re-sends.
-async fn send_encryption_key_raw(
-    cfg: &GhostConfig,
-    ghost_mxid: &str,
-    device_id: &str,
-    recipients: &[OwnedUserId],
-    key: &[u8; 16],
-    key_index: u8,
-    seq: u64,
-) -> Result<()> {
-    let content = build_key_content(&cfg.room_id, device_id, keys::encode_key(key), key_index, now_ms());
-    let content_json = serde_json::to_value(&content).context("serializing encryption key content")?;
-
-    // { messages: { "@user:hs": { "*": <content> } } }
-    let per_device = serde_json::json!({ "*": content_json });
-    let mut messages = serde_json::Map::new();
-    for recipient in recipients {
-        messages.insert(recipient.to_string(), per_device.clone());
-    }
-    let body = serde_json::json!({ "messages": serde_json::Value::Object(messages) });
-
-    // Per-ghost unique, deterministic txn id (no RNG): device + monotonic seq.
-    let txn = format!("{device_id}-key-{seq}");
-    let url = cs_url(
-        &cfg.homeserver_url,
-        &["sendToDevice", "io.element.call.encryption_keys", &txn],
-        Some(ghost_mxid),
-    )?;
-    let resp = cfg
-        .http
-        .put(url)
-        .bearer_auth(&cfg.as_token)
-        .json(&body)
-        .send()
-        .await
-        .context("PUT /sendToDevice (encryption_keys)")?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("sendToDevice failed: {}", err_body(resp).await));
-    }
-    Ok(())
-}
-
-/// Build the `io.element.call.encryption_keys` to-device content for a ghost key.
-/// `member.id` (`{device_id}_m.call`) and `member.claimed_device_id` let Element
-/// Call peers reconstruct the ghost's LiveKit identity and attribute the key.
-fn build_key_content(
-    room_id: &str,
-    device_id: &str,
-    key_b64: String,
-    key_index: u8,
-    sent_ts: u64,
-) -> CallEncryptionKeysEventContent {
-    CallEncryptionKeysEventContent {
-        keys: EncKeyEntry { index: key_index, key: key_b64 },
-        room_id: room_id.to_owned(),
-        member: EncKeyMember {
-            claimed_device_id: device_id.to_owned(),
-            id: format!("{device_id}_m.call"),
-        },
-        session: EncKeySession {
-            call_id: String::new(),
-            application: "m.call".to_owned(),
-            scope: "m.room".to_owned(),
-        },
-        sent_ts,
-    }
-}
-
-/// Current Unix time in milliseconds (the `sent_ts` field).
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 // ─── Raw client-server API helpers (appservice masquerade) ──────────────────────
 
@@ -970,14 +1116,16 @@ fn matrix_url(homeserver: &str, segments: &[&str], masquerade: Option<&str>) -> 
 }
 
 /// Build a client-server API URL under `/_matrix/client/v3` (the common case).
-fn cs_url(homeserver: &str, segments: &[&str], masquerade: Option<&str>) -> Result<Url> {
+/// `pub(crate)` so the plaintext key transport (`rtc::key_transport`) can reuse it.
+pub(crate) fn cs_url(homeserver: &str, segments: &[&str], masquerade: Option<&str>) -> Result<Url> {
     let mut full = vec!["_matrix", "client", "v3"];
     full.extend_from_slice(segments);
     matrix_url(homeserver, &full, masquerade)
 }
 
 /// Read an error response body for logging (bearer tokens are never in bodies).
-async fn err_body(resp: reqwest::Response) -> String {
+/// `pub(crate)` so the plaintext key transport (`rtc::key_transport`) can reuse it.
+pub(crate) async fn err_body(resp: reqwest::Response) -> String {
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     format!("{status}: {text}")
@@ -1363,7 +1511,7 @@ mod tests {
         // The to-device content must carry the exact fields Element Call reads to
         // map a key to the ghost's LiveKit identity. A regression here = peers
         // install the key under the wrong identity → noise (constraint #3-adjacent).
-        let content = build_key_content("!room:nether.im", "D42", "AAAA".to_owned(), 0, 1234);
+        let content = keys::build_key_content("!room:nether.im", "D42", "AAAA".to_owned(), 0, 1234);
         let v = serde_json::to_value(&content).unwrap();
         assert_eq!(v["keys"]["index"], 0);
         assert_eq!(v["keys"]["key"], "AAAA");
@@ -1373,5 +1521,117 @@ mod tests {
         assert_eq!(v["session"]["application"], "m.call");
         assert_eq!(v["session"]["scope"], "m.room");
         assert_eq!(v["sent_ts"], 1234);
+    }
+
+    // ── distribute_key_loop, driven with mock transport + recipient source ──────
+
+    use super::super::key_transport::KeySendOutcome;
+
+    /// Records the recipient lists passed to each `send_key`.
+    #[derive(Default)]
+    struct MockTransport {
+        sends: StdMutex<Vec<Vec<OwnedUserId>>>,
+    }
+
+    #[async_trait]
+    impl KeyTransport for MockTransport {
+        async fn send_key(
+            &self,
+            recipients: &[OwnedUserId],
+            _key: &[u8; 16],
+            _key_index: u8,
+        ) -> Result<KeySendOutcome> {
+            self.sends.lock().unwrap().push(recipients.to_vec());
+            Ok(KeySendOutcome {
+                delivered: recipients.len(),
+                failed: Vec::new(),
+            })
+        }
+        fn kind(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    /// Returns a fixed recipient list every poll.
+    struct MockSource {
+        users: Vec<OwnedUserId>,
+    }
+
+    #[async_trait]
+    impl RecipientSource for MockSource {
+        async fn recipients(&self) -> Result<Vec<OwnedUserId>> {
+            Ok(self.users.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn key_loop_sends_to_current_recipients_then_stops_on_cancel() {
+        let alice: OwnedUserId = "@alice:nether.im".parse().unwrap();
+        let source = Arc::new(MockSource {
+            users: vec![alice.clone()],
+        });
+        let transport = Arc::new(MockTransport::default());
+        let (_gen_tx, gen_rx) = watch::channel(0u64);
+        let cancel = CancellationToken::new();
+
+        let handle = tokio::spawn(distribute_key_loop(
+            source,
+            [7u8; 16],
+            transport.clone(),
+            gen_rx,
+            cancel.clone(),
+        ));
+
+        // The first iteration sends immediately, then waits the 3s burst interval
+        // (a new recipient sets burst > 0). Cancel inside that window → exactly one
+        // send, to the current recipient set.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        handle.await.unwrap();
+
+        let sends = transport.sends.lock().unwrap();
+        assert_eq!(sends.len(), 1, "expected one send before cancel");
+        assert_eq!(sends[0], vec![alice]);
+    }
+
+    #[tokio::test]
+    async fn key_loop_skips_send_when_no_recipients() {
+        let source = Arc::new(MockSource { users: vec![] });
+        let transport = Arc::new(MockTransport::default());
+        let (_gen_tx, gen_rx) = watch::channel(0u64);
+        let cancel = CancellationToken::new();
+
+        let handle = tokio::spawn(distribute_key_loop(
+            source,
+            [0u8; 16],
+            transport.clone(),
+            gen_rx,
+            cancel.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        handle.await.unwrap();
+
+        assert!(
+            transport.sends.lock().unwrap().is_empty(),
+            "no recipients ⇒ no key send"
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_transport_empty_recipients_is_noop() {
+        // The empty guard must short-circuit before any network call.
+        let t = PlaintextTransport::new(
+            reqwest::Client::new(),
+            "https://nether.im".into(),
+            "as_tok".into(),
+            "!r:nether.im".into(),
+            "@nether-voicebridge_1:nether.im".into(),
+            "D1".into(),
+        );
+        let outcome = t.send_key(&[], &[0u8; 16], 0).await.unwrap();
+        assert!(outcome.failed.is_empty());
+        assert_eq!(outcome.delivered, 0);
+        assert_eq!(t.kind(), "plaintext");
     }
 }
