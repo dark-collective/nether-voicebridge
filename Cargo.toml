@@ -8,6 +8,14 @@ members = [
     "crates/bridge",
 ]
 
+# Strip symbols from release builds. The binary statically links libwebrtc and is
+# huge with symbols (the debug build is ~900 MB); stripping cuts it several-fold so
+# the Docker image layer fits under the registry's upload limit (Cloudflare's ~100 MB
+# body cap in front of nether.codes) and deploys stay lean. Symbols only — no
+# behavior change.
+[profile.release]
+strip = true
+
 # Shared dependency versions. The pinned, version-sensitive crates (songbird for
 # DAVE, livekit for E2EE/frame crypto — see CLAUDE.md constraint #7) live here so
 # every member resolves the exact same release. Per-crate manifests reference
