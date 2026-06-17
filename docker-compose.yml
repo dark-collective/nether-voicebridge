@@ -30,16 +30,16 @@ services:
       # At least one of BOT_USER_ID or SENDER_LOCALPART is required:
       # NETHER_MATRIX_BOT_USER_ID: "@voicebridge:nether.im"   # full MXID
       NETHER_MATRIX_SENDER_LOCALPART: "voicebridge"          # derives MXID when BOT_USER_ID absent
-      # NETHER_MATRIX_DEVICE_ID: "ABCDEFGHIJ"
       NETHER_MATRIX_APPSERVICE_ID: "voicebridge"
       NETHER_MATRIX_APPSERVICE_TOKEN: ""
 
-      # Optional (defaults shown):
+      # Optional:
+      # NETHER_MATRIX_DEVICE_ID: "ABCDEFGHIJ"   # auto-derived from the bridge name when unset
       # NETHER_PUPPET_NICKNAME_PREFIX: "[Matrix] "
-      # NETHER_BRIDGE_NAME: ""                  # label used in logs
+      # NETHER_BRIDGE_NAME: ""                  # label used in logs + store-path leaf
       # NETHER_MATRIX_ACCESS_TOKEN: ""          # omit for appservice-auth mode
-      # NETHER_LIVEKIT_MEDIA_E2EE: "false"      # true for encrypted Matrix rooms
-      # NETHER_LIVEKIT_KEY_TRANSPORT: "plaintext"  # or "olm" for encrypted rooms
+      # NETHER_LIVEKIT_MEDIA_E2EE: ""           # auto-detected from room encryption; set true/false only to force
+      # NETHER_LIVEKIT_KEY_TRANSPORT: ""        # auto-selected (olm for encrypted rooms); set only to force
       # NETHER_MATRIX_BOT_DISPLAY_NAME: ""
       # NETHER_MATRIX_BOT_AVATAR_PATH: ""       # path inside the container
       # NETHER_LIVEKIT_LK_JWT_URL: ""           # auto-derived; override only if needed

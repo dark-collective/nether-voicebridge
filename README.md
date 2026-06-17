@@ -87,17 +87,17 @@ docker compose logs -f
 | `NETHER_MATRIX_ROOM_ID` | ✓ | | Internal room ID (`!abc:nether.im`) |
 | `NETHER_MATRIX_BOT_USER_ID` | one of¹ | | Full bot MXID |
 | `NETHER_MATRIX_SENDER_LOCALPART` | one of¹ | | Bot localpart; derives MXID from homeserver domain |
-| `NETHER_MATRIX_DEVICE_ID` | ✓ | | |
+| `NETHER_MATRIX_DEVICE_ID` | | *(auto-derived)* | Derived from the bridge name when unset |
 | `NETHER_MATRIX_APPSERVICE_ID` | ✓ | | |
 | `NETHER_MATRIX_APPSERVICE_TOKEN` | ✓ | | |
 | `NETHER_PUPPET_NICKNAME_PREFIX` | | `[Matrix] ` | Set to empty string to disable |
-| `NETHER_BRIDGE_NAME` | | `unnamed` | Label used in logs |
+| `NETHER_BRIDGE_NAME` | | `bridge-0` | Label used in logs; also the store-path leaf |
 | `NETHER_DISCORD_CAPTURE_WAV` | | `false` | Debug only — writes unbounded WAV files |
-| `NETHER_MATRIX_STORE_PATH` | | `/app/data` | Persists on the volume; rarely needs changing |
+| `NETHER_MATRIX_STORE_PATH` | | *(auto-derived)* | Derived as `/app/data/<bridge-name>` on the volume; rarely set |
 | `NETHER_MATRIX_BOT_DISPLAY_NAME` | | | |
 | `NETHER_MATRIX_BOT_AVATAR_PATH` | | | Path inside the container |
-| `NETHER_LIVEKIT_MEDIA_E2EE` | | `false` | Set `true` for an encrypted Matrix room |
-| `NETHER_LIVEKIT_KEY_TRANSPORT` | | `plaintext` | `olm` for true E2EE (encrypted rooms) |
+| `NETHER_LIVEKIT_MEDIA_E2EE` | | *(auto-detected)* | Detected from the room's `m.room.encryption`; set `true`/`false` only to force |
+| `NETHER_LIVEKIT_KEY_TRANSPORT` | | *(auto-selected)* | `olm` for encrypted rooms, `plaintext` otherwise; set only to force |
 | `NETHER_LIVEKIT_LK_JWT_URL` | | *(auto-derived)* | Override lk-jwt-service endpoint |
 | `NETHER_LIVEKIT_URL` | | *(auto-derived)* | Override LiveKit SFU WebSocket URL |
 

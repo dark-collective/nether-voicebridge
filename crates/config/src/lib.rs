@@ -426,13 +426,14 @@ impl Config {
     /// Required vars:
     ///   NETHER_PUPPET_TOKENS, NETHER_DISCORD_GUILD_ID, NETHER_DISCORD_CHANNEL_ID,
     ///   NETHER_MATRIX_HOMESERVER_URL, NETHER_MATRIX_ROOM_ID,
-    ///   NETHER_MATRIX_DEVICE_ID, NETHER_MATRIX_APPSERVICE_ID, NETHER_MATRIX_APPSERVICE_TOKEN
+    ///   NETHER_MATRIX_APPSERVICE_ID, NETHER_MATRIX_APPSERVICE_TOKEN
     ///   At least one of: NETHER_MATRIX_BOT_USER_ID, NETHER_MATRIX_SENDER_LOCALPART
     ///
     /// Optional vars:
     ///   NETHER_PUPPET_NICKNAME_PREFIX (default "[Matrix] ")
     ///   NETHER_BRIDGE_NAME
     ///   NETHER_DISCORD_CAPTURE_WAV (default false)
+    ///   NETHER_MATRIX_DEVICE_ID (auto-derived from bridge name when absent)
     ///   NETHER_MATRIX_BOT_USER_ID — full bot MXID; derived from SENDER_LOCALPART when absent
     ///   NETHER_MATRIX_SENDER_LOCALPART — bot localpart; derives bot MXID when BOT_USER_ID absent
     ///   NETHER_MATRIX_ACCESS_TOKEN (omit for appservice-auth mode)
@@ -491,7 +492,9 @@ impl Config {
         if bot_user_id.is_none() && sender_localpart.is_none() {
             missing.push("NETHER_MATRIX_BOT_USER_ID (or NETHER_MATRIX_SENDER_LOCALPART)");
         }
-        let device_id = require!("NETHER_MATRIX_DEVICE_ID");
+        // Optional like file mode: when absent, `resolve_device_ids` derives a stable
+        // id from the bridge name (the same leaf as `store_path`).
+        let device_id = optional!("NETHER_MATRIX_DEVICE_ID");
         let access_token = optional!("NETHER_MATRIX_ACCESS_TOKEN");
         let appservice_id = require!("NETHER_MATRIX_APPSERVICE_ID");
         let appservice_token = require!("NETHER_MATRIX_APPSERVICE_TOKEN");
@@ -545,7 +548,7 @@ impl Config {
                     room_id: room_id.unwrap(),
                     bot_user_id: bot_user_id.unwrap_or_default(),
                     sender_localpart,
-                    device_id: device_id.unwrap(),
+                    device_id: device_id.unwrap_or_default(),
                     access_token,
                     appservice_id: appservice_id.unwrap(),
                     appservice_token: appservice_token.unwrap(),
@@ -562,6 +565,14 @@ impl Config {
             }],
         };
         cfg.resolve_bot_user_ids();
+        // Omitted `NETHER_MATRIX_DEVICE_ID` derives from the bridge name, as in file mode.
+        cfg.resolve_device_ids();
+        // Mirror `load()`'s store-path resolution: an omitted `NETHER_MATRIX_STORE_PATH`
+        // leaves `store_path` empty, which must be filled from `data_dir` (honoring the
+        // `NVB_DATA_DIR` override the Docker image sets to `/app/data`) — otherwise the
+        // sqlite store + ghost Olm stores land off the persistent volume.
+        let data_dir = std::env::var("NVB_DATA_DIR").unwrap_or_else(|_| cfg.data_dir.clone());
+        cfg.resolve_store_paths(&data_dir);
         Ok(cfg)
     }
 
@@ -1395,5 +1406,46 @@ appservice_token = "hs_tok"
         assert_eq!(m.bot_user_id, "@bot-account:nether.im");
         assert_eq!(m.sender_localpart.as_deref(), Some("namespace-anchor"));
         cfg.validate().expect("should validate");
+    }
+
+    // ---- from_env() ----
+
+    /// `from_env()` must run the same store-path resolution `load()` does: an omitted
+    /// `NETHER_MATRIX_STORE_PATH` is derived from the bridge name, never left empty
+    /// (an empty path sends the sqlite + ghost Olm stores off the persistent volume).
+    /// Sole reader/writer of `NETHER_*`/`NVB_DATA_DIR` in the suite, so the env
+    /// mutation can't race another test.
+    #[test]
+    fn from_env_derives_store_path_when_unset() {
+        let vars = [
+            ("NETHER_PUPPET_TOKENS", "tok-a,tok-b"),
+            ("NETHER_DISCORD_GUILD_ID", "111"),
+            ("NETHER_DISCORD_CHANNEL_ID", "222"),
+            ("NETHER_MATRIX_HOMESERVER_URL", "https://nether.im"),
+            ("NETHER_MATRIX_ROOM_ID", "!r:nether.im"),
+            ("NETHER_MATRIX_SENDER_LOCALPART", "voicebridge-bot"),
+            ("NETHER_MATRIX_APPSERVICE_ID", "voicebridge"),
+            ("NETHER_MATRIX_APPSERVICE_TOKEN", "hs_tok"),
+            ("NETHER_BRIDGE_NAME", "envtest"),
+        ];
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+        std::env::set_var("NVB_DATA_DIR", "/app/data");
+
+        let cfg = Config::from_env().expect("from_env should succeed");
+        let m = &cfg.bridges[0].matrix;
+        // store_path derived under NVB_DATA_DIR, NOT left empty.
+        assert_eq!(m.store_path, "/app/data/envtest");
+        // device_id auto-derives from the bridge name when unset (file-mode parity).
+        assert_eq!(m.device_id, "envtest");
+        // sender_localpart still derives the bot MXID.
+        assert_eq!(m.bot_user_id, "@voicebridge-bot:nether.im");
+        cfg.validate().expect("env config should validate");
+
+        for (k, _) in vars {
+            std::env::remove_var(k);
+        }
+        std::env::remove_var("NVB_DATA_DIR");
     }
 }

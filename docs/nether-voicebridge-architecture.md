@@ -108,6 +108,17 @@ count as humans.
 - Open: join puppet pool to channel (one auto-elected as the capture anchor);
   establish subscriber participant + bridge's own MatrixRTC membership.
 - Per participant: allocate puppet (Matrix human) / mint ghost (Discord human).
+- **Presence vs. media (Discord→Matrix).** Discord presence alone — detected from
+  gateway Voice State Updates on *any* puppet bot, no bot in the voice channel —
+  makes ghosts visible: each Discord human gets a ghost that posts `m.call.member`
+  with **no media**, so Matrix users see who's waiting even in an empty call. The
+  capture anchor only joins the Discord voice channel, and the ghosts only connect
+  LiveKit (and deliver E2EE keys), once a **Matrix** human is in the call; they
+  publish before they're announced so a (re)joining speaker is heard immediately.
+  When the last Matrix human leaves, the subscriber disconnects and the capture
+  anchor leaves the Discord voice channel after a short grace; the Discord users'
+  presence ghosts (their `m.call.member`) remain, so the room still shows who's
+  waiting.
 - Close: tear down all connections, return puppets to pool, retire ghosts,
   drop memberships. No leaked connections (test this explicitly).
 
