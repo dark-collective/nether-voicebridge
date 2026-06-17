@@ -63,6 +63,10 @@ The full design and the phased build history live in:
 - **Per bridged room:** the Matrix room must allow power level **0** for the
   `org.matrix.msc3401.call.member` state event (the standard Element Call setup),
   or Discord→Matrix ghosts can't post their membership. See the architecture doc.
+- **Per bridged room (non-public only):** on the appservice-auth path the bot
+  joins as a full member via the appservice, so the room needs **no
+  `guest_access`** — but a **restricted or invite-only** room still requires the
+  bot user to be **invited** (or a member of the room's allow-space) first.
 
 ## Quickstart (from source)
 
