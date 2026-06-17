@@ -448,11 +448,21 @@ impl GhostPool {
                     ghosts.insert(key, GhostHandle { cancel, join, mute_tx });
                 }
                 GhostCommand::SetMuted { key, muted } => {
-                    // `watch::send` keeps the latest value even if the ghost is
-                    // still connecting (the receiver lives for the task's life, so
-                    // an Err here only means the ghost already retired).
+                    // `watch` keeps the latest value even if the ghost is still
+                    // connecting (the receiver lives for the task's life). Use
+                    // `send_if_modified` so the receiver only wakes — and the track
+                    // only re-mutes / logs — on an ACTUAL change: Discord re-sends
+                    // unchanged voice state, so `set_muted` is called on every
+                    // update, but we want one toggle = one effect.
                     if let Some(handle) = ghosts.get(&key) {
-                        let _ = handle.mute_tx.send(muted);
+                        handle.mute_tx.send_if_modified(|cur| {
+                            if *cur == muted {
+                                false
+                            } else {
+                                *cur = muted;
+                                true
+                            }
+                        });
                     }
                 }
                 GhostCommand::Release { key } => {
