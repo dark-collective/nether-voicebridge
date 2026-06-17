@@ -31,11 +31,23 @@ async fn main() -> Result<()> {
         }))
         .init();
 
-    let config_path =
-        std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
-
-    let cfg = nvb_config::Config::load(&config_path)
-        .with_context(|| format!("loading config from {config_path}"))?;
+    let cfg = match std::env::var("CONFIG_PATH") {
+        Ok(path) => {
+            // CONFIG_PATH explicitly set — always load from that file.
+            nvb_config::Config::load(&path)
+                .with_context(|| format!("loading config from {path}"))?
+        }
+        Err(_) => match nvb_config::Config::load("config.toml") {
+            Ok(cfg) => cfg,
+            Err(nvb_config::ConfigError::Io { .. }) => {
+                tracing::info!("no config.toml found, loading config from environment variables");
+                nvb_config::Config::from_env().context(
+                    "no config.toml found; set CONFIG_PATH or supply all NETHER_* environment variables",
+                )?
+            }
+            Err(e) => return Err(e).context("loading config from config.toml"),
+        },
+    };
     cfg.validate().context("config validation failed")?;
     cfg.log_redacted_summary();
     // `data_dir` was already consumed by `load` to resolve each bridge's

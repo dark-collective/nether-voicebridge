@@ -1,6 +1,4 @@
-This is a stub for the README.md when created - use as a template for the docker section of the README
-
-## Running with Docker
+# Running with Docker
 
 ### Prerequisites
 

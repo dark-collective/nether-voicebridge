@@ -77,10 +77,39 @@ holds bot tokens and Matrix access/appservice tokens.
 ## Docker
 
 ```bash
-cp config.example.toml config.toml   # fill in
+cp config.example.toml config.toml   # fill in - or set environment variables
 docker compose up -d
 docker compose logs -f
 ```
+
+### Environment Variables
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `NETHER_PUPPET_TOKENS` | ✓ | | Comma-separated Discord bot tokens |
+| `NETHER_DISCORD_GUILD_ID` | ✓ | | |
+| `NETHER_DISCORD_CHANNEL_ID` | ✓ | | |
+| `NETHER_MATRIX_HOMESERVER_URL` | ✓ | | |
+| `NETHER_MATRIX_ROOM_ID` | ✓ | | Internal room ID (`!abc:nether.im`) |
+| `NETHER_MATRIX_BOT_USER_ID` | one of¹ | | Full bot MXID |
+| `NETHER_MATRIX_SENDER_LOCALPART` | one of¹ | | Bot localpart; derives MXID from homeserver domain |
+| `NETHER_MATRIX_DEVICE_ID` | | *(auto-derived)* | Derived from the bridge name when unset |
+| `NETHER_MATRIX_APPSERVICE_ID` | ✓ | | |
+| `NETHER_MATRIX_APPSERVICE_TOKEN` | ✓ | | |
+| `NETHER_PUPPET_NICKNAME_PREFIX` | | `[Matrix] ` | Set to empty string to disable |
+| `NETHER_BRIDGE_NAME` | | `bridge-0` | Label used in logs; also the store-path leaf |
+| `NETHER_DISCORD_CAPTURE_WAV` | | `false` | Debug only — writes unbounded WAV files |
+| `NETHER_MATRIX_STORE_PATH` | | *(auto-derived)* | Derived as `/app/data/<bridge-name>` on the volume; rarely set |
+| `NETHER_MATRIX_BOT_DISPLAY_NAME` | | | |
+| `NETHER_MATRIX_BOT_AVATAR_PATH` | | | Path inside the container |
+| `NETHER_LIVEKIT_MEDIA_E2EE` | | *(auto-detected)* | Detected from the room's `m.room.encryption`; set `true`/`false` only to force |
+| `NETHER_LIVEKIT_KEY_TRANSPORT` | | *(auto-selected)* | `olm` for encrypted rooms, `plaintext` otherwise; set only to force |
+| `NETHER_LIVEKIT_LK_JWT_URL` | | *(auto-derived)* | Override lk-jwt-service endpoint |
+| `NETHER_LIVEKIT_URL` | | *(auto-derived)* | Override LiveKit SFU WebSocket URL |
+
+¹ At least one of `BOT_USER_ID` or `SENDER_LOCALPART` is required. When only
+`SENDER_LOCALPART` is set, the full MXID is derived as
+`@{localpart}:{homeserver}`. Both can be set independently when the appservice
+namespace anchor and the bot account differ.
 
 The matrix-sdk store persists on a named volume; store paths are auto-derived
 under `/app/data` so no `store_path` config is needed. See

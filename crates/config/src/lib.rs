@@ -14,6 +14,10 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("config validation error: {0}")]
     Validation(String),
+    #[error("missing required environment variables: {0}")]
+    MissingEnv(String),
+    #[error("invalid environment variable value: {0}")]
+    InvalidEnv(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,10 +79,17 @@ pub struct PuppetsConfig {
 #[derive(Debug, Deserialize)]
 pub struct ServerProfile {
     pub homeserver_url: String,
-    /// The bot's MXID. In appservice mode (no `access_token`) its localpart must be
-    /// an appservice-namespace user (e.g. the registration's `sender_localpart`) —
-    /// distinct from `appservice_id`, so it can't be auto-derived.
+    /// The bot's full MXID (e.g. `@voicebridge:example.com`). Optional: when omitted,
+    /// it is derived from `sender_localpart` + the homeserver domain via
+    /// `resolve_bot_user_ids`. An explicit value always wins. Separately configurable
+    /// from `sender_localpart` so the namespace anchor and the bot account can differ.
+    #[serde(default)]
     pub bot_user_id: String,
+    /// The appservice `sender_localpart` from the registration YAML
+    /// (e.g. `voicebridge-bot`). When `bot_user_id` is absent, the bridge derives the
+    /// bot MXID as `@{sender_localpart}:{server_name}` via `resolve_bot_user_ids`.
+    #[serde(default)]
+    pub sender_localpart: Option<String>,
     /// Optional regular-account token shared by all bridges using this profile. When
     /// absent, those bridges self-provision via appservice login.
     #[serde(default)]
@@ -154,6 +165,17 @@ fn slugify(name: &str) -> String {
     }
 }
 
+/// Extract the Matrix server name from a homeserver URL: the host (and non-standard
+/// port), without scheme or path. `https://matrix.example.com` → `matrix.example.com`;
+/// `https://matrix.example.com:8448/` → `matrix.example.com:8448`.
+fn server_name_from_url(homeserver_url: &str) -> Option<String> {
+    let rest = homeserver_url
+        .strip_prefix("https://")
+        .or_else(|| homeserver_url.strip_prefix("http://"))?;
+    let host_port = rest.split('/').next()?;
+    if host_port.is_empty() { None } else { Some(host_port.to_owned()) }
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct MatrixConfig {
     /// Inherited from the `[server.<name>]` profile when omitted. Empty string is the
@@ -164,9 +186,17 @@ pub struct MatrixConfig {
     /// `resolve_servers`). Empty = "not set".
     #[serde(default)]
     pub room_id: String,
-    /// Inherited from the `[server.<name>]` profile when omitted. Empty = "not set".
+    /// The bot's full MXID. Inherited from the `[server.<name>]` profile or derived
+    /// from `sender_localpart` + homeserver domain via `resolve_bot_user_ids` when
+    /// omitted. An explicit value always wins. Empty = "not set".
     #[serde(default)]
     pub bot_user_id: String,
+    /// Appservice `sender_localpart` (from the registration YAML). When `bot_user_id`
+    /// is absent, the bridge derives it as `@{sender_localpart}:{server_name}` via
+    /// `resolve_bot_user_ids`. Inherited from the `[server.<name>]` profile when
+    /// omitted. Separately configurable so the namespace anchor and bot account can differ.
+    #[serde(default)]
+    pub sender_localpart: Option<String>,
     /// The device ID for the bot's matrix-sdk session. In access_token mode this
     /// must match the device the token was minted for; in appservice-auth mode
     /// (no `access_token`) it is a stable device id we assert via appservice
@@ -285,6 +315,7 @@ impl Config {
         // room_id into its `matrix` block BEFORE the per-bridge auto-derivations,
         // so inherited fields are in place when device_id/store_path resolve.
         cfg.resolve_servers();
+        cfg.resolve_bot_user_ids();
         cfg.resolve_device_ids();
         // `NVB_DATA_DIR` (set to `/app/data` by the Docker image) overrides the
         // configured `data_dir`; fall back to it otherwise.
@@ -317,6 +348,9 @@ impl Config {
             if m.bot_user_id.is_empty() {
                 m.bot_user_id = profile.bot_user_id.clone();
             }
+            if m.sender_localpart.is_none() {
+                m.sender_localpart = profile.sender_localpart.clone();
+            }
             if m.appservice_id.is_empty() {
                 m.appservice_id = profile.appservice_id.clone();
             }
@@ -326,6 +360,24 @@ impl Config {
             if m.access_token.is_none() {
                 m.access_token = profile.access_token.clone();
             }
+        }
+    }
+
+    /// Fill each bridge's empty `matrix.bot_user_id` by deriving it from
+    /// `matrix.sender_localpart` and the homeserver domain. Runs after `resolve_servers`
+    /// so inherited fields are in place. An explicit `bot_user_id` is left as-is.
+    /// Silently skips a bridge when derivation can't complete (unparseable
+    /// `homeserver_url` or no `sender_localpart`) — `validate()` will surface the
+    /// remaining empty `bot_user_id` as a clear error.
+    pub fn resolve_bot_user_ids(&mut self) {
+        for b in self.bridges.iter_mut() {
+            let m = &mut b.matrix;
+            if !m.bot_user_id.is_empty() {
+                continue;
+            }
+            let Some(localpart) = &m.sender_localpart else { continue };
+            let Some(server_name) = server_name_from_url(&m.homeserver_url) else { continue };
+            m.bot_user_id = format!("@{localpart}:{server_name}");
         }
     }
 
@@ -369,6 +421,161 @@ impl Config {
         }
     }
 
+    /// Build a single-bridge config entirely from environment variables.
+    ///
+    /// Required vars:
+    ///   NETHER_PUPPET_TOKENS, NETHER_DISCORD_GUILD_ID, NETHER_DISCORD_CHANNEL_ID,
+    ///   NETHER_MATRIX_HOMESERVER_URL, NETHER_MATRIX_ROOM_ID,
+    ///   NETHER_MATRIX_APPSERVICE_ID, NETHER_MATRIX_APPSERVICE_TOKEN
+    ///   At least one of: NETHER_MATRIX_BOT_USER_ID, NETHER_MATRIX_SENDER_LOCALPART
+    ///
+    /// Optional vars:
+    ///   NETHER_PUPPET_NICKNAME_PREFIX (default "[Matrix] ")
+    ///   NETHER_BRIDGE_NAME
+    ///   NETHER_DISCORD_CAPTURE_WAV (default false)
+    ///   NETHER_MATRIX_DEVICE_ID (auto-derived from bridge name when absent)
+    ///   NETHER_MATRIX_BOT_USER_ID — full bot MXID; derived from SENDER_LOCALPART when absent
+    ///   NETHER_MATRIX_SENDER_LOCALPART — bot localpart; derives bot MXID when BOT_USER_ID absent
+    ///   NETHER_MATRIX_ACCESS_TOKEN (omit for appservice-auth mode)
+    ///   NETHER_MATRIX_STORE_PATH (auto-derived from bridge name when absent)
+    ///   NETHER_MATRIX_BOT_DISPLAY_NAME, NETHER_MATRIX_BOT_AVATAR_PATH
+    ///   NETHER_LIVEKIT_MEDIA_E2EE (auto-detected from room encryption when absent)
+    ///   NETHER_LIVEKIT_KEY_TRANSPORT ("plaintext" | "olm", auto-selected when absent)
+    ///   NETHER_LIVEKIT_LK_JWT_URL, NETHER_LIVEKIT_URL
+    pub fn from_env() -> Result<Self, ConfigError> {
+        let mut missing: Vec<&'static str> = Vec::new();
+
+        // Returns Some(value) for a non-empty env var, records the name as missing otherwise.
+        macro_rules! require {
+            ($var:literal) => {
+                match std::env::var($var) {
+                    Ok(v) if !v.is_empty() => Some(v),
+                    _ => {
+                        missing.push($var);
+                        None
+                    }
+                }
+            };
+        }
+
+        // Returns Some(value) for a set, non-empty env var; None when absent or empty.
+        macro_rules! optional {
+            ($var:literal) => {
+                std::env::var($var).ok().filter(|v| !v.is_empty())
+            };
+        }
+
+        let tokens_raw = match std::env::var("NETHER_PUPPET_TOKENS") {
+            Ok(v) if !v.is_empty() => v,
+            _ => {
+                missing.push("NETHER_PUPPET_TOKENS");
+                String::new()
+            }
+        };
+
+        let nickname_prefix = optional!("NETHER_PUPPET_NICKNAME_PREFIX")
+            .unwrap_or_else(default_nickname_prefix);
+
+        let discord_guild_id = require!("NETHER_DISCORD_GUILD_ID");
+        let discord_channel_id = require!("NETHER_DISCORD_CHANNEL_ID");
+        let capture_wav = optional!("NETHER_DISCORD_CAPTURE_WAV")
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1"))
+            .unwrap_or(false);
+
+        let homeserver_url = require!("NETHER_MATRIX_HOMESERVER_URL");
+        let room_id = require!("NETHER_MATRIX_ROOM_ID");
+        // bot_user_id and sender_localpart are independently optional: at least one must
+        // be present. When bot_user_id is absent, resolve_bot_user_ids derives it from
+        // sender_localpart + homeserver domain.
+        let bot_user_id = optional!("NETHER_MATRIX_BOT_USER_ID");
+        let sender_localpart = optional!("NETHER_MATRIX_SENDER_LOCALPART");
+        if bot_user_id.is_none() && sender_localpart.is_none() {
+            missing.push("NETHER_MATRIX_BOT_USER_ID (or NETHER_MATRIX_SENDER_LOCALPART)");
+        }
+        // Optional like file mode: when absent, `resolve_device_ids` derives a stable
+        // id from the bridge name (the same leaf as `store_path`).
+        let device_id = optional!("NETHER_MATRIX_DEVICE_ID");
+        let access_token = optional!("NETHER_MATRIX_ACCESS_TOKEN");
+        let appservice_id = require!("NETHER_MATRIX_APPSERVICE_ID");
+        let appservice_token = require!("NETHER_MATRIX_APPSERVICE_TOKEN");
+        let store_path = optional!("NETHER_MATRIX_STORE_PATH").unwrap_or_default();
+        let bot_display_name = optional!("NETHER_MATRIX_BOT_DISPLAY_NAME");
+        let bot_avatar_path = optional!("NETHER_MATRIX_BOT_AVATAR_PATH");
+
+        let media_e2ee = optional!("NETHER_LIVEKIT_MEDIA_E2EE")
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1"));
+        let key_transport = optional!("NETHER_LIVEKIT_KEY_TRANSPORT")
+            .map(|v| match v.to_lowercase().as_str() {
+                "plaintext" => Ok(KeyTransport::Plaintext),
+                "olm" => Ok(KeyTransport::Olm),
+                other => Err(ConfigError::InvalidEnv(format!(
+                    "NETHER_LIVEKIT_KEY_TRANSPORT: unknown value '{other}' \
+                     (expected 'plaintext' or 'olm')"
+                ))),
+            })
+            .transpose()?;
+        let lk_jwt_url = optional!("NETHER_LIVEKIT_LK_JWT_URL");
+        let url = optional!("NETHER_LIVEKIT_URL");
+
+        if !missing.is_empty() {
+            return Err(ConfigError::MissingEnv(missing.join(", ")));
+        }
+
+        let name = optional!("NETHER_BRIDGE_NAME");
+
+        let mut cfg = Config {
+            puppets: PuppetsConfig {
+                tokens: tokens_raw
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                nickname_prefix,
+            },
+            servers: std::collections::HashMap::new(),
+            data_dir: default_data_dir(),
+            bridges: vec![BridgeConfig {
+                name,
+                server: None,
+                room_id: String::new(),
+                discord: DiscordConfig {
+                    guild_id: discord_guild_id.unwrap(),
+                    channel_id: discord_channel_id.unwrap(),
+                    capture_wav,
+                },
+                matrix: MatrixConfig {
+                    homeserver_url: homeserver_url.unwrap(),
+                    room_id: room_id.unwrap(),
+                    bot_user_id: bot_user_id.unwrap_or_default(),
+                    sender_localpart,
+                    device_id: device_id.unwrap_or_default(),
+                    access_token,
+                    appservice_id: appservice_id.unwrap(),
+                    appservice_token: appservice_token.unwrap(),
+                    store_path,
+                    bot_display_name,
+                    bot_avatar_path,
+                },
+                livekit: LiveKitConfig {
+                    lk_jwt_url,
+                    url,
+                    media_e2ee,
+                    key_transport,
+                },
+            }],
+        };
+        cfg.resolve_bot_user_ids();
+        // Omitted `NETHER_MATRIX_DEVICE_ID` derives from the bridge name, as in file mode.
+        cfg.resolve_device_ids();
+        // Mirror `load()`'s store-path resolution: an omitted `NETHER_MATRIX_STORE_PATH`
+        // leaves `store_path` empty, which must be filled from `data_dir` (honoring the
+        // `NVB_DATA_DIR` override the Docker image sets to `/app/data`) — otherwise the
+        // sqlite store + ghost Olm stores land off the persistent volume.
+        let data_dir = std::env::var("NVB_DATA_DIR").unwrap_or_else(|_| cfg.data_dir.clone());
+        cfg.resolve_store_paths(&data_dir);
+        Ok(cfg)
+    }
+
     /// Validate cross-bridge invariants. Hard errors abort startup; softer
     /// likely-mistakes are logged as warnings.
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -408,7 +615,7 @@ impl Config {
             let m = &b.matrix;
             let missing: Vec<&str> = [
                 ("homeserver_url", m.homeserver_url.is_empty()),
-                ("bot_user_id", m.bot_user_id.is_empty()),
+                ("bot_user_id (or sender_localpart)", m.bot_user_id.is_empty()),
                 ("room_id", m.room_id.is_empty()),
                 ("device_id", m.device_id.is_empty()),
                 ("appservice_id", m.appservice_id.is_empty()),
@@ -559,6 +766,7 @@ impl Config {
                 server = %name,
                 homeserver_url = %p.homeserver_url,
                 bot_user_id = %p.bot_user_id,
+                sender_localpart = ?p.sender_localpart,
                 appservice_id = %p.appservice_id,
                 appservice_token = "[redacted]",
                 access_token = if p.access_token.is_some() { "[redacted]" } else { "none" },
@@ -585,6 +793,7 @@ impl BridgeConfig {
             matrix_homeserver_url = %self.matrix.homeserver_url,
             matrix_room_id = %self.matrix.room_id,
             matrix_bot_user_id = %self.matrix.bot_user_id,
+            matrix_sender_localpart = ?self.matrix.sender_localpart,
             matrix_device_id = %self.matrix.device_id,
             matrix_store_path = %self.matrix.store_path,
             matrix_access_token = "[redacted]",
@@ -999,10 +1208,12 @@ appservice_token = "hs_tok"
     }
 
     /// Parse + run the same resolution chain `Config::load` does (server-merge,
-    /// device_id derive, store_path derive) so tests exercise the real pipeline.
+    /// bot_user_id derive, device_id derive, store_path derive) so tests exercise
+    /// the real pipeline.
     fn loaded(raw: &str) -> Config {
         let mut cfg: Config = toml::from_str(raw).expect("parse failed");
         cfg.resolve_servers();
+        cfg.resolve_bot_user_ids();
         cfg.resolve_device_ids();
         cfg.resolve_store_paths("./nether-store");
         cfg
@@ -1092,5 +1303,149 @@ appservice_token = "hs_tok"
         assert_eq!(cfg.bridges[0].matrix.device_id, "light-voice");
         assert_eq!(cfg.bridges[1].matrix.device_id, "dark-voice");
         cfg.validate().expect("distinct derived devices → valid");
+    }
+
+    // ---- sender_localpart → bot_user_id derivation ----
+
+    /// A `[server.<name>]` profile that uses sender_localpart instead of bot_user_id.
+    fn server_block_localpart(name: &str, localpart: &str) -> String {
+        format!(
+            r#"[server.{name}]
+homeserver_url = "https://nether.im"
+sender_localpart = "{localpart}"
+appservice_id = "voicebridge"
+appservice_token = "hs_tok"
+
+"#
+        )
+    }
+
+    #[test]
+    fn server_name_from_url_parses_correctly() {
+        assert_eq!(
+            server_name_from_url("https://matrix.example.com"),
+            Some("matrix.example.com".to_owned())
+        );
+        assert_eq!(
+            server_name_from_url("https://matrix.example.com:8448/"),
+            Some("matrix.example.com:8448".to_owned())
+        );
+        assert_eq!(
+            server_name_from_url("http://localhost:8008"),
+            Some("localhost:8008".to_owned())
+        );
+        assert_eq!(server_name_from_url("not-a-url"), None);
+        assert_eq!(server_name_from_url("https://"), None);
+    }
+
+    #[test]
+    fn sender_localpart_inline_derives_bot_user_id() {
+        // sender_localpart in [bridge.matrix] → bot_user_id derived from HS domain.
+        let raw = format!(
+            "{}[[bridge]]\nname = \"a\"\nroom_id = \"!r:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n[bridge.matrix]\nhomeserver_url = \"https://nether.im\"\nsender_localpart = \"voicebridge-bot\"\ndevice_id = \"DEV\"\naccess_token = \"tok\"\nappservice_id = \"voicebridge\"\nappservice_token = \"hs_tok\"\nstore_path = \"./s\"\n",
+            puppets_block(&["Bot a"]),
+        );
+        let cfg = loaded(&raw);
+        let m = &cfg.bridges[0].matrix;
+        assert_eq!(m.bot_user_id, "@voicebridge-bot:nether.im");
+        assert_eq!(m.sender_localpart.as_deref(), Some("voicebridge-bot"));
+        cfg.validate().expect("should validate");
+    }
+
+    #[test]
+    fn sender_localpart_in_profile_derives_bot_user_id() {
+        // Profile with only sender_localpart (no bot_user_id) → bot_user_id derived.
+        let raw = format!(
+            "{}{}[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!r:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n",
+            puppets_block(&["Bot a"]),
+            server_block_localpart("nether", "voicebridge-bot"),
+        );
+        let cfg = loaded(&raw);
+        let m = &cfg.bridges[0].matrix;
+        assert_eq!(m.bot_user_id, "@voicebridge-bot:nether.im");
+        assert_eq!(m.sender_localpart.as_deref(), Some("voicebridge-bot"));
+        cfg.validate().expect("should validate");
+    }
+
+    #[test]
+    fn explicit_bot_user_id_beats_sender_localpart() {
+        // Both set in profile: bot_user_id wins; sender_localpart is still propagated.
+        let raw = format!(
+            "{}[server.nether]\nhomeserver_url = \"https://nether.im\"\nbot_user_id = \"@custom-bot:nether.im\"\nsender_localpart = \"voicebridge-bot\"\nappservice_id = \"voicebridge\"\nappservice_token = \"hs_tok\"\n\n{}[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!r:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n",
+            puppets_block(&["Bot a"]),
+            "",
+        );
+        let cfg = loaded(&raw);
+        let m = &cfg.bridges[0].matrix;
+        assert_eq!(m.bot_user_id, "@custom-bot:nether.im");
+        assert_eq!(m.sender_localpart.as_deref(), Some("voicebridge-bot"));
+        cfg.validate().expect("should validate");
+    }
+
+    #[test]
+    fn missing_both_bot_user_id_and_sender_localpart_errors() {
+        // Neither bot_user_id nor sender_localpart → validate catches the empty bot_user_id.
+        let raw = format!(
+            "{}[[bridge]]\nname = \"a\"\nroom_id = \"!r:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n[bridge.matrix]\nhomeserver_url = \"https://nether.im\"\ndevice_id = \"DEV\"\naccess_token = \"tok\"\nappservice_id = \"voicebridge\"\nappservice_token = \"hs_tok\"\nstore_path = \"./s\"\n",
+            puppets_block(&["Bot a"]),
+        );
+        let cfg = loaded(&raw);
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn sender_localpart_independent_of_bot_user_id_in_profile() {
+        // bot_user_id and sender_localpart can differ — both are preserved as-is.
+        let raw = format!(
+            "{}[server.nether]\nhomeserver_url = \"https://nether.im\"\nbot_user_id = \"@bot-account:nether.im\"\nsender_localpart = \"namespace-anchor\"\nappservice_id = \"voicebridge\"\nappservice_token = \"hs_tok\"\n\n{}[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!r:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n",
+            puppets_block(&["Bot a"]),
+            "",
+        );
+        let cfg = loaded(&raw);
+        let m = &cfg.bridges[0].matrix;
+        assert_eq!(m.bot_user_id, "@bot-account:nether.im");
+        assert_eq!(m.sender_localpart.as_deref(), Some("namespace-anchor"));
+        cfg.validate().expect("should validate");
+    }
+
+    // ---- from_env() ----
+
+    /// `from_env()` must run the same store-path resolution `load()` does: an omitted
+    /// `NETHER_MATRIX_STORE_PATH` is derived from the bridge name, never left empty
+    /// (an empty path sends the sqlite + ghost Olm stores off the persistent volume).
+    /// Sole reader/writer of `NETHER_*`/`NVB_DATA_DIR` in the suite, so the env
+    /// mutation can't race another test.
+    #[test]
+    fn from_env_derives_store_path_when_unset() {
+        let vars = [
+            ("NETHER_PUPPET_TOKENS", "tok-a,tok-b"),
+            ("NETHER_DISCORD_GUILD_ID", "111"),
+            ("NETHER_DISCORD_CHANNEL_ID", "222"),
+            ("NETHER_MATRIX_HOMESERVER_URL", "https://nether.im"),
+            ("NETHER_MATRIX_ROOM_ID", "!r:nether.im"),
+            ("NETHER_MATRIX_SENDER_LOCALPART", "voicebridge-bot"),
+            ("NETHER_MATRIX_APPSERVICE_ID", "voicebridge"),
+            ("NETHER_MATRIX_APPSERVICE_TOKEN", "hs_tok"),
+            ("NETHER_BRIDGE_NAME", "envtest"),
+        ];
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+        std::env::set_var("NVB_DATA_DIR", "/app/data");
+
+        let cfg = Config::from_env().expect("from_env should succeed");
+        let m = &cfg.bridges[0].matrix;
+        // store_path derived under NVB_DATA_DIR, NOT left empty.
+        assert_eq!(m.store_path, "/app/data/envtest");
+        // device_id auto-derives from the bridge name when unset (file-mode parity).
+        assert_eq!(m.device_id, "envtest");
+        // sender_localpart still derives the bot MXID.
+        assert_eq!(m.bot_user_id, "@voicebridge-bot:nether.im");
+        cfg.validate().expect("env config should validate");
+
+        for (k, _) in vars {
+            std::env::remove_var(k);
+        }
+        std::env::remove_var("NVB_DATA_DIR");
     }
 }

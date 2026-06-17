@@ -2,6 +2,9 @@
 # Copy to config.toml and fill in real values. NEVER commit config.toml.
 # Override the config path at runtime: CONFIG_PATH=/path/to/config.toml
 #
+# Single-bridge deployments can skip this file entirely and use NETHER_* environment
+# variables instead — see docs/docker-usage.md for the full variable reference.
+#
 # Two top-level pieces:
 #   [puppets]  — ONE shared pool of Discord bot tokens, used by ALL bridges. Bots
 #                are allocated to channels dynamically as people speak.
@@ -87,8 +90,16 @@ homeserver_url = "https://nether.im"
 # /devtools, not that label.
 room_id = "!yourroomid:nether.im"
 
-# MXID of the bridge bot account you created on nether.im.
+# The bridge bot's full MXID. Two equivalent spellings — provide one or the other
+# (both in the same block is fine too; an explicit bot_user_id always wins):
+#   bot_user_id     = "@voicebridge:nether.im"   # full MXID
+#   sender_localpart = "voicebridge"              # localpart only; bot_user_id is derived
+#                                                 # as @{sender_localpart}:{homeserver}
+# The two are separately configurable so the appservice namespace anchor and the
+# actual bot account can differ (e.g. sender_localpart = "voicebridge-as" vs
+# bot_user_id = "@voicebridge-bot:nether.im", where both are in the AS namespace).
 bot_user_id = "@voicebridge:nether.im"
+# sender_localpart = "voicebridge"
 
 # Device ID for the bot's matrix-sdk session. In access_token mode it must match
 # the device the token was minted for (Element → Settings → Help & About →
@@ -183,7 +194,8 @@ appservice_token = "your_appservice_hs_token_here"
 # [bridge.matrix]
 # homeserver_url = "https://nether.im"
 # room_id = "!anotherroomid:nether.im"
-# bot_user_id = "@voicebridge:nether.im"
+# bot_user_id = "@voicebridge:nether.im"   # or use sender_localpart below
+# sender_localpart = "voicebridge"          # derives bot_user_id when above is absent
 # device_id = "ABCDEFGHIJ"
 # access_token = "syt_your_access_token_here"
 # appservice_id = "voicebridge"
