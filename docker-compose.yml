@@ -1,9 +1,6 @@
 services:
   voicebridge:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: nether-voicebridge:latest
+    image: nether.codes/dark/nether-voicebridge:latest
     restart: unless-stopped
     volumes:
       # config.toml holds all secrets — never baked into the image.
