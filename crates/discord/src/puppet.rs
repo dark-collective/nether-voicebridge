@@ -713,6 +713,101 @@ impl SharedPool {
         }
     }
 
+    /// After a bot frees, upgrade overflow speakers to dedicated puppets across ALL
+    /// already-anchored channels — not just one whose own slot freed. A steal demotes
+    /// a donor's speaker into overflow without ever freeing a slot *in that channel*,
+    /// so without this cross-channel sweep the demoted speaker stays stranded in the
+    /// mix even after the stealing channel returns the bot to the pool. FCFS: promote
+    /// the globally-oldest waiting overflow speaker first; stop when no guild-capable
+    /// free bot remains. Each iteration consumes a free bot or marks a guild
+    /// exhausted, so it terminates.
+    fn promote_overflow_into_free_bots(&self, guard: &mut AllocState) {
+        let mut exhausted: HashSet<GuildId> = HashSet::new();
+        loop {
+            // The anchored channel (guild not yet exhausted) whose oldest overflow
+            // speaker has the lowest seq — global FCFS across channels.
+            let pick = guard
+                .channels
+                .iter()
+                .filter(|(_, ch)| {
+                    ch.anchor.load(Ordering::Relaxed) != NO_ANCHOR
+                        && !exhausted.contains(&ch.guild_id)
+                })
+                .filter_map(|(k, ch)| {
+                    ch.assignments
+                        .values()
+                        .filter_map(|a| match a {
+                            Assign::Overflow { seq, .. } => Some(*seq),
+                            _ => None,
+                        })
+                        .min()
+                        .map(|seq| (k.clone(), ch.guild_id, seq))
+                })
+                .min_by_key(|(_, _, seq)| *seq);
+            let Some((key, guild, _)) = pick else { break };
+            let Some(idx) = self.take_free_bot(guild) else {
+                exhausted.insert(guild);
+                continue;
+            };
+            // Promote that channel's oldest overflow speaker into the freed bot as a
+            // dedicated (non-anchor) puppet — mirrors the free-bot path in `assign`.
+            let promoted = {
+                let Some(ch) = guard.channels.get_mut(&key) else {
+                    self.slots[idx].busy.store(false, Ordering::Relaxed);
+                    continue;
+                };
+                let promote = ch
+                    .assignments
+                    .iter()
+                    .filter_map(|(k, a)| match a {
+                        Assign::Overflow { name, muted, seq } => {
+                            Some((k.clone(), name.clone(), *muted, *seq))
+                        }
+                        _ => None,
+                    })
+                    .min_by_key(|(_, _, _, seq)| *seq);
+                let Some((pkey, pname, pmuted, pseq)) = promote else {
+                    // Raced away (speaker left); return the bot and re-evaluate.
+                    self.slots[idx].busy.store(false, Ordering::Relaxed);
+                    continue;
+                };
+                ch.overflow_mixer.remove(&pkey);
+                ch.assignments
+                    .insert(pkey.clone(), Assign::Puppet { idx, seq: pseq });
+                self.slots[idx].mixer.clear();
+                Self::route_to(&mut ch.routes, &pkey, self.slots[idx].mixer.clone());
+                *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(pname.clone());
+                self.slots[idx].muted.store(pmuted, Ordering::Relaxed);
+                tracing::info!(channel = %key, promoted = %pkey, idx, "promoted overflow speaker into freed pool bot (cross-channel)");
+                (self.ctx_for(ch), pname, pmuted)
+            };
+            let (ctx, name, pmuted) = promoted;
+            let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Assign {
+                ctx: Box::new(ctx),
+                display_name: name,
+            });
+            // A fresh Assign joins unmuted; restore the speaker's mute if it was
+            // muted while demoted (the join applies the nickname, not the mute).
+            if pmuted {
+                let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetMuted(true));
+            }
+            // Overflow count dropped → the anchor may no longer host overflow.
+            let ch = &guard.channels[&key];
+            self.reconcile_anchor_label(ch);
+            self.reconcile_anchor_mute(ch);
+        }
+    }
+
+    /// Re-home freed pool capacity after a bot returns to the pool: first give
+    /// anchor-less channels a bot (a fully-unbridged channel recovers before we
+    /// upgrade an already-working one), then promote overflow speakers into any
+    /// remaining free bots. Called wherever a bot frees.
+    fn rebalance(&self, guard: &mut AllocState) {
+        self.service_pending(guard);
+        self.promote_overflow_into_free_bots(guard);
+    }
+
     /// Make bot `idx` the anchor of channel `key`, promoting that channel's oldest
     /// waiting (overflow) speaker into it. Sends the bot Assign + BecomeAnchor.
     fn activate_channel_with(&self, guard: &mut AllocState, key: &str, idx: usize) {
@@ -1048,7 +1143,7 @@ impl SharedPool {
             let ch = &guard.channels[&bridge];
             self.reconcile_anchor_label(ch);
             self.reconcile_anchor_mute(ch);
-            self.service_pending(&mut guard);
+            self.rebalance(&mut guard);
             tracing::error!(
                 bridge = %bridge,
                 key = %key,
@@ -1064,7 +1159,7 @@ impl SharedPool {
     fn recover_bot(&self, idx: usize) {
         self.slots[idx].unhealthy.store(false, Ordering::Relaxed);
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
-        self.service_pending(&mut guard);
+        self.rebalance(&mut guard);
         tracing::info!(idx, "puppet join-timeout quarantine cleared — eligible again");
     }
 
@@ -1186,7 +1281,7 @@ impl SharedPool {
                                 self.reconcile_anchor_label(ch);
                                 self.reconcile_anchor_mute(ch);
                                 tracing::info!(bridge, moved = %vkey, freed = vidx, onto_anchor = idx, "consolidated participant onto capture anchor; freed spare bot");
-                                self.service_pending(&mut guard);
+                                self.rebalance(&mut guard);
                                 return;
                             }
                         }
@@ -1243,7 +1338,7 @@ impl SharedPool {
                             }
                         }
                         // A freed bot can activate a channel waiting for an anchor.
-                        self.service_pending(&mut guard);
+                        self.rebalance(&mut guard);
                     }
                 }
             }
@@ -1293,7 +1388,7 @@ impl SharedPool {
             ch.overflow_mixer.clear();
         }
         // The bots just freed can activate channels waiting for an anchor.
-        self.service_pending(&mut guard);
+        self.rebalance(&mut guard);
     }
 
     /// Release a capture-only-held anchor once its channel is idle on BOTH sides:
@@ -1328,7 +1423,7 @@ impl SharedPool {
             ch.overflow_mixer.clear();
         }
         tracing::info!(bridge, idx, "channel idle (no puppets, no Discord speakers) — releasing capture-only anchor");
-        self.service_pending(&mut guard);
+        self.rebalance(&mut guard);
     }
 
     /// Arm (or re-arm) the grace timer that releases a capture-only anchor if no
@@ -1395,7 +1490,7 @@ impl SharedPool {
             ch.anchor_idle_release = None;
         }
         tracing::info!(bridge, idx, "capture-only anchor idle grace elapsed — leaving Discord voice (no Matrix user present)");
-        self.service_pending(&mut guard);
+        self.rebalance(&mut guard);
     }
 
     /// Record that bot `idx` is now a member of `guild` (from `ready`/
@@ -1409,7 +1504,7 @@ impl SharedPool {
             .insert(guild);
         if added {
             let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
-            self.service_pending(&mut guard);
+            self.rebalance(&mut guard);
         }
     }
 
@@ -2116,6 +2211,52 @@ mod tests {
         assert!(p.test_is_overflow("A", "a3"), "newest A speaker demoted");
         assert_eq!(p.test_anchor("A"), Some(anchor_a), "A anchor unchanged");
         assert!(p.test_slot_of("A", "a2").is_some());
+    }
+
+    #[test]
+    fn freed_bot_repromotes_donor_overflow_after_steal() {
+        // Reproduces the live "stranded overflow bot" bug: a steal demotes a donor
+        // speaker to overflow; when the stealing channel later frees the bot, the
+        // donor's demoted speaker must be re-promoted to a dedicated puppet (it was
+        // previously left in overflow forever — no cross-channel re-promotion).
+        let p = pool(3);
+        channel(&p, "A", 1, 10);
+        channel(&p, "B", 2, 20); // different guild; all 3 bots are in both
+        p.assign("A", "a1", "A1");
+        p.assign("A", "a2", "A2");
+        p.assign("A", "a3", "A3"); // A uses all 3 bots
+        // B activates by stealing A's newest dedicated speaker (a3 → A overflow).
+        p.assign("B", "b1", "B1");
+        assert!(p.test_is_overflow("A", "a3"), "a3 demoted to overflow by steal");
+        assert!(p.test_anchor("B").is_some(), "B got an anchor");
+        // B empties → its bot returns to the pool, which must re-promote a3.
+        p.release("B", "b1");
+        assert!(
+            p.test_slot_of("A", "a3").is_some(),
+            "a3 re-promoted to a dedicated puppet after the bot freed"
+        );
+        assert!(!p.test_is_overflow("A", "a3"), "a3 no longer in overflow");
+    }
+
+    #[test]
+    fn freed_bot_only_repromotes_guild_capable_channel() {
+        // A freed bot in guild 1 must NOT be pulled into a guild-2 channel's overflow
+        // it can't serve. Partitioned pool: bot 0 ∈ guild 1, bot 1 ∈ guild 2.
+        let p = pool(2);
+        p.register_channel(Arc::from("A"), "1", "10", Arc::new(NoopCapture), None).unwrap();
+        p.register_channel(Arc::from("B"), "2", "20", Arc::new(NoopCapture), None).unwrap();
+        p.slots[0].guilds.write().unwrap().insert(GuildId::new(1));
+        p.slots[1].guilds.write().unwrap().insert(GuildId::new(2));
+        // B (guild 2) anchored on bot 1, plus an overflow speaker it can't promote
+        // (no guild-2 bot free).
+        p.assign("B", "b1", "B1");
+        p.assign("B", "b2", "B2");
+        assert!(p.test_is_overflow("B", "b2"), "b2 overflow (no guild-2 spare)");
+        // A (guild 1) takes bot 0, then releases it → bot 0 frees.
+        p.assign("A", "a1", "A1");
+        p.release("A", "a1");
+        // The freed guild-1 bot can't serve B (guild 2); b2 stays overflow.
+        assert!(p.test_is_overflow("B", "b2"), "b2 still overflow — bot wrong guild");
     }
 
     #[test]
