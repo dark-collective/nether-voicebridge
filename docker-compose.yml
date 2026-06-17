@@ -27,7 +27,9 @@ services:
       NETHER_DISCORD_CHANNEL_ID: ""
       NETHER_MATRIX_HOMESERVER_URL: "https://nether.im"
       NETHER_MATRIX_ROOM_ID: "!yourroomid:nether.im"
-      # NETHER_MATRIX_BOT_USER_ID: "@voicebridge:nether.im"
+      # At least one of BOT_USER_ID or SENDER_LOCALPART is required:
+      # NETHER_MATRIX_BOT_USER_ID: "@voicebridge:nether.im"   # full MXID
+      NETHER_MATRIX_SENDER_LOCALPART: "voicebridge"          # derives MXID when BOT_USER_ID absent
       # NETHER_MATRIX_DEVICE_ID: "ABCDEFGHIJ"
       NETHER_MATRIX_APPSERVICE_ID: "voicebridge"
       NETHER_MATRIX_APPSERVICE_TOKEN: ""

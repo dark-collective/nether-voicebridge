@@ -85,7 +85,8 @@ docker compose logs -f
 | `NETHER_DISCORD_CHANNEL_ID` | ✓ | | |
 | `NETHER_MATRIX_HOMESERVER_URL` | ✓ | | |
 | `NETHER_MATRIX_ROOM_ID` | ✓ | | Internal room ID (`!abc:nether.im`) |
-| `NETHER_MATRIX_BOT_USER_ID` | ✓ | | |
+| `NETHER_MATRIX_BOT_USER_ID` | one of¹ | | Full bot MXID |
+| `NETHER_MATRIX_SENDER_LOCALPART` | one of¹ | | Bot localpart; derives MXID from homeserver domain |
 | `NETHER_MATRIX_DEVICE_ID` | ✓ | | |
 | `NETHER_MATRIX_APPSERVICE_ID` | ✓ | | |
 | `NETHER_MATRIX_APPSERVICE_TOKEN` | ✓ | | |
@@ -99,6 +100,11 @@ docker compose logs -f
 | `NETHER_LIVEKIT_KEY_TRANSPORT` | | `plaintext` | `olm` for true E2EE (encrypted rooms) |
 | `NETHER_LIVEKIT_LK_JWT_URL` | | *(auto-derived)* | Override lk-jwt-service endpoint |
 | `NETHER_LIVEKIT_URL` | | *(auto-derived)* | Override LiveKit SFU WebSocket URL |
+
+¹ At least one of `BOT_USER_ID` or `SENDER_LOCALPART` is required. When only
+`SENDER_LOCALPART` is set, the full MXID is derived as
+`@{localpart}:{homeserver}`. Both can be set independently when the appservice
+namespace anchor and the bot account differ.
 
 The matrix-sdk store persists on a named volume; store paths are auto-derived
 under `/app/data` so no `store_path` config is needed. See
