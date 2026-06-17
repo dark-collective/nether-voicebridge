@@ -72,10 +72,33 @@ holds bot tokens and Matrix access/appservice tokens.
 ## Docker
 
 ```bash
-cp config.example.toml config.toml   # fill in
+cp config.example.toml config.toml   # fill in - or set environment variables
 docker compose up -d
 docker compose logs -f
 ```
+
+### Environment Variables
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `NETHER_PUPPET_TOKENS` | ✓ | | Comma-separated Discord bot tokens |
+| `NETHER_DISCORD_GUILD_ID` | ✓ | | |
+| `NETHER_DISCORD_CHANNEL_ID` | ✓ | | |
+| `NETHER_MATRIX_HOMESERVER_URL` | ✓ | | |
+| `NETHER_MATRIX_ROOM_ID` | ✓ | | Internal room ID (`!abc:nether.im`) |
+| `NETHER_MATRIX_BOT_USER_ID` | ✓ | | |
+| `NETHER_MATRIX_DEVICE_ID` | ✓ | | |
+| `NETHER_MATRIX_APPSERVICE_ID` | ✓ | | |
+| `NETHER_MATRIX_APPSERVICE_TOKEN` | ✓ | | |
+| `NETHER_PUPPET_NICKNAME_PREFIX` | | `[Matrix] ` | Set to empty string to disable |
+| `NETHER_BRIDGE_NAME` | | `unnamed` | Label used in logs |
+| `NETHER_DISCORD_CAPTURE_WAV` | | `false` | Debug only — writes unbounded WAV files |
+| `NETHER_MATRIX_STORE_PATH` | | `/app/data` | Persists on the volume; rarely needs changing |
+| `NETHER_MATRIX_BOT_DISPLAY_NAME` | | | |
+| `NETHER_MATRIX_BOT_AVATAR_PATH` | | | Path inside the container |
+| `NETHER_LIVEKIT_MEDIA_E2EE` | | `false` | Set `true` for an encrypted Matrix room |
+| `NETHER_LIVEKIT_KEY_TRANSPORT` | | `plaintext` | `olm` for true E2EE (encrypted rooms) |
+| `NETHER_LIVEKIT_LK_JWT_URL` | | *(auto-derived)* | Override lk-jwt-service endpoint |
+| `NETHER_LIVEKIT_URL` | | *(auto-derived)* | Override LiveKit SFU WebSocket URL |
 
 The matrix-sdk store persists on a named volume; store paths are auto-derived
 under `/app/data` so no `store_path` config is needed. See
