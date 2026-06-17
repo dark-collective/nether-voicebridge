@@ -41,6 +41,7 @@ use async_trait::async_trait;
 use livekit::e2ee::key_provider::{KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions};
 use livekit::e2ee::{E2eeOptions, EncryptionType};
 use livekit::id::ParticipantIdentity;
+use livekit::track::LocalAudioTrack;
 use livekit::webrtc::audio_frame::AudioFrame;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::{Room, RoomOptions};
@@ -163,6 +164,8 @@ enum GhostCommand {
         avatar_url: Option<String>,
         frame_rx: mpsc::Receiver<Vec<i16>>,
     },
+    /// Mirror the speaker's mute state onto their ghost's LiveKit track.
+    SetMuted { key: String, muted: bool },
     /// Retire the ghost for `key`.
     Release { key: String },
     /// Retire every ghost (call teardown).
@@ -176,6 +179,10 @@ enum GhostCommand {
 struct GhostHandle {
     cancel: CancellationToken,
     join: tokio::task::JoinHandle<()>,
+    /// Latest mute state for the ghost's track. A `watch` so a `SetMuted` that
+    /// arrives before the ghost finishes connecting is applied once the track is
+    /// live (also covers a user who joins already muted).
+    mute_tx: watch::Sender<bool>,
 }
 
 /// The ghost pool / capture router. Cheap to construct; the appservice work
@@ -427,6 +434,7 @@ impl GhostPool {
                         }
                     }
                     let cancel = CancellationToken::new();
+                    let (mute_tx, mute_rx) = watch::channel(false);
                     let mut cfg = self.cfg.clone();
                     // Apply the resolved E2EE settings (the `new`-time fields are
                     // placeholders — see `GhostPool::new`).
@@ -434,10 +442,18 @@ impl GhostPool {
                     cfg.key_transport = key_transport;
                     let focus = focus.clone().expect("focus set above");
                     let join = tokio::spawn(
-                        run_ghost(cfg, focus, client.clone(), members_gen_rx.clone(), call_active_rx.clone(), key.clone(), display_name, avatar_url, frame_rx, cancel.clone())
+                        run_ghost(cfg, focus, client.clone(), members_gen_rx.clone(), call_active_rx.clone(), key.clone(), display_name, avatar_url, frame_rx, mute_rx, cancel.clone())
                             .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
                     );
-                    ghosts.insert(key, GhostHandle { cancel, join });
+                    ghosts.insert(key, GhostHandle { cancel, join, mute_tx });
+                }
+                GhostCommand::SetMuted { key, muted } => {
+                    // `watch::send` keeps the latest value even if the ghost is
+                    // still connecting (the receiver lives for the task's life, so
+                    // an Err here only means the ghost already retired).
+                    if let Some(handle) = ghosts.get(&key) {
+                        let _ = handle.mute_tx.send(muted);
+                    }
                 }
                 GhostCommand::Release { key } => {
                     // Await the teardown inline so the leave PUT is guaranteed to
@@ -495,6 +511,21 @@ impl CaptureRouter for GhostPool {
         sink
     }
 
+    fn set_muted(&self, key: &str, muted: bool) {
+        // Only forward for a speaker that actually has a ghost — keeps a stray
+        // mute update for a non-ghost (or already-released) user a cheap no-op.
+        let known = self
+            .sinks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(key);
+        if known {
+            let _ = self
+                .cmd_tx
+                .send(GhostCommand::SetMuted { key: key.to_owned(), muted });
+        }
+    }
+
     fn release(&self, key: &str) {
         let removed = self
             .sinks
@@ -528,6 +559,7 @@ async fn run_ghost(
     display_name: String,
     avatar_url: Option<String>,
     frame_rx: mpsc::Receiver<Vec<i16>>,
+    mute_rx: watch::Receiver<bool>,
     cancel: CancellationToken,
 ) {
     let ghost_mxid = format!("@{GHOST_LOCALPART_PREFIX}{key}:{}", cfg.server_name);
@@ -630,7 +662,7 @@ async fn run_ghost(
         // minted for one of our OWN puppet bots in a startup race, see
         // `retract_self_ghost`), we must abort BEFORE publishing a track or posting
         // membership, or the puppet would briefly surface in the call (echo).
-        let (source, media_key) = tokio::select! {
+        let (source, track, media_key) = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 if let Some(h) = presence_membership.take() {
@@ -694,8 +726,10 @@ async fn run_ghost(
             );
         }
 
-        // 6. Pump frames until cancelled.
-        pump_audio(frame_rx, &source, &cancel).await;
+        // 6. Pump frames until cancelled, mirroring the Discord user's mute state
+        // onto the track as it changes (and applying the current state up front, so
+        // a user who joined muted starts muted).
+        pump_audio(frame_rx, &source, &track, mute_rx, &cancel).await;
 
         // 7. Teardown. Stop the membership-retry task first (it observes `cancel`)
         // and await it so a late join can't race past the leave below and linger.
@@ -717,13 +751,29 @@ async fn run_ghost(
 async fn pump_audio(
     mut frame_rx: mpsc::Receiver<Vec<i16>>,
     source: &NativeAudioSource,
+    track: &LocalAudioTrack,
+    mut mute_rx: watch::Receiver<bool>,
     cancel: &CancellationToken,
 ) {
+    // Mirror the Discord speaker's mute state onto the LiveKit track. `mute()`/
+    // `unmute()` signal the server so Element Call peers see the mic-off indicator
+    // (constraint: a muted Discord user must show muted in EC). Apply the current
+    // state up front — covers a user who joined already muted — then track changes.
+    apply_track_mute(track, *mute_rx.borrow_and_update());
     let mut jitter = JitterBuffer::new(JITTER_TARGET_MS, JITTER_MAX_MS, SAMPLE_RATE);
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
+            res = mute_rx.changed() => {
+                // Sender drops only when the ghost retires (which also cancels,
+                // handled by the biased arm above); ignore Err and re-check.
+                if res.is_ok() {
+                    let muted = *mute_rx.borrow_and_update();
+                    apply_track_mute(track, muted);
+                    tracing::info!(muted, "ghost track mute mirrored from Discord");
+                }
+            }
             frame = frame_rx.recv() => {
                 let Some(frame20) = frame else { break };
                 jitter.push(&frame20);
@@ -744,6 +794,17 @@ async fn pump_audio(
     }
 }
 
+/// Set the ghost track's mute state to `muted`. `LocalAudioTrack::mute`/`unmute`
+/// are idempotent and cheap, so re-applying the same state (e.g. the up-front
+/// apply) is harmless. The caller logs on an actual toggle.
+fn apply_track_mute(track: &LocalAudioTrack, muted: bool) {
+    if muted {
+        track.mute();
+    } else {
+        track.unmute();
+    }
+}
+
 /// Connect the ghost to LiveKit, publish its audio track, and spawn the
 /// room-event drain. Returns the source to feed and, when media E2EE is on, the
 /// 16-byte media key this ghost encrypts its frames under (to be distributed to
@@ -755,7 +816,7 @@ async fn connect_and_publish(
     ghost_mxid: &str,
     device_id: &str,
     cancel: CancellationToken,
-) -> Result<(NativeAudioSource, Option<[u8; 16]>)> {
+) -> Result<(NativeAudioSource, LocalAudioTrack, Option<[u8; 16]>)> {
     let openid_token = fetch_openid_token(cfg, ghost_mxid).await?;
     let jwt_resp = lk_jwt::fetch_livekit_token(
         &cfg.http,
@@ -815,7 +876,7 @@ async fn connect_and_publish(
         room.e2ee_manager().set_enabled(true);
         tracing::info!(identity = %identity, "ghost E2EE enabled — publishing encrypted frames");
     }
-    let source = publish::publish(&room).await?;
+    let (source, track) = publish::publish(&room).await?;
 
     // Move the room + events into a drain task: it keeps the connection alive,
     // logs events so the unbounded channel never fills, and closes the room when
@@ -840,7 +901,7 @@ async fn connect_and_publish(
         tracing::debug!("ghost LiveKit room closed");
     });
 
-    Ok((source, media_key))
+    Ok((source, track, media_key))
 }
 
 // ─── E2EE media-key distribution (Path 2 plaintext / Path 3 Olm) ────────────────

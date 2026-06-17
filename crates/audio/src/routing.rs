@@ -82,6 +82,12 @@ pub trait CaptureRouter: Send + Sync {
     fn assign(&self, key: &str, display_name: &str, avatar_url: Option<&str>)
         -> Arc<dyn CaptureSink>;
 
+    /// Mirror the Discord speaker's mute state onto their ghost's LiveKit track
+    /// (so a muted Discord user shows muted in Element Call).  The mirror of
+    /// [`PlaybackRouter::set_muted`].  A no-op for an unknown `key` (a speaker
+    /// with no ghost yet).
+    fn set_muted(&self, key: &str, muted: bool);
+
     /// Retire the speaker's ghost (they left the voice channel).  A no-op for an
     /// unknown `key`.
     fn release(&self, key: &str);
@@ -156,6 +162,7 @@ mod tests {
     #[derive(Default)]
     struct StubRouter {
         sinks: Mutex<HashMap<String, Arc<RecordingSink>>>,
+        muted: Mutex<HashMap<String, bool>>,
     }
     impl StubRouter {
         fn recorded(&self, key: &str) -> Vec<Vec<i16>> {
@@ -163,6 +170,9 @@ mod tests {
         }
         fn len(&self) -> usize {
             self.sinks.lock().unwrap().len()
+        }
+        fn muted(&self, key: &str) -> Option<bool> {
+            self.muted.lock().unwrap().get(key).copied()
         }
     }
     impl CaptureRouter for StubRouter {
@@ -178,6 +188,9 @@ mod tests {
                 .entry(key.to_owned())
                 .or_insert_with(|| Arc::new(RecordingSink::default()))
                 .clone()
+        }
+        fn set_muted(&self, key: &str, muted: bool) {
+            self.muted.lock().unwrap().insert(key.to_owned(), muted);
         }
         fn release(&self, key: &str) {
             self.sinks.lock().unwrap().remove(key);
@@ -215,5 +228,16 @@ mod tests {
         router.assign("b", "B", None);
         router.release_all();
         assert_eq!(router.len(), 0);
+    }
+
+    #[test]
+    fn capture_router_records_mute_state() {
+        let router = StubRouter::default();
+        router.assign("alice", "Alice", None);
+        assert_eq!(router.muted("alice"), None); // not yet mirrored
+        router.set_muted("alice", true);
+        assert_eq!(router.muted("alice"), Some(true));
+        router.set_muted("alice", false);
+        assert_eq!(router.muted("alice"), Some(false));
     }
 }

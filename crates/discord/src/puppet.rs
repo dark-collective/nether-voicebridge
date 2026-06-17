@@ -1533,11 +1533,17 @@ impl EventHandler for PuppetHandler {
         // plain join, a channel hop, and leaving voice entirely (channel_id None)
         // uniformly, without relying on the (often-absent) old voice state.
         let here = new.channel_id;
+        // A muted Discord user (self-mute or server-mute) should show muted in
+        // Element Call. Mirror it onto their ghost on EVERY update for the channel
+        // they're in — a mute toggle is an update on an already-present user, so it
+        // must run outside the `note_presence` transition guard below.
+        let muted = new.self_mute || new.mute;
         for ch in self.pool.channels_in_guild(guild_id) {
             if Some(ch.channel_id) == here {
                 if self.pool.note_presence(&ch.bridge, user_id, true) {
                     ensure_ghost(&ctx, &ch, user_id, new.member.as_ref()).await;
                 }
+                ch.capture_router.set_muted(&user_id.to_string(), muted);
             } else if self.pool.note_presence(&ch.bridge, user_id, false) {
                 drop_ghost(&ch, user_id);
                 // The last Discord speaker leaving may leave a capture-only anchor
@@ -1568,6 +1574,10 @@ impl EventHandler for PuppetHandler {
                 if self.pool.note_presence(&ch.bridge, user_id, true) {
                     ensure_ghost(&ctx, &ch, user_id, vs.member.as_ref()).await;
                 }
+                // Seed the initial mute state for a user already muted before this
+                // bot connected (their toggle won't arrive as a voice_state_update).
+                ch.capture_router
+                    .set_muted(&user_id.to_string(), vs.self_mute || vs.mute);
             }
         }
         if self.pool.slots[self.idx].busy.load(Ordering::Relaxed) {
@@ -2006,6 +2016,7 @@ mod tests {
         fn assign(&self, _k: &str, _n: &str, _a: Option<&str>) -> Arc<dyn GhostSink> {
             Arc::new(NoopCaptureSink)
         }
+        fn set_muted(&self, _k: &str, _muted: bool) {}
         fn release(&self, _k: &str) {}
         fn release_all(&self) {}
     }

@@ -24,9 +24,11 @@ const NUM_CHANNELS: u32 = 1;
 /// libwebrtc buffer depth; see the `rtc/tone.rs` doc for why 1000 ms self-paces.
 const QUEUE_SIZE_MS: u32 = 1000;
 
-/// Create a mono audio source, publish it to `room`, and return the source so
-/// the consumer can feed `capture_frame` 10 ms mono frames into it.
-pub async fn publish(room: &Room) -> Result<NativeAudioSource> {
+/// Create a mono audio source, publish it to `room`, and return the source (to
+/// feed `capture_frame` 10 ms mono frames into) plus the published track (so the
+/// caller can `mute()`/`unmute()` it — used to mirror a Discord speaker's mute
+/// state onto their ghost). The track is cheap to clone and `Arc`-backed.
+pub async fn publish(room: &Room) -> Result<(NativeAudioSource, LocalAudioTrack)> {
     let source = NativeAudioSource::new(
         AudioSourceOptions::default(),
         SAMPLE_RATE,
@@ -43,10 +45,10 @@ pub async fn publish(room: &Room) -> Result<NativeAudioSource> {
     };
 
     room.local_participant()
-        .publish_track(LocalTrack::Audio(track), options)
+        .publish_track(LocalTrack::Audio(track.clone()), options)
         .await
         .context("publishing bridge audio track to LiveKit room")?;
 
     tracing::info!("bridge audio track published (mono, 48 kHz)");
-    Ok(source)
+    Ok((source, track))
 }
