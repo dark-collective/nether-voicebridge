@@ -343,6 +343,7 @@ impl GhostPool {
     /// enumerate the call's human members so each ghost can deliver its media key
     /// to them — see [`distribute_key_loop`]. `members_gen_rx` is bumped by the
     /// sync loop when a new human joins, waking those loops to re-key the joiner.
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
     pub async fn run(
         self: Arc<Self>,
@@ -353,6 +354,10 @@ impl GhostPool {
         media_e2ee: bool,
         key_transport: KeyTransportMode,
         members_gen_rx: watch::Receiver<u64>,
+        // True while a Matrix human is in the call. A ghost connects + publishes
+        // (and delivers its E2EE key) as soon as this is true, rather than waiting
+        // for its Discord user to speak — so audio is instant on first utterance.
+        call_active_rx: watch::Receiver<bool>,
         bridge: Arc<str>,
         shutdown: CancellationToken,
     ) -> Result<()> {
@@ -429,7 +434,7 @@ impl GhostPool {
                     cfg.key_transport = key_transport;
                     let focus = focus.clone().expect("focus set above");
                     let join = tokio::spawn(
-                        run_ghost(cfg, focus, client.clone(), members_gen_rx.clone(), key.clone(), display_name, avatar_url, frame_rx, cancel.clone())
+                        run_ghost(cfg, focus, client.clone(), members_gen_rx.clone(), call_active_rx.clone(), key.clone(), display_name, avatar_url, frame_rx, cancel.clone())
                             .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
                     );
                     ghosts.insert(key, GhostHandle { cancel, join });
@@ -518,6 +523,7 @@ async fn run_ghost(
     focus: LivekitFocusInfo,
     client: Client,
     members_gen_rx: watch::Receiver<u64>,
+    mut call_active_rx: watch::Receiver<bool>,
     key: String,
     display_name: String,
     avatar_url: Option<String>,
@@ -567,23 +573,94 @@ async fn run_ghost(
             tracing::error!(error = %e, "ghost join_room failed — skipping");
             return;
         }
-        // 3. OpenID → lk-jwt → connect + publish. The Room handle is moved into
-        // the event-drain task, which keeps the connection up and closes it on
-        // cancel; we keep only the source to feed.
-        let (source, media_key) =
-            match connect_and_publish(&cfg, &focus, &ghost_mxid, &device_id, cancel.clone()).await {
+        // 4. Presence phase — ONLY while no Matrix human is in the call yet. Post
+        // m.call.member (no media) so Element Call shows "a Discord user is waiting
+        // here", then wait for a human. Skipped entirely when a human is already
+        // present (e.g. a Discord user rejoining mid-call), so we go straight to the
+        // publish-first path below — see step 5 for why ordering matters.
+        let mut presence_membership: Option<tokio::task::JoinHandle<()>> = None;
+        if !*call_active_rx.borrow_and_update() {
+            presence_membership = Some(tokio::spawn(
+                post_membership_until_joined(
+                    cfg.clone(),
+                    ghost_mxid.clone(),
+                    device_id.clone(),
+                    focus.clone(),
+                    cancel.clone(),
+                )
+                .instrument(tracing::Span::current()),
+            ));
+            tracing::info!(display_name = %display_name, "ghost present (membership posting; no media until a Matrix user joins the call)");
+            loop {
+                if *call_active_rx.borrow_and_update() {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        // Cancelled (Discord user left) before any Matrix human —
+                        // retract and retire without ever touching LiveKit.
+                        if let Some(h) = presence_membership.take() {
+                            h.abort();
+                        }
+                        if let Err(e) = post_membership(&cfg, &ghost_mxid, &device_id, &focus, true).await {
+                            tracing::warn!(error = %e, "ghost post_membership(leave) failed");
+                        }
+                        tracing::info!("ghost retired (was presence-only)");
+                        return;
+                    }
+                    // Sender drops only on shutdown, which also cancels (handled above
+                    // by the biased arm); ignore the result and re-check.
+                    _ = call_active_rx.changed() => {}
+                }
+            }
+        }
+
+        // 5. Active phase — a Matrix human is present. Publish the LiveKit track
+        // FIRST, THEN (re-)post m.call.member. Element Call subscribes to a ghost's
+        // track when it processes the membership WITH the track already live; posting
+        // membership before the track (as a naive presence-first flow does) leaves a
+        // window where EC sees the member with no track and never re-subscribes to
+        // the late track — which silenced a Discord user who left and rejoined
+        // mid-call. The Room handle is moved into the event-drain task, which keeps
+        // the connection up and closes it on cancel; we keep only the source to feed.
+        // Honor cancellation across the connect: `connect_and_publish` does network
+        // I/O that does not itself observe `cancel`, so race it. This is what makes a
+        // self-heal effective — if this ghost was retracted mid-connect (e.g. it was
+        // minted for one of our OWN puppet bots in a startup race, see
+        // `retract_self_ghost`), we must abort BEFORE publishing a track or posting
+        // membership, or the puppet would briefly surface in the call (echo).
+        let (source, media_key) = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                if let Some(h) = presence_membership.take() {
+                    h.abort();
+                }
+                if let Err(e) = post_membership(&cfg, &ghost_mxid, &device_id, &focus, true).await {
+                    tracing::warn!(error = %e, "ghost post_membership(leave) failed");
+                }
+                tracing::info!("ghost retired (cancelled before publish)");
+                return;
+            }
+            res = connect_and_publish(&cfg, &focus, &ghost_mxid, &device_id, cancel.clone()) => match res {
                 Ok(out) => out,
                 Err(e) => {
-                    tracing::error!(error = %e, "ghost LiveKit connect/publish failed — skipping");
+                    tracing::error!(error = %e, "ghost LiveKit connect/publish failed — retracting");
+                    if let Some(h) = presence_membership.take() {
+                        h.abort();
+                    }
+                    if let Err(e) = post_membership(&cfg, &ghost_mxid, &device_id, &focus, true).await {
+                        tracing::warn!(error = %e, "ghost post_membership(leave) failed");
+                    }
                     return;
                 }
-            };
-        // 4. Post m.call.member join so EC shows the ghost in the call — retried
-        // until it lands (or the ghost is cancelled). The track is already
-        // published, so we keep going and publish immediately; EC subscribes the
-        // moment membership posts. Retrying self-heals a transient failure (e.g. the
-        // room's m.call.member power level being wrong then fixed) without needing
-        // the Discord user to rejoin.
+            }
+        };
+        // Track is live → post membership now (EC subscribes off this). Drop any
+        // presence-phase post first so this is the last writer at the state key.
+        if let Some(h) = presence_membership.take() {
+            h.abort();
+        }
         let membership_handle = tokio::spawn(
             post_membership_until_joined(
                 cfg.clone(),
@@ -594,9 +671,9 @@ async fn run_ghost(
             )
             .instrument(tracing::Span::current()),
         );
-        tracing::info!(display_name = %display_name, "ghost publishing Discord speaker audio (membership posting)");
+        tracing::info!(display_name = %display_name, "ghost publishing Discord speaker audio");
 
-        // 4b. E2EE only: distribute this ghost's media key to the call's humans so
+        // 5b. E2EE only: distribute this ghost's media key to the call's humans so
         // they can decrypt its encrypted frames. The transport (plaintext Path 2 vs
         // Olm Path 3) is built inside the spawned task so audio pumping below is never
         // blocked on crypto-client bootstrap. Runs until cancel (re-sends to catch
@@ -617,10 +694,10 @@ async fn run_ghost(
             );
         }
 
-        // 5. Pump frames until cancelled.
+        // 6. Pump frames until cancelled.
         pump_audio(frame_rx, &source, &cancel).await;
 
-        // 6. Teardown. Stop the membership-retry task first (it observes `cancel`)
+        // 7. Teardown. Stop the membership-retry task first (it observes `cancel`)
         // and await it so a late join can't race past the leave below and linger.
         let _ = membership_handle.await;
         // Retract call membership (best-effort; a no-op if we never joined). The

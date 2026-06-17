@@ -53,6 +53,13 @@ const NO_ANCHOR: usize = usize::MAX;
 /// `manager.join` timed out, before a recovery timer makes it eligible again.
 const QUARANTINE_COOLDOWN: Duration = Duration::from_secs(120);
 
+/// How long a capture-only anchor (one held in voice with no Matrix participant of
+/// its own, only Discord speakers remaining) lingers before it leaves the Discord
+/// channel. Long enough to absorb a Matrix membership flap (which would otherwise
+/// churn the songbird/SSRC session) but bounded so no nameless bot idles in voice
+/// once the call is genuinely empty of Matrix users.
+const ANCHOR_IDLE_GRACE: Duration = Duration::from_secs(90);
+
 /// Nickname (before the configured prefix) shown on the overflow-host puppet while
 /// it is carrying more than one Matrix speaker (members beyond the puppet count).
 const OVERFLOW_LABEL: &str = "Overflow";
@@ -199,6 +206,18 @@ struct ChannelState {
     assignments: HashMap<String, Assign>,
     /// Participant key → swappable route handle (shared with the Matrix-side sink).
     routes: HashMap<String, Route>,
+    /// Discord user ids currently present in this voice channel (humans only —
+    /// bridge bots excluded). Maintained from gateway voice-state events on ANY
+    /// bot, under the alloc lock; set semantics make duplicate events from the
+    /// pool's several bots idempotent, so ghost create/retire fires exactly once.
+    /// Decoupled from the anchor: presence (hence ghost visibility) does not need
+    /// a bot in the voice channel.
+    presence: HashSet<u64>,
+    /// Pending grace timer for a capture-only anchor (held with no Matrix
+    /// participant). Cancelled when a participant is (re)assigned within the grace;
+    /// fires `release_capture_only_anchor_if_idle` so the bot leaves voice if still
+    /// idle. `Some` only while such a timer is armed.
+    anchor_idle_release: Option<CancellationToken>,
 }
 
 impl ChannelState {
@@ -265,10 +284,25 @@ impl SharedPool {
             })
             .collect();
 
+        // Pre-populate bot_ids by decoding each puppet's user id from its token, so
+        // echo-exclusion is correct BEFORE any gateway event. Otherwise a puppet
+        // lingering in a voice channel (e.g. after an ungraceful crash) could be
+        // ghosted by another bot's startup seeding before its own `ready` registers
+        // it — an echo (constraint #5). Best-effort; `ready` re-confirms each id.
+        let mut bot_ids = HashSet::new();
+        for tok in &cfg.tokens {
+            match decode_bot_user_id(tok) {
+                Some(id) => {
+                    bot_ids.insert(id);
+                }
+                None => tracing::warn!("could not decode a puppet bot user id from its token — relying on `ready` (a brief startup echo window is possible)"),
+            }
+        }
+
         Arc::new(Self {
             nickname_prefix: Arc::from(cfg.nickname_prefix.as_str()),
             slots,
-            bot_ids: Arc::new(RwLock::new(HashSet::new())),
+            bot_ids: Arc::new(RwLock::new(bot_ids)),
             alloc: StdMutex::new(AllocState {
                 channels: HashMap::new(),
                 next_seq: 0,
@@ -311,6 +345,8 @@ impl SharedPool {
             anchor: Arc::new(AtomicUsize::new(NO_ANCHOR)),
             assignments: HashMap::new(),
             routes: HashMap::new(),
+            presence: HashSet::new(),
+            anchor_idle_release: None,
         };
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
         guard.channels.insert(bridge.to_string(), state);
@@ -416,15 +452,81 @@ impl SharedPool {
         }
     }
 
-    /// Look up the channel where bot `idx` is the current anchor and whose guild
-    /// matches `guild_id`, returning its [`ChannelCtx`]. Used by the presence
-    /// handler to attribute voice-state events to the right channel/room.
-    fn anchor_channel_ctx(&self, idx: usize, guild_id: GuildId) -> Option<ChannelCtx> {
+    /// Look up the bridged channel at `guild_id`/`channel_id` (regardless of which
+    /// bot, if any, anchors it), returning its [`ChannelCtx`]. Used to attribute a
+    /// voice member to its room without holding the anchor.
+    fn by_channel(&self, guild_id: GuildId, channel_id: ChannelId) -> Option<ChannelCtx> {
         let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
-        let ch = guard.channels.values().find(|ch| {
-            ch.guild_id == guild_id && ch.anchor.load(Ordering::Relaxed) == idx
-        })?;
+        let ch = guard
+            .channels
+            .values()
+            .find(|ch| ch.guild_id == guild_id && ch.channel_id == channel_id)?;
         Some(self.ctx_for(ch))
+    }
+
+    /// Every bridged channel in `guild_id`, as [`ChannelCtx`]es — regardless of
+    /// which bot (if any) anchors them. Lets ANY bot reconcile a voice-state event
+    /// against all the guild's channels, so presence detection is not gated on
+    /// holding the anchor.
+    fn channels_in_guild(&self, guild_id: GuildId) -> Vec<ChannelCtx> {
+        let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .channels
+            .values()
+            .filter(|ch| ch.guild_id == guild_id)
+            .map(|ch| self.ctx_for(ch))
+            .collect()
+    }
+
+    /// Whether `user_id` is one of our own puppet bots (echo-exclusion: a bridge
+    /// bot is never a ghost and never counts as Discord presence).
+    fn is_bridge_bot(&self, user_id: u64) -> bool {
+        self.bot_ids
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&user_id)
+    }
+
+    /// Retract any ghost wrongly minted for one of our OWN puppet bots. A puppet is
+    /// never a Discord speaker, but a startup race can mint one: if the bot was
+    /// already in a voice channel (e.g. a session lingering from a previous crash)
+    /// when another bot's `guild_create` seeding scanned voice members, this bot's
+    /// id was not yet in `bot_ids`, so it slipped past echo-exclusion (constraint
+    /// #5). Called from `ready` the moment the id is recorded, so the echo
+    /// self-corrects — typically before the ghost ever publishes or posts
+    /// membership. Mirrors `drop_ghost`'s teardown.
+    fn retract_self_ghost(&self, user_id: u64) {
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        for ch in guard.channels.values_mut() {
+            ch.presence.remove(&user_id);
+            let removed = ch
+                .user_sinks
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&user_id)
+                .is_some();
+            if removed {
+                ch.capture_router.release(&user_id.to_string());
+                tracing::warn!(user_id, bridge = %ch.bridge, "retracted echo ghost minted for our own puppet bot before its ready (startup race)");
+            }
+        }
+    }
+
+    /// Record that `user_id` is now `present` (or gone) in `bridge`'s channel,
+    /// returning `true` iff this call observed the **edge** — the user was newly
+    /// inserted (0→1) or actually removed (1→0). Voice-state events reach every bot
+    /// in the guild; the shared `presence` set under the alloc lock makes duplicates
+    /// idempotent, so exactly one observer drives the ghost create/retire.
+    fn note_presence(&self, bridge: &str, user_id: u64, present: bool) -> bool {
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(ch) = guard.channels.get_mut(bridge) else {
+            return false;
+        };
+        if present {
+            ch.presence.insert(user_id)
+        } else {
+            ch.presence.remove(&user_id)
+        }
     }
 
     // ── Allocation (all under `self.alloc`) ──────────────────────────────────
@@ -689,6 +791,41 @@ impl SharedPool {
             guard.next_seq
         };
 
+        // A Matrix participant is (re)joining → cancel any pending idle-release grace
+        // on this channel's capture-only anchor.
+        Self::cancel_anchor_idle_release(&mut guard, bridge);
+
+        // (Fix 2c) Reuse a capture-only anchor — one held in voice with no
+        // participant of its own — for this participant instead of taking a fresh
+        // bot. It's already in voice, so relabel + re-point the route; don't send a
+        // fresh Assign (which would re-join and churn its SSRC map). Keeps it named
+        // and avoids a nameless "[Matrix] " bot beside a freshly-allocated puppet.
+        let reuse_anchor = guard.channels.get(bridge).and_then(|ch| {
+            let a = ch.anchor.load(Ordering::Relaxed);
+            let serves = ch
+                .assignments
+                .values()
+                .any(|x| matches!(x, Assign::Puppet { idx, .. } if *idx == a));
+            (a != NO_ANCHOR && !serves).then_some(a)
+        });
+        if let Some(idx) = reuse_anchor {
+            let route = {
+                let ch = guard.channels.get_mut(bridge).unwrap();
+                ch.assignments
+                    .insert(key.to_owned(), Assign::Puppet { idx, seq });
+                *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(display_name.to_owned());
+                self.slots[idx].muted.store(false, Ordering::Relaxed);
+                self.slots[idx].mixer.clear();
+                Self::route_to(&mut ch.routes, key, self.slots[idx].mixer.clone())
+            };
+            let ch = &guard.channels[bridge];
+            self.reconcile_anchor_label(ch);
+            self.reconcile_anchor_mute(ch);
+            tracing::info!(bridge, key, display_name, idx, "assigned participant to capture-only anchor (reused, no new bot)");
+            return Arc::new(RoutedSink { route, key: key.to_owned() });
+        }
+
         // Try to claim a free bot (in this guild) for a dedicated puppet.
         if let Some(idx) = self.take_free_bot(guild) {
             let ctx = {
@@ -950,7 +1087,7 @@ impl SharedPool {
         }
     }
 
-    fn release(&self, bridge: &str, key: &str) {
+    fn release(self: &Arc<Self>, bridge: &str, key: &str) {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
         // Remove the assignment; act on what it was.
         let removed = match guard.channels.get_mut(bridge) {
@@ -1001,19 +1138,72 @@ impl SharedPool {
                         }
                     }
                     None => {
+                        let is_anchor = guard.channels[bridge].anchor.load(Ordering::Relaxed) == idx;
+
+                        // (Fix 2a) If this freed bot was the anchor but OTHER puppets
+                        // still serve Matrix participants, move the oldest such
+                        // participant onto this anchor (route-swap — the anchor keeps
+                        // its songbird session / SSRC map, so no audio churn) and free
+                        // the now-spare bot. Otherwise the anchor would linger as a
+                        // nameless "[Matrix] " capture-only bot beside the real
+                        // puppets, wasting a slot.
+                        if is_anchor {
+                            let victim = guard.channels[bridge]
+                                .assignments
+                                .iter()
+                                .filter_map(|(k, a)| match a {
+                                    Assign::Puppet { idx: vidx, seq } if *vidx != idx => {
+                                        Some((k.clone(), *vidx, *seq))
+                                    }
+                                    _ => None,
+                                })
+                                .min_by_key(|(_, _, seq)| *seq);
+                            if let Some((vkey, vidx, vseq)) = victim {
+                                let vname = self.slots[vidx]
+                                    .name
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .clone()
+                                    .unwrap_or_default();
+                                let vmuted = self.slots[vidx].muted.load(Ordering::Relaxed);
+                                {
+                                    let ch = guard.channels.get_mut(bridge).unwrap();
+                                    ch.assignments
+                                        .insert(vkey.clone(), Assign::Puppet { idx, seq: vseq });
+                                    self.slots[idx].mixer.clear();
+                                    Self::route_to(&mut ch.routes, &vkey, self.slots[idx].mixer.clone());
+                                    *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
+                                        Some(vname);
+                                    self.slots[idx].muted.store(vmuted, Ordering::Relaxed);
+                                }
+                                // Free the now-spare bot.
+                                self.slots[vidx].mixer.clear();
+                                self.slots[vidx].busy.store(false, Ordering::Relaxed);
+                                *self.slots[vidx].name.lock().unwrap_or_else(PoisonError::into_inner) =
+                                    None;
+                                let _ = self.slots[vidx].cmd_tx.try_send(PuppetCommand::Release);
+                                let ch = &guard.channels[bridge];
+                                self.reconcile_anchor_label(ch);
+                                self.reconcile_anchor_mute(ch);
+                                tracing::info!(bridge, moved = %vkey, freed = vidx, onto_anchor = idx, "consolidated participant onto capture anchor; freed spare bot");
+                                self.service_pending(&mut guard);
+                                return;
+                            }
+                        }
+
                         // If this freed bot is the capture anchor and Discord
                         // speakers are still present, KEEP it in the voice channel
-                        // as a capture-only anchor. Leaving would drop the songbird
-                        // session and reset SSRC→user mappings, cutting Discord→Matrix
-                        // audio for everyone until each speaker re-onsets — exactly the
-                        // churn a spurious Matrix membership flap would otherwise cause.
-                        let (is_anchor, speakers_present) = {
-                            let ch = &guard.channels[bridge];
-                            (
-                                ch.anchor.load(Ordering::Relaxed) == idx,
-                                !ch.user_sinks.read().unwrap_or_else(PoisonError::into_inner).is_empty(),
-                            )
-                        };
+                        // as a capture-only anchor — briefly. Leaving immediately would
+                        // drop the songbird session and reset SSRC→user mappings,
+                        // cutting Discord→Matrix audio until each speaker re-onsets —
+                        // the churn a spurious Matrix membership flap would cause. But
+                        // bound it with a grace timer so no nameless bot idles in voice
+                        // once no Matrix user returns (Fix 2b).
+                        let speakers_present = !guard.channels[bridge]
+                            .user_sinks
+                            .read()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .is_empty();
                         if is_anchor && speakers_present {
                             // Drop only its playback identity; keep busy + anchor so
                             // it stays un-allocatable and still the elected anchor.
@@ -1021,7 +1211,8 @@ impl SharedPool {
                             *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
                             let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetNickname(String::new()));
                             let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetMuted(false));
-                            tracing::info!(bridge, key, idx, "last puppet released but Discord speakers remain — keeping capture-only anchor (songbird/SSRC map preserved)");
+                            tracing::info!(bridge, key, idx, "last puppet released but Discord speakers remain — keeping capture-only anchor (grace before release)");
+                            self.schedule_anchor_idle_release(&mut guard, bridge);
                             return;
                         }
                         // No overflow waiting, no capture need → free the bot.
@@ -1140,6 +1331,73 @@ impl SharedPool {
         self.service_pending(&mut guard);
     }
 
+    /// Arm (or re-arm) the grace timer that releases a capture-only anchor if no
+    /// Matrix participant returns within [`ANCHOR_IDLE_GRACE`]. Cancels any prior
+    /// timer for the channel. Must be called with the `alloc` guard already held
+    /// (it stores the token under it); the spawned task re-locks on expiry.
+    fn schedule_anchor_idle_release(self: &Arc<Self>, guard: &mut AllocState, bridge: &str) {
+        let token = CancellationToken::new();
+        let Some(ch) = guard.channels.get_mut(bridge) else { return };
+        if let Some(old) = ch.anchor_idle_release.replace(token.clone()) {
+            old.cancel();
+        }
+        let pool = self.clone();
+        let bridge = bridge.to_owned();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = token.cancelled() => {}
+                _ = tokio::time::sleep(ANCHOR_IDLE_GRACE) => {
+                    pool.release_capture_only_anchor_if_idle(&bridge);
+                }
+            }
+        });
+    }
+
+    /// Cancel a pending capture-only-anchor idle-release timer (a Matrix
+    /// participant is (re)joining, so the anchor is no longer idle).
+    fn cancel_anchor_idle_release(guard: &mut AllocState, bridge: &str) {
+        if let Some(ch) = guard.channels.get_mut(bridge) {
+            if let Some(tok) = ch.anchor_idle_release.take() {
+                tok.cancel();
+            }
+        }
+    }
+
+    /// Grace-timer callback: release the capture-only anchor (leave Discord voice)
+    /// iff the channel still has an anchor and **no** Matrix participant — i.e. the
+    /// grace elapsed with nobody returning. A no-op if a participant reused the
+    /// anchor in the meantime (then it serves someone and must stay).
+    fn release_capture_only_anchor_if_idle(&self, bridge: &str) {
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let idx = {
+            let Some(ch) = guard.channels.get(bridge) else { return };
+            let anchor = ch.anchor.load(Ordering::Relaxed);
+            if anchor == NO_ANCHOR {
+                return;
+            }
+            let any_puppet = ch
+                .assignments
+                .values()
+                .any(|a| matches!(a, Assign::Puppet { .. }));
+            if any_puppet {
+                return; // a Matrix participant is present — keep the capture path
+            }
+            anchor
+        };
+        self.slots[idx].mixer.clear();
+        self.slots[idx].busy.store(false, Ordering::Relaxed);
+        *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Release);
+        {
+            let ch = guard.channels.get_mut(bridge).unwrap();
+            ch.anchor.store(NO_ANCHOR, Ordering::Relaxed);
+            ch.overflow_mixer.clear();
+            ch.anchor_idle_release = None;
+        }
+        tracing::info!(bridge, idx, "capture-only anchor idle grace elapsed — leaving Discord voice (no Matrix user present)");
+        self.service_pending(&mut guard);
+    }
+
     /// Record that bot `idx` is now a member of `guild` (from `ready`/
     /// `guild_create`), then service any channel in that guild waiting for a bot
     /// (covers the startup race where an assign arrives before membership is known).
@@ -1228,6 +1486,9 @@ impl EventHandler for PuppetHandler {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(ready.user.id.get());
+        // Self-heal: if a startup race ghosted this bot before its id was known
+        // (e.g. it was lingering in voice from a previous crash), retract it now.
+        self.pool.retract_self_ghost(ready.user.id.get());
 
         // Seed this bot's guild membership from the ready payload so the allocator
         // knows which channels it can serve before any assign arrives.
@@ -1253,22 +1514,36 @@ impl EventHandler for PuppetHandler {
         slot.connected.store(true, Ordering::Relaxed);
     }
 
-    /// Drive ghost **presence** off Discord voice-channel membership. Only the
-    /// anchor of the channel matching the event acts (voice-state events reach
-    /// every bot's gateway, but presence is decided once, by the anchor).
+    /// Drive ghost **presence** off Discord voice-channel membership. Voice-state
+    /// events reach every bot's gateway and need NO bot in the voice channel, so
+    /// any bot can run this — presence (hence ghost visibility) is decoupled from
+    /// the capture anchor. The shared per-channel presence set makes the create/
+    /// retire fire exactly once regardless of how many bots see the event.
     #[tracing::instrument(parent = None, name = "puppet", skip_all, fields(idx = self.idx))]
     async fn voice_state_update(&self, ctx: Context, _old: Option<VoiceState>, new: VoiceState) {
         let Some(guild_id) = new.guild_id else { return };
-        let Some(channel) = self.pool.anchor_channel_ctx(self.idx, guild_id) else {
-            return; // this bot is not the anchor of any channel in this guild
-        };
         let user_id = new.user_id.get();
-        if new.channel_id == Some(channel.channel_id) {
-            ensure_ghost(&ctx, &channel, user_id, new.member.as_ref()).await;
-        } else if drop_ghost(&channel, user_id) {
-            // Last Discord speaker left → a capture-only anchor (one held with no
-            // playback puppet) is now idle and should leave the channel.
-            self.pool.maybe_release_idle_anchor(&channel.bridge);
+        // Our own puppet/anchor bots are never ghosts and never count as presence
+        // (echo-exclusion, constraint #5). `ensure_ghost` double-checks bot_ids.
+        if self.pool.is_bridge_bot(user_id) {
+            return;
+        }
+        // Reconcile this user across every bridged channel in the guild: present in
+        // `here` (if it's a bridged channel), absent from the rest. This handles a
+        // plain join, a channel hop, and leaving voice entirely (channel_id None)
+        // uniformly, without relying on the (often-absent) old voice state.
+        let here = new.channel_id;
+        for ch in self.pool.channels_in_guild(guild_id) {
+            if Some(ch.channel_id) == here {
+                if self.pool.note_presence(&ch.bridge, user_id, true) {
+                    ensure_ghost(&ctx, &ch, user_id, new.member.as_ref()).await;
+                }
+            } else if self.pool.note_presence(&ch.bridge, user_id, false) {
+                drop_ghost(&ch, user_id);
+                // The last Discord speaker leaving may leave a capture-only anchor
+                // (one held with no playback puppet) idle — release it if so.
+                self.pool.maybe_release_idle_anchor(&ch.bridge);
+            }
         }
     }
 
@@ -1278,6 +1553,23 @@ impl EventHandler for PuppetHandler {
     #[tracing::instrument(parent = None, name = "puppet", skip_all, fields(idx = self.idx))]
     async fn guild_create(&self, ctx: Context, guild: serenity::model::guild::Guild, _is_new: Option<bool>) {
         self.pool.note_bot_guild(self.idx, guild.id);
+        // Seed presence ghosts for Discord users ALREADY in a bridged voice channel
+        // before this bot connected — pre-existing members arrive in the guild
+        // payload, not as voice_state_update events, so without this they'd stay
+        // invisible to Matrix until they next toggled their voice state. Idempotent
+        // across the pool's bots via the shared presence set.
+        for (uid, vs) in &guild.voice_states {
+            let Some(chan_id) = vs.channel_id else { continue };
+            let user_id = uid.get();
+            if self.pool.is_bridge_bot(user_id) {
+                continue;
+            }
+            if let Some(ch) = self.pool.by_channel(guild.id, chan_id) {
+                if self.pool.note_presence(&ch.bridge, user_id, true) {
+                    ensure_ghost(&ctx, &ch, user_id, vs.member.as_ref()).await;
+                }
+            }
+        }
         if self.pool.slots[self.idx].busy.load(Ordering::Relaxed) {
             return;
         }
@@ -1335,14 +1627,33 @@ async fn ensure_ghost(ctx: &Context, channel: &ChannelCtx, user_id: u64, member:
         },
     };
 
-    let sink = channel
-        .capture_router
-        .assign(&user_id.to_string(), &name, avatar_url.as_deref());
-    channel
-        .user_sinks
-        .write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(user_id, sink);
+    // Commit under the user_sinks write lock, and RE-CHECK bot_ids here: the user's
+    // gateway `ready` may have landed during the (awaited) name resolution above,
+    // revealing it as one of our OWN puppet bots that was in voice before its id was
+    // known (a startup race — see `retract_self_ghost`). Holding the write lock
+    // across the re-check and the insert makes this race-free against
+    // `retract_self_ghost`, which removes the id under the same lock.
+    {
+        let mut sinks = channel
+            .user_sinks
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if channel
+            .bot_ids
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&user_id)
+        {
+            return; // our own puppet bot — never a ghost (echo prevention)
+        }
+        if sinks.contains_key(&user_id) {
+            return; // raced with another ensure_ghost for the same user
+        }
+        let sink = channel
+            .capture_router
+            .assign(&user_id.to_string(), &name, avatar_url.as_deref());
+        sinks.insert(user_id, sink);
+    }
     tracing::info!(bridge = %channel.bridge, user_id, display_name = %name, "Discord user present — ghost assigned");
 }
 
@@ -1360,6 +1671,26 @@ fn drop_ghost(channel: &ChannelCtx, user_id: u64) -> bool {
     channel.capture_router.release(&user_id.to_string());
     tracing::info!(bridge = %channel.bridge, user_id, "Discord user left — ghost released");
     now_empty
+}
+
+/// Decode a bot's user id from its token. A Discord bot token is
+/// `base64(user_id) "." base64(timestamp) "." hmac`; the first segment base64-
+/// decodes to the decimal user id. Best-effort — returns `None` on any unexpected
+/// shape (the caller then relies on the `ready` event to learn the id).
+fn decode_bot_user_id(token: &str) -> Option<u64> {
+    use base64::Engine;
+    // Tolerate a leading "Bot " and surrounding whitespace; tokens are stored raw.
+    let first = token
+        .trim()
+        .strip_prefix("Bot ")
+        .unwrap_or(token.trim())
+        .split('.')
+        .next()?;
+    let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(first)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(first))
+        .ok()?;
+    std::str::from_utf8(&bytes).ok()?.parse::<u64>().ok()
 }
 
 /// Resolve a Discord member's display name: server nick → global name → username.
@@ -1874,5 +2205,136 @@ mod tests {
         *route.lock().unwrap() = b.clone();
         sink.push(&vec![80i16; PRIME]);
         assert!(b.pop_10ms_mixed().iter().all(|&s| s == 80), "frames follow to B after swap");
+    }
+
+    #[test]
+    fn note_presence_reports_edges_once() {
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        // Voice-state events reach every pool bot; only the first observer of a
+        // join sees the 0→1 edge (the one that should mint the ghost).
+        assert!(p.note_presence("A", 1001, true), "first join is an edge");
+        assert!(!p.note_presence("A", 1001, true), "duplicate join (2nd bot) is not");
+        assert!(!p.note_presence("A", 1001, true), "still not");
+        // Likewise only the first observer of the matching leave sees the 1→0 edge.
+        assert!(p.note_presence("A", 1001, false), "first leave is an edge");
+        assert!(!p.note_presence("A", 1001, false), "duplicate leave is not");
+        // A leave for a user that was never present is never an edge.
+        assert!(!p.note_presence("A", 9999, false));
+    }
+
+    #[test]
+    fn note_presence_is_per_user_and_per_channel() {
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        channel(&p, "B", 1, 20);
+        assert!(p.note_presence("A", 1, true));
+        assert!(p.note_presence("A", 2, true), "a distinct user is its own edge");
+        assert!(p.note_presence("B", 1, true), "same user in another channel edges once");
+        // Leaving A leaves the user's B presence untouched.
+        assert!(p.note_presence("A", 1, false));
+        assert!(!p.note_presence("A", 1, false));
+        assert!(p.note_presence("B", 1, false), "B still tracked the user");
+        // An unknown bridge is a no-op, never an edge.
+        assert!(!p.note_presence("nope", 1, true));
+    }
+
+    #[test]
+    fn bridge_bots_excluded_from_presence() {
+        let p = pool(1);
+        // A puppet bot's user id, as recorded on the gateway `ready` event.
+        p.bot_ids.write().unwrap().insert(4242);
+        assert!(p.is_bridge_bot(4242), "our own bot is recognised");
+        assert!(!p.is_bridge_bot(1001), "a human is not");
+    }
+
+    #[test]
+    fn releasing_anchor_consolidates_a_participant_onto_it() {
+        // When the anchor's own participant leaves while OTHER participants remain,
+        // the oldest moves onto the anchor (route-swap, SSRC map preserved) and its
+        // old bot is freed — no nameless "[Matrix] " capture-only orphan.
+        let p = pool(3);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice"); // anchor
+        p.assign("A", "bob", "Bob"); // oldest non-anchor
+        p.assign("A", "carol", "Carol");
+        let anchor = p.test_anchor("A").unwrap();
+        let bob_old = p.test_slot_of("A", "bob").unwrap();
+        assert_ne!(bob_old, anchor);
+
+        p.release("A", "alice");
+
+        assert_eq!(p.test_anchor("A"), Some(anchor), "anchor bot is unchanged");
+        assert_eq!(p.test_slot_of("A", "bob"), Some(anchor), "bob consolidated onto the anchor");
+        assert!(p.test_slot_of("A", "carol").is_some(), "carol still served");
+        assert_eq!(p.test_free_count(), 1, "bob's old bot was freed");
+        assert!(p.test_slot_of("A", "alice").is_none(), "alice released");
+    }
+
+    #[tokio::test]
+    async fn assign_reuses_a_capture_only_anchor() {
+        // A lone participant leaving while a Discord speaker remains retains a
+        // capture-only anchor; the next participant must REUSE it, not grab a fresh
+        // bot (which would leave the anchor as a nameless "[Matrix] " bot).
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        let anchor = p.test_anchor("A").unwrap();
+        // Mark a Discord speaker present so the anchor is retained on release.
+        {
+            let guard = p.alloc.lock().unwrap();
+            let ch = guard.channels.get("A").unwrap();
+            ch.user_sinks
+                .write()
+                .unwrap()
+                .insert(999, Arc::new(NoopCaptureSink));
+        }
+        p.release("A", "alice"); // no other puppet → capture-only anchor (grace armed)
+        assert_eq!(p.test_anchor("A"), Some(anchor), "capture-only anchor retained");
+        assert!(p.test_slot_of("A", "alice").is_none());
+
+        p.assign("A", "dave", "Dave");
+        assert_eq!(p.test_slot_of("A", "dave"), Some(anchor), "dave reused the anchor bot");
+        assert_eq!(p.test_free_count(), 1, "the spare bot stayed free (no fresh allocation)");
+    }
+
+    #[test]
+    fn decode_bot_user_id_from_token() {
+        use base64::Engine;
+        let uid = 1515382284960796774u64;
+        let seg = base64::engine::general_purpose::STANDARD_NO_PAD.encode(uid.to_string());
+        let token = format!("{seg}.AbCdEf.xyz123-hmac");
+        assert_eq!(decode_bot_user_id(&token), Some(uid), "decodes a token-shaped string");
+        assert_eq!(
+            decode_bot_user_id(&format!("Bot {token}")),
+            Some(uid),
+            "tolerates a 'Bot ' prefix"
+        );
+        assert_eq!(decode_bot_user_id("not-base64.x.y"), None, "rejects garbage");
+    }
+
+    #[test]
+    fn retract_self_ghost_clears_presence_and_sink() {
+        // A startup race can mint a ghost for our own puppet bot before its id is in
+        // `bot_ids`; retract_self_ghost (called from `ready`) must clean it up.
+        let p = pool(1);
+        channel(&p, "A", 1, 10);
+        {
+            let mut guard = p.alloc.lock().unwrap();
+            let ch = guard.channels.get_mut("A").unwrap();
+            ch.presence.insert(4242);
+            ch.user_sinks
+                .write()
+                .unwrap()
+                .insert(4242, Arc::new(NoopCaptureSink));
+        }
+        p.retract_self_ghost(4242);
+        let guard = p.alloc.lock().unwrap();
+        let ch = guard.channels.get("A").unwrap();
+        assert!(!ch.presence.contains(&4242), "presence entry cleared");
+        assert!(
+            !ch.user_sinks.read().unwrap().contains_key(&4242),
+            "ghost sink cleared"
+        );
     }
 }

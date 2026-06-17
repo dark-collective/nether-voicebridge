@@ -82,9 +82,13 @@ pub async fn run(
         tracing::warn!(error = %e, "stale-ghost sweep failed (continuing)");
     }
 
-    // The call-active watch lives entirely between the sync loop (sender) and
-    // the RTC loop (receiver) — created here, never exposed.
+    // The call-active watch is fed by the sync loop (sender) and consumed by the
+    // RTC loop AND the ghost pool: a ghost connects/publishes (and delivers its
+    // E2EE key) as soon as a Matrix human is present, so audio is ready before the
+    // Discord user speaks. `watch::Receiver` is cloneable; clone for the ghost pool
+    // before `rtc::run` below moves the original.
     let (call_active_tx, call_active_rx) = watch::channel(false);
+    let call_active_rx_ghost = call_active_rx.clone();
 
     // Membership-generation watch: the sync loop bumps it whenever a new human
     // joins the call; each ghost's key-distribution loop waits on it to (re-)send
@@ -118,6 +122,7 @@ pub async fn run(
             media_e2ee,
             key_transport,
             members_gen_rx,
+            call_active_rx_ghost,
             bridge.clone(),
             shutdown.clone()
         ),
