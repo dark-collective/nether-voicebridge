@@ -19,6 +19,11 @@ channel↔room pairs at once.
   individually-controllable **puppet bots** (named after the Matrix user, mutable
   per-user). Discord speakers appear in the Matrix call as **appservice ghosts**
   (named + avatared after the Discord user).
+- **See who's waiting.** Discord users show up in the Matrix call as ghosts **even
+  when no Matrix user is in the call** (membership only, no media) — so Matrix
+  users can tell at a glance whether a room is worth joining. The moment a Matrix
+  user joins, every present ghost goes live (audio + E2EE keys) before anyone even
+  speaks; no bot sits idle in a Discord voice channel just to show presence.
 - **Multiple bridges, one process.** Each `[[bridge]]` pairs one Discord channel
   with one Matrix room; add more blocks to bridge more pairs. The Discord puppet
   bots are a single shared pool, allocated across channels on demand.
@@ -89,8 +94,11 @@ builds, and CI/runner notes.
   sets `NVB_DATA_DIR=/app/data`). Each bridge gets a distinct store.
 - **LiveKit endpoints are auto-derived** from the homeserver's `.well-known`
   `rtc_foci` and the lk-jwt response — not configured by hand.
-- **`media_e2ee`** is per-bridge: `false` for unencrypted rooms, `true` for
-  encrypted rooms (with `key_transport = "olm"` for true per-ghost E2EE).
+- **`media_e2ee` is auto-detected** per bridge from the room's
+  `m.room.encryption` state (encrypted ⇒ on with per-ghost Olm, unencrypted ⇒
+  off); it's an optional override now — set it only to force a value.
+  `key_transport` likewise auto-selects (`olm` for an encrypted room, else
+  plaintext).
 
 ## Community & contributing
 
