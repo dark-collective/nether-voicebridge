@@ -2,6 +2,9 @@
 # Copy to config.toml and fill in real values. NEVER commit config.toml.
 # Override the config path at runtime: CONFIG_PATH=/path/to/config.toml
 #
+# Single-bridge deployments can skip this file entirely and use NETHER_* environment
+# variables instead — see docs/docker-usage.md for the full variable reference.
+#
 # Two top-level pieces:
 #   [puppets]  — ONE shared pool of Discord bot tokens, used by ALL bridges. Bots
 #                are allocated to channels dynamically as people speak.

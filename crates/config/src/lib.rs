@@ -14,6 +14,10 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("config validation error: {0}")]
     Validation(String),
+    #[error("missing required environment variables: {0}")]
+    MissingEnv(String),
+    #[error("invalid environment variable value: {0}")]
+    InvalidEnv(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,6 +371,136 @@ impl Config {
             };
             b.matrix.store_path = format!("{base}/{leaf}");
         }
+    }
+
+    /// Build a single-bridge config entirely from environment variables.
+    ///
+    /// Required vars:
+    ///   NETHER_PUPPET_TOKENS, NETHER_DISCORD_GUILD_ID, NETHER_DISCORD_CHANNEL_ID,
+    ///   NETHER_MATRIX_HOMESERVER_URL, NETHER_MATRIX_ROOM_ID, NETHER_MATRIX_BOT_USER_ID,
+    ///   NETHER_MATRIX_DEVICE_ID, NETHER_MATRIX_APPSERVICE_ID, NETHER_MATRIX_APPSERVICE_TOKEN
+    ///
+    /// Optional vars (with defaults):
+    ///   NETHER_PUPPET_NICKNAME_PREFIX (default "[Matrix] ")
+    ///   NETHER_BRIDGE_NAME
+    ///   NETHER_DISCORD_CAPTURE_WAV (default false)
+    ///   NETHER_MATRIX_ACCESS_TOKEN (omit for appservice-auth mode)
+    ///   NETHER_MATRIX_STORE_PATH (default "./nether-store")
+    ///   NETHER_MATRIX_BOT_DISPLAY_NAME, NETHER_MATRIX_BOT_AVATAR_PATH
+    ///   NETHER_LIVEKIT_MEDIA_E2EE (default false)
+    ///   NETHER_LIVEKIT_KEY_TRANSPORT ("plaintext" | "olm", default "plaintext")
+    ///   NETHER_LIVEKIT_LK_JWT_URL, NETHER_LIVEKIT_URL
+    pub fn from_env() -> Result<Self, ConfigError> {
+        let mut missing: Vec<&'static str> = Vec::new();
+
+        // Returns Some(value) for a non-empty env var, records the name as missing otherwise.
+        macro_rules! require {
+            ($var:literal) => {
+                match std::env::var($var) {
+                    Ok(v) if !v.is_empty() => Some(v),
+                    _ => {
+                        missing.push($var);
+                        None
+                    }
+                }
+            };
+        }
+
+        // Returns Some(value) for a set, non-empty env var; None when absent or empty.
+        macro_rules! optional {
+            ($var:literal) => {
+                std::env::var($var).ok().filter(|v| !v.is_empty())
+            };
+        }
+
+        let tokens_raw = match std::env::var("NETHER_PUPPET_TOKENS") {
+            Ok(v) if !v.is_empty() => v,
+            _ => {
+                missing.push("NETHER_PUPPET_TOKENS");
+                String::new()
+            }
+        };
+
+        let nickname_prefix = optional!("NETHER_PUPPET_NICKNAME_PREFIX")
+            .unwrap_or_else(default_nickname_prefix);
+
+        let discord_guild_id = require!("NETHER_DISCORD_GUILD_ID");
+        let discord_channel_id = require!("NETHER_DISCORD_CHANNEL_ID");
+        let capture_wav = optional!("NETHER_DISCORD_CAPTURE_WAV")
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1"))
+            .unwrap_or(false);
+
+        let homeserver_url = require!("NETHER_MATRIX_HOMESERVER_URL");
+        let room_id = require!("NETHER_MATRIX_ROOM_ID");
+        let bot_user_id = require!("NETHER_MATRIX_BOT_USER_ID");
+        let device_id = require!("NETHER_MATRIX_DEVICE_ID");
+        let access_token = optional!("NETHER_MATRIX_ACCESS_TOKEN");
+        let appservice_id = require!("NETHER_MATRIX_APPSERVICE_ID");
+        let appservice_token = require!("NETHER_MATRIX_APPSERVICE_TOKEN");
+        let store_path =
+            optional!("NETHER_MATRIX_STORE_PATH").unwrap_or_else(default_store_path);
+        let bot_display_name = optional!("NETHER_MATRIX_BOT_DISPLAY_NAME");
+        let bot_avatar_path = optional!("NETHER_MATRIX_BOT_AVATAR_PATH");
+
+        let media_e2ee = optional!("NETHER_LIVEKIT_MEDIA_E2EE")
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1"))
+            .unwrap_or(false);
+        let key_transport = optional!("NETHER_LIVEKIT_KEY_TRANSPORT")
+            .map(|v| match v.to_lowercase().as_str() {
+                "plaintext" => Ok(KeyTransport::Plaintext),
+                "olm" => Ok(KeyTransport::Olm),
+                other => Err(ConfigError::InvalidEnv(format!(
+                    "NETHER_LIVEKIT_KEY_TRANSPORT: unknown value '{other}' \
+                     (expected 'plaintext' or 'olm')"
+                ))),
+            })
+            .transpose()?
+            .unwrap_or_else(default_key_transport);
+        let lk_jwt_url = optional!("NETHER_LIVEKIT_LK_JWT_URL");
+        let url = optional!("NETHER_LIVEKIT_URL");
+
+        if !missing.is_empty() {
+            return Err(ConfigError::MissingEnv(missing.join(", ")));
+        }
+
+        let name = optional!("NETHER_BRIDGE_NAME");
+
+        Ok(Config {
+            puppets: PuppetsConfig {
+                tokens: tokens_raw
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                nickname_prefix,
+            },
+            bridges: vec![BridgeConfig {
+                name,
+                discord: DiscordConfig {
+                    guild_id: discord_guild_id.unwrap(),
+                    channel_id: discord_channel_id.unwrap(),
+                    capture_wav,
+                },
+                matrix: MatrixConfig {
+                    homeserver_url: homeserver_url.unwrap(),
+                    room_id: room_id.unwrap(),
+                    bot_user_id: bot_user_id.unwrap(),
+                    device_id: device_id.unwrap(),
+                    access_token,
+                    appservice_id: appservice_id.unwrap(),
+                    appservice_token: appservice_token.unwrap(),
+                    store_path,
+                    bot_display_name,
+                    bot_avatar_path,
+                },
+                livekit: LiveKitConfig {
+                    lk_jwt_url,
+                    url,
+                    media_e2ee,
+                    key_transport,
+                },
+            }],
+        })
     }
 
     /// Validate cross-bridge invariants. Hard errors abort startup; softer

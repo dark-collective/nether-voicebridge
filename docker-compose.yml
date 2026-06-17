@@ -3,18 +3,46 @@ services:
     image: nether.codes/dark/nether-voicebridge:latest
     restart: unless-stopped
     volumes:
-      # config.toml holds all secrets — never baked into the image.
-      # Copy config.example.toml to config.toml, fill it in, and keep it here.
-      - ./config.toml:/app/config.toml:ro
-      # Persistent matrix-sdk SQLite store. Set store_path = "/app/data/<name>"
-      # in config.toml (not a relative path — relative paths write inside the
-      # container and are lost on restart).
+      # Persistent matrix-sdk SQLite store (session state + Olm crypto).
+      # Store paths inside the container are auto-derived as /app/data/<bridge-name>
+      # via the NVB_DATA_DIR=/app/data baked into the image — no config change needed.
       - voicebridge-data:/app/data
+      # CONFIG FILE MODE (multi-bridge or preference): uncomment to mount a
+      # config.toml instead of using the NETHER_* env vars below. When this is
+      # mounted the env vars are ignored (the file is found and parsed first).
+      # Copy config.example.toml → config.toml, fill in values, never commit it.
+      # - ./config.toml:/app/config.toml:ro
     environment:
-      # Log filter: global default "info", with the binary crate itself bumped
-      # to "debug". Matches scripts/dev-run.sh's convention. Raise further
-      # (e.g. "nether_voicebridge=debug,debug") when diagnosing audio issues.
+      # Log filter. Raise to "debug" for a specific crate when diagnosing issues.
+      # e.g. "nvb_discord=debug,nvb_matrix_rtc=debug,info"
       RUST_LOG: "nether_voicebridge=debug,info"
+
+      # When config.toml is not mounted above, the bridge reads from these vars.
+      # When in this mode, the bridge supports only a single bridge
+      # Fill in the values and remove the leading # from each line you need.
+
+      # Required:
+      NETHER_PUPPET_TOKENS: "token1,token2"   # comma-separated Discord bot tokens
+      NETHER_DISCORD_GUILD_ID: ""
+      NETHER_DISCORD_CHANNEL_ID: ""
+      NETHER_MATRIX_HOMESERVER_URL: "https://nether.im"
+      NETHER_MATRIX_ROOM_ID: "!yourroomid:nether.im"
+      # NETHER_MATRIX_BOT_USER_ID: "@voicebridge:nether.im"
+      # NETHER_MATRIX_DEVICE_ID: "ABCDEFGHIJ"
+      NETHER_MATRIX_APPSERVICE_ID: "voicebridge"
+      NETHER_MATRIX_APPSERVICE_TOKEN: ""
+
+      # Optional (defaults shown):
+      # NETHER_PUPPET_NICKNAME_PREFIX: "[Matrix] "
+      # NETHER_BRIDGE_NAME: ""                  # label used in logs
+      # NETHER_MATRIX_ACCESS_TOKEN: ""          # omit for appservice-auth mode
+      # NETHER_LIVEKIT_MEDIA_E2EE: "false"      # true for encrypted Matrix rooms
+      # NETHER_LIVEKIT_KEY_TRANSPORT: "plaintext"  # or "olm" for encrypted rooms
+      # NETHER_MATRIX_BOT_DISPLAY_NAME: ""
+      # NETHER_MATRIX_BOT_AVATAR_PATH: ""       # path inside the container
+      # NETHER_LIVEKIT_LK_JWT_URL: ""           # auto-derived; override only if needed
+      # NETHER_LIVEKIT_URL: ""                  # auto-derived; override only if needed
+      # NETHER_DISCORD_CAPTURE_WAV: "false"     # debug only — writes unbounded WAV files
 
 volumes:
   voicebridge-data:
