@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use super::jitter::JitterBuffer;
-use super::{mix_mono, SAMPLES_10MS};
+use super::{mix_mono, rms_dbfs, SAMPLES_10MS};
 
 /// Jitter sizing for each inbound (LiveKit → Discord) participant stream.
 ///
@@ -37,6 +37,15 @@ const JITTER_TARGET_MS: u32 = 150;
 const JITTER_MAX_MS: u32 = 500;
 const SAMPLE_RATE: u32 = 48_000;
 
+/// Level (dBFS) above which a pushed frame counts as real speech rather than
+/// silence/comfort-noise. True digital silence is −96 dBFS (the [`rms_dbfs`]
+/// floor); DTX/comfort-noise and faint room tone sit low, while quiet speech is
+/// typically above −45. −50 clears the noise floor without dropping soft speech.
+/// Read by the Discord-side speaking gate (via [`PlaybackMixer::loud_frames`]) to
+/// pause/resume the puppet's track so its Discord "speaking" ring tracks real
+/// audio instead of staying permanently green.
+const SPEAKING_FLOOR_DBFS: f32 = -50.0;
+
 /// A set of per-participant jitter buffers that mix down to one mono stream.
 ///
 /// Shared (via `Arc`) between the LiveKit consumer tasks (producers, one per
@@ -50,6 +59,11 @@ pub struct PlaybackMixer {
     /// i.e. every active stream underran this tick. A mid-speech gap (crackle).
     /// Genuine silence (no participants) is not counted.
     underruns: AtomicU64,
+    /// Monotonic count of pushed frames whose level exceeded [`SPEAKING_FLOOR_DBFS`]
+    /// — i.e. frames carrying real speech. Drives the Discord speaking gate: while
+    /// this stalls (only silence / no frames arriving) the gate pauses the track so
+    /// the puppet stops signalling "speaking" to Discord.
+    loud_frames: AtomicU64,
 }
 
 impl PlaybackMixer {
@@ -57,6 +71,7 @@ impl PlaybackMixer {
         Self {
             buffers: Mutex::new(HashMap::new()),
             underruns: AtomicU64::new(0),
+            loud_frames: AtomicU64::new(0),
         }
     }
 
@@ -64,6 +79,12 @@ impl PlaybackMixer {
     /// Each buffer pre-buffers to the target depth (priming) so the real-time
     /// playback consumer isn't fed silence on every small arrival stall.
     pub fn push(&self, key: &str, mono: &[i16]) {
+        // Voice-activity tally for the speaking gate. Done on the push side (not at
+        // pop) because a paused track stops being read, so the gate can only learn
+        // that audio resumed from frames arriving here.
+        if rms_dbfs(mono) > SPEAKING_FLOOR_DBFS {
+            self.loud_frames.fetch_add(1, Ordering::Relaxed);
+        }
         let mut map = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
         map.entry(key.to_owned())
             .or_insert_with(|| {
@@ -75,6 +96,14 @@ impl PlaybackMixer {
     /// Read and reset the underrun counter (for periodic health logging).
     pub fn take_underruns(&self) -> u64 {
         self.underruns.swap(0, Ordering::Relaxed)
+    }
+
+    /// Monotonic count of pushed frames that carried real speech (above
+    /// [`SPEAKING_FLOOR_DBFS`]). The speaking gate polls this: an advance since the
+    /// last poll means audio is flowing (resume/keep the track playing); a stall
+    /// past the hangover means silence (pause the track → Discord ring clears).
+    pub fn loud_frames(&self) -> u64 {
+        self.loud_frames.load(Ordering::Relaxed)
     }
 
     /// Largest queued depth (samples) across all participant buffers — for
@@ -207,5 +236,49 @@ mod tests {
         m.push("p1", &vec![100i16; PRIME]);
         m.remove("p1");
         assert!(m.pop_10ms_mixed().iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn loud_frames_counts_only_loud_pushes() {
+        let m = PlaybackMixer::new();
+        m.push("p1", &vec![0i16; SAMPLES_10MS]); // digital silence (−96 dBFS)
+        assert_eq!(m.loud_frames(), 0);
+        m.push("p1", &vec![8000i16; SAMPLES_10MS]); // ≈ −12 dBFS, real speech
+        assert_eq!(m.loud_frames(), 1);
+        m.push("p1", &vec![0i16; SAMPLES_10MS]); // silence again — no advance
+        assert_eq!(m.loud_frames(), 1);
+    }
+
+    #[test]
+    fn loud_frames_threshold_boundary() {
+        // A constant-amplitude frame has RMS = 20*log10(a/32767) dBFS. The gate
+        // floor is −50 dBFS → a ≈ 32767*10^(-50/20) ≈ 103. Straddle it.
+        let m = PlaybackMixer::new();
+        m.push("p1", &vec![90i16; SAMPLES_10MS]); // ≈ −51.2 dBFS → below floor
+        assert_eq!(m.loud_frames(), 0, "−51 dBFS must not count");
+        m.push("p1", &vec![120i16; SAMPLES_10MS]); // ≈ −48.7 dBFS → above floor
+        assert_eq!(m.loud_frames(), 1, "−49 dBFS must count");
+    }
+
+    #[test]
+    fn loud_frames_advances_per_push_across_keys() {
+        // Overflow semantics: any loud speaker advances the shared counter, so the
+        // overflow track stays "speaking" while anyone in the mix is talking.
+        let m = PlaybackMixer::new();
+        m.push("a", &vec![8000i16; SAMPLES_10MS]);
+        m.push("b", &vec![8000i16; SAMPLES_10MS]);
+        assert_eq!(m.loud_frames(), 2);
+    }
+
+    #[test]
+    fn loud_frames_independent_of_underruns() {
+        let m = PlaybackMixer::new();
+        // A loud push (below the prime cushion) is withheld → counts as an underrun
+        // on pop, but still tallies as a loud frame on push. The two are orthogonal.
+        m.push("p1", &vec![8000i16; SAMPLES_10MS]);
+        let _ = m.pop_10ms_mixed();
+        assert_eq!(m.loud_frames(), 1);
+        assert_eq!(m.take_underruns(), 1);
+        assert_eq!(m.loud_frames(), 1, "reading underruns must not touch loud_frames");
     }
 }

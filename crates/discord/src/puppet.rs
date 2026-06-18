@@ -32,6 +32,7 @@ use serenity::{async_trait, model::prelude::*, prelude::*};
 use songbird::{
     driver::{DecodeConfig, DecodeMode},
     input::{Input, RawAdapter},
+    tracks::TrackHandle,
     CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler, SerenityInit,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -59,6 +60,17 @@ const QUARANTINE_COOLDOWN: Duration = Duration::from_secs(120);
 /// churn the songbird/SSRC session) but bounded so no nameless bot idles in voice
 /// once the call is genuinely empty of Matrix users.
 const ANCHOR_IDLE_GRACE: Duration = Duration::from_secs(90);
+
+/// Speaking-gate poll cadence. One Discord tick; well under the mixer's 150 ms
+/// jitter prime, so resuming a paused track on speech onset adds at most one tick
+/// of latency and never clips the first phoneme.
+const GATE_POLL: Duration = Duration::from_millis(20);
+
+/// Silence hold-off before the speaking gate pauses a playback track. Debounces
+/// the natural gaps between words so the Discord "speaking" ring doesn't strobe.
+/// songbird appends its own ~100 ms (5-frame) silence tail after the track goes
+/// quiet, so the ring clears ~350 ms after speech actually stops.
+const GATE_HANGOVER: Duration = Duration::from_millis(250);
 
 /// Nickname (before the configured prefix) shown on the overflow-host puppet while
 /// it is carrying more than one Matrix speaker (members beyond the puppet count).
@@ -1827,15 +1839,34 @@ async fn puppet_command_loop(
     mut cmd_rx: mpsc::Receiver<PuppetCommand>,
 ) {
     let mut current: Option<ChannelCtx> = None;
+    // Per-track speaking gates (see `spawn_speaking_gate`). The puppet gate covers
+    // this bot's own dedicated track; the overflow gate covers the channel overflow
+    // mix it plays *while it is the anchor*. Cancelled on Release / re-Assign so each
+    // join spawns exactly one of each and nothing leaks across reuse.
+    let mut puppet_gate: Option<(CancellationToken, tokio::task::JoinHandle<()>)> = None;
+    let mut overflow_gate: Option<(CancellationToken, tokio::task::JoinHandle<()>)> = None;
+    let cancel_gate = |g: &mut Option<(CancellationToken, tokio::task::JoinHandle<()>)>| {
+        if let Some((tok, _jh)) = g.take() {
+            tok.cancel(); // task self-terminates within one GATE_POLL; don't await it
+        }
+    };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             PuppetCommand::Assign { ctx: chan, display_name } => {
                 let chan = *chan;
-                let joined =
+                // A reused bot starts a fresh track; drop any prior gates first. It is
+                // also no longer anchoring whatever it anchored before.
+                cancel_gate(&mut puppet_gate);
+                cancel_gate(&mut overflow_gate);
+                let handle =
                     puppet_join(&chan, idx, &ctx, &mixer, &current_ssrc, &nickname_prefix, &display_name)
                         .await;
+                let bridge = chan.bridge.clone();
                 current = Some(chan);
-                if joined {
+                if let Some(handle) = handle {
+                    let tok = CancellationToken::new();
+                    let jh = spawn_speaking_gate(handle, mixer.clone(), tok.clone(), bridge, "puppet");
+                    puppet_gate = Some((tok, jh));
                     // Activate this bot as anchor iff the allocator elected it.
                     pool.on_join_succeeded(idx);
                 } else {
@@ -1851,7 +1882,19 @@ async fn puppet_command_loop(
             }
             PuppetCommand::BecomeAnchor => {
                 if let Some(chan) = &current {
-                    puppet_become_anchor(chan, idx, &ctx).await;
+                    // Idempotent: drop any prior overflow gate before (re)anchoring.
+                    cancel_gate(&mut overflow_gate);
+                    if let Some(handle) = puppet_become_anchor(chan, idx, &ctx).await {
+                        let tok = CancellationToken::new();
+                        let jh = spawn_speaking_gate(
+                            handle,
+                            chan.overflow_mixer.clone(),
+                            tok.clone(),
+                            chan.bridge.clone(),
+                            "overflow",
+                        );
+                        overflow_gate = Some((tok, jh));
+                    }
                 } else {
                     tracing::warn!(idx, "BecomeAnchor with no current channel");
                 }
@@ -1872,11 +1915,15 @@ async fn puppet_command_loop(
                 }
             }
             PuppetCommand::Release => {
+                cancel_gate(&mut puppet_gate);
+                cancel_gate(&mut overflow_gate);
                 if let Some(chan) = current.take() {
                     puppet_leave(&ctx, idx, &chan, &current_ssrc).await;
                 }
             }
             PuppetCommand::ReleaseAndAck { done } => {
+                cancel_gate(&mut puppet_gate);
+                cancel_gate(&mut overflow_gate);
                 if let Some(chan) = current.take() {
                     puppet_leave(&ctx, idx, &chan, &current_ssrc).await;
                 }
@@ -1890,12 +1937,17 @@ async fn puppet_command_loop(
 /// Register the Discord→Matrix capture handlers + overflow playback on this bot's
 /// voice connection (it has become the anchor), then seed ghosts for members
 /// already present in the channel.
-async fn puppet_become_anchor(channel: &ChannelCtx, idx: usize, ctx: &Context) {
-    let Some(manager) = songbird::get(ctx).await else { return };
+async fn puppet_become_anchor(
+    channel: &ChannelCtx,
+    idx: usize,
+    ctx: &Context,
+) -> Option<TrackHandle> {
+    let manager = songbird::get(ctx).await?;
     let Some(call_lock) = manager.get(channel.guild_id) else {
         tracing::warn!(idx, "anchor command but puppet not in voice yet");
-        return;
+        return None;
     };
+    let overflow_handle;
     {
         let mut call = call_lock.lock().await;
         call.add_global_event(
@@ -1914,7 +1966,7 @@ async fn puppet_become_anchor(channel: &ChannelCtx, idx: usize, ctx: &Context) {
         let overflow_src = PlaybackSource::new(channel.overflow_mixer.clone());
         let overflow_input =
             Input::from(RawAdapter::new(overflow_src, PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS));
-        let _overflow_handle = call.play_input(overflow_input);
+        overflow_handle = call.play_input(overflow_input);
     }
     tracing::info!(idx, bridge = %channel.bridge, "anchor capture active — Discord→Matrix demux from this puppet");
 
@@ -1936,6 +1988,7 @@ async fn puppet_become_anchor(channel: &ChannelCtx, idx: usize, ctx: &Context) {
     for uid in present {
         ensure_ghost(ctx, channel, uid, None).await;
     }
+    Some(overflow_handle)
 }
 
 /// Self-mute/unmute this puppet's voice connection to mirror the Matrix
@@ -1952,6 +2005,53 @@ async fn puppet_set_muted(ctx: &Context, idx: usize, guild_id: GuildId, muted: b
     }
 }
 
+/// Drive a playback track's Discord "speaking" ring from real audio activity.
+///
+/// songbird marks a track "speaking" whenever it yields a full frame, and our
+/// [`PlaybackSource`] always yields one (silence on underrun, never EOF — EOF would
+/// end the track permanently), so the ring would stay green forever. This task
+/// **pauses** the track after [`GATE_HANGOVER`] with no loud frames (songbird then
+/// stops signalling "speaking" → the ring clears) and **resumes** it the moment
+/// audio returns. Activity is observed on the push side via
+/// [`PlaybackMixer::loud_frames`], because a paused track is no longer read.
+///
+/// `play`/`pause` errors are ignored: after a leave the track is gone and the next
+/// `cancel` wins. The task exits within one [`GATE_POLL`] of cancellation.
+fn spawn_speaking_gate(
+    handle: TrackHandle,
+    mixer: Arc<PlaybackMixer>,
+    cancel: CancellationToken,
+    bridge: Arc<str>,
+    label: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last_loud = mixer.loud_frames();
+        let mut last_active = tokio::time::Instant::now();
+        let mut playing = true; // a freshly `play_input`'d track starts Playing
+        let mut ticker = tokio::time::interval(GATE_POLL);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = ticker.tick() => {
+                    let now = mixer.loud_frames();
+                    if now != last_loud {
+                        last_loud = now;
+                        last_active = tokio::time::Instant::now();
+                        if !playing {
+                            let _ = handle.play();
+                            playing = true;
+                        }
+                    } else if playing && last_active.elapsed() >= GATE_HANGOVER {
+                        let _ = handle.pause();
+                        playing = false;
+                    }
+                }
+            }
+        }
+        tracing::debug!(bridge = %bridge, label, "speaking gate stopped");
+    })
+}
+
 /// Returns `true` if the bot actually joined the voice channel. `false` on a join
 /// failure (e.g. the gateway timed out after a channel hop) — the caller fails the
 /// participant over to another pool bot.
@@ -1963,10 +2063,10 @@ async fn puppet_join(
     current_ssrc: &Arc<StdMutex<Option<u32>>>,
     nickname_prefix: &str,
     display_name: &str,
-) -> bool {
+) -> Option<TrackHandle> {
     let Some(manager) = songbird::get(ctx).await else {
         tracing::error!(idx, "songbird not registered on puppet client");
-        return false;
+        return None;
     };
 
     // Register handlers and start playback on the Call *before* connecting: two
@@ -1974,6 +2074,7 @@ async fn puppet_join(
     // attached after the await — `DriverConnect` (our own SSRC, echo-exclusion)
     // and `SpeakingStateUpdate` (others' SSRC→user; emitted around connect).
     let call_lock = manager.get_or_insert(channel.guild_id);
+    let handle: Option<TrackHandle>;
     {
         let mut call = call_lock.lock().await;
         call.add_global_event(
@@ -2001,7 +2102,7 @@ async fn puppet_join(
         }
         let source = PlaybackSource::new(mixer.clone());
         let input = Input::from(RawAdapter::new(source, PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS));
-        let _handle = call.play_input(input);
+        handle = Some(call.play_input(input));
     }
 
     if let Err(e) = manager.join(channel.guild_id, channel.channel_id).await {
@@ -2009,7 +2110,7 @@ async fn puppet_join(
         // Reset the (possibly half-open) Call so a later reuse of this bot starts
         // clean once it recovers from quarantine.
         let _ = manager.remove(channel.guild_id).await;
-        return false;
+        return None;
     }
 
     let nick = build_nickname(nickname_prefix, display_name);
@@ -2017,7 +2118,7 @@ async fn puppet_join(
         tracing::warn!(idx, error = %e, "failed to set puppet nickname");
     }
     tracing::info!(idx, bridge = %channel.bridge, display_name, "puppet joined voice and assigned");
-    true
+    handle
 }
 
 async fn puppet_leave(
