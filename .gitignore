@@ -1,5 +1,8 @@
 /target/
 
+# Built .deb/.rpm packages (packaging/build-packages.sh output).
+/dist/
+
 # Real secrets — never commit. Only config.example.toml (placeholders) is tracked.
 config.toml
 config.local.toml

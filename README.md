@@ -9,9 +9,19 @@ showing up as their own named participant on the far side.
 A single Rust binary on a tokio runtime; one process can bridge many
 channel↔room pairs at once.
 
-<!-- TODO: add screenshots — e.g. a Matrix call roster showing Discord users as
-     ghosts, and a Discord voice channel showing Matrix users as named puppet
-     bots. -->
+> [!WARNING]
+> **Heavy active development — pre-1.0.** This project is **vibe-coded** and has
+> **not yet had a human code review**. It works in day-to-day use on the author's
+> homeserver, but expect rough edges, breaking changes, and bugs. Run it at your
+> own risk, and please report what breaks. Come say hi / get help in the Matrix
+> room: [`#nether-voicebridge:nether.im`](https://matrix.to/#/%23nether-voicebridge:nether.im).
+
+## Screenshots
+
+<!-- screenshots TODO: e.g. a Matrix call roster showing Discord users as ghosts,
+     and a Discord voice channel showing Matrix users as named puppet bots. -->
+
+_Coming soon._
 
 ## What it does
 
@@ -51,6 +61,7 @@ The full design and the phased build history live in:
 - [`docs/nether-voicebridge-architecture.md`](docs/nether-voicebridge-architecture.md) — architecture & rationale
 - [`docs/nether-voicebridge-build-plan.md`](docs/nether-voicebridge-build-plan.md) — phase-by-phase build plan
 - [`docs/docker-usage.md`](docs/docker-usage.md) — running under Docker + CI notes
+- [`docs/packaging.md`](docs/packaging.md) — `.deb`/`.rpm` packages + systemd service
 
 ## Requirements
 
@@ -120,6 +131,38 @@ under `/app/data` so no `store_path` config is needed. See
 [`docs/docker-usage.md`](docs/docker-usage.md) for the full guide, multi-arch
 builds, and CI/runner notes.
 
+## Install (Debian/Ubuntu & Fedora/RHEL)
+
+Pre-built `.deb` and `.rpm` packages are attached to each
+[release](https://nether.codes/dark/nether-voicebridge/releases). They install the
+binary to `/usr/bin`, a systemd unit, and an example config, and create a dedicated
+`nether-voicebridge` system user.
+
+```bash
+# Debian / Ubuntu
+sudo apt install ./nether-voicebridge_<version>_amd64.deb
+# Fedora / RHEL
+sudo dnf install ./nether-voicebridge-<version>-1.x86_64.rpm
+```
+
+Then configure and start it:
+
+```bash
+# Create the live config from the shipped example and fill in your tokens/IDs.
+sudo cp /etc/nether-voicebridge/config.example.toml /etc/nether-voicebridge/config.toml
+sudo chown root:nether-voicebridge /etc/nether-voicebridge/config.toml
+sudo chmod 640 /etc/nether-voicebridge/config.toml   # holds bot/appservice secrets
+sudoedit /etc/nether-voicebridge/config.toml
+
+sudo systemctl enable --now nether-voicebridge
+journalctl -u nether-voicebridge -f
+```
+
+The service reads `/etc/nether-voicebridge/config.toml` and stores matrix-sdk data
+(Olm crypto + state) under `/var/lib/nether-voicebridge`. See
+[`docs/packaging.md`](docs/packaging.md) for the package layout and how to build
+the packages yourself (`packaging/build-packages.sh`).
+
 ## Configuration notes
 
 - **`store_path` is optional** — omitted, it auto-derives to
@@ -135,10 +178,13 @@ builds, and CI/runner notes.
 
 ## Community & contributing
 
+- **Development & support room:**
+  [`#nether-voicebridge:nether.im`](https://matrix.to/#/%23nether-voicebridge:nether.im)
+  — questions, help, and where the work happens.
 - Issues and roadmap: the project's Forgejo repo at
   [nether.codes/dark/nether-voicebridge](https://nether.codes/dark/nether-voicebridge).
-- <!-- TODO: add the Matrix room/space link for the project community. -->
 
 ## License
 
-<!-- TODO: choose and add a license (add a LICENSE file and state it here). -->
+Licensed under the **GNU Affero General Public License v3.0 or later**
+(AGPL-3.0-or-later). See [`LICENSE`](LICENSE) for the full text.

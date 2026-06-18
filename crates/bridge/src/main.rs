@@ -165,12 +165,12 @@ async fn main() -> Result<()> {
         _ = &mut drain => {
             tracing::warn!("all bridges have exited");
         }
-        // Operator shutdown.
-        sig = tokio::signal::ctrl_c() => {
-            if let Err(e) = sig {
-                tracing::warn!(error = %e, "ctrl_c signal handler failed");
-            }
-            tracing::info!("shutting down — cancelling bridges and draining to baseline");
+        // Operator shutdown. Race SIGINT (Ctrl-C) *and* SIGTERM so the graceful
+        // drain runs no matter how we're stopped: `systemctl stop` and `docker
+        // stop` both send SIGTERM, and without this they'd skip teardown and leave
+        // puppets in voice / stale ghost `m.call.member` behind on every restart.
+        signal = shutdown_signal() => {
+            tracing::info!(via = signal, "shutting down — cancelling bridges and draining to baseline");
             for root in &bridge_roots {
                 root.cancel();
             }
@@ -194,4 +194,34 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve once either SIGINT (Ctrl-C, interactive) or SIGTERM (the default
+/// `systemctl stop` / `docker stop` signal) arrives, returning which one fired.
+/// Both must trigger the same graceful drain — see the shutdown `select!` above.
+async fn shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    // If SIGTERM can't be hooked (extremely unlikely on a Unix daemon), fall back
+    // to SIGINT-only rather than aborting startup.
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not install SIGTERM handler — Ctrl-C only");
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::warn!(error = %e, "ctrl_c signal handler failed");
+            }
+            return "SIGINT";
+        }
+    };
+
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => {
+            if let Err(e) = r {
+                tracing::warn!(error = %e, "ctrl_c signal handler failed");
+            }
+            "SIGINT"
+        }
+        _ = sigterm.recv() => "SIGTERM",
+    }
 }

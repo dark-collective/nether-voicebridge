@@ -1,0 +1,83 @@
+name: Release Packages
+
+# Builds the .deb and .rpm and attaches them to the Forgejo Release for the tag.
+# Runs alongside docker.yml (which builds the image) on the same `v*` tag push.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  packages:
+    runs-on: docker
+    # Same toolchain base as the Dockerfile builder stage.
+    container:
+      image: rust:1-bookworm
+    steps:
+      - name: Install build + packaging dependencies
+        run: |
+          apt-get update
+          # Native build deps (mirror the Dockerfile): livekit needs cmake/clang/
+          # protobuf, songbird/opus needs libopus-dev, plus pkg-config + openssl
+          # headers for transitive crates.
+          apt-get install -y --no-install-recommends \
+            build-essential cmake clang libclang-dev libopus-dev \
+            pkg-config protobuf-compiler libssl-dev ca-certificates curl
+          # nfpm (pinned), installed as a static binary.
+          NFPM_VERSION=2.46.3
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | tar -xz -C /usr/local/bin nfpm
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        id: vars
+        run: |
+          # v0.2.0 -> 0.2.0
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        run: cargo build --release --locked -p nether-voicebridge
+
+      - name: Build .deb and .rpm
+        env:
+          NVB_VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          mkdir -p dist
+          nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+          nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+          ls -l dist/
+
+      # Create (or reuse) the Release for this tag, then upload both packages.
+      # RELEASE_TOKEN must be a Forgejo token with `write:repository` scope on this
+      # repo (the Docker job's REGISTRY_TOKEN is package-scoped and won't work here).
+      - name: Publish packages to the Forgejo Release
+        env:
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          auth="Authorization: token ${TOKEN}"
+
+          # Look up an existing release for the tag; create one if absent.
+          rel_id=$(curl -fsSL -H "$auth" "${API}/releases/tags/${TAG}" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' || true)
+          if [ -z "$rel_id" ]; then
+            rel_id=$(curl -fsSL -X POST -H "$auth" -H 'Content-Type: application/json' \
+              -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"draft\":false,\"prerelease\":false}" \
+              "${API}/releases" \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+          fi
+          echo "release id: $rel_id"
+
+          for f in dist/*.deb dist/*.rpm; do
+            name=$(basename "$f")
+            echo "uploading $name"
+            curl -fsSL -X POST -H "$auth" \
+              -F "attachment=@${f}" \
+              "${API}/releases/${rel_id}/assets?name=${name}" >/dev/null
+          done

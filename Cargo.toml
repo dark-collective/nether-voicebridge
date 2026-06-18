@@ -8,6 +8,17 @@ members = [
     "crates/bridge",
 ]
 
+# Shared package metadata. Every crate inherits these with `<field>.workspace =
+# true`, so a release version bump is a single edit here. License is AGPL-3.0
+# (matches the Matrix bridge ecosystem — mautrix, Synapse, Element); all
+# dependencies (Apache-2.0 / MIT / ISC) are compatible.
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+repository = "https://nether.codes/dark/nether-voicebridge"
+homepage = "https://nether.codes/dark/nether-voicebridge"
+
 # Strip symbols from release builds. The binary statically links libwebrtc and is
 # huge with symbols (the debug build is ~900 MB); stripping cuts it several-fold so
 # the Docker image layer fits under the registry's upload limit (Cloudflare's ~100 MB

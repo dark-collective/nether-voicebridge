@@ -1,0 +1,45 @@
+[Unit]
+Description=Nether Voice Bridge (Discord <-> Matrix voice bridge)
+Documentation=https://nether.codes/dark/nether-voicebridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nether-voicebridge
+Group=nether-voicebridge
+
+# The binary reads CONFIG_PATH (falling back to ./config.toml) and uses
+# NVB_DATA_DIR as the base for each bridge's auto-derived matrix-sdk store.
+Environment=CONFIG_PATH=/etc/nether-voicebridge/config.toml
+Environment=NVB_DATA_DIR=/var/lib/nether-voicebridge
+WorkingDirectory=/var/lib/nether-voicebridge
+ExecStart=/usr/bin/nether-voicebridge
+
+# systemd creates and chowns /var/lib/nether-voicebridge to the service user on
+# start (mode 0750), so the matrix-sdk SQLite stores survive restarts.
+StateDirectory=nether-voicebridge
+StateDirectoryMode=0750
+
+# The bridge drains gracefully on SIGINT *and* SIGTERM, but send SIGINT on stop
+# anyway (it is the path most exercised) and give it room to leave voice / retract
+# ghost m.call.member before systemd escalates to SIGKILL. TimeoutStopSec must
+# exceed the binary's internal 10 s teardown timeout.
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening. The service only needs to read /etc config and write its state dir.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ReadWritePaths=/var/lib/nether-voicebridge
+
+[Install]
+WantedBy=multi-user.target

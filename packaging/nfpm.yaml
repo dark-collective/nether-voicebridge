@@ -1,0 +1,58 @@
+# nfpm config — produces both .deb and .rpm from one spec.
+#   https://nfpm.goreleaser.com/
+#
+# Run from the REPOSITORY ROOT (all `src` / script paths are root-relative):
+#   NVB_VERSION=0.2.0 nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+#   NVB_VERSION=0.2.0 nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+# or just run packaging/build-packages.sh, which builds the binary first.
+name: nether-voicebridge
+arch: amd64
+platform: linux
+version: ${NVB_VERSION}
+section: net
+priority: optional
+maintainer: "Robocub <robocub@nether.codes>"
+description: |
+  Bidirectional voice bridge between Discord and Matrix (Element Call).
+  Matrix speakers appear on Discord as individually-controllable puppet bots
+  drawn from a shared pool; Discord speakers appear in the Element Call as
+  appservice ghosts. Single Rust binary; supports per-room media E2EE.
+vendor: "Nether"
+homepage: https://nether.codes/dark/nether-voicebridge
+license: AGPL-3.0-or-later
+
+contents:
+  - src: target/release/nether-voicebridge
+    dst: /usr/bin/nether-voicebridge
+    file_info:
+      mode: 0755
+
+  - src: packaging/nether-voicebridge.service
+    dst: /usr/lib/systemd/system/nether-voicebridge.service
+    file_info:
+      mode: 0644
+
+  # Shipped as an example, not config.toml — the admin copies + fills it in.
+  # `noreplace` so a packaged-example refresh on upgrade never clobbers edits.
+  - src: config.example.toml
+    dst: /etc/nether-voicebridge/config.example.toml
+    type: "config|noreplace"
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: packaging/scripts/postinstall.sh
+  preremove: packaging/scripts/preremove.sh
+  postremove: packaging/scripts/postremove.sh
+
+# libopus is linked dynamically (libopus0 on Debian, opus on Fedora/RHEL);
+# ca-certificates is needed for TLS to the homeserver / Discord.
+overrides:
+  deb:
+    depends:
+      - libopus0
+      - ca-certificates
+  rpm:
+    depends:
+      - opus
+      - ca-certificates
