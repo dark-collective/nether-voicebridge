@@ -1722,9 +1722,9 @@ async fn ensure_ghost(ctx: &Context, channel: &ChannelCtx, user_id: u64, member:
     }
 
     let (name, avatar_url) = match member {
-        Some(m) => (member_display_name(m), m.user.avatar_url()),
+        Some(m) => (member_display_name(m), member_avatar_url(m)),
         None => match channel.guild_id.member(&ctx.http, UserId::new(user_id)).await {
-            Ok(m) => (member_display_name(&m), m.user.avatar_url()),
+            Ok(m) => (member_display_name(&m), member_avatar_url(&m)),
             Err(e) => {
                 tracing::debug!(user_id, error = %e, "member lookup failed; using id as name");
                 (user_id.to_string(), None)
@@ -1804,6 +1804,14 @@ fn member_display_name(m: &Member) -> String {
         .clone()
         .or_else(|| m.user.global_name.clone())
         .unwrap_or_else(|| m.user.name.clone())
+}
+
+/// Resolve a Discord member's avatar URL: per-guild (server) avatar → global
+/// avatar → None. Uses `Member::avatar_url()` (guild avatar; None if unset),
+/// NOT `Member::face()` — `face()` falls back to Discord's default silhouette,
+/// which we don't want mirrored onto the ghost.
+fn member_avatar_url(m: &Member) -> Option<String> {
+    m.avatar_url().or_else(|| m.user.avatar_url())
 }
 
 /// Drain commands for one puppet, driving its voice connection. The loop is
