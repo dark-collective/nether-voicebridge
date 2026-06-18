@@ -2038,12 +2038,19 @@ fn spawn_speaking_gate(
                         last_loud = now;
                         last_active = tokio::time::Instant::now();
                         if !playing {
+                            // Frames arrive continuously (no DTX), so the buffer
+                            // filled to its cap while paused — drop that stale
+                            // backlog and re-prime from live audio, else playback
+                            // runs pinned at JITTER_MAX (drop-oldest → choppy).
+                            mixer.clear();
                             let _ = handle.play();
                             playing = true;
+                            tracing::debug!(bridge = %bridge, label, "speaking gate: resume (audio)");
                         }
                     } else if playing && last_active.elapsed() >= GATE_HANGOVER {
                         let _ = handle.pause();
                         playing = false;
+                        tracing::debug!(bridge = %bridge, label, "speaking gate: pause (silence)");
                     }
                 }
             }
