@@ -23,7 +23,7 @@
 //! hears every speaker including the puppets' own playback — never re-captures it.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -50,9 +50,14 @@ use crate::{
 /// Sentinel for "no anchor currently elected" in [`ChannelState::anchor`].
 const NO_ANCHOR: usize = usize::MAX;
 
-/// How long a bot stays quarantined (skipped by the allocator) after its
-/// `manager.join` timed out, before a recovery timer makes it eligible again.
-const QUARANTINE_COOLDOWN: Duration = Duration::from_secs(120);
+/// Quarantine backoff after a bot's `manager.join` times out (skipped by the
+/// allocator until a recovery timer makes it eligible again). The cooldown grows
+/// exponentially per consecutive failure — `QUARANTINE_BASE * 2^n`, capped at
+/// `QUARANTINE_MAX` — so a transient hop-glitch heals fast while a genuinely
+/// wedged gateway backs off instead of thrashing rejoin attempts. The counter
+/// (`PuppetSlot::fail_count`) resets on a successful join.
+const QUARANTINE_BASE: Duration = Duration::from_secs(15);
+const QUARANTINE_MAX: Duration = Duration::from_secs(120);
 
 /// How long a capture-only anchor (one held in voice with no Matrix participant of
 /// its own, only Discord speakers remaining) lingers before it leaves the Discord
@@ -190,8 +195,12 @@ struct PuppetSlot {
     /// Set true when this bot's `manager.join` timed out (a stuck voice gateway —
     /// seen after hopping channels in one guild). The allocator skips an unhealthy
     /// bot so failover picks a different one; a recovery timer clears it after
-    /// `QUARANTINE_COOLDOWN` so the bot becomes eligible again.
+    /// the backoff cooldown so the bot becomes eligible again.
     unhealthy: Arc<AtomicBool>,
+    /// Consecutive `manager.join` failures with no intervening success. Drives the
+    /// exponential quarantine backoff (`QUARANTINE_BASE * 2^n`, capped at
+    /// `QUARANTINE_MAX`); reset to 0 on a successful join.
+    fail_count: Arc<AtomicU32>,
 }
 
 /// A swappable audio route: the mixer a participant's frames currently flow into.
@@ -292,6 +301,7 @@ impl SharedPool {
                     guilds: RwLock::new(HashSet::new()),
                     connected: Arc::new(AtomicBool::new(false)),
                     unhealthy: Arc::new(AtomicBool::new(false)),
+                    fail_count: Arc::new(AtomicU32::new(0)),
                 }
             })
             .collect();
@@ -1052,9 +1062,11 @@ impl SharedPool {
             if serves && ch.anchor.load(Ordering::Relaxed) == idx {
                 let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::BecomeAnchor);
                 tracing::info!(bridge = %ch.bridge, idx, "puppet joined — activating capture anchor");
-                return;
+                break;
             }
         }
+        // A successful join proves the bot healthy → reset its quarantine backoff.
+        self.slots[idx].fail_count.store(0, Ordering::Relaxed);
     }
 
     /// Called by a puppet's command loop after `manager.join` FAILS (e.g. the voice
@@ -1064,12 +1076,19 @@ impl SharedPool {
     /// with no re-subscribe, and re-electing the anchor if the failed bot was it.
     /// If no healthy bot is free, the participant drops to overflow and the channel
     /// degrades to no-anchor with a loud error — an honest state, not a silent
-    /// fake-live anchor. The caller schedules a recovery timer (`recover_bot`).
-    fn on_join_failed(&self, idx: usize) {
+    /// fake-live anchor. Returns the quarantine backoff the caller should wait
+    /// before scheduling a recovery (`recover_bot`).
+    fn on_join_failed(&self, idx: usize) -> Duration {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
 
-        // Quarantine the stuck bot regardless (cleared after QUARANTINE_COOLDOWN).
+        // Quarantine the stuck bot regardless (cleared after the backoff cooldown).
         self.slots[idx].unhealthy.store(true, Ordering::Relaxed);
+        // Exponential backoff: QUARANTINE_BASE * 2^n, capped at QUARANTINE_MAX.
+        // `n` = prior consecutive failures; clamp the shift so it can't overflow.
+        let n = self.slots[idx].fail_count.fetch_add(1, Ordering::Relaxed);
+        let backoff = QUARANTINE_BASE
+            .saturating_mul(1u32 << n.min(6))
+            .min(QUARANTINE_MAX);
 
         // Locate the (bridge, key) this bot was serving.
         let found = guard.channels.iter().find_map(|(bk, ch)| {
@@ -1084,7 +1103,7 @@ impl SharedPool {
             self.slots[idx].busy.store(false, Ordering::Relaxed);
             *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
             tracing::warn!(idx, "puppet join failed; assignment already gone — quarantined");
-            return;
+            return backoff;
         };
 
         let display_name = self.slots[idx]
@@ -1164,9 +1183,10 @@ impl SharedPool {
                  (capture anchor down / audio via overflow until a bot recovers)"
             );
         }
+        backoff
     }
 
-    /// Clear a bot's join-timeout quarantine (after `QUARANTINE_COOLDOWN`) and try
+    /// Clear a bot's join-timeout quarantine (after the backoff cooldown) and try
     /// to activate any channel left without an anchor while it was unavailable.
     fn recover_bot(&self, idx: usize) {
         self.slots[idx].unhealthy.store(false, Ordering::Relaxed);
@@ -1871,11 +1891,11 @@ async fn puppet_command_loop(
                     pool.on_join_succeeded(idx);
                 } else {
                     // Quarantine this bot + fail the participant over to another,
-                    // then schedule the bot's recovery after the cooldown.
-                    pool.on_join_failed(idx);
+                    // then schedule the bot's recovery after the (backoff) cooldown.
+                    let backoff = pool.on_join_failed(idx);
                     let pool = pool.clone();
                     tokio::spawn(async move {
-                        tokio::time::sleep(QUARANTINE_COOLDOWN).await;
+                        tokio::time::sleep(backoff).await;
                         pool.recover_bot(idx);
                     });
                 }
@@ -2407,6 +2427,23 @@ mod tests {
         assert!(!p.test_is_unhealthy(sa));
         assert_eq!(p.test_anchor("A"), Some(sa), "re-anchored after recovery");
         assert_eq!(p.test_slot_of("A", "alice"), Some(sa));
+    }
+
+    #[test]
+    fn quarantine_backoff_grows_then_resets() {
+        let p = pool(1);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        let sa = p.test_slot_of("A", "alice").unwrap();
+        // Consecutive failures back off exponentially, capped at QUARANTINE_MAX.
+        assert_eq!(p.on_join_failed(sa), Duration::from_secs(15));
+        assert_eq!(p.on_join_failed(sa), Duration::from_secs(30));
+        assert_eq!(p.on_join_failed(sa), Duration::from_secs(60));
+        assert_eq!(p.on_join_failed(sa), Duration::from_secs(120));
+        assert_eq!(p.on_join_failed(sa), Duration::from_secs(120), "cap holds");
+        // A successful join proves the bot healthy → backoff resets to base.
+        p.on_join_succeeded(sa);
+        assert_eq!(p.on_join_failed(sa), Duration::from_secs(15), "reset after success");
     }
 
     #[test]
