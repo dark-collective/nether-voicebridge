@@ -24,14 +24,21 @@ jobs:
           # headers for transitive crates.
           apt-get install -y --no-install-recommends \
             build-essential cmake clang libclang-dev libopus-dev \
-            pkg-config protobuf-compiler libssl-dev ca-certificates curl
+            pkg-config protobuf-compiler libssl-dev ca-certificates curl git
           # nfpm (pinned), installed as a static binary.
           NFPM_VERSION=2.46.3
           curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
             | tar -xz -C /usr/local/bin nfpm
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      # Plain git clone instead of actions/checkout@v4: that action is a Node.js
+      # action, but this job runs in `container: rust:1-bookworm`, which has no
+      # Node — so the JS action can't exec ("node: not found") and the job died at
+      # checkout. With no JS actions in the job, the Node-less container is fine.
+      # Repo is public, so no auth is needed; --branch accepts the tag ref.
+      - name: Checkout (plain git — avoids Node-in-container requirement)
+        run: |
+          git clone --depth 1 --branch "${GITHUB_REF_NAME}" \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
 
       - name: Derive version from tag
         id: vars
