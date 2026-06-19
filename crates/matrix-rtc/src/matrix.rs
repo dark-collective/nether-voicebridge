@@ -334,6 +334,59 @@ pub(crate) fn resolve_store_device_id(store_path: &str, configured: &str) -> Str
     resolved
 }
 
+/// Resolve a per-store random salt that makes every appservice ghost's otherwise
+/// deterministic device id (`D{key}` → `D{key}-{salt}`) unique to THIS crypto store.
+///
+/// Background: ghosts mint their device id from the Discord-side key alone, so `D{key}`
+/// is byte-identical on every machine. Each store mints its own Olm signing keys, so a
+/// second store presenting the same `D{key}` with different keys trips a peer's
+/// `SigningKeyChanged` and breaks Olm — the #30 trap, here extended from the bot
+/// (`resolve_store_device_id`) to the ghosts.
+///
+/// - empty `store_path` → return `""`; the caller falls back to bare `D{key}` (no store,
+///   so no persistence and no E2EE — nothing to collide).
+/// - marker `<store_path>/ghost_device_salt` present & non-empty → reuse (warm restart →
+///   stable ghost ids → the persistent ghost crypto stores keep matching, no re-key).
+/// - otherwise → mint a fresh salt and persist it.
+///
+/// Unlike `resolve_store_device_id` there is deliberately **no** "adopt for a pre-existing
+/// store" branch: a warm store with no salt marker is a pre-fix store whose `D{key}` ids
+/// are poisoned, so we *want* fresh ghost identities (the new salted ids open fresh ghost
+/// crypto stores; see `build_ghost_crypto_client`).
+pub(crate) fn resolve_ghost_device_salt(store_path: &str) -> String {
+    if store_path.is_empty() {
+        return String::new();
+    }
+    let dir = std::path::Path::new(store_path);
+    let marker = dir.join("ghost_device_salt");
+
+    if let Ok(s) = std::fs::read_to_string(&marker) {
+        let s = s.trim();
+        if !s.is_empty() {
+            tracing::info!(salt = %s, "ghost device identity: reusing persisted ghost_device_salt from store");
+            return s.to_owned();
+        }
+    }
+
+    use rand::Rng as _;
+    let mut rng = rand::thread_rng();
+    let salt: String = (0..8)
+        .map(|_| {
+            let n: u8 = rng.gen_range(0..36);
+            if n < 10 { (b'0' + n) as char } else { (b'a' + n - 10) as char }
+        })
+        .collect();
+    tracing::info!(salt = %salt, "ghost device identity: minted fresh ghost_device_salt for store");
+
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %e, path = %dir.display(), "could not create store dir for ghost_device_salt marker");
+    }
+    if let Err(e) = std::fs::write(&marker, &salt) {
+        tracing::warn!(error = %e, path = %marker.display(), "failed to persist ghost_device_salt marker (will re-resolve next start)");
+    }
+    salt
+}
+
 /// Build and authenticate a Matrix client from config. Joins the target room,
 /// runs one sync round to populate the local state store, and returns the
 /// ready client.
@@ -976,7 +1029,7 @@ pub(crate) async fn reap_stale_memberships(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_store_device_id;
+    use super::{resolve_ghost_device_salt, resolve_store_device_id};
     use std::fs;
     use std::path::PathBuf;
 
@@ -1036,6 +1089,45 @@ mod tests {
     fn empty_store_path_returns_configured() {
         // Defensive: no store path → just the configured id, no filesystem writes.
         assert_eq!(resolve_store_device_id("", "dark-voice"), "dark-voice");
+    }
+
+    #[test]
+    fn fresh_store_mints_ghost_salt() {
+        let tmp = TmpDir::new();
+        let salt = resolve_ghost_device_salt(tmp.path());
+        assert_eq!(salt.len(), 8, "expected an 8-char salt, got {salt:?}");
+        assert!(
+            salt.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "expected lowercase-alnum salt, got {salt:?}"
+        );
+        let marker = fs::read_to_string(tmp.0.join("ghost_device_salt")).unwrap();
+        assert_eq!(marker.trim(), salt);
+    }
+
+    #[test]
+    fn ghost_salt_reused_across_calls() {
+        let tmp = TmpDir::new();
+        let a = resolve_ghost_device_salt(tmp.path());
+        let b = resolve_ghost_device_salt(tmp.path());
+        assert_eq!(a, b, "warm restart must reuse the persisted salt");
+    }
+
+    #[test]
+    fn ghost_salt_independent_of_crypto_db() {
+        let tmp = TmpDir::new();
+        // A pre-fix warm store (crypto db present, no salt marker) must still MINT a fresh
+        // salt — the pre-fix ghost ids are poisoned and we want new identities. (Contrast
+        // `pre_existing_store_adopts_configured_id`, which is the opposite for the bot.)
+        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"").unwrap();
+        let salt = resolve_ghost_device_salt(tmp.path());
+        assert_eq!(salt.len(), 8, "must mint despite an existing crypto db, got {salt:?}");
+        let marker = fs::read_to_string(tmp.0.join("ghost_device_salt")).unwrap();
+        assert_eq!(marker.trim(), salt);
+    }
+
+    #[test]
+    fn empty_store_path_returns_empty_ghost_salt() {
+        assert_eq!(resolve_ghost_device_salt(""), "");
     }
 
     // ── Stale-membership reaper (classify_stale_memberships) ───────────────────

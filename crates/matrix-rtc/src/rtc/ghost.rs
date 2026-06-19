@@ -241,9 +241,14 @@ struct GhostConfig {
     key_transport: KeyTransportMode,
     /// Base directory of the bridge's matrix-sdk store (`matrix.store_path`). Each
     /// Olm-transport ghost nests its own persistent crypto store under
-    /// `<store_path>/ghosts/<localpart>` so Olm sessions + uploaded keys survive
+    /// `<store_path>/ghosts/<device_id>` so Olm sessions + uploaded keys survive
     /// rejoins (no OTK re-upload churn).
     store_path: String,
+    /// Per-store salt (resolved once via [`crate::matrix::resolve_ghost_device_salt`])
+    /// folded into every ghost device id as `D{key}-{salt}`, making the otherwise
+    /// machine-deterministic `D{key}` unique to this crypto store (the #30 fix,
+    /// extended to ghosts). Empty ⇒ no store ⇒ ghosts fall back to bare `D{key}`.
+    ghost_device_salt: String,
     /// Optional config overrides, mirroring the subscriber path. `None` ⇒ derive
     /// the lk-jwt endpoint from the focus and the SFU ws URL from the lk-jwt
     /// response. Set only to override (non-Nether deploy / no `rtc_foci`).
@@ -291,6 +296,9 @@ impl GhostPool {
                 media_e2ee: false,
                 key_transport: KeyTransportMode::Plaintext,
                 store_path: matrix_cfg.store_path.clone(),
+                // Resolve once here (not per-ghost) so concurrent ghost spawns never race
+                // on the marker file; rides on `cfg`, cloned per assign.
+                ghost_device_salt: crate::matrix::resolve_ghost_device_salt(&matrix_cfg.store_path),
                 lk_jwt_url: livekit_cfg.lk_jwt_url.clone(),
                 lk_url: livekit_cfg.url.clone(),
                 capture_wav,
@@ -592,6 +600,20 @@ impl CaptureRouter for GhostPool {
     }
 }
 
+/// Build a ghost's Matrix device id from its key and the per-store salt.
+///
+/// `D{key}` alone is identical on every machine; folding in the per-store salt
+/// (`D{key}-{salt}`) makes it unique to this crypto store so peers never see one
+/// device id carrying two different signing keys. An empty salt (no store) yields
+/// the bare `D{key}` — unchanged legacy behavior.
+fn ghost_device_id(key: &str, salt: &str) -> String {
+    if salt.is_empty() {
+        format!("D{key}")
+    } else {
+        format!("D{key}-{salt}")
+    }
+}
+
 /// One ghost's full lifecycle: register/join/connect/publish, post call
 /// membership, then publish the speaker's audio until cancelled, retracting
 /// membership and disconnecting on the way out.
@@ -612,8 +634,10 @@ async fn run_ghost(
     let ghost_mxid = format!("@{GHOST_LOCALPART_PREFIX}{key}:{}", cfg.server_name);
     let localpart = format!("{GHOST_LOCALPART_PREFIX}{key}");
     // Stable per-ghost device id; must agree between the lk-jwt identity and the
-    // m.call.member content so EC maps the ghost's media to its membership.
-    let device_id = format!("D{key}");
+    // m.call.member content so EC maps the ghost's media to its membership. The
+    // per-store salt makes the otherwise machine-deterministic id unique to this
+    // crypto store (no cross-store SigningKeyChanged — the #30 fix for ghosts).
+    let device_id = ghost_device_id(&key, &cfg.ghost_device_salt);
 
     let span = tracing::info_span!("ghost", mxid = %ghost_mxid);
     async {
@@ -1156,7 +1180,7 @@ async fn bootstrap_olm_transport(
 
 /// Make a ghost a crypto-capable client: appservice-login it (asserting its stable
 /// `device_id`), open a persistent SQLite crypto store under
-/// `<store_path>/ghosts/<localpart>`, restore the session, sync once to upload its
+/// `<store_path>/ghosts/<device_id>`, restore the session, sync once to upload its
 /// device keys + one-time keys, and spawn a background sync (cancelled with the
 /// ghost) so its device lists stay fresh for `encrypt_and_send_raw_to_device`.
 /// Mirrors the bridge bot's `build_client`; we add no crypto of our own. The store
@@ -1168,7 +1192,10 @@ async fn build_ghost_crypto_client(
     device_id: &str,
     cancel: &CancellationToken,
 ) -> Result<Client> {
-    let store_dir = format!("{}/ghosts/{}", cfg.store_path.trim_end_matches('/'), localpart);
+    // Key the crypto store by device_id (not localpart): a new per-store salt yields a
+    // new device id → a fresh store dir → fresh signing keys/OTKs, self-migrating off the
+    // poisoned pre-fix `D{key}` identity. device_id is a safe path segment (`D`+digits[+`-`+alnum]).
+    let store_dir = format!("{}/ghosts/{}", cfg.store_path.trim_end_matches('/'), device_id);
     tokio::fs::create_dir_all(&store_dir)
         .await
         .with_context(|| format!("creating ghost crypto store dir '{store_dir}'"))?;
@@ -1788,6 +1815,24 @@ mod tests {
         let s = url.as_str();
         assert!(s.contains("/_matrix/client/v3/sendToDevice/io.element.call.encryption_keys/D42-key-3"));
         assert!(s.contains("user_id=%40nether-voicebridge_42%3Anether.im"));
+    }
+
+    #[test]
+    fn ghost_device_id_folds_in_salt() {
+        assert_eq!(ghost_device_id("42", "abc"), "D42-abc");
+        // Empty salt (no store) → unchanged legacy bare id.
+        assert_eq!(ghost_device_id("42", ""), "D42");
+    }
+
+    #[test]
+    fn salted_device_id_keeps_wire_shape() {
+        // A salted device id must still produce the exact claimed_device_id / member.id
+        // EC reads — guards the `_m.call` suffix concatenation against separator drift.
+        let content =
+            keys::build_key_content("!room:nether.im", "D42-abc", "AAAA".to_owned(), 0, 1234);
+        let v = serde_json::to_value(&content).unwrap();
+        assert_eq!(v["member"]["claimed_device_id"], "D42-abc");
+        assert_eq!(v["member"]["id"], "D42-abc_m.call");
     }
 
     #[test]
