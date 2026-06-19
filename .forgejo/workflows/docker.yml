@@ -1,16 +1,19 @@
-name: Docker Build & Push
+name: Docker Build & Release
 
+# Single compile per ref. The `image` job is the ONLY place the binary is built
+# (inside the Dockerfile builder stage); the `packages` job reuses that exact
+# binary by copying it out of the pushed image — no second `cargo build`.
 on:
   push:
     branches: [master]
     tags: ['v*']
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
-  docker:
+  image:
     runs-on: docker
     steps:
       - name: Checkout
@@ -62,3 +65,106 @@ jobs:
           # and cache-from never resolved it anyway. Cold builds are ~12 min amd64.
           # If incremental caching is wanted later, use a non-Cloudflare backend
           # (e.g. type=gha — the runner's actions cache is enabled).
+
+  # Builds the .deb and .rpm and attaches them to the Forgejo Release for the tag.
+  # Tag-only, and runs AFTER `image` so it can reuse that build's binary instead
+  # of compiling a second time (#29). The binary it packages is byte-identical to
+  # the one shipped in the Docker image.
+  packages:
+    runs-on: docker
+    needs: [image]
+    if: github.ref_type == 'tag'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install packaging dependencies (nfpm)
+        run: |
+          # nfpm (pinned), installed as a static binary. No Rust toolchain needed
+          # here — the binary comes from the image, not a local compile.
+          NFPM_VERSION=2.46.3
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | tar -xz -C /usr/local/bin nfpm
+
+      # Auth so the pull below works regardless of package visibility (same
+      # `dark` / REGISTRY_TOKEN credentials the image job pushed with).
+      - name: Log in to the Forgejo container registry
+        uses: docker/login-action@v3
+        with:
+          registry: nether.codes
+          username: dark
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Derive version from tag
+        id: vars
+        run: |
+          # v0.2.0 -> 0.2.0
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # Reuse the binary the `image` job already compiled: pull the pushed image
+      # and copy /app/nether-voicebridge out to the path nfpm.yaml expects
+      # (target/release/nether-voicebridge). This is what eliminates the second
+      # `cargo build` that used to run here.
+      - name: Extract release binary from the pushed image
+        run: |
+          set -eu
+          img="nether.codes/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}"
+          docker pull "$img"
+          cid=$(docker create "$img")
+          mkdir -p target/release
+          docker cp "$cid:/app/nether-voicebridge" target/release/nether-voicebridge
+          docker rm "$cid"
+          ls -l target/release/nether-voicebridge
+
+      - name: Build .deb and .rpm
+        env:
+          NVB_VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          mkdir -p dist
+          nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+          nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+          ls -l dist/
+
+      # Create (or reuse) the Release for this tag, then upload both packages.
+      # RELEASE_TOKEN must be a Forgejo token with `write:repository` scope on this
+      # repo (the Docker job's REGISTRY_TOKEN is package-scoped and won't work here).
+      - name: Publish packages to the Forgejo Release
+        env:
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          auth="Authorization: token ${TOKEN}"
+
+          # Semver: any tag with a hyphen pre-release identifier (e.g. v0.2.0-rc5,
+          # -beta, -alpha) is a pre-release; a bare v0.2.0 is a stable release.
+          case "${TAG}" in
+            *-*) prerelease=true ;;
+            *)   prerelease=false ;;
+          esac
+
+          # Look up an existing release for the tag; create one if absent.
+          rel_id=$(curl -fsSL -H "$auth" "${API}/releases/tags/${TAG}" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' || true)
+          if [ -z "$rel_id" ]; then
+            rel_id=$(curl -fsSL -X POST -H "$auth" -H 'Content-Type: application/json' \
+              -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"draft\":false,\"prerelease\":${prerelease}}" \
+              "${API}/releases" \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+          else
+            # Reuse path: correct a pre-existing release's flag to match the tag
+            # (e.g. one pre-created in the UI), so the rule holds either way.
+            curl -fsSL -X PATCH -H "$auth" -H 'Content-Type: application/json' \
+              -d "{\"prerelease\":${prerelease}}" \
+              "${API}/releases/${rel_id}" >/dev/null
+          fi
+          echo "release id: $rel_id"
+
+          for f in dist/*.deb dist/*.rpm; do
+            name=$(basename "$f")
+            echo "uploading $name"
+            curl -fsSL -X POST -H "$auth" \
+              -F "attachment=@${f}" \
+              "${API}/releases/${rel_id}/assets?name=${name}" >/dev/null
+          done

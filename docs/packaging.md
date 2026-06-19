@@ -63,9 +63,12 @@ Docker image.
 
 ## CI
 
-`.forgejo/workflows/release.yml` runs on `v*` tag pushes: it builds the binary,
-produces both packages, and uploads them to the Forgejo Release for the tag. It
-needs a repo Actions secret **`RELEASE_TOKEN`** — a Forgejo token with
-`write:repository` scope (the Docker job's package-scoped `REGISTRY_TOKEN` can't
-create releases). Cutting a release is then just: bump the version in
-`[workspace.package]`, commit, and push a `v<version>` tag.
+`.forgejo/workflows/docker.yml` handles both the image and the packages, so the
+binary is compiled **once** per tag. On a `v*` tag push the `image` job builds and
+pushes the Docker image (the sole compile), then the `packages` job — which
+`needs: image` and is tag-gated — pulls that image, copies the binary out of it
+(`/app/nether-voicebridge` → `target/release/`), runs `nfpm`, and uploads both
+packages to the Forgejo Release. It needs a repo Actions secret **`RELEASE_TOKEN`**
+— a Forgejo token with `write:repository` scope (the Docker job's package-scoped
+`REGISTRY_TOKEN` can't create releases). Cutting a release is then just: bump the
+version in `[workspace.package]`, commit, and push a `v<version>` tag.
