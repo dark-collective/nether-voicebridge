@@ -402,24 +402,31 @@ pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Cli
     Ok(client)
 }
 
-/// Whether the room is end-to-end encrypted, read from local state after the
-/// initial sync. Drives the per-bridge `media_e2ee` auto-detection (#14). The
-/// `m.room.encryption` state event is a one-way latch (a room never un-encrypts),
-/// so this decision is stable for the life of the bridge.
+/// Whether the room is end-to-end encrypted. Drives the per-bridge `media_e2ee`
+/// auto-detection (#14). The `m.room.encryption` state event is a one-way latch (a
+/// room never un-encrypts), so this decision is stable for the life of the bridge.
 ///
-/// Reads the raw `m.room.encryption` state event (mirrors the `CallMemberEvent`
-/// pattern used elsewhere) rather than a version-specific helper: a present,
-/// deserializable original event ⇒ encrypted. A missing room or no event ⇒ false.
-pub(crate) fn detect_room_encryption(client: &Client, room_id: &RoomId) -> bool {
-    let Some(room) = client.get_room(room_id) else {
-        tracing::warn!(%room_id, "encryption detect: room not in local state — assuming unencrypted");
-        return false;
-    };
-    let state = room.encryption_state();
-    if state.is_unknown() {
-        tracing::warn!(%room_id, "encryption state unknown after sync — assuming unencrypted");
-    }
-    state.is_encrypted()
+/// Uses [`Room::latest_encryption_state`], which fetches `m.room.encryption` from
+/// the server when the local cache is `Unknown`, then returns the state. This is
+/// **authoritative regardless of store freshness** — critical on a fresh store
+/// (first deploy), where the initial `sync_once` often hasn't loaded the encryption
+/// state yet, so the cache-only `encryption_state()` returns `Unknown` and
+/// mis-detects an encrypted room as plaintext. That false-negative is silent and
+/// catastrophic: the bridge then publishes unencrypted frames into an E2EE call
+/// (peers hear nothing) and can't decrypt incoming frames → no audio either way.
+///
+/// A missing `m.room.encryption` (HTTP 404) ⇒ not encrypted (`Ok(false)`). A real
+/// transport error propagates rather than defaulting to a guess — guessing either
+/// way breaks audio, so a determinable answer is required.
+pub(crate) async fn detect_room_encryption(client: &Client, room_id: &RoomId) -> Result<bool> {
+    let room = client
+        .get_room(room_id)
+        .with_context(|| format!("encryption detect: room {room_id} not in local state after sync"))?;
+    let state = room
+        .latest_encryption_state()
+        .await
+        .with_context(|| format!("fetching m.room.encryption for room {room_id}"))?;
+    Ok(state.is_encrypted())
 }
 
 /// Set the bridge bot's Matrix display name and avatar (best-effort — never blocks

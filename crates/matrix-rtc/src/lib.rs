@@ -58,10 +58,15 @@ pub async fn run(
     // values — not the raw config Options — drive every E2EE decision below.
     let room_id = RoomId::parse(&matrix_cfg.room_id)
         .with_context(|| format!("parsing room_id '{}'", matrix_cfg.room_id))?;
-    let detected = matrix::detect_room_encryption(&client, &room_id);
+    let detected = matrix::detect_room_encryption(&client, &room_id)
+        .await
+        .context("detecting room encryption")?;
     let media_e2ee = livekit_cfg.resolved_media_e2ee(detected);
     let key_transport = livekit_cfg.resolved_key_transport(media_e2ee);
+    // `%room_id` makes this unambiguous even if a span guard held across an await
+    // elsewhere bleeds another bridge's span onto this line (concurrent !Send runs).
     tracing::info!(
+        %room_id,
         detected_encrypted = detected,
         media_e2ee,
         ?key_transport,
