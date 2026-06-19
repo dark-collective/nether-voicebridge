@@ -1,16 +1,18 @@
 use anyhow::{Context, Result};
+use futures_util::StreamExt as _;
 use matrix_sdk::{
-    Client, Room, SessionMeta,
+    Client, Room, SessionMeta, SlidingSync,
     authentication::{SessionTokens, matrix::MatrixSession},
-    config::SyncSettings,
     deserialized_responses::SyncOrStrippedState,
     ruma::{
         MilliSecondsSinceUnixEpoch, OwnedUserId, RoomId, UserId,
+        api::client::sync::sync_events::v5::request::RoomSubscription,
         events::{
-            SyncStateEvent,
+            StateEventType, SyncStateEvent,
             call::member::{CallMemberEventContent, SyncCallMemberEvent},
             room::encryption::SyncRoomEncryptionEvent,
         },
+        uint,
     },
 };
 use std::collections::{HashMap, HashSet};
@@ -271,12 +273,15 @@ pub(crate) async fn retract_self_call_membership(
 
 /// Build and authenticate a Matrix client from config. Joins the target room,
 /// runs one sync round to populate the local state store, and returns the
-/// ready client.
+/// ready client together with the `SlidingSync` instance to reuse for the
+/// perpetual sync loop in `run()`.
 ///
-/// This is kept separate from `run()` so the crate's `run()` can clone the
-/// client into the RTC task before starting the perpetual sync loop.
+/// Uses Simplified Sliding Sync (MSC3575 / `v5`). On Synapse, the appservice
+/// `sender_localpart` user is blocked from ALL sync endpoints — the
+/// `bot_user_id` must therefore be a namespace user that is NOT the
+/// sender_localpart (Synapse's check is an exact match on `service.sender`).
 #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
-pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Client> {
+pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<(Client, SlidingSync)> {
     // Always open the persistent SQLite store at the (auto-derived, validated
     // unique) `store_path`. It must be ready BEFORE the first sync — but whether
     // the room is encrypted can only be read AFTER the sync (see
@@ -354,10 +359,38 @@ pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Cli
         }
     }
 
-    // One sync round to populate the local state store — and, with e2e on, upload
-    // this device's Olm keys + one-time keys so peers can establish Olm sessions.
-    // Bounded for the same reason as the join.
-    match tokio::time::timeout(Duration::from_secs(60), client.sync_once(SyncSettings::default())).await {
+    // Build a Simplified Sliding Sync (MSC3575 / v5) instance subscribed to
+    // this bridge's room. We request the state events we actually need:
+    // encryption state, call memberships, and room members (for display names).
+    // timeline_limit=0: no timeline events needed — we only care about state.
+    // with_all_extensions: enables to-device + e2ee extensions so Olm key
+    // delivery works through the same sync loop.
+    let room_id_typed = RoomId::parse(&cfg.room_id)?;
+    let sliding_sync = client
+        .sliding_sync("nvb-bridge")?
+        .with_all_extensions()
+        .build()
+        .await
+        .context(
+            "homeserver does not support Simplified Sliding Sync (MSC3575 / org.matrix.simplified_msc3575) \
+             — required because Synapse blocks both traditional /v3/sync and MSC3575 for the appservice \
+             sender_localpart user; use a namespace user as bot_user_id (not the sender_localpart itself)"
+        )?;
+    // RoomSubscription is #[non_exhaustive] — construct via Default then set fields.
+    let mut room_sub = RoomSubscription::default();
+    room_sub.required_state = vec![
+        (StateEventType::RoomEncryption, "".to_string()),
+        // Wildcard state key to capture all per-device call memberships.
+        (StateEventType::CallMember, "*".to_string()),
+        (StateEventType::RoomMember, "*".to_string()),
+    ];
+    room_sub.timeline_limit = uint!(0);
+    sliding_sync.subscribe_to_rooms(&[&room_id_typed], Some(room_sub), false);
+
+    // One sync round to populate the local state store — and, with e2e on,
+    // upload this device's Olm keys + one-time keys so peers can establish
+    // Olm sessions. Bounded for the same reason as the join.
+    match tokio::time::timeout(Duration::from_secs(60), sliding_sync.sync_once()).await {
         Ok(Ok(_)) => tracing::info!("initial Matrix sync complete"),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "initial Matrix sync failed");
@@ -369,7 +402,7 @@ pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Cli
         }
     }
 
-    Ok(client)
+    Ok((client, sliding_sync))
 }
 
 /// Whether the room is end-to-end encrypted, read from local state after the
@@ -559,14 +592,15 @@ async fn appservice_join_room(
     Ok(())
 }
 
-/// Run the Matrix sync loop. Must be called with a client produced by
-/// `build_client`. Drives the `SyncCallMemberEvent` handler and sends
-/// call-active signals through `call_active_tx` when the first human
+/// Run the Matrix sync loop. Must be called with a client and `SlidingSync`
+/// produced by `build_client`. Drives the `SyncCallMemberEvent` handler and
+/// sends call-active signals through `call_active_tx` when the first human
 /// joins or the last human leaves.
 #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     client: Client,
+    sliding_sync: SlidingSync,
     cfg: &MatrixConfig,
     media_e2ee: bool,
     call_active_tx: watch::Sender<bool>,
@@ -696,10 +730,13 @@ pub(crate) async fn run(
         });
     }
 
-    // Run sync forever — drives the event handler registered above and feeds
-    // to-device decryption in Stage 2 (when e2e-encryption is enabled).
-    // Retry on transient network errors (connection resets, timeouts) with a
-    // short back-off so the bridge survives long idles.
+    // Run the Simplified Sliding Sync stream forever — drives the event
+    // handlers registered above and processes to-device messages for E2EE.
+    // The SlidingSync stream continues its internal loop after yielding an
+    // error, so we don't restart it; we just back off before the next poll.
+    let sync_stream = sliding_sync.sync();
+    tokio::pin!(sync_stream);
+
     loop {
         tokio::select! {
             biased;
@@ -707,19 +744,22 @@ pub(crate) async fn run(
                 tracing::info!("Matrix sync stopping (shutdown)");
                 return Ok(());
             }
-            res = client.sync(SyncSettings::default()) => match res {
-                Ok(()) => return Ok(()),
-                Err(e) => {
+            item = sync_stream.next() => match item {
+                None => {
+                    // Only happens if stop_sync() was called externally.
+                    tracing::info!("Matrix sync stream ended");
+                    return Ok(());
+                }
+                Some(Ok(_)) => {} // UpdateSummary — event handlers already fired
+                Some(Err(e)) => {
                     let msg = e.to_string();
-                    // 401/403 are auth failures — propagate immediately.
                     if msg.contains("401") || msg.contains("403") || msg.contains("M_UNKNOWN_TOKEN") {
                         return Err(anyhow::anyhow!("Matrix sync fatal auth error: {e}"));
                     }
                     tracing::warn!(error = %e, "Matrix sync error — retrying in 5 s");
-                    // Make the back-off interruptible by shutdown too.
                     tokio::select! {
                         _ = shutdown.cancelled() => return Ok(()),
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                     }
                 }
             }

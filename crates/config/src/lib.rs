@@ -354,6 +354,12 @@ impl Config {
     /// Silently skips a bridge when derivation can't complete (unparseable
     /// `homeserver_url` or no `sender_localpart`) — `validate()` will surface the
     /// remaining empty `bot_user_id` as a clear error.
+    ///
+    /// The derived localpart is `{sender_localpart}_bot`, NOT `{sender_localpart}` itself.
+    /// On Synapse, the exact sender_localpart user is blocked from all sync endpoints
+    /// (`get_app_service_by_user_id` exact-matches it). A `_bot`-suffixed user in the
+    /// appservice namespace (which must cover `{sender_localpart}_.*` per the standard
+    /// registration template) is treated as a regular Matrix user and can sync normally.
     pub fn resolve_bot_user_ids(&mut self) {
         for b in self.bridges.iter_mut() {
             let m = &mut b.matrix;
@@ -362,7 +368,7 @@ impl Config {
             }
             let Some(localpart) = &m.sender_localpart else { continue };
             let Some(server_name) = server_name_from_url(&m.homeserver_url) else { continue };
-            m.bot_user_id = format!("@{localpart}:{server_name}");
+            m.bot_user_id = format!("@{localpart}_bot:{server_name}");
         }
     }
 
@@ -1298,21 +1304,21 @@ appservice_token = "hs_tok"
 
     #[test]
     fn sender_localpart_inline_derives_bot_user_id() {
-        // sender_localpart in [bridge.matrix] → bot_user_id derived from HS domain.
+        // sender_localpart in [bridge.matrix] → bot_user_id derived as localpart_bot.
         let raw = format!(
             "{}[[bridge]]\nname = \"a\"\nroom_id = \"!r:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n[bridge.matrix]\nhomeserver_url = \"https://nether.im\"\nsender_localpart = \"voicebridge-bot\"\ndevice_id = \"DEV\"\nappservice_id = \"voicebridge\"\nappservice_token = \"hs_tok\"\nstore_path = \"./s\"\n",
             puppets_block(&["Bot a"]),
         );
         let cfg = loaded(&raw);
         let m = &cfg.bridges[0].matrix;
-        assert_eq!(m.bot_user_id, "@voicebridge-bot:nether.im");
+        assert_eq!(m.bot_user_id, "@voicebridge-bot_bot:nether.im");
         assert_eq!(m.sender_localpart.as_deref(), Some("voicebridge-bot"));
         cfg.validate().expect("should validate");
     }
 
     #[test]
     fn sender_localpart_in_profile_derives_bot_user_id() {
-        // Profile with only sender_localpart (no bot_user_id) → bot_user_id derived.
+        // Profile with only sender_localpart (no bot_user_id) → bot_user_id derived as localpart_bot.
         let raw = format!(
             "{}{}[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!r:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n",
             puppets_block(&["Bot a"]),
@@ -1320,7 +1326,7 @@ appservice_token = "hs_tok"
         );
         let cfg = loaded(&raw);
         let m = &cfg.bridges[0].matrix;
-        assert_eq!(m.bot_user_id, "@voicebridge-bot:nether.im");
+        assert_eq!(m.bot_user_id, "@voicebridge-bot_bot:nether.im");
         assert_eq!(m.sender_localpart.as_deref(), Some("voicebridge-bot"));
         cfg.validate().expect("should validate");
     }
@@ -1397,8 +1403,8 @@ appservice_token = "hs_tok"
         assert_eq!(m.store_path, "/app/data/envtest");
         // device_id auto-derives from the bridge name when unset (file-mode parity).
         assert_eq!(m.device_id, "envtest");
-        // sender_localpart still derives the bot MXID.
-        assert_eq!(m.bot_user_id, "@voicebridge-bot:nether.im");
+        // sender_localpart still derives the bot MXID (as localpart_bot).
+        assert_eq!(m.bot_user_id, "@voicebridge-bot_bot:nether.im");
         cfg.validate().expect("env config should validate");
 
         for (k, _) in vars {
