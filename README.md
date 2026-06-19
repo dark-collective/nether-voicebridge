@@ -49,6 +49,25 @@ named participants.*
 - **On-demand lifecycle.** A bridge opens when the first human appears on either
   side and tears down to baseline when the last human leaves both.
 
+## Future directions
+
+- **An independent human code review / security audit.** The bridge handles DAVE
+  (MLS) and Matrix media E2EE; a careful review by human eyes — especially of the
+  key-handling and echo-exclusion paths — would raise confidence beyond automated
+  checks. Worth doing before any "stable" claim.
+- **Video relay (webcam / screen share).** Carrying video — and screen/app share
+  *with* its audio — between Discord and Element Call, not just voice. This requires
+  driving Discord with **self-bots** (ToS violation) to relay video streams.
+- **Soundboard support.** Bridging Discord's soundboard clips (and/or a Matrix-side
+  equivalent) through the audio core.
+- **Interop with mautrix-discord ghosts.** Where a room already runs the
+  [mautrix-discord](https://github.com/mautrix/discord) text/chat bridge, exploring
+  whether voice ghosts could align with or reuse its existing Discord-user ghosts,
+  rather than presenting a second, separate set of puppets/ghosts.
+
+If any of these matters to you, say so in the community room or on the issue tracker
+(below) — interest is what moves an idea up the list.
+
 ## How it works
 
 Matrix speakers → Discord runs through a shared **puppet pool** (one floating
@@ -199,29 +218,6 @@ tar xzf nether-voicebridge-$ver-x86_64-linux.tar.gz
   off); it's an optional override now — set it only to force a value.
   `key_transport` likewise auto-selects (`olm` for an encrypted room, else
   plaintext).
-
-## Future directions
-
-Ideas being considered — **none are committed, scheduled, or guaranteed.** They're
-recorded here to sketch where the project *could* go, not to promise it will. Some
-may turn out to be impractical or not worth the complexity.
-
-- **An independent human code review / security audit.** The bridge handles DAVE
-  (MLS) and Matrix media E2EE; a careful review by human eyes — especially of the
-  key-handling and echo-exclusion paths — would raise confidence beyond automated
-  checks. Worth doing before any "stable" claim.
-- **Video relay (webcam / screen share).** Carrying video — and screen/app share
-  *with* its audio — between Discord and Element Call, not just voice. This requires
-  driving Discord with **self-bots** (ToS violation) to relay video streams.
-- **Soundboard support.** Bridging Discord's soundboard clips (and/or a Matrix-side
-  equivalent) through the audio core.
-- **Interop with mautrix-discord ghosts.** Where a room already runs the
-  [mautrix-discord](https://github.com/mautrix/discord) text/chat bridge, exploring
-  whether voice ghosts could align with or reuse its existing Discord-user ghosts,
-  rather than presenting a second, separate set of puppets/ghosts.
-
-If any of these matters to you, say so in the community room or on the issue tracker
-(below) — interest is what moves an idea up the list.
 
 ## Community & contributing
 
