@@ -15,7 +15,7 @@ use matrix_sdk::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -829,6 +829,151 @@ pub(crate) async fn run(
     }
 }
 
+/// How long a non-ghost `m.call.member` must be continuously absent from the
+/// LiveKit roster before the reaper empties it. Long enough to never reap a user
+/// still establishing their RTC connection; short enough to clear a failed-to-
+/// connect phantom within ~a minute of a call becoming active. See
+/// [`reap_stale_memberships`].
+pub(crate) const REAP_GRACE: Duration = Duration::from_secs(45);
+
+/// One `m.call.member` entry, reduced to just the fields the reaper decision
+/// needs. Keeping the decision pure (this + a live-MXID set + a clock) makes it
+/// unit-testable without a live SDK or LiveKit room.
+struct MembershipEntry {
+    /// The state event's state_key (its unique handle; what we'd empty).
+    state_key: String,
+    /// The membership owner's bare MXID (the event sender).
+    mxid: String,
+    /// A bridge-owned identity (our ghost, or the bridge bot itself). Never reaped
+    /// — those are managed by their own lifecycles (constraint #5 / self-cleanup).
+    is_bridge_owned: bool,
+    /// The state_key starts with `@` (legacy format). Matrix auth only lets that
+    /// user set it, so the bot cannot empty it — we skip (and never track) it.
+    legacy_state_key: bool,
+}
+
+/// Pure reaper decision. Returns the state_keys to empty **now**, and mutates
+/// `phantom_since` in place: a newly-absent membership starts its grace clock; a
+/// present (or bridge-owned, or reaped) one is cleared; entries whose membership
+/// has vanished from room state are pruned.
+///
+/// "Present" is matched on the **bare MXID**, not mxid+device: a genuinely
+/// connected user is never reaped even if their membership's device disagrees
+/// with their LiveKit-track device (the keying hazard fixed in `8bf4a90`). The
+/// tradeoff — a duplicate stale membership for a present multi-device user is left
+/// alone — is acceptable.
+fn classify_stale_memberships(
+    live_mxids: &HashSet<String>,
+    entries: &[MembershipEntry],
+    phantom_since: &mut HashMap<String, Instant>,
+    now: Instant,
+    grace: Duration,
+) -> Vec<String> {
+    let mut reap = Vec::new();
+    let mut present_keys: HashSet<&str> = HashSet::new();
+    for e in entries {
+        present_keys.insert(e.state_key.as_str());
+        if e.is_bridge_owned || live_mxids.contains(&e.mxid) {
+            phantom_since.remove(&e.state_key); // present / not ours to reap
+            continue;
+        }
+        if e.legacy_state_key {
+            continue; // can't overwrite an @-state-key as the bot
+        }
+        let since = *phantom_since.entry(e.state_key.clone()).or_insert(now);
+        if now.duration_since(since) >= grace {
+            reap.push(e.state_key.clone());
+            phantom_since.remove(&e.state_key);
+        }
+    }
+    // Drop timers for memberships no longer present in room state.
+    phantom_since.retain(|k, _| present_keys.contains(k.as_str()));
+    reap
+}
+
+/// Reap stale `m.call.member` phantoms: real users whose membership lingers in
+/// room state but who have **no live LiveKit participant** (failed-to-connect,
+/// or a client that died without a clean leave — common when the homeserver
+/// lacks MSC4140 delayed events, e.g. Tuwunel). Forgejo issue #25.
+///
+/// Empties each confirmed phantom as the bridge bot via
+/// `send_state_event_for_key` — permitted because Element Call uses the per-device
+/// `_@…` state-key (not `@`-prefixed, so not owner-restricted) and the room sets
+/// `m.call.member` at PL 0. `live_mxids` is the set of bare MXIDs currently in the
+/// LiveKit room (built by the caller from `remote_participants()`); `phantom_since`
+/// carries each entry's grace clock across calls. Best-effort: read/write failures
+/// are logged, never fatal.
+pub(crate) async fn reap_stale_memberships(
+    client: &Client,
+    room_id: &RoomId,
+    bot_user_id: &UserId,
+    live_mxids: &HashSet<String>,
+    phantom_since: &mut HashMap<String, Instant>,
+) {
+    let Some(room) = client.get_room(room_id) else { return };
+    let raws = match room.get_state_events_static::<CallMemberEventContent>().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "reaper: could not read call memberships");
+            return;
+        }
+    };
+
+    // Keep the originals so we can write the retraction with the typed state_key.
+    let mut originals = Vec::new();
+    for raw in raws {
+        let Ok(ev) = raw.deserialize() else { continue };
+        if let SyncOrStrippedState::Sync(SyncStateEvent::Original(o)) = ev {
+            if matches!(o.content, CallMemberEventContent::Empty(_)) {
+                continue; // already retracted
+            }
+            originals.push(o);
+        }
+    }
+
+    let entries: Vec<MembershipEntry> = originals
+        .iter()
+        .map(|o| {
+            let mxid = o.sender.as_str().to_owned();
+            let is_bridge_owned = o.sender.as_str() == bot_user_id.as_str()
+                || crate::rtc::ghost::is_bridge_excluded_identity(o.sender.as_str());
+            let state_key = o.state_key.as_ref().to_owned();
+            let legacy_state_key = state_key.starts_with('@');
+            MembershipEntry { state_key, mxid, is_bridge_owned, legacy_state_key }
+        })
+        .collect();
+
+    let to_reap: HashSet<String> =
+        classify_stale_memberships(live_mxids, &entries, phantom_since, Instant::now(), REAP_GRACE)
+            .into_iter()
+            .collect();
+    if to_reap.is_empty() {
+        return;
+    }
+
+    for o in &originals {
+        if !to_reap.contains(o.state_key.as_ref()) {
+            continue;
+        }
+        match room
+            .send_state_event_for_key(&o.state_key, CallMemberEventContent::new_empty(None))
+            .await
+        {
+            Ok(_) => tracing::info!(
+                sender = %o.sender,
+                state_key = %o.state_key.as_ref(),
+                "reaped phantom m.call.member (no live LiveKit participant)"
+            ),
+            Err(e) => tracing::warn!(
+                sender = %o.sender,
+                state_key = %o.state_key.as_ref(),
+                error = %e,
+                "failed to reap phantom membership (room PL for m.call.member may be > 0)"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::resolve_store_device_id;
@@ -891,5 +1036,82 @@ mod tests {
     fn empty_store_path_returns_configured() {
         // Defensive: no store path → just the configured id, no filesystem writes.
         assert_eq!(resolve_store_device_id("", "dark-voice"), "dark-voice");
+    }
+
+    // ── Stale-membership reaper (classify_stale_memberships) ───────────────────
+    use super::{classify_stale_memberships, MembershipEntry};
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+
+    const GRACE: Duration = Duration::from_secs(45);
+
+    fn entry(state_key: &str, mxid: &str, owned: bool, legacy: bool) -> MembershipEntry {
+        MembershipEntry {
+            state_key: state_key.to_owned(),
+            mxid: mxid.to_owned(),
+            is_bridge_owned: owned,
+            legacy_state_key: legacy,
+        }
+    }
+
+    fn live(mxids: &[&str]) -> HashSet<String> {
+        mxids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn present_user_is_never_reaped_and_clears_timer() {
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        let entries = [entry("_@alice:x_DEV_m.call", "@alice:x", false, false)];
+        // Even with a pre-existing (stale) timer, a user back in LiveKit is kept.
+        since.insert("_@alice:x_DEV_m.call".to_owned(), t0);
+        let reap = classify_stale_memberships(&live(&["@alice:x"]), &entries, &mut since, t0 + GRACE * 2, GRACE);
+        assert!(reap.is_empty());
+        assert!(since.is_empty(), "present user's timer is cleared");
+    }
+
+    #[test]
+    fn absent_user_reaped_only_after_grace() {
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        let entries = [entry("_@ghosty:x_DEV_m.call", "@ghosty:x", false, false)];
+        let empty = live(&[]);
+
+        // First sight: starts the clock, nothing reaped yet.
+        let reap = classify_stale_memberships(&empty, &entries, &mut since, t0, GRACE);
+        assert!(reap.is_empty());
+        // Still within grace.
+        let reap = classify_stale_memberships(&empty, &entries, &mut since, t0 + Duration::from_secs(30), GRACE);
+        assert!(reap.is_empty());
+        // Past grace → reaped, timer dropped.
+        let reap = classify_stale_memberships(&empty, &entries, &mut since, t0 + GRACE, GRACE);
+        assert_eq!(reap, vec!["_@ghosty:x_DEV_m.call".to_string()]);
+        assert!(since.is_empty());
+    }
+
+    #[test]
+    fn bridge_owned_and_legacy_are_never_reaped() {
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        let entries = [
+            entry("_@nether-voicebridge_1:x_D1_m.call", "@nether-voicebridge_1:x", true, false), // ghost
+            entry("@legacy:x", "@legacy:x", false, true),                                         // @-state-key
+        ];
+        let empty = live(&[]);
+        // Even well past grace, neither is reaped.
+        let reap = classify_stale_memberships(&empty, &entries, &mut since, t0 + GRACE * 3, GRACE);
+        assert!(reap.is_empty());
+        assert!(since.is_empty(), "neither owned nor legacy entries are tracked");
+    }
+
+    #[test]
+    fn vanished_membership_is_pruned_from_timers() {
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        since.insert("_@gone:x_DEV_m.call".to_owned(), t0);
+        // The membership is no longer in room state (no entries) → its timer is pruned.
+        let reap = classify_stale_memberships(&live(&[]), &[], &mut since, t0 + Duration::from_secs(5), GRACE);
+        assert!(reap.is_empty());
+        assert!(since.is_empty(), "timer for a vanished membership is dropped");
     }
 }

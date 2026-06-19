@@ -38,8 +38,9 @@ use matrix_sdk::{
     Client,
     ruma::{OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId},
 };
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -48,6 +49,12 @@ use nvb_audio::routing::PlaybackRouter;
 use nvb_config::{LiveKitConfig, MatrixConfig};
 use keys::CallEncryptionKeysEventContent;
 use well_known::LivekitFocusInfo;
+
+/// How often, while a call is active, to sweep for stale `m.call.member`
+/// phantoms (users in the Matrix roster with no live LiveKit participant). With
+/// `matrix::REAP_GRACE` (45 s), a pre-existing phantom clears within ~a minute of
+/// the call becoming active. See [`matrix::reap_stale_memberships`].
+const REAP_INTERVAL: Duration = Duration::from_secs(20);
 
 /// State held while the bridge bot is connected to a live call (subscribe-only).
 struct ActiveSession {
@@ -175,6 +182,13 @@ pub(crate) async fn run(
     let mut membership_cancel: Option<CancellationToken> = None;
     let mut membership_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+    // Stale-membership reaper state: per-state-key "phantom since" grace clocks,
+    // and the periodic tick that drives the sweep while a call is active (#25).
+    let mut phantom_since: HashMap<String, Instant> = HashMap::new();
+    let mut reap_interval = tokio::time::interval(REAP_INTERVAL);
+    // First tick fires immediately; skip the missed tick rather than bursting.
+    reap_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         let is_active = *call_active_rx.borrow_and_update();
 
@@ -244,6 +258,9 @@ pub(crate) async fn run(
                 tracing::info!("call ended — disconnecting subscriber");
                 teardown(&mut active_session, &shared_provider, &router, true).await;
                 joined = false;
+                // No live roster anymore — drop the reaper's grace clocks so the
+                // next call starts fresh.
+                phantom_since.clear();
                 // Stop the membership-retry task and await it before retracting, so
                 // a late retry-join can't race past the leave and linger.
                 if let Some(mc) = membership_cancel.take() {
@@ -261,13 +278,23 @@ pub(crate) async fn run(
             _ => {}
         }
 
-        // Wait for the next call-active transition, or a process shutdown.
+        // Wait for the next call-active transition, a reaper tick, or shutdown.
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
             changed = call_active_rx.changed() => {
                 if changed.is_err() {
                     break;
+                }
+            }
+            _ = reap_interval.tick() => {
+                // Only meaningful with a live LiveKit roster to compare against.
+                if let Some(sess) = &active_session {
+                    let live_mxids = live_roster_mxids(&sess.lk_session.room);
+                    crate::matrix::reap_stale_memberships(
+                        &client, &room_id, &bot_user_id, &live_mxids, &mut phantom_since,
+                    )
+                    .await;
                 }
             }
         }
@@ -295,6 +322,18 @@ pub(crate) async fn run(
 
     tracing::info!("RTC task exiting — teardown complete");
     Ok(())
+}
+
+/// The set of bare MXIDs currently present in the LiveKit room — the reaper's
+/// "who's really here" ground truth. LiveKit identities are `{mxid}:{device}`;
+/// [`session::participant_mxid`] strips the device so we match on the bare MXID
+/// (a present user is never reaped even if their membership device differs from
+/// their track device).
+fn live_roster_mxids(room: &livekit::Room) -> std::collections::HashSet<String> {
+    room.remote_participants()
+        .values()
+        .map(|p| session::participant_mxid(&p.identity().to_string()).to_owned())
+        .collect()
 }
 
 /// Post the bridge bot's `m.call.member` (E2EE only). Returns `Err` so the caller's
