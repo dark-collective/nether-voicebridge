@@ -5,6 +5,9 @@
 //! reframe/mix/jitter path with no live SDKs, and the result written back out
 //! for inspection or assertion.
 
+use std::fs::File;
+use std::io::BufWriter;
+
 use anyhow::{Context, Result};
 use hound::{SampleFormat, WavSpec, WavWriter};
 
@@ -54,10 +57,60 @@ pub fn write_wav_mono_48k(path: &str, samples: &[i16]) -> Result<()> {
     Ok(())
 }
 
+/// A streaming mono 48 kHz WAV writer for **live diagnostic captures** that run
+/// for the length of a call — where buffering the whole stream in memory before a
+/// single [`write_wav_mono_48k`] would grow unbounded.
+///
+/// Used as "Tap B" of the issue-#32 bisection: the exact mono PCM each ghost
+/// hands to LiveKit (`publish_<key>.wav`), the counterpart to the discord crate's
+/// per-SSRC stereo "Tap A" (`capture_<ssrc>.wav`). Comparing the two localizes
+/// whether corruption is introduced by our audio core or only downstream
+/// (Opus/E2EE).
+///
+/// Like `hound`'s writer, [`finalize`](Self::finalize) **must** be called to write
+/// the correct RIFF/data header lengths — dropping without it leaves a truncated,
+/// unplayable header.
+pub struct WavMonoWriter {
+    writer: WavWriter<BufWriter<File>>,
+    samples_written: u64,
+}
+
+impl WavMonoWriter {
+    /// Create `path` for streaming mono 48 kHz 16-bit PCM, truncating any existing
+    /// file.
+    pub fn create(path: &str) -> Result<Self> {
+        let file = File::create(path).with_context(|| format!("creating WAV '{path}'"))?;
+        let writer = WavWriter::new(BufWriter::new(file), MONO_SPEC)
+            .with_context(|| format!("initialising WAV writer '{path}'"))?;
+        Ok(Self { writer, samples_written: 0 })
+    }
+
+    /// Append one mono frame. On a per-sample write error the rest of the frame is
+    /// skipped (the caller is a diagnostic on the audio hot path and must not fail).
+    pub fn write(&mut self, mono: &[i16]) {
+        for &s in mono {
+            if self.writer.write_sample(s).is_err() {
+                break;
+            }
+            self.samples_written += 1;
+        }
+    }
+
+    /// Total mono samples written so far.
+    pub fn samples_written(&self) -> u64 {
+        self.samples_written
+    }
+
+    /// Flush the RIFF/data headers. Required before the file is playable.
+    pub fn finalize(self) -> Result<()> {
+        self.writer.finalize().context("finalising WAV")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{jitter::JitterBuffer, mix_mono, rms_dbfs, SAMPLES_20MS};
+    use crate::{jitter::JitterBuffer, mix_mono, rms_dbfs, SAMPLES_10MS, SAMPLES_20MS};
 
     /// Build a temp path under the OS temp dir (no Date/rand: use the test name).
     fn tmp(name: &str) -> String {
@@ -118,6 +171,24 @@ mod tests {
 
         let _ = std::fs::remove_file(&in_path);
         let _ = std::fs::remove_file(&out_path);
+    }
+
+    /// The streaming Tap-B writer produces the same bytes as the one-shot writer
+    /// when fed 10 ms frames, and reports the sample count it wrote.
+    #[test]
+    fn streaming_writer_matches_oneshot() {
+        let stream_path = tmp("stream_write");
+        let input = sine_mono(5); // 100 ms
+        let mut w = WavMonoWriter::create(&stream_path).expect("create");
+        for chunk in input.chunks(SAMPLES_10MS) {
+            w.write(chunk);
+        }
+        assert_eq!(w.samples_written(), input.len() as u64);
+        w.finalize().expect("finalize");
+
+        let read = read_wav_mono_48k(&stream_path).expect("read");
+        assert_eq!(read, input, "streamed samples round-trip intact");
+        let _ = std::fs::remove_file(&stream_path);
     }
 
     /// Two offset mono fixtures mixed: the sum (saturating) is what the tick

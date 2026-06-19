@@ -190,7 +190,14 @@ struct VoiceReceiver {
     /// we can tell "ticks stopped" (connection dead) from "ticks fire but all
     /// silent" (decode dead) when capture goes quiet.
     ticks: AtomicU64,
+    /// Count of decoded frames whose length wasn't the expected stereo-20 ms 1920
+    /// samples (issue #32 diagnostic): songbird can hand back short PLC frames on
+    /// packet loss, a candidate source of glitching. Logged rate-limited.
+    shape_warns: AtomicU64,
 }
+
+/// Expected decoded length of one VoiceTick: 48 kHz × 20 ms × 2 channels.
+const STEREO_20MS_SAMPLES: usize = 1920;
 
 impl VoiceReceiver {
     /// Construct the capture handler for the anchor puppet.
@@ -214,6 +221,7 @@ impl VoiceReceiver {
             idx,
             dropped: AtomicU64::new(0),
             ticks: AtomicU64::new(0),
+            shape_warns: AtomicU64::new(0),
         }
     }
 
@@ -231,6 +239,21 @@ impl VoiceReceiver {
                 continue;
             }
             let Some(pcm) = &data.decoded_voice else { continue };
+            // Shape diagnostic (#32): a non-1920 decoded frame (short PLC on packet
+            // loss, or a format surprise) is a candidate corruption source. Warn
+            // rate-limited rather than silently downmixing an odd-length frame.
+            if pcm.len() != STEREO_20MS_SAMPLES {
+                let n = self.shape_warns.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_multiple_of(50) {
+                    tracing::warn!(
+                        ssrc = *ssrc,
+                        len = pcm.len(),
+                        expected = STEREO_20MS_SAMPLES,
+                        count = n,
+                        "decoded Discord frame not stereo-20ms — possible PLC/short frame"
+                    );
+                }
+            }
             if let Some(sink) = &self.capture_sink {
                 sink.write_frame(*ssrc, pcm);
             }

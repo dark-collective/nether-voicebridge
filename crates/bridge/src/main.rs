@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
         // appservice ghost per Discord speaker. Created once and shared: handed to
         // the shared pool as this channel's `CaptureRouter` (the anchor pushes
         // per-speaker audio into it), and to the Matrix side (`run`) to be driven.
-        let ghost_pool = GhostPool::new(&bridge.matrix, &bridge.livekit)
+        let ghost_pool = GhostPool::new(&bridge.matrix, &bridge.livekit, bridge.discord.capture_wav)
             .context("building ghost pool")?;
         let capture_router: Arc<dyn CaptureRouter> = ghost_pool.clone();
 

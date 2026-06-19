@@ -32,6 +32,11 @@ pub struct JitterBuffer {
     /// Whether the cushion is currently filled (we may drain).  Starts `true`
     /// when priming is disabled, `false` when it is enabled (must fill first).
     primed: bool,
+    /// Cumulative count of samples discarded by overflow drops (see `push`).
+    /// Diagnostic only — surfaced via [`dropped_samples`](Self::dropped_samples)
+    /// for health logging so a persistent backlog (a suspect for issue #32's
+    /// "random audio") is visible instead of silent.
+    dropped_samples: u64,
 }
 
 impl JitterBuffer {
@@ -61,6 +66,7 @@ impl JitterBuffer {
             max_samples,
             prime_samples: if prime { target_samples } else { 0 },
             primed: !prime,
+            dropped_samples: 0,
         }
     }
 
@@ -70,6 +76,7 @@ impl JitterBuffer {
         self.queue.extend(mono.iter().copied());
         if self.queue.len() > self.max_samples {
             let overflow = self.queue.len() - self.max_samples;
+            self.dropped_samples = self.dropped_samples.saturating_add(overflow as u64);
             self.queue.drain(..overflow);
         }
     }
@@ -118,6 +125,13 @@ impl JitterBuffer {
     pub fn target_samples(&self) -> usize {
         self.target_samples
     }
+
+    /// Cumulative samples dropped to overflow since creation (diagnostic).
+    /// A steadily climbing value means the consumer can't keep up and audio is
+    /// being silently discarded mid-stream — a candidate cause of glitching.
+    pub fn dropped_samples(&self) -> u64 {
+        self.dropped_samples
+    }
 }
 
 #[cfg(test)]
@@ -164,6 +178,17 @@ mod tests {
         let popped = jb.pop_10ms().expect("frame");
         let dropped = (SAMPLES_10MS * 4) - (SAMPLES_10MS * 2);
         assert_eq!(popped[0], dropped as i16);
+        // The overflow counter records exactly what was discarded.
+        assert_eq!(jb.dropped_samples(), dropped as u64);
+    }
+
+    #[test]
+    fn dropped_samples_starts_zero_and_only_counts_overflow() {
+        let mut jb = JitterBuffer::new(60, 120, SR);
+        assert_eq!(jb.dropped_samples(), 0);
+        // A normal push well under the cap drops nothing.
+        jb.push(&vec![0i16; SAMPLES_10MS]);
+        assert_eq!(jb.dropped_samples(), 0);
     }
 
     #[test]
