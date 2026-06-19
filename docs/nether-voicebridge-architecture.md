@@ -35,25 +35,25 @@ tasks and channels.
 
 ```
                          ┌──────────────────────────────────────┐
-                         │              Coordinator              │
-                         │  (one Bridge per channel-pair)        │
+                         │              Coordinator             │
+                         │  (one Bridge per channel-pair)       │
                          └──────────────────────────────────────┘
                                           │
-                    ┌─────────────────────┴─────────────────────┐
+                    ┌─────────────────────┴──────────────────────┐
                     │                  Bridge                    │
                     │  lifecycle state machine + AudioRouter     │
                     └────────────────────────────────────────────┘
         Discord side  │                                      │  Matrix side
                       ▼                                      ▼
    ┌───────────────────────────────┐        ┌──────────────────────────────────┐
-   │ Puppet pool (N bots)          │        │ Subscriber participant (1)        │
-   │  one floating CAPTURE ANCHOR: │        │  livekit-rust, subscribes to all  │
-   │   songbird RX, all SSRCs,     │        │  remote tracks → Opus → PCM       │
+   │ Puppet pool (N bots)          │        │ Subscriber participant (1)       │
+   │  one floating CAPTURE ANCHOR: │        │  livekit-rust, subscribes to all │
+   │   songbird RX, all SSRCs,     │        │  remote tracks → Opus → PCM      │
    │   DAVE decrypt → Opus → PCM   │        ├──────────────────────────────────┤
-   │  the rest are per-speaker     │        │ Ghost set (N appservice users)    │
-   │  puppets:                     │        │  one per Discord speaker          │
-   │   PCM → Opus → DAVE → play,   │        │  PCM → publish own LiveKit track  │
-   │   nickname = Matrix display   │        │  + post m.call membership event   │
+   │  the rest are per-speaker     │        │ Ghost set (N appservice users)   │
+   │  puppets:                     │        │  one per Discord speaker         │
+   │   PCM → Opus → DAVE → play,   │        │  PCM → publish own LiveKit track │
+   │   nickname = Matrix display   │        │  + post m.call membership event  │
    └───────────────────────────────┘        └──────────────────────────────────┘
 ```
 
