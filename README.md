@@ -32,6 +32,9 @@ named participants.*
   individually-controllable **puppet bots** (named after the Matrix user, mutable
   per-user). Discord speakers appear in the Matrix call as **appservice ghosts**
   (named + avatared after the Discord user).
+- **Mute carries across.** Mute state is mirrored both ways — mute yourself in the
+  Matrix call and your Discord puppet goes muted too, and a muted Discord speaker
+  shows muted in Element Call.
 - **See who's waiting.** Discord users show up in the Matrix call as ghosts **even
   when no Matrix user is in the call** (membership only, no media) — so Matrix
   users can tell at a glance whether a room is worth joining. The moment a Matrix
@@ -48,6 +51,12 @@ named participants.*
   delivers per-ghost keys via Olm — true E2EE the homeserver can't read.
 - **On-demand lifecycle.** A bridge opens when the first human appears on either
   side and tears down to baseline when the last human leaves both.
+- **Self-healing call roster.** On homeservers without
+  [MSC4140](https://github.com/matrix-org/matrix-spec-proposals/pull/4140) delayed
+  events, a client that crashes or fails to connect can leave a "phantom"
+  `m.call.member` that never expires. The bridge spots call members with no live
+  media after a grace period and clears them, so the roster doesn't fill with
+  participants who aren't really there.
 
 ## Future directions
 
