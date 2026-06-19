@@ -70,14 +70,27 @@ jobs:
           set -eu
           auth="Authorization: token ${TOKEN}"
 
+          # Semver: any tag with a hyphen pre-release identifier (e.g. v0.2.0-rc5,
+          # -beta, -alpha) is a pre-release; a bare v0.2.0 is a stable release.
+          case "${TAG}" in
+            *-*) prerelease=true ;;
+            *)   prerelease=false ;;
+          esac
+
           # Look up an existing release for the tag; create one if absent.
           rel_id=$(curl -fsSL -H "$auth" "${API}/releases/tags/${TAG}" \
             | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' || true)
           if [ -z "$rel_id" ]; then
             rel_id=$(curl -fsSL -X POST -H "$auth" -H 'Content-Type: application/json' \
-              -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"draft\":false,\"prerelease\":false}" \
+              -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"draft\":false,\"prerelease\":${prerelease}}" \
               "${API}/releases" \
               | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+          else
+            # Reuse path: correct a pre-existing release's flag to match the tag
+            # (e.g. one pre-created in the UI), so the rule holds either way.
+            curl -fsSL -X PATCH -H "$auth" -H 'Content-Type: application/json' \
+              -d "{\"prerelease\":${prerelease}}" \
+              "${API}/releases/${rel_id}" >/dev/null
           fi
           echo "release id: $rel_id"
 
