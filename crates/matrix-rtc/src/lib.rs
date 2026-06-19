@@ -50,7 +50,7 @@ pub async fn run(
     // Build the client first (surfaces login/restore errors before the loops). It
     // always opens the persistent store and does the initial sync, so room state
     // (incl. `m.room.encryption`) is local by the time it returns.
-    let (client, sliding_sync) = matrix::build_client(matrix_cfg, &bridge).await?;
+    let client = matrix::build_client(matrix_cfg, &bridge).await?;
 
     // Resolve media-E2EE for this bridge (#14): auto-detect from the room's
     // `m.room.encryption` state, unless the config pins an override. An encrypted
@@ -104,7 +104,6 @@ pub async fn run(
     tokio::try_join!(
         matrix::run(
             client.clone(),
-            sliding_sync,
             matrix_cfg,
             media_e2ee,
             call_active_tx,
