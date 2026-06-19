@@ -18,10 +18,13 @@ channel↔room pairs at once.
 
 ## Screenshots
 
-<!-- screenshots TODO: e.g. a Matrix call roster showing Discord users as ghosts,
-     and a Discord voice channel showing Matrix users as named puppet bots. -->
+![A Matrix Element Call (left) and the bridged Discord voice channel (right) side
+by side: Discord speakers appear as named ghosts in the Element call, and Matrix
+speakers appear as named puppet bots in Discord.](docs/images/nether-voicebridge.png)
 
-_Coming soon._
+*Left: an Element Call with the bridged participants. Right: the same conversation
+in the Discord voice channel — each side shows the other's speakers as their own
+named participants.*
 
 ## What it does
 
