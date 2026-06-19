@@ -172,7 +172,7 @@ fn server_name_from_url(homeserver_url: &str) -> Option<String> {
     if host_port.is_empty() { None } else { Some(host_port.to_owned()) }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct MatrixConfig {
     /// Inherited from the `[server.<name>]` profile when omitted. Empty string is the
     /// "not set" sentinel that `resolve_servers` fills.

@@ -269,6 +269,71 @@ pub(crate) async fn retract_self_call_membership(
     }
 }
 
+/// Resolve the Matrix `device_id` to assert for the bot, **pairing the device identity
+/// with the crypto store** so identity and Olm keys always travel together (fixes #30).
+///
+/// The bot's configured `device_id` is derived from the bridge *name*, not the store —
+/// so wiping the store and restarting re-provisions the SAME device_id with NEW identity
+/// keys. Peers that cached the old identity reject the change (`SigningKeyChanged`) and
+/// never open a fresh Olm session to it, so they never deliver the call's media key to the
+/// subscriber → the bot can't decrypt the humans' audio (Matrix→Discord goes silent on a
+/// fresh store). Making the id a property of the store avoids the collision entirely:
+/// - **marker present** (`<store_path>/device_id`) → reuse it (warm restart; crypto stays valid).
+/// - **no marker but the store already held an SDK crypto db before this run** → adopt the
+///   configured id and write the marker (back-compat: existing deployments keep their identity,
+///   no re-key).
+/// - **genuinely fresh store** → mint a NEW unique id (peers see a brand-new device and open
+///   Olm normally) and write the marker.
+///
+/// Appservice-auth only — the caller must NOT use this on the regular-account (`access_token`)
+/// path, whose device is pinned to the token.
+pub(crate) fn resolve_store_device_id(store_path: &str, configured: &str) -> String {
+    if store_path.is_empty() {
+        return configured.to_owned();
+    }
+    let dir = std::path::Path::new(store_path);
+    let marker = dir.join("device_id");
+
+    // Reuse a previously-persisted id (warm restart).
+    if let Ok(s) = std::fs::read_to_string(&marker) {
+        let s = s.trim();
+        if !s.is_empty() {
+            tracing::info!(device_id = %s, "device identity: reusing persisted id from store");
+            return s.to_owned();
+        }
+    }
+
+    // No marker yet. If the SDK crypto db already exists, this is a pre-fix warm store —
+    // adopt the configured id so its established identity is preserved (no re-key).
+    let crypto_pre_existing = dir.join("matrix-sdk-crypto.sqlite3").exists();
+    let resolved = if crypto_pre_existing {
+        tracing::info!(device_id = %configured, "device identity: adopting configured id for pre-existing store");
+        configured.to_owned()
+    } else {
+        // Genuinely fresh store: mint a unique id so a wiped store never collides with a
+        // previously-seen device identity (the #30 SigningKeyChanged trap).
+        use rand::Rng as _;
+        let mut rng = rand::thread_rng();
+        let suffix: String = (0..8)
+            .map(|_| {
+                let n: u8 = rng.gen_range(0..36);
+                if n < 10 { (b'0' + n) as char } else { (b'a' + n - 10) as char }
+            })
+            .collect();
+        let id = format!("{configured}-{suffix}");
+        tracing::info!(device_id = %id, "device identity: minted fresh unique id for new store");
+        id
+    };
+
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %e, path = %dir.display(), "could not create store dir for device_id marker");
+    }
+    if let Err(e) = std::fs::write(&marker, &resolved) {
+        tracing::warn!(error = %e, path = %marker.display(), "failed to persist device_id marker (will re-resolve next start)");
+    }
+    resolved
+}
+
 /// Build and authenticate a Matrix client from config. Joins the target room,
 /// runs one sync round to populate the local state store, and returns the
 /// ready client.
@@ -737,5 +802,70 @@ pub(crate) async fn run(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_store_device_id;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// A unique throwaway directory under the system temp dir, removed on drop.
+    struct TmpDir(PathBuf);
+    impl TmpDir {
+        fn new() -> Self {
+            use rand::Rng as _;
+            let n: u64 = rand::thread_rng().gen();
+            let dir = std::env::temp_dir().join(format!("nvb-devid-test-{n:016x}"));
+            fs::create_dir_all(&dir).unwrap();
+            TmpDir(dir)
+        }
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn fresh_store_mints_unique_id() {
+        let tmp = TmpDir::new();
+        let id = resolve_store_device_id(tmp.path(), "dark-voice");
+        assert!(id.starts_with("dark-voice-"), "expected a minted id, got {id}");
+        assert!(id.len() > "dark-voice-".len(), "expected a random suffix, got {id}");
+        // The minted id is persisted so the next restart reuses it.
+        let marker = fs::read_to_string(tmp.0.join("device_id")).unwrap();
+        assert_eq!(marker.trim(), id);
+    }
+
+    #[test]
+    fn pre_existing_store_adopts_configured_id() {
+        let tmp = TmpDir::new();
+        // Simulate a pre-fix warm store: an SDK crypto db present, no marker yet.
+        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"").unwrap();
+        let id = resolve_store_device_id(tmp.path(), "dark-voice");
+        assert_eq!(id, "dark-voice", "pre-existing store must keep its identity (no re-key)");
+        let marker = fs::read_to_string(tmp.0.join("device_id")).unwrap();
+        assert_eq!(marker.trim(), "dark-voice");
+    }
+
+    #[test]
+    fn existing_marker_is_reused_verbatim() {
+        let tmp = TmpDir::new();
+        fs::write(tmp.0.join("device_id"), "persisted-xyz").unwrap();
+        // Even with a crypto db present and a different configured id, the marker wins.
+        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"").unwrap();
+        let id = resolve_store_device_id(tmp.path(), "dark-voice");
+        assert_eq!(id, "persisted-xyz");
+    }
+
+    #[test]
+    fn empty_store_path_returns_configured() {
+        // Defensive: no store path → just the configured id, no filesystem writes.
+        assert_eq!(resolve_store_device_id("", "dark-voice"), "dark-voice");
     }
 }
