@@ -291,16 +291,12 @@ pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Cli
 
     let bot_user_id: OwnedUserId = cfg.bot_user_id.parse()?;
 
-    // Two auth modes. With a config `access_token`, use it (regular account).
-    // Without one, self-provision a device + token via appservice login — no
-    // password needed (the homeserver may use SSO), and it yields a clean,
-    // un-pinned device identity. `bot_user_id` must then be an appservice user.
-    // The appservice-login session is GUEST-classified by some homeservers
-    // (Tuwunel), which matters for how we join below.
-    let (access_token, used_appservice_auth) = match cfg.access_token.as_deref() {
-        Some(tok) if !tok.is_empty() => (tok.to_owned(), false),
-        _ => (appservice_login(cfg, bot_user_id.localpart()).await?, true),
-    };
+    // Self-provision a device + token via appservice login — no password needed
+    // (the homeserver may use SSO), and it yields a clean, un-pinned device
+    // identity. `bot_user_id` must be an appservice user. The appservice-login
+    // session is GUEST-classified by some homeservers (Tuwunel), which matters
+    // for how we join below.
+    let access_token = appservice_login(cfg, bot_user_id.localpart()).await?;
 
     let session = MatrixSession {
         meta: SessionMeta {
@@ -316,71 +312,45 @@ pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Cli
     tracing::info!(user_id = %bot_user_id, "Matrix session restored");
 
     let room_id = RoomId::parse(&cfg.room_id)?;
-    // Join the room (idempotent if already a member). Bound it: a restricted-room
-    // 403 (or a wedged homeserver) otherwise hangs startup silently for minutes.
-    if used_appservice_auth {
-        // The appservice-login session is guest-classified by some homeservers
-        // (Tuwunel), so a client `/join` with it hits the `m.room.guest_access`
-        // check and 403s ("Guests are not allowed to join this room") on any room
-        // without `guest_access=can_join` — even when the bot is invited. Join via
-        // an appservice-ASSERTED `POST /join` instead (the exact path ghosts use):
-        // an appservice assertion yields a FULL, non-guest member, so no room needs
-        // `guest_access`. The SDK client learns the membership from the `sync_once`
-        // below. Restricted/non-public rooms still need an invite (or allow-space
-        // membership) — the assertion respects join rules, it only bypasses the
-        // guest check.
-        match tokio::time::timeout(
-            Duration::from_secs(30),
-            appservice_join_room(
-                &cfg.homeserver_url,
-                &cfg.appservice_token,
-                &cfg.room_id,
-                bot_user_id.as_str(),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(())) => {
-                tracing::info!(room_id = %room_id, "joined Matrix room (appservice-asserted full member)")
-            }
-            Ok(Err(e)) => {
-                let msg = e.to_string();
-                if msg.contains("403") || msg.contains("M_FORBIDDEN") {
-                    tracing::error!(
-                        room_id = %room_id, error = %e,
-                        "appservice-asserted join forbidden (403) — for a restricted/non-public room the bot still needs an invite (or allow-space membership)"
-                    );
-                } else {
-                    tracing::error!(room_id = %room_id, error = %e, "appservice-asserted join failed");
-                }
-                return Err(anyhow::anyhow!("appservice join failed: {e}"));
-            }
-            Err(_) => {
-                tracing::error!(room_id = %room_id, "appservice join timed out after 30 s — homeserver unreachable or wedged");
-                return Err(anyhow::anyhow!("appservice join timed out after 30 s"));
-            }
+    // Join the room via an appservice-ASSERTED `POST /join` (the same path ghosts
+    // use). The appservice-login session is guest-classified by some homeservers
+    // (Tuwunel), so a regular client `/join` hits the `m.room.guest_access` check
+    // and 403s on rooms without `guest_access=can_join` — even when the bot is
+    // invited. The appservice assertion yields a FULL, non-guest member, so no room
+    // needs `guest_access`. The SDK client learns the membership from `sync_once`.
+    // Restricted/non-public rooms still need an invite (or allow-space membership)
+    // — the assertion respects join rules, it only bypasses the guest check.
+    // Bound it: a restricted-room 403 (or a wedged homeserver) otherwise hangs
+    // startup silently for minutes.
+    match tokio::time::timeout(
+        Duration::from_secs(30),
+        appservice_join_room(
+            &cfg.homeserver_url,
+            &cfg.appservice_token,
+            &cfg.room_id,
+            bot_user_id.as_str(),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            tracing::info!(room_id = %room_id, "joined Matrix room (appservice-asserted full member)")
         }
-    } else {
-        // Regular account: its login session is a full (non-guest) user, so the
-        // SDK join is fine.
-        match tokio::time::timeout(Duration::from_secs(30), client.join_room_by_id(&room_id)).await {
-            Ok(Ok(_)) => tracing::info!(room_id = %room_id, "joined Matrix room"),
-            Ok(Err(e)) => {
-                let msg = e.to_string();
-                if msg.contains("403") || msg.contains("M_FORBIDDEN") {
-                    tracing::error!(
-                        room_id = %room_id, error = %e,
-                        "Matrix join forbidden (403) — is the bot invited/joined to the room (and its space, if restricted)?"
-                    );
-                } else {
-                    tracing::error!(room_id = %room_id, error = %e, "Matrix join failed");
-                }
-                return Err(anyhow::anyhow!("join_room_by_id failed: {e}"));
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            if msg.contains("403") || msg.contains("M_FORBIDDEN") {
+                tracing::error!(
+                    room_id = %room_id, error = %e,
+                    "appservice-asserted join forbidden (403) — for a restricted/non-public room the bot still needs an invite (or allow-space membership)"
+                );
+            } else {
+                tracing::error!(room_id = %room_id, error = %e, "appservice-asserted join failed");
             }
-            Err(_) => {
-                tracing::error!(room_id = %room_id, "Matrix join timed out after 30 s — homeserver unreachable or wedged");
-                return Err(anyhow::anyhow!("join_room_by_id timed out after 30 s"));
-            }
+            return Err(anyhow::anyhow!("appservice join failed: {e}"));
+        }
+        Err(_) => {
+            tracing::error!(room_id = %room_id, "appservice join timed out after 30 s — homeserver unreachable or wedged");
+            return Err(anyhow::anyhow!("appservice join timed out after 30 s"));
         }
     }
 

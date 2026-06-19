@@ -101,27 +101,14 @@ room_id = "!yourroomid:nether.im"
 bot_user_id = "@voicebridge:nether.im"
 # sender_localpart = "voicebridge"
 
-# Device ID for the bot's matrix-sdk session. In access_token mode it must match
-# the device the token was minted for (Element → Settings → Help & About →
-# "Session ID", or GET /_matrix/client/v3/account/whoami). In appservice-auth
-# mode (no access_token, see below) it is any STABLE id we assert via appservice
-# login — keep it fixed so the persistent crypto store stays valid.
+# Device ID for the bot's matrix-sdk session. A stable id asserted via appservice
+# login — keep it fixed so the persistent crypto store stays valid across restarts.
+# Optional: when omitted, it auto-derives from the bridge name.
 device_id = "ABCDEFGHIJ"
 
-# Access token for the bot account. TWO modes:
-#  • Provide it  → regular-account auth (Element → Settings → Help & About →
-#    Access Token, or the /login API). `bot_user_id` is your real bot account.
-#  • OMIT it     → appservice-auth: the bridge self-provisions a device + token
-#    via m.login.application_service (no password — good for SSO homeservers, and
-#    it yields a clean crypto identity). `bot_user_id` must then be an appservice
-#    user (e.g. the registration's sender_localpart, "@voicebridge_as:..."),
-#    invited to the room/space like any participant. Recommended for media_e2ee.
-access_token = "syt_your_access_token_here"
-
 # These two fields come from the appservice registration YAML you install on
-# Tuwunel. Needed for Phase 8 ghosts AND for appservice-auth mode above (the
-# appservice_token is the as_token used to mint/masquerade). The id is whatever
-# name you chose when registering the appservice.
+# Tuwunel. The appservice_token is the as_token used to authenticate and
+# masquerade. The id is whatever name you chose when registering the appservice.
 appservice_id = "voicebridge"
 appservice_token = "your_appservice_hs_token_here"
 
@@ -153,8 +140,8 @@ appservice_token = "your_appservice_hs_token_here"
 # call makes peers hear static, and not encrypting into an E2EE call means they
 # can't decrypt — which is exactly why auto-detect is the default. When it resolves
 # on, the bridge does Olm via a persistent crypto store and posts m.call.member to
-# receive media keys — pair it with appservice-auth (omit access_token above) for a
-# clean, self-provisioned device identity. Works BOTH directions. Set this only to
+# receive media keys via a clean, self-provisioned appservice device identity.
+# Works BOTH directions. Set this only to
 # FORCE a value (e.g. media_e2ee = false to keep a bridge plaintext in an encrypted
 # room); leave it commented to auto-detect.
 # media_e2ee = false
@@ -176,11 +163,10 @@ appservice_token = "your_appservice_hs_token_here"
 # does NOT carry its own bot tokens — it draws from the shared [puppets] pool
 # above (make sure those bots are invited to this bridge's guild too).
 #
-# Reusing ONE Matrix account across bridges: use appservice-auth (omit
-# `access_token`) and give each bridge a DISTINCT `device_id`. The appservice
+# Reusing ONE Matrix account across bridges: give each bridge a DISTINCT
+# `device_id` (or omit to auto-derive one from the bridge name). The appservice
 # self-provisions a separate device per bridge, so the same `bot_user_id` can back
-# many bridges safely. An `access_token`, by contrast, pins one token to one
-# device — two bridges sharing a token (or a device_id) makes their crypto clients
+# many bridges safely. Two bridges sharing a device_id makes their crypto clients
 # collide and breaks E2EE. So: same appservice user is fine, same device_id is not.
 #
 # [[bridge]]
@@ -197,7 +183,6 @@ appservice_token = "your_appservice_hs_token_here"
 # bot_user_id = "@voicebridge:nether.im"   # or use sender_localpart below
 # sender_localpart = "voicebridge"          # derives bot_user_id when above is absent
 # device_id = "ABCDEFGHIJ"
-# access_token = "syt_your_access_token_here"
 # appservice_id = "voicebridge"
 # appservice_token = "your_appservice_hs_token_here"
 # store_path = "./nether-store/gaming"   # OPTIONAL — auto-derives to <data_dir>/<name>

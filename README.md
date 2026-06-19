@@ -87,7 +87,7 @@ cargo run                            # reads ./config.toml (override with CONFIG
 ```
 
 `config.example.toml` documents every field. **Never commit `config.toml`** — it
-holds bot tokens and Matrix access/appservice tokens.
+holds bot tokens and Matrix appservice tokens.
 
 ## Docker
 

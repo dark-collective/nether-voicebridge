@@ -32,10 +32,10 @@ pub struct Config {
     pub puppets: PuppetsConfig,
     /// Named homeserver/appservice profiles, keyed by label. TOML `[server.<name>]`
     /// blocks map here. A bridge sets `server = "<name>"` to inherit this profile's
-    /// `homeserver_url` / `bot_user_id` / `appservice_id` / `appservice_token` /
-    /// `access_token` instead of repeating them — any field a bridge sets explicitly
-    /// still wins. Defaults to empty (bridges may instead spell everything out
-    /// inline in `[bridge.matrix]`).
+    /// `homeserver_url` / `bot_user_id` / `appservice_id` / `appservice_token`
+    /// instead of repeating them — any field a bridge sets explicitly still wins.
+    /// Defaults to empty (bridges may instead spell everything out inline in
+    /// `[bridge.matrix]`).
     #[serde(rename = "server", default)]
     pub servers: std::collections::HashMap<String, ServerProfile>,
     /// One entry per bridged channel-pair. TOML `[[bridge]]` blocks map here.
@@ -90,10 +90,6 @@ pub struct ServerProfile {
     /// bot MXID as `@{sender_localpart}:{server_name}` via `resolve_bot_user_ids`.
     #[serde(default)]
     pub sender_localpart: Option<String>,
-    /// Optional regular-account token shared by all bridges using this profile. When
-    /// absent, those bridges self-provision via appservice login.
-    #[serde(default)]
-    pub access_token: Option<String>,
     pub appservice_id: String,
     pub appservice_token: String,
 }
@@ -197,21 +193,13 @@ pub struct MatrixConfig {
     /// omitted. Separately configurable so the namespace anchor and bot account can differ.
     #[serde(default)]
     pub sender_localpart: Option<String>,
-    /// The device ID for the bot's matrix-sdk session. In access_token mode this
-    /// must match the device the token was minted for; in appservice-auth mode
-    /// (no `access_token`) it is a stable device id we assert via appservice
-    /// login, reused every start so the persistent crypto store stays valid.
-    /// Optional: when omitted it auto-derives from the bridge `name` (slug, same
-    /// leaf as `store_path`) via `resolve_device_ids` — stable per bridge and
+    /// The device ID for the bot's matrix-sdk session. A stable id we assert via
+    /// appservice login, reused every start so the persistent crypto store stays
+    /// valid. Optional: when omitted it auto-derives from the bridge `name` (slug,
+    /// same leaf as `store_path`) via `resolve_device_ids` — stable per bridge and
     /// distinct across bridges. Empty = "not set".
     #[serde(default)]
     pub device_id: String,
-    /// Regular-account access token. When omitted, the bridge self-provisions a
-    /// device + token via appservice login (`m.login.application_service`,
-    /// authenticated with `appservice_token`) — `bot_user_id` must then be an
-    /// appservice-namespace user (e.g. the registration's `sender_localpart`).
-    #[serde(default)]
-    pub access_token: Option<String>,
     /// Inherited from the `[server.<name>]` profile when omitted. Empty = "not set".
     #[serde(default)]
     pub appservice_id: String,
@@ -357,9 +345,6 @@ impl Config {
             if m.appservice_token.is_empty() {
                 m.appservice_token = profile.appservice_token.clone();
             }
-            if m.access_token.is_none() {
-                m.access_token = profile.access_token.clone();
-            }
         }
     }
 
@@ -436,7 +421,6 @@ impl Config {
     ///   NETHER_MATRIX_DEVICE_ID (auto-derived from bridge name when absent)
     ///   NETHER_MATRIX_BOT_USER_ID — full bot MXID; derived from SENDER_LOCALPART when absent
     ///   NETHER_MATRIX_SENDER_LOCALPART — bot localpart; derives bot MXID when BOT_USER_ID absent
-    ///   NETHER_MATRIX_ACCESS_TOKEN (omit for appservice-auth mode)
     ///   NETHER_MATRIX_STORE_PATH (auto-derived from bridge name when absent)
     ///   NETHER_MATRIX_BOT_DISPLAY_NAME, NETHER_MATRIX_BOT_AVATAR_PATH
     ///   NETHER_LIVEKIT_MEDIA_E2EE (auto-detected from room encryption when absent)
@@ -495,7 +479,6 @@ impl Config {
         // Optional like file mode: when absent, `resolve_device_ids` derives a stable
         // id from the bridge name (the same leaf as `store_path`).
         let device_id = optional!("NETHER_MATRIX_DEVICE_ID");
-        let access_token = optional!("NETHER_MATRIX_ACCESS_TOKEN");
         let appservice_id = require!("NETHER_MATRIX_APPSERVICE_ID");
         let appservice_token = require!("NETHER_MATRIX_APPSERVICE_TOKEN");
         let store_path = optional!("NETHER_MATRIX_STORE_PATH").unwrap_or_default();
@@ -549,7 +532,6 @@ impl Config {
                     bot_user_id: bot_user_id.unwrap_or_default(),
                     sender_localpart,
                     device_id: device_id.unwrap_or_default(),
-                    access_token,
                     appservice_id: appservice_id.unwrap(),
                     appservice_token: appservice_token.unwrap(),
                     store_path,
@@ -676,24 +658,6 @@ impl Config {
             }
         }
 
-        // Hard: every bridge's bot needs a way to authenticate — either a
-        // regular-account access_token, or (when absent) appservice login, which
-        // requires a non-empty appservice_token.
-        for b in &self.bridges {
-            let has_access_token = b
-                .matrix
-                .access_token
-                .as_deref()
-                .is_some_and(|t| !t.is_empty());
-            if !has_access_token && b.matrix.appservice_token.is_empty() {
-                return Err(ConfigError::Validation(format!(
-                    "bridge bot '{}': no access_token and no appservice_token — \
-                     cannot authenticate (provide one or the other)",
-                    b.matrix.bot_user_id
-                )));
-            }
-        }
-
         // Soft: explicitly pinning `key_transport = "olm"` while explicitly
         // forcing `media_e2ee = false` is contradictory — Olm transport is ignored
         // with E2EE off. (Both are now auto by default; only flag the deliberate
@@ -769,7 +733,6 @@ impl Config {
                 sender_localpart = ?p.sender_localpart,
                 appservice_id = %p.appservice_id,
                 appservice_token = "[redacted]",
-                access_token = if p.access_token.is_some() { "[redacted]" } else { "none" },
                 "server profile loaded"
             );
         }
@@ -796,7 +759,6 @@ impl BridgeConfig {
             matrix_sender_localpart = ?self.matrix.sender_localpart,
             matrix_device_id = %self.matrix.device_id,
             matrix_store_path = %self.matrix.store_path,
-            matrix_access_token = "[redacted]",
             matrix_appservice_id = %self.matrix.appservice_id,
             matrix_appservice_token = "[redacted]",
             matrix_bot_display_name = ?self.matrix.bot_display_name,
@@ -843,7 +805,6 @@ homeserver_url = "https://nether.im"
 room_id = "{room}"
 bot_user_id = "@bridge:nether.im"
 device_id = "DEV{chan}"
-access_token = "syt_tok"
 appservice_id = "voicebridge"
 appservice_token = "hs_tok"
 store_path = "{store}"
@@ -978,7 +939,6 @@ homeserver_url = "https://nether.im"
 room_id = "{room}"
 bot_user_id = "@bridge:nether.im"
 device_id = "DEV{chan}"
-access_token = "syt_tok"
 appservice_id = "voicebridge"
 appservice_token = "hs_tok"
 
@@ -1126,7 +1086,6 @@ homeserver_url = "https://nether.im"
 room_id = "!r:nether.im"
 bot_user_id = "@bridge:nether.im"
 device_id = "BRIDGE01"
-access_token = "syt_tok"
 appservice_id = "voicebridge"
 appservice_token = "hs_tok"
 store_path = "./s"
@@ -1177,7 +1136,6 @@ homeserver_url = "https://nether.im"
 room_id = "!r:nether.im"
 bot_user_id = "@bridge:nether.im"
 device_id = "BRIDGE01"
-access_token = "syt_tok"
 appservice_id = "voicebridge"
 appservice_token = "hs_tok"
 store_path = "./s1"
@@ -1342,7 +1300,7 @@ appservice_token = "hs_tok"
     fn sender_localpart_inline_derives_bot_user_id() {
         // sender_localpart in [bridge.matrix] → bot_user_id derived from HS domain.
         let raw = format!(
-            "{}[[bridge]]\nname = \"a\"\nroom_id = \"!r:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n[bridge.matrix]\nhomeserver_url = \"https://nether.im\"\nsender_localpart = \"voicebridge-bot\"\ndevice_id = \"DEV\"\naccess_token = \"tok\"\nappservice_id = \"voicebridge\"\nappservice_token = \"hs_tok\"\nstore_path = \"./s\"\n",
+            "{}[[bridge]]\nname = \"a\"\nroom_id = \"!r:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n[bridge.matrix]\nhomeserver_url = \"https://nether.im\"\nsender_localpart = \"voicebridge-bot\"\ndevice_id = \"DEV\"\nappservice_id = \"voicebridge\"\nappservice_token = \"hs_tok\"\nstore_path = \"./s\"\n",
             puppets_block(&["Bot a"]),
         );
         let cfg = loaded(&raw);
@@ -1386,7 +1344,7 @@ appservice_token = "hs_tok"
     fn missing_both_bot_user_id_and_sender_localpart_errors() {
         // Neither bot_user_id nor sender_localpart → validate catches the empty bot_user_id.
         let raw = format!(
-            "{}[[bridge]]\nname = \"a\"\nroom_id = \"!r:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n[bridge.matrix]\nhomeserver_url = \"https://nether.im\"\ndevice_id = \"DEV\"\naccess_token = \"tok\"\nappservice_id = \"voicebridge\"\nappservice_token = \"hs_tok\"\nstore_path = \"./s\"\n",
+            "{}[[bridge]]\nname = \"a\"\nroom_id = \"!r:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n[bridge.matrix]\nhomeserver_url = \"https://nether.im\"\ndevice_id = \"DEV\"\nappservice_id = \"voicebridge\"\nappservice_token = \"hs_tok\"\nstore_path = \"./s\"\n",
             puppets_block(&["Bot a"]),
         );
         let cfg = loaded(&raw);
