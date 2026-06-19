@@ -125,6 +125,33 @@ jobs:
           nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
           ls -l dist/
 
+      # Standalone tarball for non-deb/rpm distros: the same glibc/amd64 binary
+      # the image carries, bundled with the example config, systemd unit, license,
+      # and README so it's a self-contained drop-in. No recompile — reuses the
+      # binary extracted above.
+      - name: Build the standalone x86_64 tarball
+        env:
+          NVB_VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -eu
+          stage="nether-voicebridge-${NVB_VERSION}-x86_64-linux"
+          mkdir -p "dist/${stage}"
+          cp target/release/nether-voicebridge "dist/${stage}/"
+          cp config.example.toml packaging/nether-voicebridge.service LICENSE README.md "dist/${stage}/"
+          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+          rm -rf "dist/${stage}"
+          ls -l dist/
+
+      # Checksums over every release asset. Run last (after deb/rpm + tarball
+      # exist); `cd dist` so the file lists bare names → `sha256sum -c SHA256SUMS`
+      # works from inside the extracted/downloaded dir.
+      - name: Generate SHA256SUMS
+        run: |
+          set -eu
+          cd dist
+          sha256sum *.deb *.rpm *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
       # Create (or reuse) the Release for this tag, then upload both packages.
       # RELEASE_TOKEN must be a Forgejo token with `write:repository` scope on this
       # repo (the Docker job's REGISTRY_TOKEN is package-scoped and won't work here).
@@ -161,7 +188,7 @@ jobs:
           fi
           echo "release id: $rel_id"
 
-          for f in dist/*.deb dist/*.rpm; do
+          for f in dist/*.deb dist/*.rpm dist/*.tar.gz dist/SHA256SUMS; do
             name=$(basename "$f")
             echo "uploading $name"
             curl -fsSL -X POST -H "$auth" \

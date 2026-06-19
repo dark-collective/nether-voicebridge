@@ -163,6 +163,27 @@ The service reads `/etc/nether-voicebridge/config.toml` and stores matrix-sdk da
 [`docs/packaging.md`](docs/packaging.md) for the package layout and how to build
 the packages yourself (`packaging/build-packages.sh`).
 
+### Standalone binary (other distros)
+
+For distros without `.deb`/`.rpm` (Arch, Gentoo, NixOS, …), each
+[release](https://nether.codes/dark/nether-voicebridge/releases) also ships a
+self-contained tarball — the binary plus `config.example.toml`, the systemd unit,
+`LICENSE`, and this README — alongside a `SHA256SUMS` file:
+
+```bash
+ver=<version>   # e.g. 0.2.0
+base=https://nether.codes/dark/nether-voicebridge/releases/download/v$ver
+curl -LO $base/nether-voicebridge-$ver-x86_64-linux.tar.gz
+curl -LO $base/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing   # verify
+tar xzf nether-voicebridge-$ver-x86_64-linux.tar.gz
+```
+
+> The binary is **amd64-only** and built against **glibc 2.36** (dynamically linked
+> to **libopus**), so it needs your distro's `libopus` + `ca-certificates` and a
+> glibc host — it won't run on Alpine/musl or much older glibc. There, prefer the
+> Docker image, which carries its own runtime.
+
 ## Configuration notes
 
 - **`store_path` is optional** — omitted, it auto-derives to
@@ -175,6 +196,29 @@ the packages yourself (`packaging/build-packages.sh`).
   off); it's an optional override now — set it only to force a value.
   `key_transport` likewise auto-selects (`olm` for an encrypted room, else
   plaintext).
+
+## Future directions
+
+Ideas being considered — **none are committed, scheduled, or guaranteed.** They're
+recorded here to sketch where the project *could* go, not to promise it will. Some
+may turn out to be impractical or not worth the complexity.
+
+- **An independent human code review / security audit.** The bridge handles DAVE
+  (MLS) and Matrix media E2EE; a careful review by human eyes — especially of the
+  key-handling and echo-exclusion paths — would raise confidence beyond automated
+  checks. Worth doing before any "stable" claim.
+- **Video relay (webcam / screen share).** Carrying video — and screen/app share
+  *with* its audio — between Discord and Element Call, not just voice. This requires
+  driving Discord with **self-bots** (ToS violation) to relay video streams.
+- **Soundboard support.** Bridging Discord's soundboard clips (and/or a Matrix-side
+  equivalent) through the audio core.
+- **Interop with mautrix-discord ghosts.** Where a room already runs the
+  [mautrix-discord](https://github.com/mautrix/discord) text/chat bridge, exploring
+  whether voice ghosts could align with or reuse its existing Discord-user ghosts,
+  rather than presenting a second, separate set of puppets/ghosts.
+
+If any of these matters to you, say so in the community room or on the issue tracker
+(below) — interest is what moves an idea up the list.
 
 ## Community & contributing
 
