@@ -123,9 +123,14 @@ pub struct BridgeConfig {
 pub struct DiscordConfig {
     pub guild_id: String,
     pub channel_id: String,
-    /// When true, also write per-SSRC `capture_<ssrc>.wav` files (the Phase 3
-    /// debugging artifact) alongside forwarding audio to Matrix. Off in
-    /// production to avoid unbounded file growth.
+    /// When true, write the Discord→Matrix audio-bisection WAV taps for
+    /// debugging (issue #32): per-SSRC `capture_<ssrc>.wav` at Discord ingress
+    /// ("Tap A", what arrived) **and** per-ghost `publish_<key>.wav` at the
+    /// LiveKit publish boundary ("Tap B", the mono PCM we send). Comparing the
+    /// pair localizes corruption to our audio core vs downstream (Opus/E2EE).
+    /// Off in production to avoid unbounded file growth. (Cheap diagnostics —
+    /// drop counters, per-ghost health logging, frame-shape warnings — are always
+    /// on and need no flag.)
     #[serde(default)]
     pub capture_wav: bool,
 }

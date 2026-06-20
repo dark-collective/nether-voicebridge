@@ -182,7 +182,7 @@ pub async fn connect(
 /// MXID; otherwise (a legacy `{mxid}`-only identity) we keep it whole. Both
 /// sides of the bridge key puppets on this so a user whose membership device
 /// differs from their LiveKit-track device still maps to one puppet.
-fn participant_mxid(identity: &str) -> &str {
+pub(crate) fn participant_mxid(identity: &str) -> &str {
     match identity.rsplit_once(':') {
         Some((prefix, _device)) if UserId::parse(prefix).is_ok() => prefix,
         _ => identity,

@@ -15,7 +15,7 @@ use matrix_sdk::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -269,21 +269,70 @@ pub(crate) async fn retract_self_call_membership(
     }
 }
 
+/// Mint a unique device id from the configured base: `{configured}-{8 lowercase-alnum}`.
+/// A minted id is always distinct from the bare `configured`, which is how the caller
+/// distinguishes a properly-provisioned marker from a "plain poison" one.
+fn mint_fresh_device_id(configured: &str) -> String {
+    use rand::Rng as _;
+    let mut rng = rand::thread_rng();
+    let suffix: String = (0..8)
+        .map(|_| {
+            let n: u8 = rng.gen_range(0..36);
+            if n < 10 { (b'0' + n) as char } else { (b'a' + n - 10) as char }
+        })
+        .collect();
+    format!("{configured}-{suffix}")
+}
+
+/// Best-effort delete the bot's crypto store files so a newly-minted device id gets a clean
+/// Olm account. matrix-sdk-crypto is single-account-per-store: opening it with a new device id
+/// would otherwise restore the OLD account, defeating the re-provision. Only the crypto sqlite
+/// is removed — state/event-cache/media stores are keyed by room/event/user (device-agnostic)
+/// and the ghosts' independent crypto stores under `ghosts/` are untouched.
+///
+/// SAFETY: callers MUST invoke this only from `resolve_store_device_id`, which runs *before*
+/// `build_client` opens the sqlite store (see `lib.rs::run`). Deleting an open DB would corrupt
+/// it; do not move this past the store-open point.
+fn reset_bot_crypto_store(dir: &std::path::Path) {
+    tracing::warn!(
+        path = %dir.display(),
+        "bot crypto store reset for device re-provision (one-time; peers see a brand-new device, not a key change)"
+    );
+    for name in [
+        "matrix-sdk-crypto.sqlite3",
+        "matrix-sdk-crypto.sqlite3-shm",
+        "matrix-sdk-crypto.sqlite3-wal",
+    ] {
+        let p = dir.join(name);
+        if let Err(e) = std::fs::remove_file(&p) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(error = %e, path = %p.display(), "failed to remove bot crypto store file during reset");
+            }
+        }
+    }
+}
+
 /// Resolve the Matrix `device_id` to assert for the bot, **pairing the device identity
 /// with the crypto store** so identity and Olm keys always travel together (fixes #30).
 ///
-/// The bot's configured `device_id` is derived from the bridge *name*, not the store —
-/// so wiping the store and restarting re-provisions the SAME device_id with NEW identity
-/// keys. Peers that cached the old identity reject the change (`SigningKeyChanged`) and
-/// never open a fresh Olm session to it, so they never deliver the call's media key to the
-/// subscriber → the bot can't decrypt the humans' audio (Matrix→Discord goes silent on a
-/// fresh store). Making the id a property of the store avoids the collision entirely:
-/// - **marker present** (`<store_path>/device_id`) → reuse it (warm restart; crypto stays valid).
-/// - **no marker but the store already held an SDK crypto db before this run** → adopt the
-///   configured id and write the marker (back-compat: existing deployments keep their identity,
-///   no re-key).
-/// - **genuinely fresh store** → mint a NEW unique id (peers see a brand-new device and open
-///   Olm normally) and write the marker.
+/// The bot's configured `device_id` is derived from the bridge *name*, not the store — so the
+/// SAME plain id can exist in two different stores (e.g. a laptop and a VPS) with DIFFERENT
+/// Olm signing keys. Peers that cached one reject the other as `SigningKeyChanged` and never
+/// open a fresh Olm session, so they never deliver the call's media key to the subscriber →
+/// the bot can't decrypt the humans' audio (Matrix→Discord goes silent). Making the id a
+/// per-store-unique property avoids the collision entirely:
+/// - **minted/custom marker present** (`<store_path>/device_id`, value `!= configured`) → reuse
+///   it (warm restart; crypto stays valid).
+/// - **plain-poison marker** (value `== configured`, persisted by the old adopt path) → re-mint
+///   a unique id, reset the crypto store, rewrite the marker. One-time, idempotent self-heal:
+///   next start the marker `!= configured` and is reused unchanged.
+/// - **no marker but the store already held an SDK crypto db** (a pre-#30 store's first upgrade)
+///   → mint a unique id and reset the crypto store (the existing crypto belongs to the old plain
+///   identity), then write the marker.
+/// - **genuinely fresh store** → mint a unique id and write the marker.
+///
+/// Accepted one-time cost: a deployment that deliberately set a *plain* `matrix.device_id` on a
+/// single machine gets re-keyed once on upgrade (peers just see one new device); idempotent after.
 ///
 /// Appservice-auth only — the caller must NOT use this on the regular-account (`access_token`)
 /// path, whose device is pinned to the token.
@@ -294,44 +343,99 @@ pub(crate) fn resolve_store_device_id(store_path: &str, configured: &str) -> Str
     let dir = std::path::Path::new(store_path);
     let marker = dir.join("device_id");
 
-    // Reuse a previously-persisted id (warm restart).
+    // A previously-persisted id. Reuse it UNLESS it is the bare configured id — that "plain
+    // poison" was written by the old adopt path and collides across stores, so heal it.
+    if let Ok(s) = std::fs::read_to_string(&marker) {
+        let s = s.trim();
+        if !s.is_empty() && s != configured {
+            tracing::info!(device_id = %s, "device identity: reusing persisted id from store");
+            return s.to_owned();
+        }
+        if s == configured {
+            let id = mint_fresh_device_id(configured);
+            tracing::warn!(old = %s, device_id = %id, "device identity: migrating plain-poison marker to a unique id");
+            reset_bot_crypto_store(dir);
+            persist_device_marker(&marker, dir, &id);
+            return id;
+        }
+    }
+
+    // No marker yet.
+    let crypto_pre_existing = dir.join("matrix-sdk-crypto.sqlite3").exists();
+    let id = mint_fresh_device_id(configured);
+    if crypto_pre_existing {
+        // A pre-#30 store's first upgrade: its crypto belongs to the old plain identity, so the
+        // freshly-minted id needs a clean crypto store (mint → reset → persist marker).
+        tracing::warn!(device_id = %id, "device identity: minted unique id for pre-existing store (re-provisioning crypto)");
+        reset_bot_crypto_store(dir);
+    } else {
+        tracing::info!(device_id = %id, "device identity: minted fresh unique id for new store");
+    }
+    persist_device_marker(&marker, dir, &id);
+    id
+}
+
+/// Best-effort persist the resolved device id to the marker (shared by all resolve branches).
+fn persist_device_marker(marker: &std::path::Path, dir: &std::path::Path, id: &str) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %e, path = %dir.display(), "could not create store dir for device_id marker");
+    }
+    if let Err(e) = std::fs::write(marker, id) {
+        tracing::warn!(error = %e, path = %marker.display(), "failed to persist device_id marker (will re-resolve next start)");
+    }
+}
+
+/// Resolve a per-store random salt that makes every appservice ghost's otherwise
+/// deterministic device id (`D{key}` → `D{key}-{salt}`) unique to THIS crypto store.
+///
+/// Background: ghosts mint their device id from the Discord-side key alone, so `D{key}`
+/// is byte-identical on every machine. Each store mints its own Olm signing keys, so a
+/// second store presenting the same `D{key}` with different keys trips a peer's
+/// `SigningKeyChanged` and breaks Olm — the #30 trap, here extended from the bot
+/// (`resolve_store_device_id`) to the ghosts.
+///
+/// - empty `store_path` → return `""`; the caller falls back to bare `D{key}` (no store,
+///   so no persistence and no E2EE — nothing to collide).
+/// - marker `<store_path>/ghost_device_salt` present & non-empty → reuse (warm restart →
+///   stable ghost ids → the persistent ghost crypto stores keep matching, no re-key).
+/// - otherwise → mint a fresh salt and persist it.
+///
+/// Unlike `resolve_store_device_id` there is deliberately **no** "adopt for a pre-existing
+/// store" branch: a warm store with no salt marker is a pre-fix store whose `D{key}` ids
+/// are poisoned, so we *want* fresh ghost identities (the new salted ids open fresh ghost
+/// crypto stores; see `build_ghost_crypto_client`).
+pub(crate) fn resolve_ghost_device_salt(store_path: &str) -> String {
+    if store_path.is_empty() {
+        return String::new();
+    }
+    let dir = std::path::Path::new(store_path);
+    let marker = dir.join("ghost_device_salt");
+
     if let Ok(s) = std::fs::read_to_string(&marker) {
         let s = s.trim();
         if !s.is_empty() {
-            tracing::info!(device_id = %s, "device identity: reusing persisted id from store");
+            tracing::info!(salt = %s, "ghost device identity: reusing persisted ghost_device_salt from store");
             return s.to_owned();
         }
     }
 
-    // No marker yet. If the SDK crypto db already exists, this is a pre-fix warm store —
-    // adopt the configured id so its established identity is preserved (no re-key).
-    let crypto_pre_existing = dir.join("matrix-sdk-crypto.sqlite3").exists();
-    let resolved = if crypto_pre_existing {
-        tracing::info!(device_id = %configured, "device identity: adopting configured id for pre-existing store");
-        configured.to_owned()
-    } else {
-        // Genuinely fresh store: mint a unique id so a wiped store never collides with a
-        // previously-seen device identity (the #30 SigningKeyChanged trap).
-        use rand::Rng as _;
-        let mut rng = rand::thread_rng();
-        let suffix: String = (0..8)
-            .map(|_| {
-                let n: u8 = rng.gen_range(0..36);
-                if n < 10 { (b'0' + n) as char } else { (b'a' + n - 10) as char }
-            })
-            .collect();
-        let id = format!("{configured}-{suffix}");
-        tracing::info!(device_id = %id, "device identity: minted fresh unique id for new store");
-        id
-    };
+    use rand::Rng as _;
+    let mut rng = rand::thread_rng();
+    let salt: String = (0..8)
+        .map(|_| {
+            let n: u8 = rng.gen_range(0..36);
+            if n < 10 { (b'0' + n) as char } else { (b'a' + n - 10) as char }
+        })
+        .collect();
+    tracing::info!(salt = %salt, "ghost device identity: minted fresh ghost_device_salt for store");
 
     if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::warn!(error = %e, path = %dir.display(), "could not create store dir for device_id marker");
+        tracing::warn!(error = %e, path = %dir.display(), "could not create store dir for ghost_device_salt marker");
     }
-    if let Err(e) = std::fs::write(&marker, &resolved) {
-        tracing::warn!(error = %e, path = %marker.display(), "failed to persist device_id marker (will re-resolve next start)");
+    if let Err(e) = std::fs::write(&marker, &salt) {
+        tracing::warn!(error = %e, path = %marker.display(), "failed to persist ghost_device_salt marker (will re-resolve next start)");
     }
-    resolved
+    salt
 }
 
 /// Build and authenticate a Matrix client from config. Joins the target room,
@@ -805,9 +909,154 @@ pub(crate) async fn run(
     }
 }
 
+/// How long a non-ghost `m.call.member` must be continuously absent from the
+/// LiveKit roster before the reaper empties it. Long enough to never reap a user
+/// still establishing their RTC connection; short enough to clear a failed-to-
+/// connect phantom within ~a minute of a call becoming active. See
+/// [`reap_stale_memberships`].
+pub(crate) const REAP_GRACE: Duration = Duration::from_secs(45);
+
+/// One `m.call.member` entry, reduced to just the fields the reaper decision
+/// needs. Keeping the decision pure (this + a live-MXID set + a clock) makes it
+/// unit-testable without a live SDK or LiveKit room.
+struct MembershipEntry {
+    /// The state event's state_key (its unique handle; what we'd empty).
+    state_key: String,
+    /// The membership owner's bare MXID (the event sender).
+    mxid: String,
+    /// A bridge-owned identity (our ghost, or the bridge bot itself). Never reaped
+    /// — those are managed by their own lifecycles (constraint #5 / self-cleanup).
+    is_bridge_owned: bool,
+    /// The state_key starts with `@` (legacy format). Matrix auth only lets that
+    /// user set it, so the bot cannot empty it — we skip (and never track) it.
+    legacy_state_key: bool,
+}
+
+/// Pure reaper decision. Returns the state_keys to empty **now**, and mutates
+/// `phantom_since` in place: a newly-absent membership starts its grace clock; a
+/// present (or bridge-owned, or reaped) one is cleared; entries whose membership
+/// has vanished from room state are pruned.
+///
+/// "Present" is matched on the **bare MXID**, not mxid+device: a genuinely
+/// connected user is never reaped even if their membership's device disagrees
+/// with their LiveKit-track device (the keying hazard fixed in `8bf4a90`). The
+/// tradeoff — a duplicate stale membership for a present multi-device user is left
+/// alone — is acceptable.
+fn classify_stale_memberships(
+    live_mxids: &HashSet<String>,
+    entries: &[MembershipEntry],
+    phantom_since: &mut HashMap<String, Instant>,
+    now: Instant,
+    grace: Duration,
+) -> Vec<String> {
+    let mut reap = Vec::new();
+    let mut present_keys: HashSet<&str> = HashSet::new();
+    for e in entries {
+        present_keys.insert(e.state_key.as_str());
+        if e.is_bridge_owned || live_mxids.contains(&e.mxid) {
+            phantom_since.remove(&e.state_key); // present / not ours to reap
+            continue;
+        }
+        if e.legacy_state_key {
+            continue; // can't overwrite an @-state-key as the bot
+        }
+        let since = *phantom_since.entry(e.state_key.clone()).or_insert(now);
+        if now.duration_since(since) >= grace {
+            reap.push(e.state_key.clone());
+            phantom_since.remove(&e.state_key);
+        }
+    }
+    // Drop timers for memberships no longer present in room state.
+    phantom_since.retain(|k, _| present_keys.contains(k.as_str()));
+    reap
+}
+
+/// Reap stale `m.call.member` phantoms: real users whose membership lingers in
+/// room state but who have **no live LiveKit participant** (failed-to-connect,
+/// or a client that died without a clean leave — common when the homeserver
+/// lacks MSC4140 delayed events, e.g. Tuwunel). Forgejo issue #25.
+///
+/// Empties each confirmed phantom as the bridge bot via
+/// `send_state_event_for_key` — permitted because Element Call uses the per-device
+/// `_@…` state-key (not `@`-prefixed, so not owner-restricted) and the room sets
+/// `m.call.member` at PL 0. `live_mxids` is the set of bare MXIDs currently in the
+/// LiveKit room (built by the caller from `remote_participants()`); `phantom_since`
+/// carries each entry's grace clock across calls. Best-effort: read/write failures
+/// are logged, never fatal.
+pub(crate) async fn reap_stale_memberships(
+    client: &Client,
+    room_id: &RoomId,
+    bot_user_id: &UserId,
+    live_mxids: &HashSet<String>,
+    phantom_since: &mut HashMap<String, Instant>,
+) {
+    let Some(room) = client.get_room(room_id) else { return };
+    let raws = match room.get_state_events_static::<CallMemberEventContent>().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "reaper: could not read call memberships");
+            return;
+        }
+    };
+
+    // Keep the originals so we can write the retraction with the typed state_key.
+    let mut originals = Vec::new();
+    for raw in raws {
+        let Ok(ev) = raw.deserialize() else { continue };
+        if let SyncOrStrippedState::Sync(SyncStateEvent::Original(o)) = ev {
+            if matches!(o.content, CallMemberEventContent::Empty(_)) {
+                continue; // already retracted
+            }
+            originals.push(o);
+        }
+    }
+
+    let entries: Vec<MembershipEntry> = originals
+        .iter()
+        .map(|o| {
+            let mxid = o.sender.as_str().to_owned();
+            let is_bridge_owned = o.sender.as_str() == bot_user_id.as_str()
+                || crate::rtc::ghost::is_bridge_excluded_identity(o.sender.as_str());
+            let state_key = o.state_key.as_ref().to_owned();
+            let legacy_state_key = state_key.starts_with('@');
+            MembershipEntry { state_key, mxid, is_bridge_owned, legacy_state_key }
+        })
+        .collect();
+
+    let to_reap: HashSet<String> =
+        classify_stale_memberships(live_mxids, &entries, phantom_since, Instant::now(), REAP_GRACE)
+            .into_iter()
+            .collect();
+    if to_reap.is_empty() {
+        return;
+    }
+
+    for o in &originals {
+        if !to_reap.contains(o.state_key.as_ref()) {
+            continue;
+        }
+        match room
+            .send_state_event_for_key(&o.state_key, CallMemberEventContent::new_empty(None))
+            .await
+        {
+            Ok(_) => tracing::info!(
+                sender = %o.sender,
+                state_key = %o.state_key.as_ref(),
+                "reaped phantom m.call.member (no live LiveKit participant)"
+            ),
+            Err(e) => tracing::warn!(
+                sender = %o.sender,
+                state_key = %o.state_key.as_ref(),
+                error = %e,
+                "failed to reap phantom membership (room PL for m.call.member may be > 0)"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_store_device_id;
+    use super::{resolve_ghost_device_salt, resolve_store_device_id};
     use std::fs;
     use std::path::PathBuf;
 
@@ -843,29 +1092,171 @@ mod tests {
     }
 
     #[test]
-    fn pre_existing_store_adopts_configured_id() {
+    fn pre_existing_store_mints_and_resets_crypto() {
         let tmp = TmpDir::new();
-        // Simulate a pre-fix warm store: an SDK crypto db present, no marker yet.
-        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"").unwrap();
+        // A pre-#30 store's first upgrade: SDK crypto db present, no marker. The old adopt
+        // behavior kept the plain `dark-voice` (collision-prone); now we mint a unique id and
+        // reset the crypto store so the new device gets a clean Olm account.
+        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"x").unwrap();
+        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3-wal"), b"x").unwrap();
         let id = resolve_store_device_id(tmp.path(), "dark-voice");
-        assert_eq!(id, "dark-voice", "pre-existing store must keep its identity (no re-key)");
-        let marker = fs::read_to_string(tmp.0.join("device_id")).unwrap();
-        assert_eq!(marker.trim(), "dark-voice");
+        assert!(id.starts_with("dark-voice-"), "expected a minted id, got {id}");
+        assert_ne!(id, "dark-voice");
+        // Crypto files removed for re-provision; marker holds the new id.
+        assert!(!tmp.0.join("matrix-sdk-crypto.sqlite3").exists());
+        assert!(!tmp.0.join("matrix-sdk-crypto.sqlite3-wal").exists());
+        assert_eq!(fs::read_to_string(tmp.0.join("device_id")).unwrap().trim(), id);
     }
 
     #[test]
-    fn existing_marker_is_reused_verbatim() {
+    fn plain_marker_migrates_and_resets_then_is_idempotent() {
         let tmp = TmpDir::new();
+        // The "plain poison" written by the old adopt path: marker == configured.
+        fs::write(tmp.0.join("device_id"), "dark-voice").unwrap();
+        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"x").unwrap();
+        let id = resolve_store_device_id(tmp.path(), "dark-voice");
+        assert!(id.starts_with("dark-voice-") && id != "dark-voice", "expected migration, got {id}");
+        assert!(!tmp.0.join("matrix-sdk-crypto.sqlite3").exists(), "crypto store must be reset on migrate");
+        assert_eq!(fs::read_to_string(tmp.0.join("device_id")).unwrap().trim(), id);
+
+        // Idempotent: a second start (marker now != configured) reuses the healed id and does
+        // NOT touch a freshly-recreated crypto store.
+        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"y").unwrap();
+        let id2 = resolve_store_device_id(tmp.path(), "dark-voice");
+        assert_eq!(id2, id, "healed id must be stable across restarts");
+        assert!(tmp.0.join("matrix-sdk-crypto.sqlite3").exists(), "must not reset crypto on a healed store");
+    }
+
+    #[test]
+    fn existing_minted_marker_is_reused_verbatim() {
+        let tmp = TmpDir::new();
+        // A properly-minted/custom marker (!= configured) is reused, crypto untouched.
         fs::write(tmp.0.join("device_id"), "persisted-xyz").unwrap();
-        // Even with a crypto db present and a different configured id, the marker wins.
-        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"").unwrap();
+        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"x").unwrap();
         let id = resolve_store_device_id(tmp.path(), "dark-voice");
         assert_eq!(id, "persisted-xyz");
+        assert!(tmp.0.join("matrix-sdk-crypto.sqlite3").exists(), "minted/custom marker must not trigger reset");
     }
 
     #[test]
     fn empty_store_path_returns_configured() {
         // Defensive: no store path → just the configured id, no filesystem writes.
         assert_eq!(resolve_store_device_id("", "dark-voice"), "dark-voice");
+    }
+
+    #[test]
+    fn fresh_store_mints_ghost_salt() {
+        let tmp = TmpDir::new();
+        let salt = resolve_ghost_device_salt(tmp.path());
+        assert_eq!(salt.len(), 8, "expected an 8-char salt, got {salt:?}");
+        assert!(
+            salt.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "expected lowercase-alnum salt, got {salt:?}"
+        );
+        let marker = fs::read_to_string(tmp.0.join("ghost_device_salt")).unwrap();
+        assert_eq!(marker.trim(), salt);
+    }
+
+    #[test]
+    fn ghost_salt_reused_across_calls() {
+        let tmp = TmpDir::new();
+        let a = resolve_ghost_device_salt(tmp.path());
+        let b = resolve_ghost_device_salt(tmp.path());
+        assert_eq!(a, b, "warm restart must reuse the persisted salt");
+    }
+
+    #[test]
+    fn ghost_salt_independent_of_crypto_db() {
+        let tmp = TmpDir::new();
+        // A pre-fix warm store (crypto db present, no salt marker) must still MINT a fresh
+        // salt — the pre-fix ghost ids are poisoned and we want new identities. (Contrast
+        // `pre_existing_store_adopts_configured_id`, which is the opposite for the bot.)
+        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"").unwrap();
+        let salt = resolve_ghost_device_salt(tmp.path());
+        assert_eq!(salt.len(), 8, "must mint despite an existing crypto db, got {salt:?}");
+        let marker = fs::read_to_string(tmp.0.join("ghost_device_salt")).unwrap();
+        assert_eq!(marker.trim(), salt);
+    }
+
+    #[test]
+    fn empty_store_path_returns_empty_ghost_salt() {
+        assert_eq!(resolve_ghost_device_salt(""), "");
+    }
+
+    // ── Stale-membership reaper (classify_stale_memberships) ───────────────────
+    use super::{classify_stale_memberships, MembershipEntry};
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+
+    const GRACE: Duration = Duration::from_secs(45);
+
+    fn entry(state_key: &str, mxid: &str, owned: bool, legacy: bool) -> MembershipEntry {
+        MembershipEntry {
+            state_key: state_key.to_owned(),
+            mxid: mxid.to_owned(),
+            is_bridge_owned: owned,
+            legacy_state_key: legacy,
+        }
+    }
+
+    fn live(mxids: &[&str]) -> HashSet<String> {
+        mxids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn present_user_is_never_reaped_and_clears_timer() {
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        let entries = [entry("_@alice:x_DEV_m.call", "@alice:x", false, false)];
+        // Even with a pre-existing (stale) timer, a user back in LiveKit is kept.
+        since.insert("_@alice:x_DEV_m.call".to_owned(), t0);
+        let reap = classify_stale_memberships(&live(&["@alice:x"]), &entries, &mut since, t0 + GRACE * 2, GRACE);
+        assert!(reap.is_empty());
+        assert!(since.is_empty(), "present user's timer is cleared");
+    }
+
+    #[test]
+    fn absent_user_reaped_only_after_grace() {
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        let entries = [entry("_@ghosty:x_DEV_m.call", "@ghosty:x", false, false)];
+        let empty = live(&[]);
+
+        // First sight: starts the clock, nothing reaped yet.
+        let reap = classify_stale_memberships(&empty, &entries, &mut since, t0, GRACE);
+        assert!(reap.is_empty());
+        // Still within grace.
+        let reap = classify_stale_memberships(&empty, &entries, &mut since, t0 + Duration::from_secs(30), GRACE);
+        assert!(reap.is_empty());
+        // Past grace → reaped, timer dropped.
+        let reap = classify_stale_memberships(&empty, &entries, &mut since, t0 + GRACE, GRACE);
+        assert_eq!(reap, vec!["_@ghosty:x_DEV_m.call".to_string()]);
+        assert!(since.is_empty());
+    }
+
+    #[test]
+    fn bridge_owned_and_legacy_are_never_reaped() {
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        let entries = [
+            entry("_@nether-voicebridge_1:x_D1_m.call", "@nether-voicebridge_1:x", true, false), // ghost
+            entry("@legacy:x", "@legacy:x", false, true),                                         // @-state-key
+        ];
+        let empty = live(&[]);
+        // Even well past grace, neither is reaped.
+        let reap = classify_stale_memberships(&empty, &entries, &mut since, t0 + GRACE * 3, GRACE);
+        assert!(reap.is_empty());
+        assert!(since.is_empty(), "neither owned nor legacy entries are tracked");
+    }
+
+    #[test]
+    fn vanished_membership_is_pruned_from_timers() {
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        since.insert("_@gone:x_DEV_m.call".to_owned(), t0);
+        // The membership is no longer in room state (no entries) → its timer is pruned.
+        let reap = classify_stale_memberships(&live(&[]), &[], &mut since, t0 + Duration::from_secs(5), GRACE);
+        assert!(reap.is_empty());
+        assert!(since.is_empty(), "timer for a vanished membership is dropped");
     }
 }

@@ -18,10 +18,13 @@ channel↔room pairs at once.
 
 ## Screenshots
 
-<!-- screenshots TODO: e.g. a Matrix call roster showing Discord users as ghosts,
-     and a Discord voice channel showing Matrix users as named puppet bots. -->
+![A Matrix Element Call (left) and the bridged Discord voice channel (right) side
+by side: Discord speakers appear as named ghosts in the Element call, and Matrix
+speakers appear as named puppet bots in Discord.](docs/images/nether-voicebridge.png)
 
-_Coming soon._
+*Left: an Element Call with the bridged participants. Right: the same conversation
+in the Discord voice channel — each side shows the other's speakers as their own
+named participants.*
 
 ## What it does
 
@@ -29,6 +32,9 @@ _Coming soon._
   individually-controllable **puppet bots** (named after the Matrix user, mutable
   per-user). Discord speakers appear in the Matrix call as **appservice ghosts**
   (named + avatared after the Discord user).
+- **Mute carries across.** Mute state is mirrored both ways — mute yourself in the
+  Matrix call and your Discord puppet goes muted too, and a muted Discord speaker
+  shows muted in Element Call.
 - **See who's waiting.** Discord users show up in the Matrix call as ghosts **even
   when no Matrix user is in the call** (membership only, no media) — so Matrix
   users can tell at a glance whether a room is worth joining. The moment a Matrix
@@ -45,6 +51,31 @@ _Coming soon._
   delivers per-ghost keys via Olm — true E2EE the homeserver can't read.
 - **On-demand lifecycle.** A bridge opens when the first human appears on either
   side and tears down to baseline when the last human leaves both.
+- **Self-healing call roster.** On homeservers without
+  [MSC4140](https://github.com/matrix-org/matrix-spec-proposals/pull/4140) delayed
+  events, a client that crashes or fails to connect can leave a "phantom"
+  `m.call.member` that never expires. The bridge spots call members with no live
+  media after a grace period and clears them, so the roster doesn't fill with
+  participants who aren't really there.
+
+## Future directions
+
+- **An independent human code review / security audit.** The bridge handles DAVE
+  (MLS) and Matrix media E2EE; a careful review by human eyes — especially of the
+  key-handling and echo-exclusion paths — would raise confidence beyond automated
+  checks. Worth doing before any "stable" claim.
+- **Video relay (webcam / screen share).** Carrying video — and screen/app share
+  *with* its audio — between Discord and Element Call, not just voice. This requires
+  driving Discord with **self-bots** (ToS violation) to relay video streams.
+- **Soundboard support.** Bridging Discord's soundboard clips (and/or a Matrix-side
+  equivalent) through the audio core.
+- **Interop with mautrix-discord ghosts.** Where a room already runs the
+  [mautrix-discord](https://github.com/mautrix/discord) text/chat bridge, exploring
+  whether voice ghosts could align with or reuse its existing Discord-user ghosts,
+  rather than presenting a second, separate set of puppets/ghosts.
+
+If any of these matters to you, say so in the community room or on the issue tracker
+(below) — interest is what moves an idea up the list.
 
 ## How it works
 
@@ -162,6 +193,27 @@ The service reads `/etc/nether-voicebridge/config.toml` and stores matrix-sdk da
 (Olm crypto + state) under `/var/lib/nether-voicebridge`. See
 [`docs/packaging.md`](docs/packaging.md) for the package layout and how to build
 the packages yourself (`packaging/build-packages.sh`).
+
+### Standalone binary (other distros)
+
+For distros without `.deb`/`.rpm` (Arch, Gentoo, NixOS, …), each
+[release](https://nether.codes/dark/nether-voicebridge/releases) also ships a
+self-contained tarball — the binary plus `config.example.toml`, the systemd unit,
+`LICENSE`, and this README — alongside a `SHA256SUMS` file:
+
+```bash
+ver=<version>   # e.g. 0.2.0
+base=https://nether.codes/dark/nether-voicebridge/releases/download/v$ver
+curl -LO $base/nether-voicebridge-$ver-x86_64-linux.tar.gz
+curl -LO $base/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing   # verify
+tar xzf nether-voicebridge-$ver-x86_64-linux.tar.gz
+```
+
+> The binary is **amd64-only** and built against **glibc 2.36** (dynamically linked
+> to **libopus**), so it needs your distro's `libopus` + `ca-certificates` and a
+> glibc host — it won't run on Alpine/musl or much older glibc. There, prefer the
+> Docker image, which carries its own runtime.
 
 ## Configuration notes
 

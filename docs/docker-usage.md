@@ -52,9 +52,58 @@ environment:
   RUST_LOG: "nether_voicebridge=debug,info"
 ```
 
+### Diagnostics (#32: Discord→Matrix audio corrosion)
+
+The Discord→Matrix audio path ships two tiers of diagnostics for chasing
+intermittent corruption (issue #32).
+
+**Always on — no flag.** Drop counters, a per-ghost health line (~every 5 s), and
+frame-shape warnings (short PLC / non-1920-sample frames) are compiled in and always
+emitted as `tracing` logs. The only knob is verbosity — raise `RUST_LOG` (see
+[Log verbosity](#log-verbosity) above) and read the health lines. Start here.
+
+**Opt-in — WAV taps (`capture_wav`, default off).** For a live A/B bisection, enable
+the per-bridge `capture_wav` flag, which writes two raw 48 kHz mono WAVs:
+
+- **Tap A** — `capture_<ssrc>.wav`: what *arrived* from Discord, at ingress.
+- **Tap B** — `publish_<key>.wav`: the exact mono PCM we *hand to LiveKit*, at the
+  publish boundary.
+
+How to read the pair: if Tap A and Tap B both sound clean but Element Call is
+garbled, the fault is **downstream** of our audio core (Opus encode / frame E2EE),
+not in the bridge's reframing/mixing. If Tap B is already corrupt, the problem is in
+our core.
+
+Enable it via the bridge's Discord section in `config.toml`:
+
+```toml
+[bridge.discord]
+capture_wav = true
+```
+
+…or, in Docker, via the equivalent environment variable (applies to all bridges):
+
+```yaml
+environment:
+  NETHER_DISCORD_CAPTURE_WAV: "true"
+```
+
+**Caveats — leave this off in normal production:**
+
+- Files are written with **bare relative filenames** to the process working
+  directory, which in the image is `/app` — **not** the `/app/data` volume. They are
+  therefore ephemeral: retrieve them with `docker compose cp` / `docker compose exec`
+  while the container is up, or they vanish on `docker compose down`.
+- The files grow **unbounded** for the whole session (headers are finalized on a
+  clean Ctrl-C / SIGTERM shutdown).
+- Filenames are **not** bridge-prefixed, so do not enable `capture_wav` on two
+  bridges that might see the same Discord SSRC at the same time — they would collide.
+
 ### Multi-architecture builds
 
-To build for both `linux/amd64` and `linux/arm64` and push to a registry:
+The published images and release artifacts are **amd64-only**. If you need arm64,
+build it yourself — to build for both `linux/amd64` and `linux/arm64` and push to a
+registry:
 
 ```bash
 docker buildx build \
@@ -72,7 +121,9 @@ A plain `docker compose build` builds only for the host architecture.
 `nether.codes` container registry on every push to `master` and on `v*` tags. It
 needs a Forgejo runner with a `docker` label and a reachable Docker daemon
 (socket-mounted into the job container). The first build is heavy — the WebRTC
-download plus a full release compile, doubled for the emulated arm64 leg.
+download plus a full release compile. CI is **amd64-only** (the emulated arm64 leg
+is disabled — see the commented QEMU step in `docker.yml`), so a cold build is
+~12 min.
 
 ### Limiting runner resources
 

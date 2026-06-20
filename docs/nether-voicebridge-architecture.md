@@ -35,31 +35,32 @@ tasks and channels.
 
 ```
                          ┌──────────────────────────────────────┐
-                         │              Coordinator              │
-                         │  (one Bridge per channel-pair)        │
+                         │              Coordinator             │
+                         │  (one Bridge per channel-pair)       │
                          └──────────────────────────────────────┘
                                           │
-                    ┌─────────────────────┴─────────────────────┐
+                    ┌─────────────────────┴──────────────────────┐
                     │                  Bridge                    │
                     │  lifecycle state machine + AudioRouter     │
                     └────────────────────────────────────────────┘
         Discord side  │                                      │  Matrix side
                       ▼                                      ▼
    ┌───────────────────────────────┐        ┌──────────────────────────────────┐
-   │ Listener bot (1)              │        │ Subscriber participant (1)        │
-   │  songbird RX, all SSRCs       │        │  livekit-rust, subscribes to all  │
-   │  DAVE decrypt → Opus → PCM    │        │  remote tracks → Opus → PCM       │
-   ├───────────────────────────────┤        ├──────────────────────────────────┤
-   │ Puppet pool (N bots)          │        │ Ghost set (N appservice users)    │
-   │  one per Matrix speaker       │        │  one per Discord speaker          │
-   │  PCM → Opus → DAVE → play     │        │  PCM → publish own LiveKit track  │
-   │  nickname = Matrix display    │        │  + post m.call membership event   │
+   │ Puppet pool (N bots)          │        │ Subscriber participant (1)       │
+   │  one floating CAPTURE ANCHOR: │        │  livekit-rust, subscribes to all │
+   │   songbird RX, all SSRCs,     │        │  remote tracks → Opus → PCM      │
+   │   DAVE decrypt → Opus → PCM   │        ├──────────────────────────────────┤
+   │  the rest are per-speaker     │        │ Ghost set (N appservice users)   │
+   │  puppets:                     │        │  one per Discord speaker         │
+   │   PCM → Opus → DAVE → play,   │        │  PCM → publish own LiveKit track │
+   │   nickname = Matrix display   │        │  + post m.call membership event  │
    └───────────────────────────────┘        └──────────────────────────────────┘
 ```
 
 ### Direction: Discord → Matrix
-1. Listener bot (songbird, receive on) captures per-SSRC Opus from every
-   Discord speaker; DAVE-decrypts; decodes to PCM.
+1. The **capture anchor** — a floating bot drawn from the puppet pool (no
+   dedicated listener), elected per active channel — runs songbird receive:
+   per-SSRC Opus from every Discord speaker; DAVE-decrypts; decodes to PCM.
 2. For each *human* Discord speaker, the Coordinator has minted a **ghost**
    (`@nether-voicebridge_<id>:nether.im`) which: posts its `m.call` membership state
    event, fetches a LiveKit JWT from lk-jwt-service for its identity, connects
@@ -121,6 +122,15 @@ count as humans.
   waiting.
 - Close: tear down all connections, return puppets to pool, retire ghosts,
   drop memberships. No leaked connections (test this explicitly).
+- **Mute mirroring:** mute state is reflected across the bridge both ways — a
+  Matrix participant muting mutes their Discord puppet (`Call::mute`), and a muted
+  Discord speaker is published muted to the call.
+- **Phantom-membership reaping:** on homeservers without MSC4140 delayed events, a
+  client that disconnects uncleanly can leave an `m.call.member` that never expires.
+  The subscriber periodically clears call members that have no live LiveKit
+  participant after a grace period (legitimate because, at the EC-standard PL 0, the
+  `org.matrix.msc3401.call.member` state key is non-`@`-scoped — any participant may
+  empty it).
 
 Handle room tombstones (follow upgrades) and call-end events.
 
@@ -168,17 +178,19 @@ Handle room tombstones (follow upgrades) and call-end events.
       Olm to-device, and `keys::install_peer_key` feeds the raw key to the
       subscriber's LiveKit KeyProvider. The subscriber self-provisions an
       appservice device (fresh, un-pinned Olm identity).
-    - **Publish (Discord→Matrix) — Path 2 (plaintext key transport), staged
-      toward Path 3.** Each ghost configures HKDF/GCM frame encryption (same
-      `KeyProvider` options as the subscriber), generates a 16-byte media key,
-      sets it under its own LiveKit identity, and **distributes it plaintext**
-      via an `io.element.call.encryption_keys` to-device masqueraded as the ghost
-      (`rtc::ghost::distribute_key_loop`, re-sent every 5 s to reach late
-      joiners). Caveat: plaintext transport is **homeserver-readable** (not true
-      E2EE for ghost audio) and breaks if either client starts enforcing
-      encryption. **Path 3** swaps only the transport to per-ghost Olm (durable,
-      true E2EE) — the LiveKit encryption / identity / content shape are already
-      shared.
+    - **Publish (Discord→Matrix) — done, live-verified.** Each ghost configures
+      HKDF/GCM frame encryption (same `KeyProvider` options as the subscriber),
+      generates a 16-byte media key, sets it under its own LiveKit identity, and
+      distributes it via an `io.element.call.encryption_keys` to-device
+      masqueraded as the ghost (`rtc::ghost::distribute_key_loop`, burst + ~5 s
+      heartbeat to reach late joiners). Two transports, auto-selected by
+      `key_transport`:
+      - **`olm` (Path 3, true E2EE — live on encrypted rooms).** Each ghost becomes
+        its own crypto client and Olm-encrypts the key per recipient device, so the
+        homeserver can't read it. This is the default for an encrypted room.
+      - **`plaintext` (Path 2, fallback).** A homeserver-readable key send — fine for
+        unencrypted rooms, but not true E2EE for ghost audio. Selected automatically
+        when the room is unencrypted; can be forced via config.
 
 ## Proposed crate layout
 

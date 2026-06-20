@@ -61,11 +61,28 @@ The script builds the release binary, then runs `nfpm` from the repo root (all
 paths in `packaging/nfpm.yaml` are root-relative). amd64 only for now, mirroring the
 Docker image.
 
+## Standalone binary tarball
+
+For distros without `.deb`/`.rpm`, each release also carries a self-contained
+`nether-voicebridge-<version>-x86_64-linux.tar.gz` — the same glibc/amd64 binary the
+Docker image and packages use, bundled with `config.example.toml`, the systemd unit,
+`LICENSE`, and the README. A `SHA256SUMS` file covering every release asset (deb, rpm,
+tarball) is attached too; verify with `sha256sum -c SHA256SUMS --ignore-missing`.
+
+Like the binary itself, the tarball is **amd64-only** and dynamically linked against
+**glibc 2.36 + libopus** — it is not a static/musl build, so it needs those runtime
+libraries and a glibc host. The end-user install steps are in the README's
+"Standalone binary" section.
+
 ## CI
 
-`.forgejo/workflows/release.yml` runs on `v*` tag pushes: it builds the binary,
-produces both packages, and uploads them to the Forgejo Release for the tag. It
-needs a repo Actions secret **`RELEASE_TOKEN`** — a Forgejo token with
-`write:repository` scope (the Docker job's package-scoped `REGISTRY_TOKEN` can't
-create releases). Cutting a release is then just: bump the version in
-`[workspace.package]`, commit, and push a `v<version>` tag.
+`.forgejo/workflows/docker.yml` handles both the image and the packages, so the
+binary is compiled **once** per tag. On a `v*` tag push the `image` job builds and
+pushes the Docker image (the sole compile), then the `packages` job — which
+`needs: image` and is tag-gated — pulls that image, copies the binary out of it
+(`/app/nether-voicebridge` → `target/release/`), runs `nfpm`, builds the standalone
+tarball, generates `SHA256SUMS`, and uploads all four assets (`.deb`, `.rpm`,
+`.tar.gz`, `SHA256SUMS`) to the Forgejo Release. It needs a repo Actions secret **`RELEASE_TOKEN`**
+— a Forgejo token with `write:repository` scope (the Docker job's package-scoped
+`REGISTRY_TOKEN` can't create releases). Cutting a release is then just: bump the
+version in `[workspace.package]`, commit, and push a `v<version>` tag.
