@@ -269,21 +269,70 @@ pub(crate) async fn retract_self_call_membership(
     }
 }
 
+/// Mint a unique device id from the configured base: `{configured}-{8 lowercase-alnum}`.
+/// A minted id is always distinct from the bare `configured`, which is how the caller
+/// distinguishes a properly-provisioned marker from a "plain poison" one.
+fn mint_fresh_device_id(configured: &str) -> String {
+    use rand::Rng as _;
+    let mut rng = rand::thread_rng();
+    let suffix: String = (0..8)
+        .map(|_| {
+            let n: u8 = rng.gen_range(0..36);
+            if n < 10 { (b'0' + n) as char } else { (b'a' + n - 10) as char }
+        })
+        .collect();
+    format!("{configured}-{suffix}")
+}
+
+/// Best-effort delete the bot's crypto store files so a newly-minted device id gets a clean
+/// Olm account. matrix-sdk-crypto is single-account-per-store: opening it with a new device id
+/// would otherwise restore the OLD account, defeating the re-provision. Only the crypto sqlite
+/// is removed — state/event-cache/media stores are keyed by room/event/user (device-agnostic)
+/// and the ghosts' independent crypto stores under `ghosts/` are untouched.
+///
+/// SAFETY: callers MUST invoke this only from `resolve_store_device_id`, which runs *before*
+/// `build_client` opens the sqlite store (see `lib.rs::run`). Deleting an open DB would corrupt
+/// it; do not move this past the store-open point.
+fn reset_bot_crypto_store(dir: &std::path::Path) {
+    tracing::warn!(
+        path = %dir.display(),
+        "bot crypto store reset for device re-provision (one-time; peers see a brand-new device, not a key change)"
+    );
+    for name in [
+        "matrix-sdk-crypto.sqlite3",
+        "matrix-sdk-crypto.sqlite3-shm",
+        "matrix-sdk-crypto.sqlite3-wal",
+    ] {
+        let p = dir.join(name);
+        if let Err(e) = std::fs::remove_file(&p) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(error = %e, path = %p.display(), "failed to remove bot crypto store file during reset");
+            }
+        }
+    }
+}
+
 /// Resolve the Matrix `device_id` to assert for the bot, **pairing the device identity
 /// with the crypto store** so identity and Olm keys always travel together (fixes #30).
 ///
-/// The bot's configured `device_id` is derived from the bridge *name*, not the store —
-/// so wiping the store and restarting re-provisions the SAME device_id with NEW identity
-/// keys. Peers that cached the old identity reject the change (`SigningKeyChanged`) and
-/// never open a fresh Olm session to it, so they never deliver the call's media key to the
-/// subscriber → the bot can't decrypt the humans' audio (Matrix→Discord goes silent on a
-/// fresh store). Making the id a property of the store avoids the collision entirely:
-/// - **marker present** (`<store_path>/device_id`) → reuse it (warm restart; crypto stays valid).
-/// - **no marker but the store already held an SDK crypto db before this run** → adopt the
-///   configured id and write the marker (back-compat: existing deployments keep their identity,
-///   no re-key).
-/// - **genuinely fresh store** → mint a NEW unique id (peers see a brand-new device and open
-///   Olm normally) and write the marker.
+/// The bot's configured `device_id` is derived from the bridge *name*, not the store — so the
+/// SAME plain id can exist in two different stores (e.g. a laptop and a VPS) with DIFFERENT
+/// Olm signing keys. Peers that cached one reject the other as `SigningKeyChanged` and never
+/// open a fresh Olm session, so they never deliver the call's media key to the subscriber →
+/// the bot can't decrypt the humans' audio (Matrix→Discord goes silent). Making the id a
+/// per-store-unique property avoids the collision entirely:
+/// - **minted/custom marker present** (`<store_path>/device_id`, value `!= configured`) → reuse
+///   it (warm restart; crypto stays valid).
+/// - **plain-poison marker** (value `== configured`, persisted by the old adopt path) → re-mint
+///   a unique id, reset the crypto store, rewrite the marker. One-time, idempotent self-heal:
+///   next start the marker `!= configured` and is reused unchanged.
+/// - **no marker but the store already held an SDK crypto db** (a pre-#30 store's first upgrade)
+///   → mint a unique id and reset the crypto store (the existing crypto belongs to the old plain
+///   identity), then write the marker.
+/// - **genuinely fresh store** → mint a unique id and write the marker.
+///
+/// Accepted one-time cost: a deployment that deliberately set a *plain* `matrix.device_id` on a
+/// single machine gets re-keyed once on upgrade (peers just see one new device); idempotent after.
 ///
 /// Appservice-auth only — the caller must NOT use this on the regular-account (`access_token`)
 /// path, whose device is pinned to the token.
@@ -294,44 +343,46 @@ pub(crate) fn resolve_store_device_id(store_path: &str, configured: &str) -> Str
     let dir = std::path::Path::new(store_path);
     let marker = dir.join("device_id");
 
-    // Reuse a previously-persisted id (warm restart).
+    // A previously-persisted id. Reuse it UNLESS it is the bare configured id — that "plain
+    // poison" was written by the old adopt path and collides across stores, so heal it.
     if let Ok(s) = std::fs::read_to_string(&marker) {
         let s = s.trim();
-        if !s.is_empty() {
+        if !s.is_empty() && s != configured {
             tracing::info!(device_id = %s, "device identity: reusing persisted id from store");
             return s.to_owned();
         }
+        if s == configured {
+            let id = mint_fresh_device_id(configured);
+            tracing::warn!(old = %s, device_id = %id, "device identity: migrating plain-poison marker to a unique id");
+            reset_bot_crypto_store(dir);
+            persist_device_marker(&marker, dir, &id);
+            return id;
+        }
     }
 
-    // No marker yet. If the SDK crypto db already exists, this is a pre-fix warm store —
-    // adopt the configured id so its established identity is preserved (no re-key).
+    // No marker yet.
     let crypto_pre_existing = dir.join("matrix-sdk-crypto.sqlite3").exists();
-    let resolved = if crypto_pre_existing {
-        tracing::info!(device_id = %configured, "device identity: adopting configured id for pre-existing store");
-        configured.to_owned()
+    let id = mint_fresh_device_id(configured);
+    if crypto_pre_existing {
+        // A pre-#30 store's first upgrade: its crypto belongs to the old plain identity, so the
+        // freshly-minted id needs a clean crypto store (mint → reset → persist marker).
+        tracing::warn!(device_id = %id, "device identity: minted unique id for pre-existing store (re-provisioning crypto)");
+        reset_bot_crypto_store(dir);
     } else {
-        // Genuinely fresh store: mint a unique id so a wiped store never collides with a
-        // previously-seen device identity (the #30 SigningKeyChanged trap).
-        use rand::Rng as _;
-        let mut rng = rand::thread_rng();
-        let suffix: String = (0..8)
-            .map(|_| {
-                let n: u8 = rng.gen_range(0..36);
-                if n < 10 { (b'0' + n) as char } else { (b'a' + n - 10) as char }
-            })
-            .collect();
-        let id = format!("{configured}-{suffix}");
         tracing::info!(device_id = %id, "device identity: minted fresh unique id for new store");
-        id
-    };
+    }
+    persist_device_marker(&marker, dir, &id);
+    id
+}
 
+/// Best-effort persist the resolved device id to the marker (shared by all resolve branches).
+fn persist_device_marker(marker: &std::path::Path, dir: &std::path::Path, id: &str) {
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, path = %dir.display(), "could not create store dir for device_id marker");
     }
-    if let Err(e) = std::fs::write(&marker, &resolved) {
+    if let Err(e) = std::fs::write(marker, id) {
         tracing::warn!(error = %e, path = %marker.display(), "failed to persist device_id marker (will re-resolve next start)");
     }
-    resolved
 }
 
 /// Resolve a per-store random salt that makes every appservice ghost's otherwise
@@ -1065,24 +1116,50 @@ mod tests {
     }
 
     #[test]
-    fn pre_existing_store_adopts_configured_id() {
+    fn pre_existing_store_mints_and_resets_crypto() {
         let tmp = TmpDir::new();
-        // Simulate a pre-fix warm store: an SDK crypto db present, no marker yet.
-        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"").unwrap();
+        // A pre-#30 store's first upgrade: SDK crypto db present, no marker. The old adopt
+        // behavior kept the plain `dark-voice` (collision-prone); now we mint a unique id and
+        // reset the crypto store so the new device gets a clean Olm account.
+        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"x").unwrap();
+        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3-wal"), b"x").unwrap();
         let id = resolve_store_device_id(tmp.path(), "dark-voice");
-        assert_eq!(id, "dark-voice", "pre-existing store must keep its identity (no re-key)");
-        let marker = fs::read_to_string(tmp.0.join("device_id")).unwrap();
-        assert_eq!(marker.trim(), "dark-voice");
+        assert!(id.starts_with("dark-voice-"), "expected a minted id, got {id}");
+        assert_ne!(id, "dark-voice");
+        // Crypto files removed for re-provision; marker holds the new id.
+        assert!(!tmp.0.join("matrix-sdk-crypto.sqlite3").exists());
+        assert!(!tmp.0.join("matrix-sdk-crypto.sqlite3-wal").exists());
+        assert_eq!(fs::read_to_string(tmp.0.join("device_id")).unwrap().trim(), id);
     }
 
     #[test]
-    fn existing_marker_is_reused_verbatim() {
+    fn plain_marker_migrates_and_resets_then_is_idempotent() {
         let tmp = TmpDir::new();
+        // The "plain poison" written by the old adopt path: marker == configured.
+        fs::write(tmp.0.join("device_id"), "dark-voice").unwrap();
+        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"x").unwrap();
+        let id = resolve_store_device_id(tmp.path(), "dark-voice");
+        assert!(id.starts_with("dark-voice-") && id != "dark-voice", "expected migration, got {id}");
+        assert!(!tmp.0.join("matrix-sdk-crypto.sqlite3").exists(), "crypto store must be reset on migrate");
+        assert_eq!(fs::read_to_string(tmp.0.join("device_id")).unwrap().trim(), id);
+
+        // Idempotent: a second start (marker now != configured) reuses the healed id and does
+        // NOT touch a freshly-recreated crypto store.
+        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"y").unwrap();
+        let id2 = resolve_store_device_id(tmp.path(), "dark-voice");
+        assert_eq!(id2, id, "healed id must be stable across restarts");
+        assert!(tmp.0.join("matrix-sdk-crypto.sqlite3").exists(), "must not reset crypto on a healed store");
+    }
+
+    #[test]
+    fn existing_minted_marker_is_reused_verbatim() {
+        let tmp = TmpDir::new();
+        // A properly-minted/custom marker (!= configured) is reused, crypto untouched.
         fs::write(tmp.0.join("device_id"), "persisted-xyz").unwrap();
-        // Even with a crypto db present and a different configured id, the marker wins.
-        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"").unwrap();
+        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"x").unwrap();
         let id = resolve_store_device_id(tmp.path(), "dark-voice");
         assert_eq!(id, "persisted-xyz");
+        assert!(tmp.0.join("matrix-sdk-crypto.sqlite3").exists(), "minted/custom marker must not trigger reset");
     }
 
     #[test]
