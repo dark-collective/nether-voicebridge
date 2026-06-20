@@ -82,11 +82,15 @@ use super::publish;
 use super::session::decode_jwt_claims;
 use super::well_known::{self, LivekitFocusInfo};
 
-/// Localpart prefix for ghost MXIDs (`@nether-voicebridge_<discord_user_id>:server`).
-/// Must match the appservice namespace regex (`@nether-voicebridge_.*`). Note: this
-/// is deliberately NOT `discord_` — that namespace is owned by mautrix-discord, and
-/// sharing it on the same homeserver would collide.
-const GHOST_LOCALPART_PREFIX: &str = "nether-voicebridge_";
+/// Build the ghost localpart prefix (`{sender_localpart}_`) from the appservice
+/// sender localpart. Ghost MXIDs are `@{sender_localpart}_{discord_user_id}:server`,
+/// which matches the appservice namespace regex `@{sender_localpart}_.*`. Falls back
+/// to `"nether-voicebridge_"` when `sender_localpart` is absent (defensive only —
+/// the config validator requires it). Deliberately NOT `discord_` — that namespace is
+/// owned by mautrix-discord, and sharing it on the same homeserver would collide.
+pub(crate) fn ghost_localpart_prefix(sender_localpart: Option<&str>) -> String {
+    sender_localpart.unwrap_or("nether-voicebridge").to_owned() + "_"
+}
 
 /// MatrixRTC call-membership state event type (MSC3401). Matches what
 /// `rtc::membership` posts via ruma's typed `send_state_event_for_key`; here we
@@ -106,13 +110,13 @@ const FRAME_CHANNEL_DEPTH: usize = 50;
 
 /// Is this LiveKit participant identity one of our ghosts? Used by the bridge
 /// bot's subscriber to skip ghost tracks (echo prevention, constraint #5). The
-/// identity is `@nether-voicebridge_<id>:server[:device]`; the localpart is the
+/// identity is `@{sender_localpart}_{id}:server[:device]`; the localpart is the
 /// segment between `@` and the first `:`.
-pub(crate) fn is_ghost_identity(identity: &str) -> bool {
+pub(crate) fn is_ghost_identity(identity: &str, ghost_prefix: &str) -> bool {
     identity
         .strip_prefix('@')
         .and_then(|rest| rest.split(':').next())
-        .is_some_and(|localpart| localpart.starts_with(GHOST_LOCALPART_PREFIX))
+        .is_some_and(|localpart| localpart.starts_with(ghost_prefix))
 }
 
 /// The prefix this bridge minted ghosts under *before* the rename to
@@ -140,8 +144,8 @@ pub(crate) fn is_legacy_ghost_identity(identity: &str) -> bool {
 /// Should this identity be excluded from call-participant counting, key recipients,
 /// and capture/forward? True for our current ghosts and for stale legacy ghosts.
 /// (Constraint #5 echo-prevention plus the post-rename leftover cleanup.)
-pub(crate) fn is_bridge_excluded_identity(identity: &str) -> bool {
-    is_ghost_identity(identity) || is_legacy_ghost_identity(identity)
+pub(crate) fn is_bridge_excluded_identity(identity: &str, ghost_prefix: &str) -> bool {
+    is_ghost_identity(identity, ghost_prefix) || is_legacy_ghost_identity(identity)
 }
 
 /// A [`CaptureSink`] for one ghost: pushes a Discord speaker's 20 ms mono frames
@@ -258,6 +262,10 @@ struct GhostConfig {
     /// `publish_<key>.wav` of the exact mono PCM it feeds LiveKit. Mirrors the
     /// discord crate's `capture_wav` (Tap A); off in production.
     capture_wav: bool,
+    /// Ghost MXID localpart prefix: `{sender_localpart}_`. Must match the
+    /// appservice namespace regex. Derived once in `GhostPool::new` from
+    /// `matrix.sender_localpart` so all ghosts use the same prefix.
+    ghost_localpart_prefix: String,
 }
 
 impl GhostPool {
@@ -302,6 +310,7 @@ impl GhostPool {
                 lk_jwt_url: livekit_cfg.lk_jwt_url.clone(),
                 lk_url: livekit_cfg.url.clone(),
                 capture_wav,
+                ghost_localpart_prefix: ghost_localpart_prefix(matrix_cfg.sender_localpart.as_deref()),
             },
         }))
     }
@@ -339,7 +348,7 @@ impl GhostPool {
             if matches!(orig.content, CallMemberEventContent::Empty(_)) {
                 continue;
             }
-            if is_ghost_identity(orig.sender.as_str()) {
+            if is_ghost_identity(orig.sender.as_str(), &self.cfg.ghost_localpart_prefix) {
                 // Current-prefix ghost: masquerade-retract (we own this namespace).
                 let state_key: &str = orig.state_key.as_ref();
                 match retract_membership_raw(&self.cfg, orig.sender.as_str(), state_key).await {
@@ -631,8 +640,8 @@ async fn run_ghost(
     mute_rx: watch::Receiver<bool>,
     cancel: CancellationToken,
 ) {
-    let ghost_mxid = format!("@{GHOST_LOCALPART_PREFIX}{key}:{}", cfg.server_name);
-    let localpart = format!("{GHOST_LOCALPART_PREFIX}{key}");
+    let ghost_mxid = format!("@{}{key}:{}", cfg.ghost_localpart_prefix, cfg.server_name);
+    let localpart = format!("{}{key}", cfg.ghost_localpart_prefix);
     // Stable per-ghost device id; must agree between the lk-jwt identity and the
     // m.call.member content so EC maps the ghost's media to its membership. The
     // per-store salt makes the otherwise machine-deterministic id unique to this
@@ -1397,7 +1406,7 @@ async fn enumerate_key_recipients(client: &Client, cfg: &GhostConfig) -> Result<
             continue;
         }
         let sender = orig.sender;
-        if is_bridge_excluded_identity(sender.as_str()) || sender.as_str() == cfg.bot_user_id {
+        if is_bridge_excluded_identity(sender.as_str(), &cfg.ghost_localpart_prefix) || sender.as_str() == cfg.bot_user_id {
             continue;
         }
         if !recipients.contains(&sender) {
@@ -1761,13 +1770,18 @@ mod tests {
 
     #[test]
     fn ghost_identity_detection() {
-        assert!(is_ghost_identity("@nether-voicebridge_12345:nether.im"));
-        assert!(is_ghost_identity("@nether-voicebridge_12345:nether.im:DEVICE"));
-        assert!(!is_ghost_identity("@dark:nether.im"));
-        assert!(!is_ghost_identity("@dark:nether.im:DEVICE"));
+        let pfx = "nether-voicebridge_";
+        assert!(is_ghost_identity("@nether-voicebridge_12345:nether.im", pfx));
+        assert!(is_ghost_identity("@nether-voicebridge_12345:nether.im:DEVICE", pfx));
+        assert!(!is_ghost_identity("@dark:nether.im", pfx));
+        assert!(!is_ghost_identity("@dark:nether.im:DEVICE", pfx));
         // mautrix-discord's namespace must NOT be detected as a *current* ghost.
-        assert!(!is_ghost_identity("@discord_12345:nether.im"));
-        assert!(!is_ghost_identity("not-an-mxid"));
+        assert!(!is_ghost_identity("@discord_12345:nether.im", pfx));
+        assert!(!is_ghost_identity("not-an-mxid", pfx));
+        // A different deployment prefix works too.
+        let test_pfx = "test-nether-voicebridge_";
+        assert!(is_ghost_identity("@test-nether-voicebridge_12345:shadowdrake.org", test_pfx));
+        assert!(!is_ghost_identity("@nether-voicebridge_12345:shadowdrake.org", test_pfx));
     }
 
     #[test]
@@ -1783,9 +1797,10 @@ mod tests {
         assert!(!is_legacy_ghost_identity("@nether-voicebridge_123:nether.im"));
 
         // The combined exclusion helper covers both current and legacy ghosts.
-        assert!(is_bridge_excluded_identity("@nether-voicebridge_123:nether.im"));
-        assert!(is_bridge_excluded_identity("@discord_996161727068643380:nether.im"));
-        assert!(!is_bridge_excluded_identity("@dark:nether.im"));
+        let pfx = "nether-voicebridge_";
+        assert!(is_bridge_excluded_identity("@nether-voicebridge_123:nether.im", pfx));
+        assert!(is_bridge_excluded_identity("@discord_996161727068643380:nether.im", pfx));
+        assert!(!is_bridge_excluded_identity("@dark:nether.im", pfx));
     }
 
     #[test]

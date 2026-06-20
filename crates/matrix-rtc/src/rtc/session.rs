@@ -100,6 +100,7 @@ pub async fn connect(
     room_id: OwnedRoomId,
     router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
+    ghost_prefix: Arc<str>,
     parent_cancel: CancellationToken,
 ) -> Result<LiveSession> {
     let span = tracing::info_span!("rtc.session", sfu_url = %url, use_e2ee);
@@ -157,7 +158,7 @@ pub async fn connect(
     // this session's event task + per-track consumers.
     let cancel = parent_cancel.child_token();
     let event_task = tokio::spawn(
-        handle_room_events(events, client, room_id, router, cancel.clone(), bridge.clone())
+        handle_room_events(events, client, room_id, router, cancel.clone(), bridge.clone(), ghost_prefix)
             .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
     );
 
@@ -312,6 +313,7 @@ async fn handle_room_events(
     router: Arc<dyn PlaybackRouter>,
     cancel: CancellationToken,
     bridge: Arc<str>,
+    ghost_prefix: Arc<str>,
 ) {
     // Per-track child tokens so an individual unsubscribe can stop just that
     // consumer; cancelling the parent (teardown) stops them all.
@@ -347,7 +349,7 @@ async fn handle_room_events(
                 // Echo prevention (constraint #5): a ghost is a Discord speaker we
                 // ourselves publish into this call. Re-bridging its audio back to
                 // Discord would loop. Skip bridge-owned ghost identities.
-                if super::ghost::is_bridge_excluded_identity(&identity) {
+                if super::ghost::is_bridge_excluded_identity(&identity, &ghost_prefix) {
                     tracing::debug!(from_identity = %identity, "skipping bridge-owned ghost track (echo prevention)");
                     continue;
                 }

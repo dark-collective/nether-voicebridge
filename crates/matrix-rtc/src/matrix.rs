@@ -85,6 +85,7 @@ async fn apply_member_event(
     content: &CallMemberEventContent,
     ts: MilliSecondsSinceUnixEpoch,
     bot_user_id: &OwnedUserId,
+    ghost_prefix: &str,
     participants: &ParticipantSet,
     call_active_tx: &watch::Sender<bool>,
     members_gen_tx: &watch::Sender<u64>,
@@ -105,7 +106,7 @@ async fn apply_member_event(
     // Excludes our current ghosts AND stale legacy `@discord_*` ghosts left in old
     // room state (post-rename) — otherwise a leftover membership is miscounted as a
     // real participant and gets a phantom Discord puppet.
-    if crate::rtc::ghost::is_bridge_excluded_identity(user_id.as_str()) {
+    if crate::rtc::ghost::is_bridge_excluded_identity(user_id.as_str(), ghost_prefix) {
         return;
     }
 
@@ -761,6 +762,9 @@ pub(crate) async fn run(
     let room_id = RoomId::parse(&cfg.room_id)?;
     let participants: ParticipantSet = Arc::new(Mutex::new(HashSet::new()));
     let pending_leaves: PendingLeaves = Arc::new(Mutex::new(HashMap::new()));
+    let ghost_prefix: Arc<str> = Arc::from(
+        crate::rtc::ghost::ghost_localpart_prefix(cfg.sender_localpart.as_deref()).as_str(),
+    );
 
     // Register handler BEFORE sync so events during the initial round-trip are captured.
     // Scope it to THIS bridge's room: `add_event_handler` is global across every
@@ -779,6 +783,7 @@ pub(crate) async fn run(
         // not inherit the bridge span — re-establish it for per-bridge logs.
         let bridge = bridge.clone();
         let router = router.clone();
+        let ghost_prefix = ghost_prefix.clone();
         client.add_room_event_handler(&room_id, move |ev: SyncCallMemberEvent, room: Room| {
             let participants = participants.clone();
             let pending_leaves = pending_leaves.clone();
@@ -788,6 +793,7 @@ pub(crate) async fn run(
             let shutdown = shutdown.clone();
             let bridge = bridge.clone();
             let router = router.clone();
+            let ghost_prefix = ghost_prefix.clone();
             let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
             async move {
                 let Some(orig) = ev.as_original() else { return };
@@ -800,6 +806,7 @@ pub(crate) async fn run(
                     &orig.content,
                     ts,
                     &bot_user_id,
+                    &ghost_prefix,
                     &participants,
                     &call_active_tx,
                     &members_gen_tx,
@@ -835,6 +842,7 @@ pub(crate) async fn run(
                 &orig.content,
                 ts,
                 &bot_user_id,
+                &ghost_prefix,
                 &participants,
                 &call_active_tx,
                 &members_gen_tx,
@@ -987,6 +995,7 @@ pub(crate) async fn reap_stale_memberships(
     client: &Client,
     room_id: &RoomId,
     bot_user_id: &UserId,
+    ghost_prefix: &str,
     live_mxids: &HashSet<String>,
     phantom_since: &mut HashMap<String, Instant>,
 ) {
@@ -1016,7 +1025,7 @@ pub(crate) async fn reap_stale_memberships(
         .map(|o| {
             let mxid = o.sender.as_str().to_owned();
             let is_bridge_owned = o.sender.as_str() == bot_user_id.as_str()
-                || crate::rtc::ghost::is_bridge_excluded_identity(o.sender.as_str());
+                || crate::rtc::ghost::is_bridge_excluded_identity(o.sender.as_str(), ghost_prefix);
             let state_key = o.state_key.as_ref().to_owned();
             let legacy_state_key = state_key.starts_with('@');
             MembershipEntry { state_key, mxid, is_bridge_owned, legacy_state_key }

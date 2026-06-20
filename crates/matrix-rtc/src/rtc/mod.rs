@@ -92,6 +92,9 @@ pub(crate) async fn run(
 ) -> Result<()> {
     // Build a dedicated HTTP client on rustls.
     let http = reqwest::Client::builder().use_rustls_tls().build()?;
+    let ghost_prefix: Arc<str> = Arc::from(
+        ghost::ghost_localpart_prefix(mx_cfg.sender_localpart.as_deref()).as_str(),
+    );
 
     // Discover the LiveKit SFU focus once at startup.
     let focus = well_known::discover_livekit_focus(
@@ -218,6 +221,7 @@ pub(crate) async fn run(
                     lk_cfg.url.as_deref(),
                     router.clone(),
                     bridge.clone(),
+                    ghost_prefix.clone(),
                     shutdown.clone(),
                 )
                 .await
@@ -292,7 +296,7 @@ pub(crate) async fn run(
                 if let Some(sess) = &active_session {
                     let live_mxids = live_roster_mxids(&sess.lk_session.room);
                     crate::matrix::reap_stale_memberships(
-                        &client, &room_id, &bot_user_id, &live_mxids, &mut phantom_since,
+                        &client, &room_id, &bot_user_id, &ghost_prefix, &live_mxids, &mut phantom_since,
                     )
                     .await;
                 }
@@ -421,6 +425,7 @@ async fn join_livekit(
     url_override: Option<&str>,
     router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
+    ghost_prefix: Arc<str>,
     shutdown: CancellationToken,
 ) -> Result<ActiveSession> {
     let openid_token = openid::get_openid_token(client).await?;
@@ -442,6 +447,7 @@ async fn join_livekit(
         room_id.to_owned(),
         router,
         bridge,
+        ghost_prefix.clone(),
         shutdown,
     )
     .await?;
