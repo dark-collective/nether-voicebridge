@@ -98,8 +98,15 @@ jobs:
       - name: Derive version from tag
         id: vars
         run: |
-          # v0.2.0 -> 0.2.0
-          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          # v0.2.0 -> 0.2.0 ; v0.2.1-rc1 -> 0.2.1~rc1
+          # Convert the first '-' (semver pre-release separator) to '~' so dpkg/rpm
+          # sort a pre-release BELOW its eventual stable release (0.2.1~rc1 < 0.2.1).
+          # A plain '-rcN' is a Debian *revision* and sorts ABOVE the empty revision
+          # of the bare version, which would wrongly rank the final release as a
+          # downgrade. The git tag keeps '-rc' (refnames can't contain '~'); the
+          # prerelease detection below still matches on the tag's hyphen.
+          v="${GITHUB_REF_NAME#v}"
+          echo "version=${v/-/\~}" >> "$GITHUB_OUTPUT"
 
       # Reuse the binary the `image` job already compiled: pull the pushed image
       # and copy /app/nether-voicebridge out to the path nfpm.yaml expects

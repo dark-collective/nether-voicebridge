@@ -140,6 +140,18 @@ test.
   `appservice_id`). `validate()` rejects unknown `server` references, any required
   matrix field still empty after merge, and duplicate
   `(homeserver_url, bot_user_id, device_id)` across bridges.
+- **Device ids are minted unique-per-crypto-store, not just per-bridge (#30).** At
+  runtime the configured/derived device id is only a *base*: the bot mints
+  `<base>-<rand>` paired with its crypto store (`matrix.rs::resolve_store_device_id`,
+  marker `<store_path>/device_id`) and each ghost folds in a per-store salt →
+  `D<key>-<salt>` (`resolve_ghost_device_salt`; ghost crypto store dir keyed by the
+  resulting device id). This is mandatory: the *same* device id presenting *different*
+  Olm signing keys across two stores (e.g. a dev box and a VPS, or a wiped store)
+  makes peers reject it as `SigningKeyChanged` → media keys never delivered → silent
+  encrypted audio. A wiped/copied/second store therefore **re-provisions a brand-new
+  device** (and resets that store's crypto); the one-time re-key is expected and
+  peer-safe (peers see a new device, not a changed key). Don't "stabilize" device ids
+  back to the bare base.
 - **Async:** one tokio task per long-lived connection (each puppet, subscriber,
   each ghost). Wire tasks with `tokio::sync::mpsc`; use
   `CancellationToken` for shutdown.
