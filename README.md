@@ -63,7 +63,7 @@ named participants.*
 - **An independent human code review / security audit.** The bridge handles DAVE
   (MLS) and Matrix media E2EE; a careful review by human eyes — especially of the
   key-handling and echo-exclusion paths — would raise confidence beyond automated
-  checks. Worth doing before any "stable" claim.
+  checks.
 - **Video relay (webcam / screen share).** Carrying video — and screen/app share
   *with* its audio — between Discord and Element Call, not just voice. This requires
   driving Discord with **self-bots** (ToS violation) to relay video streams.
