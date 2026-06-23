@@ -8,8 +8,8 @@ services:
       # via the NVB_DATA_DIR=/app/data baked into the image — no config change needed.
       - voicebridge-data:/app/data
       # CONFIG FILE MODE (multi-bridge or preference): uncomment to mount a
-      # config.toml instead of using the NETHER_* env vars below. When this is
-      # mounted the env vars are ignored (the file is found and parsed first).
+      # config.toml. When the file is present it takes priority over env vars;
+      # when absent the bridge reads NETHER_* vars below (single-bridge only).
       # Copy config.example.toml → config.toml, fill in values, never commit it.
       # - ./config.toml:/app/config.toml:ro
     environment:
@@ -37,7 +37,6 @@ services:
       # NETHER_MATRIX_DEVICE_ID: "ABCDEFGHIJ"   # auto-derived from the bridge name when unset
       # NETHER_PUPPET_NICKNAME_PREFIX: "[Matrix] "
       # NETHER_BRIDGE_NAME: ""                  # label used in logs + store-path leaf
-      # NETHER_MATRIX_ACCESS_TOKEN: ""          # omit for appservice-auth mode
       # NETHER_LIVEKIT_MEDIA_E2EE: ""           # auto-detected from room encryption; set true/false only to force
       # NETHER_LIVEKIT_KEY_TRANSPORT: ""        # auto-selected (olm for encrypted rooms); set only to force
       # NETHER_MATRIX_BOT_DISPLAY_NAME: ""

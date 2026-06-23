@@ -32,11 +32,22 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = match std::env::var("CONFIG_PATH") {
-        Ok(path) => {
-            // CONFIG_PATH explicitly set — always load from that file.
-            nvb_config::Config::load(&path)
-                .with_context(|| format!("loading config from {path}"))?
-        }
+        Ok(path) => match nvb_config::Config::load(&path) {
+            Ok(cfg) => cfg,
+            // File not found: CONFIG_PATH may be baked into the image as a default
+            // location (e.g. /app/config.toml) but no file was mounted — fall back to
+            // env vars just like the no-file path below.
+            Err(nvb_config::ConfigError::Io { .. }) => {
+                tracing::info!(
+                    "config file not found at {path}, \
+                     loading config from environment variables"
+                );
+                nvb_config::Config::from_env().context(
+                    "config file not found; supply all NETHER_* environment variables",
+                )?
+            }
+            Err(e) => return Err(e).with_context(|| format!("loading config from {path}")),
+        },
         Err(_) => match nvb_config::Config::load("config.toml") {
             Ok(cfg) => cfg,
             Err(nvb_config::ConfigError::Io { .. }) => {

@@ -85,6 +85,7 @@ async fn apply_member_event(
     content: &CallMemberEventContent,
     ts: MilliSecondsSinceUnixEpoch,
     bot_user_id: &OwnedUserId,
+    ghost_prefix: &str,
     participants: &ParticipantSet,
     call_active_tx: &watch::Sender<bool>,
     members_gen_tx: &watch::Sender<u64>,
@@ -105,7 +106,7 @@ async fn apply_member_event(
     // Excludes our current ghosts AND stale legacy `@discord_*` ghosts left in old
     // room state (post-rename) — otherwise a leftover membership is miscounted as a
     // real participant and gets a phantom Discord puppet.
-    if crate::rtc::ghost::is_bridge_excluded_identity(user_id.as_str()) {
+    if crate::rtc::ghost::is_bridge_excluded_identity(user_id.as_str(), ghost_prefix) {
         return;
     }
 
@@ -334,8 +335,8 @@ fn reset_bot_crypto_store(dir: &std::path::Path) {
 /// Accepted one-time cost: a deployment that deliberately set a *plain* `matrix.device_id` on a
 /// single machine gets re-keyed once on upgrade (peers just see one new device); idempotent after.
 ///
-/// Appservice-auth only — the caller must NOT use this on the regular-account (`access_token`)
-/// path, whose device is pinned to the token.
+/// Applies to every bridge: all Matrix auth is now appservice login (the bridge
+/// self-provisions an un-pinned device), so the device id is always store-paired here.
 pub(crate) fn resolve_store_device_id(store_path: &str, configured: &str) -> String {
     if store_path.is_empty() {
         return configured.to_owned();
@@ -444,6 +445,12 @@ pub(crate) fn resolve_ghost_device_salt(store_path: &str) -> String {
 ///
 /// This is kept separate from `run()` so the crate's `run()` can clone the
 /// client into the RTC task before starting the perpetual sync loop.
+///
+/// On Synapse, the appservice `sender_localpart` user is blocked from ALL sync
+/// endpoints (`get_app_service_by_user_id` exact-matches it). Use a namespace
+/// user as `bot_user_id` (not the sender_localpart itself) so sync proceeds
+/// normally — the `_bot`-suffixed auto-derivation in `resolve_bot_user_ids`
+/// handles this automatically when `bot_user_id` is not set explicitly.
 #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
 pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Client> {
     // Always open the persistent SQLite store at the (auto-derived, validated
@@ -460,16 +467,12 @@ pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Cli
 
     let bot_user_id: OwnedUserId = cfg.bot_user_id.parse()?;
 
-    // Two auth modes. With a config `access_token`, use it (regular account).
-    // Without one, self-provision a device + token via appservice login — no
-    // password needed (the homeserver may use SSO), and it yields a clean,
-    // un-pinned device identity. `bot_user_id` must then be an appservice user.
-    // The appservice-login session is GUEST-classified by some homeservers
-    // (Tuwunel), which matters for how we join below.
-    let (access_token, used_appservice_auth) = match cfg.access_token.as_deref() {
-        Some(tok) if !tok.is_empty() => (tok.to_owned(), false),
-        _ => (appservice_login(cfg, bot_user_id.localpart()).await?, true),
-    };
+    // Self-provision a device + token via appservice login — no password needed
+    // (the homeserver may use SSO), and it yields a clean, un-pinned device
+    // identity. `bot_user_id` must be an appservice user. The appservice-login
+    // session is GUEST-classified by some homeservers (Tuwunel), which matters
+    // for how we join below.
+    let access_token = appservice_login(cfg, bot_user_id.localpart()).await?;
 
     let session = MatrixSession {
         meta: SessionMeta {
@@ -485,71 +488,45 @@ pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Cli
     tracing::info!(user_id = %bot_user_id, "Matrix session restored");
 
     let room_id = RoomId::parse(&cfg.room_id)?;
-    // Join the room (idempotent if already a member). Bound it: a restricted-room
-    // 403 (or a wedged homeserver) otherwise hangs startup silently for minutes.
-    if used_appservice_auth {
-        // The appservice-login session is guest-classified by some homeservers
-        // (Tuwunel), so a client `/join` with it hits the `m.room.guest_access`
-        // check and 403s ("Guests are not allowed to join this room") on any room
-        // without `guest_access=can_join` — even when the bot is invited. Join via
-        // an appservice-ASSERTED `POST /join` instead (the exact path ghosts use):
-        // an appservice assertion yields a FULL, non-guest member, so no room needs
-        // `guest_access`. The SDK client learns the membership from the `sync_once`
-        // below. Restricted/non-public rooms still need an invite (or allow-space
-        // membership) — the assertion respects join rules, it only bypasses the
-        // guest check.
-        match tokio::time::timeout(
-            Duration::from_secs(30),
-            appservice_join_room(
-                &cfg.homeserver_url,
-                &cfg.appservice_token,
-                &cfg.room_id,
-                bot_user_id.as_str(),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(())) => {
-                tracing::info!(room_id = %room_id, "joined Matrix room (appservice-asserted full member)")
-            }
-            Ok(Err(e)) => {
-                let msg = e.to_string();
-                if msg.contains("403") || msg.contains("M_FORBIDDEN") {
-                    tracing::error!(
-                        room_id = %room_id, error = %e,
-                        "appservice-asserted join forbidden (403) — for a restricted/non-public room the bot still needs an invite (or allow-space membership)"
-                    );
-                } else {
-                    tracing::error!(room_id = %room_id, error = %e, "appservice-asserted join failed");
-                }
-                return Err(anyhow::anyhow!("appservice join failed: {e}"));
-            }
-            Err(_) => {
-                tracing::error!(room_id = %room_id, "appservice join timed out after 30 s — homeserver unreachable or wedged");
-                return Err(anyhow::anyhow!("appservice join timed out after 30 s"));
-            }
+    // Join the room via an appservice-ASSERTED `POST /join` (the same path ghosts
+    // use). The appservice-login session is guest-classified by some homeservers
+    // (Tuwunel), so a regular client `/join` hits the `m.room.guest_access` check
+    // and 403s on rooms without `guest_access=can_join` — even when the bot is
+    // invited. The appservice assertion yields a FULL, non-guest member, so no room
+    // needs `guest_access`. The SDK client learns the membership from `sync_once`.
+    // Restricted/non-public rooms still need an invite (or allow-space membership)
+    // — the assertion respects join rules, it only bypasses the guest check.
+    // Bound it: a restricted-room 403 (or a wedged homeserver) otherwise hangs
+    // startup silently for minutes.
+    match tokio::time::timeout(
+        Duration::from_secs(30),
+        appservice_join_room(
+            &cfg.homeserver_url,
+            &cfg.appservice_token,
+            &cfg.room_id,
+            bot_user_id.as_str(),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            tracing::info!(room_id = %room_id, "joined Matrix room (appservice-asserted full member)")
         }
-    } else {
-        // Regular account: its login session is a full (non-guest) user, so the
-        // SDK join is fine.
-        match tokio::time::timeout(Duration::from_secs(30), client.join_room_by_id(&room_id)).await {
-            Ok(Ok(_)) => tracing::info!(room_id = %room_id, "joined Matrix room"),
-            Ok(Err(e)) => {
-                let msg = e.to_string();
-                if msg.contains("403") || msg.contains("M_FORBIDDEN") {
-                    tracing::error!(
-                        room_id = %room_id, error = %e,
-                        "Matrix join forbidden (403) — is the bot invited/joined to the room (and its space, if restricted)?"
-                    );
-                } else {
-                    tracing::error!(room_id = %room_id, error = %e, "Matrix join failed");
-                }
-                return Err(anyhow::anyhow!("join_room_by_id failed: {e}"));
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            if msg.contains("403") || msg.contains("M_FORBIDDEN") {
+                tracing::error!(
+                    room_id = %room_id, error = %e,
+                    "appservice-asserted join forbidden (403) — for a restricted/non-public room the bot still needs an invite (or allow-space membership)"
+                );
+            } else {
+                tracing::error!(room_id = %room_id, error = %e, "appservice-asserted join failed");
             }
-            Err(_) => {
-                tracing::error!(room_id = %room_id, "Matrix join timed out after 30 s — homeserver unreachable or wedged");
-                return Err(anyhow::anyhow!("join_room_by_id timed out after 30 s"));
-            }
+            return Err(anyhow::anyhow!("appservice join failed: {e}"));
+        }
+        Err(_) => {
+            tracing::error!(room_id = %room_id, "appservice join timed out after 30 s — homeserver unreachable or wedged");
+            return Err(anyhow::anyhow!("appservice join timed out after 30 s"));
         }
     }
 
@@ -765,10 +742,10 @@ async fn appservice_join_room(
     Ok(())
 }
 
-/// Run the Matrix sync loop. Must be called with a client produced by
-/// `build_client`. Drives the `SyncCallMemberEvent` handler and sends
-/// call-active signals through `call_active_tx` when the first human
-/// joins or the last human leaves.
+/// Run the Matrix sync loop (classic `/v3/sync` via `client.sync`). Must be called
+/// with a client produced by `build_client`. Drives the `SyncCallMemberEvent`
+/// handler and sends call-active signals through `call_active_tx` when the first
+/// human joins or the last human leaves.
 #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
@@ -785,6 +762,9 @@ pub(crate) async fn run(
     let room_id = RoomId::parse(&cfg.room_id)?;
     let participants: ParticipantSet = Arc::new(Mutex::new(HashSet::new()));
     let pending_leaves: PendingLeaves = Arc::new(Mutex::new(HashMap::new()));
+    let ghost_prefix: Arc<str> = Arc::from(
+        crate::rtc::ghost::ghost_localpart_prefix(cfg.sender_localpart.as_deref()).as_str(),
+    );
 
     // Register handler BEFORE sync so events during the initial round-trip are captured.
     // Scope it to THIS bridge's room: `add_event_handler` is global across every
@@ -803,6 +783,7 @@ pub(crate) async fn run(
         // not inherit the bridge span — re-establish it for per-bridge logs.
         let bridge = bridge.clone();
         let router = router.clone();
+        let ghost_prefix = ghost_prefix.clone();
         client.add_room_event_handler(&room_id, move |ev: SyncCallMemberEvent, room: Room| {
             let participants = participants.clone();
             let pending_leaves = pending_leaves.clone();
@@ -812,6 +793,7 @@ pub(crate) async fn run(
             let shutdown = shutdown.clone();
             let bridge = bridge.clone();
             let router = router.clone();
+            let ghost_prefix = ghost_prefix.clone();
             let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
             async move {
                 let Some(orig) = ev.as_original() else { return };
@@ -824,6 +806,7 @@ pub(crate) async fn run(
                     &orig.content,
                     ts,
                     &bot_user_id,
+                    &ghost_prefix,
                     &participants,
                     &call_active_tx,
                     &members_gen_tx,
@@ -859,6 +842,7 @@ pub(crate) async fn run(
                 &orig.content,
                 ts,
                 &bot_user_id,
+                &ghost_prefix,
                 &participants,
                 &call_active_tx,
                 &members_gen_tx,
@@ -925,7 +909,7 @@ pub(crate) async fn run(
                     // Make the back-off interruptible by shutdown too.
                     tokio::select! {
                         _ = shutdown.cancelled() => return Ok(()),
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                     }
                 }
             }
@@ -1011,6 +995,7 @@ pub(crate) async fn reap_stale_memberships(
     client: &Client,
     room_id: &RoomId,
     bot_user_id: &UserId,
+    ghost_prefix: &str,
     live_mxids: &HashSet<String>,
     phantom_since: &mut HashMap<String, Instant>,
 ) {
@@ -1040,7 +1025,7 @@ pub(crate) async fn reap_stale_memberships(
         .map(|o| {
             let mxid = o.sender.as_str().to_owned();
             let is_bridge_owned = o.sender.as_str() == bot_user_id.as_str()
-                || crate::rtc::ghost::is_bridge_excluded_identity(o.sender.as_str());
+                || crate::rtc::ghost::is_bridge_excluded_identity(o.sender.as_str(), ghost_prefix);
             let state_key = o.state_key.as_ref().to_owned();
             let legacy_state_key = state_key.starts_with('@');
             MembershipEntry { state_key, mxid, is_bridge_owned, legacy_state_key }

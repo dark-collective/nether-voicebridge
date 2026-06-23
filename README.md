@@ -101,7 +101,10 @@ The full design and the phased build history live in:
   or manage the RTC infrastructure.
 - One or more **Discord bot applications** (the puppet pool), each invited to your
   guild(s) with *Connect, Speak, Use Voice Activity, Change Nickname*.
-- An **appservice registration** on the homeserver for the Matrix-side ghosts.
+- An **appservice registration** on the homeserver for the bridge bot and the
+  Matrix-side ghosts (see `appservice-registration.yaml`). Its users-namespace
+  regex stem must equal the bridge's `sender_localpart`, covering both the
+  `@{stem}_bot` bot and the `@{stem}_<id>` ghosts.
 - **Per bridged room:** the Matrix room must allow power level **0** for the
   `org.matrix.msc3401.call.member` state event (the standard Element Call setup),
   or Discord→Matrix ghosts can't post their membership. See the architecture doc.
@@ -118,7 +121,7 @@ cargo run                            # reads ./config.toml (override with CONFIG
 ```
 
 `config.example.toml` documents every field. **Never commit `config.toml`** — it
-holds bot tokens and Matrix access/appservice tokens.
+holds bot tokens and Matrix appservice tokens.
 
 ## Docker
 
@@ -153,9 +156,14 @@ docker compose logs -f
 | `NETHER_LIVEKIT_URL` | | *(auto-derived)* | Override LiveKit SFU WebSocket URL |
 
 ¹ At least one of `BOT_USER_ID` or `SENDER_LOCALPART` is required. When only
-`SENDER_LOCALPART` is set, the full MXID is derived as
-`@{localpart}:{homeserver}`. Both can be set independently when the appservice
-namespace anchor and the bot account differ.
+`SENDER_LOCALPART` is set, the bot MXID is derived as
+`@{localpart}_bot:{homeserver}` (the `_bot` suffix avoids the appservice's bare
+sender user, which Synapse blocks from sync). `SENDER_LOCALPART` is also the stem
+of the ghost MXIDs (`@{localpart}_<id>`), so it must equal the stem of your
+appservice users-namespace regex — set the regex to `@{localpart}_.*` so it covers
+both the `_bot` user and the ghosts. Set `BOT_USER_ID` explicitly only to override
+the derived bot (it must still be in that namespace, or be the registration's own
+sender user).
 
 The matrix-sdk store persists on a named volume; store paths are auto-derived
 under `/app/data` so no `store_path` config is needed. See
@@ -220,6 +228,12 @@ tar xzf nether-voicebridge-$ver-x86_64-linux.tar.gz
 - **`store_path` is optional** — omitted, it auto-derives to
   `<data_dir>/<bridge>` (`data_dir` defaults to `./nether-store`; the Docker image
   sets `NVB_DATA_DIR=/app/data`). Each bridge gets a distinct store.
+- **`sender_localpart` is the appservice namespace stem** — it derives the bot
+  (`@{stem}_bot`) and the ghosts (`@{stem}_<id>`), so it must equal the stem of your
+  registration's `namespaces.users` regex (default `nether-voicebridge`). Set an
+  explicit `bot_user_id` only to override the derived bot. Upgrading an existing
+  deployment needs no appservice re-registration unless you change this stem — see
+  the CHANGELOG "Upgrading" note.
 - **LiveKit endpoints are auto-derived** from the homeserver's `.well-known`
   `rtc_foci` and the lk-jwt response — not configured by hand.
 - **`media_e2ee` is auto-detected** per bridge from the room's

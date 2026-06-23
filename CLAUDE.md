@@ -35,17 +35,16 @@ test.
   calls" shows *"Default"* both when unset (→ `state_default` 50) and when an
   explicit `0` override is present — so it's unreliable; check the RAW
   `m.room.power_levels`.
-- **Bot joins as a full appservice member — no `guest_access` needed.** On the
-  appservice-auth path (no config `access_token`) the bot self-provisions via
-  `m.login.application_service`, and some homeservers (Tuwunel) **guest-classify
-  that login session** — so a client `/join` with it 403s *"Guests are not allowed
-  to join this room"* on any room lacking `m.room.guest_access=can_join`, even when
-  invited. Fixed (`matrix.rs::appservice_join_room`, verified 2026-06-17): the bot
-  joins via an appservice-**asserted** `POST /join` with the `as_token` (the same
-  path ghosts use → a full, non-guest member), so **no room needs `guest_access`**.
-  Join rules are still enforced: a **restricted/invite-only** room still needs the
-  bot **invited** (or in the allow-space) first. Regular-account bridges (real
-  `access_token`) keep the SDK join unchanged.
+- **Bot joins as a full appservice member — no `guest_access` needed.** The bridge
+  always authenticates via `m.login.application_service`. Some homeservers (Tuwunel)
+  **guest-classify that login session** — so a client `/join` with it 403s *"Guests
+  are not allowed to join this room"* on any room lacking
+  `m.room.guest_access=can_join`, even when invited. Fixed
+  (`matrix.rs::appservice_join_room`, verified 2026-06-17): the bot joins via an
+  appservice-**asserted** `POST /join` with the `as_token` (the same path ghosts use
+  → a full, non-guest member), so **no room needs `guest_access`**. Join rules are
+  still enforced: a **restricted/invite-only** room still needs the bot **invited**
+  (or in the allow-space) first.
 - **Per-room media E2EE is auto-detected (opt-out override).** By default the
   bridge reads the room's `m.room.encryption` state at startup and resolves
   `media_e2ee` from it (encrypted ⇒ on, unencrypted ⇒ off) — `livekit.media_e2ee`
@@ -129,7 +128,7 @@ test.
   happens in `Config::resolve_store_paths` (`crates/config/src/lib.rs`); an
   explicit `store_path` always wins. **Server/appservice profiles:** the
   homeserver/appservice fields shared across bridges (`homeserver_url`,
-  `bot_user_id`, `appservice_id`, `appservice_token`, optional `access_token`)
+  `bot_user_id`, `appservice_id`, `appservice_token`)
   live once in a named `[server.<name>]` profile; a bridge sets `server =
   "<name>"` + its own `room_id` (bridge-level) + `[bridge.discord]` and inherits
   the rest (`Config::resolve_servers` — an explicit `[bridge.matrix]` value still

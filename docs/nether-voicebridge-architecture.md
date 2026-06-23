@@ -62,7 +62,8 @@ tasks and channels.
    dedicated listener), elected per active channel — runs songbird receive:
    per-SSRC Opus from every Discord speaker; DAVE-decrypts; decodes to PCM.
 2. For each *human* Discord speaker, the Coordinator has minted a **ghost**
-   (`@nether-voicebridge_<id>:nether.im`) which: posts its `m.call` membership state
+   (`@{sender_localpart}_<id>:nether.im`, where `sender_localpart` defaults to
+   `nether-voicebridge`) which: posts its `m.call` membership state
    event, fetches a LiveKit JWT from lk-jwt-service for its identity, connects
    to the LiveKit room as a participant, and **publishes that speaker's PCM**
    as its own audio track.

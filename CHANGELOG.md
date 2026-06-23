@@ -3,6 +3,44 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- **Matrix auth is now appservice-login only.** The regular-account `access_token`
+  config field (and `NETHER_MATRIX_ACCESS_TOKEN`) is removed; every bridge
+  self-provisions its device via `m.login.application_service`. **Breaking** for any
+  config that set `access_token` — drop the field.
+- **Bot MXID derives with a `_bot` suffix.** When `bot_user_id` is omitted, it is
+  derived as `@{sender_localpart}_bot:{homeserver}` (previously `@{sender_localpart}`).
+  The bare `sender_localpart` user is the appservice's sender, which Synapse blocks
+  from sync; the `_bot` namespace user syncs normally. Set `bot_user_id` explicitly
+  to keep a different in-namespace bot.
+
+### Added
+- **`sender_localpart` now drives the ghost prefix** (`@{sender_localpart}_<id>`)
+  instead of a hard-coded `nether-voicebridge_`, so a custom localpart works
+  (closes #37). `CONFIG_PATH` pointing at a missing file now falls back to
+  `NETHER_*` environment variables (Docker default-path convenience).
+
+### Fixed
+- The bridge bot's MXID (`@{sender_localpart}_bot`) shares the ghost prefix; the
+  startup ghost sweep no longer misclassifies it as a ghost and retracts its own
+  `m.call.member` (`is_ghost_identity` now requires a numeric suffix).
+- Switching `sender_localpart` no longer orphans old `@nether-voicebridge_<id>`
+  ghost memberships — they're recognized as legacy and cleaned up at startup.
+
+### Upgrading
+- Set the bridge config `sender_localpart` to the **stem of your appservice
+  `namespaces.users` regex** (default `nether-voicebridge` for the standard
+  registration). Keep an explicit `bot_user_id` if you were using one.
+- **No appservice re-registration is required** for the upgrade itself: the bot and
+  ghosts stay within your existing `@{stem}_.*` namespace (and the bot may be the
+  registration's own sender user). Re-register **only** if you adopt a *custom*
+  `sender_localpart` whose stem differs from the namespace regex — then update the
+  regex to `@{new-stem}_.*` (reuse the same `as_token`/`hs_token` so the bridge
+  config's `appservice_token` stays valid).
+- Remove any `access_token` / `NETHER_MATRIX_ACCESS_TOKEN` from your config.
+
 ## [0.2.0] - 2026-06-20
 
 First packaged release: a single Rust binary that bridges Discord voice channels

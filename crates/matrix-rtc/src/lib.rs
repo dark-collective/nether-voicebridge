@@ -47,24 +47,16 @@ pub async fn run(
     bridge: Arc<str>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    // Pair the bot's Matrix device identity with its crypto store (#30): on the
-    // appservice-auth path, a wiped store must NOT reuse the configured (bridge-name-
-    // derived) device_id with fresh keys — peers reject that as a device-identity change
-    // and never deliver the call's media key to the subscriber (Matrix→Discord goes
-    // silent on a fresh store). `resolve_store_device_id` mints a unique id for a fresh
-    // store and reuses the persisted one otherwise. The regular-account (`access_token`)
-    // path keeps its token-pinned device. Shadow `matrix_cfg` so build_client, the sync
-    // loop, and the subscriber membership all assert the SAME effective device_id.
-    let appservice_auth = matrix_cfg.access_token.as_deref().is_none_or(str::is_empty);
-    let owned_cfg;
-    let matrix_cfg = if appservice_auth {
-        let mut c = matrix_cfg.clone();
-        c.device_id = matrix::resolve_store_device_id(&matrix_cfg.store_path, &matrix_cfg.device_id);
-        owned_cfg = c;
-        &owned_cfg
-    } else {
-        matrix_cfg
-    };
+    // Pair the bot's Matrix device identity with its crypto store (#30): a wiped store
+    // must NOT reuse the configured (bridge-name-derived) device_id with fresh keys —
+    // peers reject that as a device-identity change and never deliver the call's media
+    // key to the subscriber (Matrix→Discord goes silent on a fresh store).
+    // `resolve_store_device_id` mints a unique id for a fresh store and reuses the
+    // persisted one otherwise. Shadow `matrix_cfg` so build_client, the sync loop, and
+    // the subscriber membership all assert the SAME effective device_id.
+    let mut owned_cfg = matrix_cfg.clone();
+    owned_cfg.device_id = matrix::resolve_store_device_id(&matrix_cfg.store_path, &matrix_cfg.device_id);
+    let matrix_cfg = &owned_cfg;
 
     // Build the client first (surfaces login/restore errors before the loops). It
     // always opens the persistent store and does the initial sync, so room state
