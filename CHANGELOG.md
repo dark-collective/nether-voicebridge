@@ -3,6 +3,18 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] - 2026-06-23
+
+### Fixed
+- **Encrypted bridges: a speaker no longer goes silent for up to a minute when a
+  ghost's crypto client is still catching up.** Each Discord speaker's ghost is its
+  own crypto client; if it sent its media key before its device-list sync had tracked
+  the call's members, it reached nobody — and the key-distribution loop then drained
+  its burst and dropped to the 60s heartbeat, so that speaker was inaudible in the
+  encrypted call for up to a minute (*"certain users don't come through"*). The loop
+  now keeps fast-retrying (~3s) until the ghost's sync catches up, bounding the
+  worst-case silent window to a few seconds (#39).
+
 ## [0.2.1] - 2026-06-23
 
 ### Changed
