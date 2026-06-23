@@ -3,7 +3,7 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.1] - 2026-06-23
 
 ### Changed
 - **Matrix auth is now appservice-login only.** The regular-account `access_token`
@@ -86,4 +86,5 @@ and Matrix (MatrixRTC / Element Call) room calls bidirectionally.
 - Intermittent Discord→Matrix audio corrosion under investigation (#32);
   diagnostics are shipped but the root cause is not yet fixed.
 
+[0.2.1]: https://nether.codes/dark/nether-voicebridge/releases/tag/v0.2.1
 [0.2.0]: https://nether.codes/dark/nether-voicebridge/releases/tag/v0.2.0
