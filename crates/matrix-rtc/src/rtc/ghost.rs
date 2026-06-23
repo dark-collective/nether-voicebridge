@@ -1321,6 +1321,16 @@ async fn distribute_key_loop(
     // Burst re-sends still owed after the last membership change. >0 ⇒ wake fast.
     let mut burst: u32 = 0;
     loop {
+        // Did this iteration deliver the key to at least one device? A send that
+        // reaches NOBODY is almost always a cold-start race: this ghost's own crypto
+        // client hasn't yet tracked the recipients' devices (its background sync /
+        // `/keys/query` lags the first send), so `get_user_devices` returns empty.
+        // Such an iteration must keep retrying at the FAST burst interval until sync
+        // catches up — NOT drain the burst, mark recipients keyed, and drop to the
+        // 60s heartbeat, which would leave that speaker silent in an encrypted call
+        // for up to a minute (observed on a busy VPS: 57 such failures, multi-minute
+        // gaps). Defaults true so empty / enumeration-error iterations idle normally.
+        let mut reached_someone = true;
         match source.recipients().await {
             Ok(current) => {
                 // A newly-seen recipient (re)starts the burst to cover its client's
@@ -1331,15 +1341,18 @@ async fn distribute_key_loop(
                 if current.is_empty() {
                     keyed.clear();
                 } else {
-                    match transport.send_key(&current, &key, 0).await {
+                    reached_someone = match transport.send_key(&current, &key, 0).await {
                         // Every targeted device got the key.
-                        Ok(o) if o.failed.is_empty() => tracing::info!(
-                            recipients = ?current.iter().map(|u| u.as_str()).collect::<Vec<_>>(),
-                            transport = transport.kind(),
-                            delivered = o.delivered,
-                            burst,
-                            "ghost media key sent"
-                        ),
+                        Ok(o) if o.failed.is_empty() => {
+                            tracing::info!(
+                                recipients = ?current.iter().map(|u| u.as_str()).collect::<Vec<_>>(),
+                                transport = transport.kind(),
+                                delivered = o.delivered,
+                                burst,
+                                "ghost media key sent"
+                            );
+                            true
+                        }
                         // Partial success — the key reached the live device(s); the
                         // unreachable ones are almost always stale/offline sessions
                         // with no one-time keys (can't be fixed from the bridge). This
@@ -1358,29 +1371,47 @@ async fn distribute_key_loop(
                                 unreachable_devices = ?o.failed.iter().map(|f| format!("{}:{}", f.user_id, f.device_id)).collect::<Vec<_>>(),
                                 "ghost media key: unreachable devices"
                             );
+                            true
                         }
                         // Reached NO devices — the real failure (e.g. the live device
                         // is out of one-time keys, or the ghost's sync hasn't tracked
-                        // anyone yet). Burst/heartbeat retries; surfaced loudly.
-                        Ok(o) => tracing::warn!(
-                            transport = transport.kind(),
-                            unreachable = o.failed.len(),
-                            burst,
-                            "ghost media key reached NO recipient devices — nobody can decrypt this ghost (will retry)"
-                        ),
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            transport = transport.kind(),
-                            "ghost media-key send failed"
-                        ),
+                        // anyone yet). Keep fast-retrying (see `reached_someone`).
+                        Ok(o) => {
+                            tracing::warn!(
+                                transport = transport.kind(),
+                                unreachable = o.failed.len(),
+                                burst,
+                                "ghost media key reached NO recipient devices — nobody can decrypt this ghost (will retry)"
+                            );
+                            false
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                transport = transport.kind(),
+                                "ghost media-key send failed"
+                            );
+                            false
+                        }
+                    };
+                    if reached_someone {
+                        // Progress: remember who we've keyed and spend one burst slot.
+                        keyed = current.into_iter().collect();
+                        burst = burst.saturating_sub(1);
                     }
-                    keyed = current.into_iter().collect();
-                    burst = burst.saturating_sub(1);
+                    // else: reached nobody — leave `keyed` and `burst` untouched, so the
+                    // new-recipient check re-arms the burst next loop and we retry at the
+                    // fast interval until this ghost's crypto sync catches up.
                 }
             }
             Err(e) => tracing::warn!(error = %e, "ghost media key: recipient enumeration failed"),
         }
-        let wait = if burst > 0 { KEY_BURST_INTERVAL } else { KEY_HEARTBEAT };
+        // Fast cadence while bursting OR while we've reached nobody (cold-sync recovery).
+        let wait = if burst > 0 || !reached_someone {
+            KEY_BURST_INTERVAL
+        } else {
+            KEY_HEARTBEAT
+        };
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
@@ -1906,7 +1937,7 @@ mod tests {
 
     // ── distribute_key_loop, driven with mock transport + recipient source ──────
 
-    use super::super::key_transport::KeySendOutcome;
+    use super::super::key_transport::{FailedRecipient, KeySendOutcome};
 
     /// Records the recipient lists passed to each `send_key`.
     #[derive(Default)]
@@ -1996,6 +2027,90 @@ mod tests {
         assert!(
             transport.sends.lock().unwrap().is_empty(),
             "no recipients ⇒ no key send"
+        );
+    }
+
+    /// Reaches NOBODY for the first `fail_first` sends (simulating a ghost whose
+    /// crypto client hasn't tracked the recipients' devices yet), then succeeds.
+    struct ColdThenWarmTransport {
+        fail_first: usize,
+        calls: StdMutex<usize>,
+    }
+
+    #[async_trait]
+    impl KeyTransport for ColdThenWarmTransport {
+        async fn send_key(
+            &self,
+            recipients: &[OwnedUserId],
+            _key: &[u8; 16],
+            _key_index: u8,
+        ) -> Result<KeySendOutcome> {
+            let mut n = self.calls.lock().unwrap();
+            *n += 1;
+            if *n <= self.fail_first {
+                // delivered=0 with a non-empty `failed` set ⇒ the "reached NO
+                // recipient devices" arm (cold crypto sync), which must fast-retry.
+                Ok(KeySendOutcome {
+                    delivered: 0,
+                    failed: recipients
+                        .iter()
+                        .map(|u| FailedRecipient {
+                            user_id: u.clone(),
+                            device_id: "DEAD".into(),
+                        })
+                        .collect(),
+                })
+            } else {
+                Ok(KeySendOutcome {
+                    delivered: recipients.len(),
+                    failed: Vec::new(),
+                })
+            }
+        }
+        fn kind(&self) -> &'static str {
+            "cold-then-warm"
+        }
+    }
+
+    /// Regression: a ghost that keeps reaching nobody (its crypto sync hasn't caught
+    /// up) must keep retrying at the FAST 3s burst interval — NOT drain the burst on
+    /// the failures and drop to the 60s heartbeat, which left speakers silent for a
+    /// minute on a busy VPS. The window (40s) deliberately runs PAST the ~18s it
+    /// takes the initial burst (6 × 3s) to drain: with the fix the cadence stays fast
+    /// (~14 sends in 40s); the old bug drained the burst and went quiet (~6 sends,
+    /// then a 60s gap). `>= 10` cleanly separates the two.
+    #[tokio::test(start_paused = true)]
+    async fn key_loop_fast_retries_until_crypto_sync_catches_up() {
+        let alice: OwnedUserId = "@alice:nether.im".parse().unwrap();
+        let source = Arc::new(MockSource {
+            users: vec![alice],
+        });
+        // Stays cold for the whole window so we measure the sustained retry cadence.
+        let transport = Arc::new(ColdThenWarmTransport {
+            fail_first: usize::MAX,
+            calls: StdMutex::new(0),
+        });
+        let (_gen_tx, gen_rx) = watch::channel(0u64);
+        let cancel = CancellationToken::new();
+
+        let handle = tokio::spawn(distribute_key_loop(
+            source,
+            [1u8; 16],
+            transport.clone(),
+            gen_rx,
+            cancel.clone(),
+        ));
+
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        cancel.cancel();
+        handle.await.unwrap();
+
+        let calls = *transport.calls.lock().unwrap();
+        assert!(
+            calls >= 10,
+            "expected sustained fast retries while reaching nobody (≈14 sends in 40s \
+             at the 3s interval); got {calls} — burst drained on failure → 60s \
+             heartbeat (the bug)"
         );
     }
 

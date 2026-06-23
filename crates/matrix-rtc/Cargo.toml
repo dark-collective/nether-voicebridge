@@ -26,3 +26,8 @@ futures-util = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 mime = "0.3"
+
+[dev-dependencies]
+# `test-util` enables tokio's paused clock (`#[tokio::test(start_paused = true)]`)
+# so the key-distribution retry cadence can be tested without real-time waits.
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "test-util"] }
