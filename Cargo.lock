@@ -3466,7 +3466,7 @@ dependencies = [
 
 [[package]]
 name = "nether-voicebridge"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -3474,6 +3474,7 @@ dependencies = [
  "nvb-config",
  "nvb-discord",
  "nvb-matrix-rtc",
+ "rlimit",
  "rustls 0.23.40",
  "tokio",
  "tokio-util",
@@ -3620,7 +3621,7 @@ dependencies = [
 
 [[package]]
 name = "nvb-audio"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "hound",
@@ -3628,7 +3629,7 @@ dependencies = [
 
 [[package]]
 name = "nvb-config"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -3638,7 +3639,7 @@ dependencies = [
 
 [[package]]
 name = "nvb-discord"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3657,7 +3658,7 @@ dependencies = [
 
 [[package]]
 name = "nvb-matrix-rtc"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4455,7 +4456,7 @@ checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes",
  "heck 0.5.0",
- "itertools 0.10.5",
+ "itertools 0.11.0",
  "log",
  "multimap",
  "once_cell",
@@ -4475,7 +4476,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -4882,6 +4883,15 @@ dependencies = [
  "crossbeam-utils",
  "portable-atomic",
  "portable-atomic-util",
+]
+
+[[package]]
+name = "rlimit"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7043b63bd0cd1aaa628e476b80e6d4023a3b50eb32789f2728908107bd0c793a"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

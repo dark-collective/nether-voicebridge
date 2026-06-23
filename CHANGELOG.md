@@ -3,6 +3,20 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.3] - 2026-06-23
+
+### Fixed
+- **Encrypted bridges with many simultaneous speakers: some speakers no longer go
+  silently inaudible under a crowd.** Each Discord speaker's ghost is its own
+  matrix-sdk client with a SQLite crypto store (db + `-wal` + `-shm`) plus sockets,
+  so a roomful of speakers could exhaust the default 1024 open-file limit →
+  `unable to open database file` → that ghost's crypto sync died and the speaker
+  was inaudible in the encrypted call. The binary now raises its own `nofile` soft
+  limit to 65536 at startup (covers Docker and manual runs, not just systemd), and
+  the systemd unit sets `LimitNOFILE=65536` as a backstop. This was the root cause
+  behind "certain users don't come through" on encrypted calls under load
+  (complements the 0.2.2 key-retry fix).
+
 ## [0.2.2] - 2026-06-23
 
 ### Fixed

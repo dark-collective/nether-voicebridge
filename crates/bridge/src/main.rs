@@ -31,6 +31,21 @@ async fn main() -> Result<()> {
         }))
         .init();
 
+    // Raise the open-file (nofile) soft limit. Each ghost (one per Discord speaker)
+    // is its own matrix-sdk client with a SQLite crypto store (db + -wal + -shm) plus
+    // connection sockets, so a crowd of speakers exhausts the default 1024 soft limit
+    // → "unable to open database file" → that ghost's crypto sync dies and the speaker
+    // is silently inaudible in an encrypted call. Raise it here so EVERY launch path
+    // is covered — systemd's LimitNOFILE only helps systemd; Docker and manual runs
+    // need this. Best-effort: raises soft toward the hard cap, never lowers it.
+    match rlimit::increase_nofile_limit(65536) {
+        Ok(n) => tracing::info!(nofile_soft = n, "raised open-file (nofile) soft limit"),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not raise nofile limit — many simultaneous speakers may exhaust file descriptors"
+        ),
+    }
+
     let cfg = match std::env::var("CONFIG_PATH") {
         Ok(path) => match nvb_config::Config::load(&path) {
             Ok(cfg) => cfg,

@@ -23,3 +23,6 @@ futures-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rustls = { workspace = true }
+# Raise the open-file (nofile) soft limit at startup so a crowd of per-ghost SQLite
+# crypto stores can't exhaust the default 1024 FDs (see main.rs).
+rlimit = "0.10"

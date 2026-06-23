@@ -31,6 +31,13 @@ TimeoutStopSec=15
 Restart=on-failure
 RestartSec=5
 
+# Each ghost (one per Discord speaker) is its own matrix-sdk client with a SQLite
+# crypto store (db + -wal + -shm) plus sockets, so a crowd of speakers can exhaust
+# the default 1024 open-file limit → "unable to open database file" → that speaker
+# goes silently inaudible on an encrypted call. The binary also raises this itself
+# at startup; this is a belt-and-suspenders backstop for systemd launches.
+LimitNOFILE=65536
+
 # Hardening. The service only needs to read /etc config and write its state dir.
 NoNewPrivileges=true
 ProtectSystem=strict
