@@ -4,13 +4,27 @@ name: Docker Build & Release
 # (inside the Dockerfile builder stage); the `packages` job reuses that exact
 # binary by copying it out of the pushed image — no second `cargo build`.
 on:
+  # Releases only: the heavy image build runs on version tags, not on every push
+  # to master (the single self-hosted runner is reserved for releases).
   push:
-    branches: [master]
     tags: ['v*']
+  # On-demand build from the Actions UI — publishes :edge for ad-hoc images
+  # without cutting a release.
+  workflow_dispatch:
 
 permissions:
   contents: write
   packages: write
+
+# CI pushes/pulls the image over tailscale (100.64.0.13:3000) to bypass the
+# Cloudflare-fronted `nether.codes` path, whose chunked registry blob upload was
+# failing mid-push with 502 / connection-reset. Forgejo stores the package by
+# owner/image regardless of the push host, so external users still
+# `docker pull nether.codes/dark/nether-voicebridge:...` (pulls go through CF
+# fine — only the large push was fragile). The runner's Docker daemon must list
+# this host under `insecure-registries` (it's plain HTTP on the tailnet).
+env:
+  REGISTRY: 100.64.0.13:3000
 
 jobs:
   image:
@@ -26,6 +40,13 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          # buildkit runs in its own container and does NOT inherit the runner
+          # daemon's insecure-registries, so the push to the plain-HTTP tailnet
+          # registry would fail on TLS. Tell buildkit it's HTTP directly.
+          buildkitd-config-inline: |
+            [registry."100.64.0.13:3000"]
+              http = true
 
       # Auth must be the `dark` account: the image namespace `nether.codes/dark/...`
       # is a USER-owned package registry, and Forgejo only lets the owning user
@@ -36,19 +57,32 @@ jobs:
       - name: Log in to the Forgejo container registry
         uses: docker/login-action@v3
         with:
-          registry: nether.codes
+          registry: ${{ env.REGISTRY }}
           username: dark
           password: ${{ secrets.REGISTRY_TOKEN }}
 
-      # push (non-tag) -> :latest ; tag push (v0.0.1) -> that exact tag.
-      - name: Determine image tag
+      # What to publish, by trigger:
+      #   stable tag (v1.2.3)        -> :v1.2.3 AND :latest
+      #   prerelease tag (v1.2.3-rc1) -> :v1.2.3 only (don't move :latest to an rc)
+      #   manual workflow_dispatch    -> :edge (ad-hoc build, not a release)
+      - name: Determine image tags
         id: vars
         run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
-          fi
+          repo="${REGISTRY}/${{ github.repository }}"
+          {
+            echo "tags<<__EOF__"
+            if [ "${{ github.ref_type }}" = "tag" ]; then
+              ref="${{ github.ref_name }}"
+              echo "${repo}:${ref}"
+              case "$ref" in
+                *-*) : ;;                      # prerelease: version tag only
+                *)   echo "${repo}:latest" ;;  # stable: also move :latest
+              esac
+            else
+              echo "${repo}:edge"              # manual dispatch
+            fi
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -59,7 +93,7 @@ jobs:
           # multi-arch: `platforms: linux/amd64,linux/arm64`).
           platforms: linux/amd64
           push: true
-          tags: nether.codes/${{ github.repository }}:${{ steps.vars.outputs.tag }}
+          tags: ${{ steps.vars.outputs.tags }}
           # No registry buildcache: cache-to mode=max pushes the huge cargo-chef
           # dependency layer, which exceeds Cloudflare's ~100 MB upload cap (413),
           # and cache-from never resolved it anyway. Cold builds are ~12 min amd64.
@@ -91,7 +125,7 @@ jobs:
       - name: Log in to the Forgejo container registry
         uses: docker/login-action@v3
         with:
-          registry: nether.codes
+          registry: ${{ env.REGISTRY }}
           username: dark
           password: ${{ secrets.REGISTRY_TOKEN }}
 
@@ -115,7 +149,7 @@ jobs:
       - name: Extract release binary from the pushed image
         run: |
           set -eu
-          img="nether.codes/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}"
+          img="${REGISTRY}/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}"
           docker pull "$img"
           cid=$(docker create "$img")
           mkdir -p target/release
@@ -164,7 +198,10 @@ jobs:
       # repo (the Docker job's REGISTRY_TOKEN is package-scoped and won't work here).
       - name: Publish packages to the Forgejo Release
         env:
-          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          # Use the tailnet API endpoint (http) instead of github.server_url so the
+          # ~38 MB asset uploads bypass Cloudflare too — the release object is the
+          # same and stays reachable at the public nether.codes URL.
+          API: http://${{ env.REGISTRY }}/api/v1/repos/${{ github.repository }}
           TOKEN: ${{ secrets.RELEASE_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
