@@ -112,33 +112,53 @@ const FRAME_CHANNEL_DEPTH: usize = 50;
 /// bot's subscriber to skip ghost tracks (echo prevention, constraint #5). The
 /// identity is `@{sender_localpart}_{id}:server[:device]`; the localpart is the
 /// segment between `@` and the first `:`.
+///
+/// Matched as `{ghost_prefix}` followed by an **all-digits** suffix — ghost
+/// localparts are always `{prefix}{discord_user_id}` and Discord user ids are
+/// numeric snowflakes. The digit check matters because the bridge bot's own MXID
+/// is `@{sender_localpart}_bot` (see `resolve_bot_user_ids`), which shares the
+/// ghost prefix; without it the bot would be misclassified as a ghost and its own
+/// `m.call.member` retracted by `sweep_stale_ghosts`. Mirrors
+/// [`is_legacy_ghost_identity`].
 pub(crate) fn is_ghost_identity(identity: &str, ghost_prefix: &str) -> bool {
     identity
         .strip_prefix('@')
         .and_then(|rest| rest.split(':').next())
-        .is_some_and(|localpart| localpart.starts_with(ghost_prefix))
+        .and_then(|localpart| localpart.strip_prefix(ghost_prefix))
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// The prefix this bridge minted ghosts under *before* the rename to
-/// [`GHOST_LOCALPART_PREFIX`]. It collided with mautrix-discord, so we no longer
-/// own it — but stale `@discord_<id>` ghosts may linger in old room state.
-const LEGACY_GHOST_PREFIX: &str = "discord_";
+/// Prefixes this bridge minted ghosts under *before* the current
+/// `ghost_localpart_prefix` (derived from config `sender_localpart`). `discord_`
+/// collided with mautrix-discord, so we never owned it. `nether-voicebridge_` was
+/// the previous hard-coded default (issue #37); a deployment that later sets a
+/// different `sender_localpart` leaves `@nether-voicebridge_<id>` ghosts behind in
+/// old room state. Stale entries under either prefix may linger and must still be
+/// recognized for cleanup/exclusion.
+const LEGACY_GHOST_PREFIXES: [&str; 2] = ["discord_", "nether-voicebridge_"];
 
-/// Is this identity a *legacy* ghost (`@discord_<digits>`) we minted before the
-/// rename? Matched only as `discord_` followed by an all-digits localpart (the
-/// Discord-user-id form we used) so a human `@discord_alice` is never caught.
+/// Is this identity a *legacy* ghost (`@{legacy_prefix}<digits>`) we minted before
+/// the current derived prefix? Matched only as a legacy prefix followed by an
+/// all-digits localpart (the Discord-user-id form we used) so a human
+/// `@discord_alice` / `@nether-voicebridge_alice` is never caught.
 ///
-/// Used for **exclusion only** ([`is_bridge_excluded_identity`]) — never for the
-/// appservice masquerade paths (register/key-send), which we no longer own for
-/// this namespace. mautrix-discord's own `@discord_<id>` ghosts match too, which
-/// is fine: they must never be counted as our call participants, and they never
-/// post `m.call.member` anyway.
+/// Used for **exclusion** ([`is_bridge_excluded_identity`]) and for the startup
+/// `sweep_stale_ghosts` legacy branch (which retracts via a bot-write `Empty`,
+/// with masquerade fallback). mautrix-discord's own `@discord_<id>` ghosts match
+/// too, which is fine: they must never be counted as our call participants, and
+/// they never post `m.call.member` anyway. When the *current* prefix is
+/// `nether-voicebridge_` (the default fallback), the sweep checks
+/// [`is_ghost_identity`] first, so those ghosts still take the masquerade path —
+/// the legacy match here only fires once the current prefix has moved on.
 pub(crate) fn is_legacy_ghost_identity(identity: &str) -> bool {
-    identity
-        .strip_prefix('@')
-        .and_then(|rest| rest.split(':').next())
-        .and_then(|localpart| localpart.strip_prefix(LEGACY_GHOST_PREFIX))
-        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    let Some(localpart) = identity.strip_prefix('@').and_then(|rest| rest.split(':').next()) else {
+        return false;
+    };
+    LEGACY_GHOST_PREFIXES.iter().any(|prefix| {
+        localpart
+            .strip_prefix(prefix)
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 /// Should this identity be excluded from call-participant counting, key recipients,
@@ -1778,6 +1798,14 @@ mod tests {
         // mautrix-discord's namespace must NOT be detected as a *current* ghost.
         assert!(!is_ghost_identity("@discord_12345:nether.im", pfx));
         assert!(!is_ghost_identity("not-an-mxid", pfx));
+        // The bridge bot (`@{sender_localpart}_bot`) shares the ghost prefix but is
+        // NOT a ghost: the all-digits suffix check excludes it. Without this the
+        // startup sweep would retract the bot's own `m.call.member`.
+        assert!(!is_ghost_identity("@nether-voicebridge_bot:nether.im", pfx));
+        assert!(!is_ghost_identity("@nether-voicebridge_bot:nether.im:DEVICE", pfx));
+        // A human in the namespace with a non-numeric localpart is likewise not a ghost.
+        assert!(!is_ghost_identity("@nether-voicebridge_alice:nether.im", pfx));
+        assert!(!is_ghost_identity("@nether-voicebridge_:nether.im", pfx));
         // A different deployment prefix works too.
         let test_pfx = "test-nether-voicebridge_";
         assert!(is_ghost_identity("@test-nether-voicebridge_12345:shadowdrake.org", test_pfx));
@@ -1793,8 +1821,17 @@ mod tests {
         assert!(!is_legacy_ghost_identity("@discord_alice:nether.im"));
         assert!(!is_legacy_ghost_identity("@discord_:nether.im"));
         assert!(!is_legacy_ghost_identity("@dark:nether.im"));
-        // Current-prefix ghosts are not "legacy".
-        assert!(!is_legacy_ghost_identity("@nether-voicebridge_123:nether.im"));
+        // The previous hard-coded default prefix is recognized as legacy too (#37
+        // migration): a deployment that moved to a different sender_localpart leaves
+        // `@nether-voicebridge_<id>` ghosts behind, and the startup sweep must still
+        // clean them up. (When the *current* prefix is still `nether-voicebridge_`,
+        // the sweep checks `is_ghost_identity` first, so those take the masquerade
+        // path — this legacy match only fires once the prefix has moved on.)
+        assert!(is_legacy_ghost_identity("@nether-voicebridge_123:nether.im"));
+        assert!(is_legacy_ghost_identity("@nether-voicebridge_12345:nether.im:DEVICE"));
+        // ...but a non-numeric localpart under that prefix (the bot, or a human) is not.
+        assert!(!is_legacy_ghost_identity("@nether-voicebridge_bot:nether.im"));
+        assert!(!is_legacy_ghost_identity("@nether-voicebridge_alice:nether.im"));
 
         // The combined exclusion helper covers both current and legacy ghosts.
         let pfx = "nether-voicebridge_";

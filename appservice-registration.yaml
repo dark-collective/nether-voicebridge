@@ -1,18 +1,31 @@
 # Nether Voice Bridge — Matrix appservice registration (Phase 8: ghosts)
 #
-# This registers the bridge's *ghost* namespace on the homeserver. Each Discord
-# speaker is mirrored into the Matrix call as a ghost user
-# `@nether-voicebridge_<id>:server` (one LiveKit participant per Discord speaker).
-# The prefix is deliberately NOT `discord_` — that namespace belongs to
-# mautrix-discord and would collide on a shared homeserver. The bridge masquerades
-# as these ghosts over the raw client-server API using `as_token` + `?user_id=` — it does
-# NOT run an appservice HTTP endpoint, so `url` is null (push-only).
+# This registers the bridge's user namespace on the homeserver. Both the bridge
+# bot and the per-speaker ghosts live under one prefix:
+#   * ghosts:  `@<stem>_<discord_user_id>:server` — one LiveKit participant per
+#              Discord speaker (the id is always numeric).
+#   * the bot: `@<stem>_bot:server` — the subscriber that bridges Matrix→Discord.
+# `<stem>` is the bridge config `matrix.sender_localpart` (default
+# `nether-voicebridge`), NOT a hard-coded string. The prefix is deliberately NOT
+# `discord_` — that namespace belongs to mautrix-discord and would collide on a
+# shared homeserver. The bridge masquerades as these users over the raw
+# client-server API using `as_token` + `?user_id=` — it does NOT run an appservice
+# HTTP endpoint, so `url` is null (push-only).
+#
+# ── KEY RULE ───────────────────────────────────────────────────────────────────
+# The `namespaces.users` regex STEM must equal the bridge config
+# `matrix.sender_localpart`, so the namespace covers BOTH `@<stem>_bot` and
+# `@<stem>_<digits>`. Here the stem is `nether-voicebridge`, so set the bridge
+# config `sender_localpart = "nether-voicebridge"`. Do NOT copy this file's
+# `sender_localpart:` (`voicebridge_as`) into the bridge config — that field names
+# the appservice's own bookkeeping user and is INDEPENDENT of the bridge's
+# bot/ghost stem. (A digits-only regex would exclude `@<stem>_bot` — use `_.*`.)
 #
 # ── Deploy on Tuwunel (manual; the bridge cannot do this itself) ───────────────
 #   1. Replace the two tokens below with long random secrets, e.g.:
 #        openssl rand -hex 32      # run twice, once per token
 #   2. Replace `nether.im` in the namespace regex with your server name if it
-#      differs (it must match the server part of `matrix.bot_user_id`).
+#      differs (it must match the server part of the bot/ghost MXIDs).
 #   3. Place this file where Tuwunel reads appservice registrations and load it
 #      (Tuwunel/Conduit-family: list the path under the server's
 #      `[global.appservice]`-style config, or register via the admin room/API),
@@ -20,12 +33,15 @@
 #   4. In the bridge `config.toml`, set per `[bridge.matrix]`:
 #        appservice_id    = "voicebridge"          # informational
 #        appservice_token = "<the as_token below>" # the bridge authenticates with this
+#        sender_localpart = "nether-voicebridge"   # = the namespace stem above
+#      The bot MXID then derives to `@nether-voicebridge_bot:server`; set an
+#      explicit `bot_user_id` instead only if you want a different in-namespace bot.
 #
 # Notes:
-#   * `sender_localpart` reserves `@voicebridge_as:server`; it must NOT collide
-#     with the bridge bot's own `matrix.bot_user_id`.
+#   * `sender_localpart` (below) reserves `@voicebridge_as:server` as the
+#     appservice's primary user; it is separate from the bridge bot/ghost stem.
 #   * The user namespace is `exclusive` so only this appservice owns
-#     `@nether-voicebridge_*`.
+#     `@nether-voicebridge_*` (both the `_bot` user and the `_<id>` ghosts).
 #   * If Tuwunel rejects a null `url`, set it to an unused localhost URL
 #     (e.g. http://localhost:0) — the bridge never serves transactions there.
 

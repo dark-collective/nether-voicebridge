@@ -335,8 +335,8 @@ fn reset_bot_crypto_store(dir: &std::path::Path) {
 /// Accepted one-time cost: a deployment that deliberately set a *plain* `matrix.device_id` on a
 /// single machine gets re-keyed once on upgrade (peers just see one new device); idempotent after.
 ///
-/// Appservice-auth only — the caller must NOT use this on the regular-account (`access_token`)
-/// path, whose device is pinned to the token.
+/// Applies to every bridge: all Matrix auth is now appservice login (the bridge
+/// self-provisions an un-pinned device), so the device id is always store-paired here.
 pub(crate) fn resolve_store_device_id(store_path: &str, configured: &str) -> String {
     if store_path.is_empty() {
         return configured.to_owned();
@@ -742,10 +742,10 @@ async fn appservice_join_room(
     Ok(())
 }
 
-/// Run the Matrix sync loop. Must be called with a client and `SlidingSync`
-/// produced by `build_client`. Drives the `SyncCallMemberEvent` handler and
-/// sends call-active signals through `call_active_tx` when the first human
-/// joins or the last human leaves.
+/// Run the Matrix sync loop (classic `/v3/sync` via `client.sync`). Must be called
+/// with a client produced by `build_client`. Drives the `SyncCallMemberEvent`
+/// handler and sends call-active signals through `call_active_tx` when the first
+/// human joins or the last human leaves.
 #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
