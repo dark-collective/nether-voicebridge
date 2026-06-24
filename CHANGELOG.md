@@ -3,6 +3,34 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.4] - 2026-06-24
+
+### Fixed
+- **A Discord voice connection that drops mid-call no longer silently blacks out the
+  bridge.** A songbird `DriverDisconnect` on an active puppet was logged and otherwise
+  ignored, so the bot never rejoined — and because one bot can be both a channel's
+  capture anchor (Discord→Matrix) *and* a Matrix user's playback puppet
+  (Matrix→Discord), a single dropped voice connection silently killed BOTH directions
+  while the bookkeeping still read healthy (the real *"connection dies after a while"*).
+  An unexpected `DriverDisconnect` now rejoins the same bot — keeping its anchor role and
+  audio route — and falls back to the existing failover/quarantine only if the rejoin
+  keeps failing; a periodic reconcile sweep also rejoins any live bot found out of voice.
+  A deliberate leave is correctly *not* treated as a fault.
+- **Discord speakers become audible in Matrix in ~1-3s instead of ~20-37s, and no longer
+  drop out on every membership change** (#42). Three changes to encrypted ghost
+  media-key delivery:
+  - *Device-scoped targeting* — a ghost now keys only the device(s) actually in the call
+    (from `m.call.member`), not every device its Matrix listeners own. On accounts with
+    many sessions this cuts per-recipient fan-out (~12→1), eliminating doomed one-time-key
+    claims against offline/stale devices and the "nobody can decrypt this ghost" windows
+    — matching Element Call's own behavior.
+  - *Lean ghost sync* — each ghost's crypto bootstrap uses a filtered `/sync` (timeline,
+    ephemeral, presence and account data dropped; room membership + encryption kept),
+    roughly halving the bootstrap and lightening homeserver load, device tracking intact.
+  - *Crypto warmed during presence* — a ghost bootstraps its crypto while idling in
+    presence (before a Matrix human joins) instead of every present ghost stampeding the
+    homeserver the instant someone joins, so its key is ready immediately on join.
+
 ## [0.2.3] - 2026-06-23
 
 ### Fixed
