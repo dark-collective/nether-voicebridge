@@ -667,6 +667,11 @@ async fn run_ghost(
     // per-store salt makes the otherwise machine-deterministic id unique to this
     // crypto store (no cross-store SigningKeyChanged — the #30 fix for ghosts).
     let device_id = ghost_device_id(&key, &cfg.ghost_device_salt);
+    // Generate the media key up front (E2EE rooms only) so we can BOTH warm the
+    // crypto + start key distribution during the presence window AND install the
+    // same key on the LiveKit frame crypto when we publish. Decouples the ~10-20s
+    // crypto bootstrap from `call_active` (see the early distribute_key_task spawn).
+    let media_key = cfg.media_e2ee.then(keys::generate_key);
 
     let span = tracing::info_span!("ghost", mxid = %ghost_mxid);
     async {
@@ -704,6 +709,28 @@ async fn run_ghost(
         if let Err(e) = join_room(&cfg, &ghost_mxid).await {
             tracing::error!(error = %e, "ghost join_room failed — skipping");
             return;
+        }
+        // 3b. E2EE only: warm the crypto client + start key distribution NOW — on
+        // presence, not on `call_active`. The ~10-20s crypto bootstrap (this ghost's
+        // own /sync) then runs during the idle presence window, so when a human joins
+        // every present ghost is already warm instead of stampeding its sync onto the
+        // homeserver simultaneously. distribute_key_loop idles (no recipients) until a
+        // human appears, then sends instantly. The SAME media_key is installed on the
+        // LiveKit frame crypto in connect_and_publish below.
+        if let Some(media_key) = media_key {
+            tokio::spawn(
+                distribute_key_task(
+                    client,
+                    cfg.clone(),
+                    localpart.clone(),
+                    ghost_mxid.clone(),
+                    device_id.clone(),
+                    media_key,
+                    members_gen_rx,
+                    cancel.clone(),
+                )
+                .instrument(tracing::Span::current()),
+            );
         }
         // 4. Presence phase — ONLY while no Matrix human is in the call yet. Post
         // m.call.member (no media) so Element Call shows "a Discord user is waiting
@@ -762,7 +789,7 @@ async fn run_ghost(
         // minted for one of our OWN puppet bots in a startup race, see
         // `retract_self_ghost`), we must abort BEFORE publishing a track or posting
         // membership, or the puppet would briefly surface in the call (echo).
-        let (source, track, media_key) = tokio::select! {
+        let (source, track) = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 if let Some(h) = presence_membership.take() {
@@ -774,7 +801,7 @@ async fn run_ghost(
                 tracing::info!("ghost retired (cancelled before publish)");
                 return;
             }
-            res = connect_and_publish(&cfg, &focus, &ghost_mxid, &device_id, cancel.clone()) => match res {
+            res = connect_and_publish(&cfg, &focus, &ghost_mxid, &device_id, media_key, cancel.clone()) => match res {
                 Ok(out) => out,
                 Err(e) => {
                     tracing::error!(error = %e, "ghost LiveKit connect/publish failed — retracting");
@@ -804,27 +831,8 @@ async fn run_ghost(
             .instrument(tracing::Span::current()),
         );
         tracing::info!(display_name = %display_name, "ghost publishing Discord speaker audio");
-
-        // 5b. E2EE only: distribute this ghost's media key to the call's humans so
-        // they can decrypt its encrypted frames. The transport (plaintext Path 2 vs
-        // Olm Path 3) is built inside the spawned task so audio pumping below is never
-        // blocked on crypto-client bootstrap. Runs until cancel (re-sends to catch
-        // joiners).
-        if let Some(media_key) = media_key {
-            tokio::spawn(
-                distribute_key_task(
-                    client,
-                    cfg.clone(),
-                    localpart.clone(),
-                    ghost_mxid.clone(),
-                    device_id.clone(),
-                    media_key,
-                    members_gen_rx,
-                    cancel.clone(),
-                )
-                .instrument(tracing::Span::current()),
-            );
-        }
+        // (Key distribution + crypto bootstrap were started on presence — step 3b —
+        // so a pre-warmed ghost can deliver its key the instant a human joins.)
 
         // 6. Pump frames until cancelled, mirroring the Discord user's mute state
         // onto the track as it changes (and applying the current state up front, so
@@ -1001,8 +1009,9 @@ async fn connect_and_publish(
     focus: &LivekitFocusInfo,
     ghost_mxid: &str,
     device_id: &str,
+    media_key: Option<[u8; 16]>,
     cancel: CancellationToken,
-) -> Result<(NativeAudioSource, LocalAudioTrack, Option<[u8; 16]>)> {
+) -> Result<(NativeAudioSource, LocalAudioTrack)> {
     let openid_token = fetch_openid_token(cfg, ghost_mxid).await?;
     let jwt_resp = lk_jwt::fetch_livekit_token(
         &cfg.http,
@@ -1027,7 +1036,11 @@ async fn connect_and_publish(
     // it under this ghost's own LiveKit identity so its outbound frames encrypt
     // under it. Element Call peers install the same key (under the same identity)
     // from the to-device event `distribute_key_loop` sends → they can decrypt us.
-    let media_key = if cfg.media_e2ee {
+    // Install the (pre-generated, in run_ghost) media key on the LiveKit frame
+    // crypto so this ghost's outbound frames encrypt under it. The same key was
+    // already (or is being) distributed to peers via to-device by the key task
+    // started on presence — so it must be the SAME bytes here, hence passing it in.
+    if let Some(key) = media_key {
         let key_provider = KeyProvider::new(KeyProviderOptions {
             ratchet_window_size: 16,
             ratchet_salt: b"LKFrameEncryptionKey".to_vec(),
@@ -1035,7 +1048,6 @@ async fn connect_and_publish(
             key_ring_size: 256,
             key_derivation_algorithm: KeyDerivationAlgorithm::HKDF,
         });
-        let key = keys::generate_key();
         // The to-device `member.claimed_device_id` (= `device_id`) makes peers
         // reconstruct exactly this identity (`{mxid}:{device_id}`); they must agree
         // or peers install the key under the wrong identity and hear noise.
@@ -1046,10 +1058,7 @@ async fn connect_and_publish(
             encryption_type: EncryptionType::Gcm,
             key_provider,
         });
-        Some(key)
-    } else {
-        None
-    };
+    }
 
     let (room, events) = Room::connect(
         cfg.lk_url.as_deref().unwrap_or(&jwt_resp.url),
@@ -1087,7 +1096,7 @@ async fn connect_and_publish(
         tracing::debug!("ghost LiveKit room closed");
     });
 
-    Ok((source, track, media_key))
+    Ok((source, track))
 }
 
 // ─── E2EE media-key distribution (Path 2 plaintext / Path 3 Olm) ────────────────
