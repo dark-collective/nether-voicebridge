@@ -59,6 +59,13 @@ const NO_ANCHOR: usize = usize::MAX;
 const QUARANTINE_BASE: Duration = Duration::from_secs(15);
 const QUARANTINE_MAX: Duration = Duration::from_secs(120);
 
+/// How often the reconcile sweep probes each active puppet's voice connection
+/// (a backstop for a silent connection death that never fired a
+/// `DriverDisconnect`). The probe is cheap and only acts when a bot the
+/// allocator believes is live is genuinely out of voice (`current_channel()`
+/// is `None`), so the interval can be generous.
+const VOICE_HEALTH_SWEEP: Duration = Duration::from_secs(15);
+
 /// How long a capture-only anchor (one held in voice with no Matrix participant of
 /// its own, only Discord speakers remaining) lingers before it leaves the Discord
 /// channel. Long enough to absorb a Matrix membership flap (which would otherwise
@@ -153,6 +160,15 @@ enum PuppetCommand {
     /// Like [`Release`](PuppetCommand::Release), but fire `done` once the puppet
     /// has actually left voice. Used by graceful shutdown to **await** teardown.
     ReleaseAndAck { done: oneshot::Sender<()> },
+    /// An UNEXPECTED voice `DriverDisconnect` fired for this bot (sent by
+    /// [`DriverFaultHandler`]). `epoch` ties it to the join generation that
+    /// registered the handler, so a disconnect from a connection we have already
+    /// replaced is ignored. The loop rejoins the bot to its current channel.
+    DriverDropped { epoch: u64 },
+    /// Reconcile probe (from the periodic sweep): if the bot is genuinely out of
+    /// voice while the allocator still believes it active, rejoin it. Catches a
+    /// silent death that emitted no `DriverDisconnect`.
+    VerifyConnected,
 }
 
 /// Where a participant's audio is currently routed within a channel. `seq` is a
@@ -201,6 +217,11 @@ struct PuppetSlot {
     /// exponential quarantine backoff (`QUARANTINE_BASE * 2^n`, capped at
     /// `QUARANTINE_MAX`); reset to 0 on a successful join.
     fail_count: Arc<AtomicU32>,
+    /// True while a mid-session voice-disconnect recovery (rejoin) is in flight.
+    /// Debounces repeated `DriverDisconnect`/sweep signals so only one rejoin runs
+    /// at a time; gated on (and cleared by) `should_recover_disconnect` /
+    /// `finish_recovery`.
+    recovering: Arc<AtomicBool>,
 }
 
 /// A swappable audio route: the mixer a participant's frames currently flow into.
@@ -302,6 +323,7 @@ impl SharedPool {
                     connected: Arc::new(AtomicBool::new(false)),
                     unhealthy: Arc::new(AtomicBool::new(false)),
                     fail_count: Arc::new(AtomicU32::new(0)),
+                    recovering: Arc::new(AtomicBool::new(false)),
                 }
             })
             .collect();
@@ -416,8 +438,29 @@ impl SharedPool {
         let clients = futures_util::future::try_join_all(futs);
         tokio::pin!(clients);
 
+        // Reconcile sweep: periodically nudge each live puppet to verify it is
+        // actually in voice and rejoin if a connection died silently (a backstop
+        // for a drop that never fired a `DriverDisconnect`). Stops on shutdown.
+        let sweeper = {
+            let pool = self.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(VOICE_HEALTH_SWEEP);
+                tick.tick().await; // consume the immediate first tick
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = tick.tick() => pool.sweep_voice_health(),
+                    }
+                }
+            })
+        };
+
         tokio::select! {
-            r = &mut clients => return r.map(|_| ()),
+            r = &mut clients => {
+                sweeper.abort();
+                return r.map(|_| ());
+            }
             _ = shutdown.cancelled() => {}
         }
 
@@ -430,6 +473,7 @@ impl SharedPool {
                 }
             }
         }
+        sweeper.abort();
         Ok(())
     }
 
@@ -1065,8 +1109,10 @@ impl SharedPool {
                 break;
             }
         }
-        // A successful join proves the bot healthy → reset its quarantine backoff.
+        // A successful join proves the bot healthy → reset its quarantine backoff
+        // and clear any in-flight recovery latch.
         self.slots[idx].fail_count.store(0, Ordering::Relaxed);
+        self.slots[idx].recovering.store(false, Ordering::Relaxed);
     }
 
     /// Called by a puppet's command loop after `manager.join` FAILS (e.g. the voice
@@ -1193,6 +1239,46 @@ impl SharedPool {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
         self.rebalance(&mut guard);
         tracing::info!(idx, "puppet join-timeout quarantine cleared — eligible again");
+    }
+
+    /// Decide whether an unexpected voice disconnect for `idx` warrants a rejoin,
+    /// and claim the recovery latch if so. Returns `true` (and sets `recovering`)
+    /// only when the allocator still believes this bot is live (`busy`), it is not
+    /// already quarantined (`unhealthy`), and no recovery is already in flight.
+    /// A deliberate leave sets `busy=false` *before* `manager.remove` fires its
+    /// `DriverDisconnect`, so that path returns `false` here — no spurious rejoin.
+    /// Caller MUST pair a `true` with exactly one [`finish_recovery`] (directly or
+    /// via the rejoin path / `on_join_succeeded`).
+    fn should_recover_disconnect(&self, idx: usize) -> bool {
+        // Serialize against the allocator's own busy/anchor mutations.
+        let _guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.slots[idx].busy.load(Ordering::Relaxed)
+            || self.slots[idx].unhealthy.load(Ordering::Relaxed)
+        {
+            return false;
+        }
+        // swap returns the prior value: claim the latch iff it was clear.
+        !self.slots[idx].recovering.swap(true, Ordering::Relaxed)
+    }
+
+    /// Release the recovery latch claimed by [`should_recover_disconnect`].
+    fn finish_recovery(&self, idx: usize) {
+        self.slots[idx].recovering.store(false, Ordering::Relaxed);
+    }
+
+    /// Reconcile sweep: ask every bot the allocator believes is live to verify it
+    /// is actually in voice (handled in the command loop, which has the songbird
+    /// `Call`). A backstop for a silent connection death that fired no
+    /// `DriverDisconnect`. Skips bots already quarantined or mid-recovery.
+    fn sweep_voice_health(&self) {
+        for slot in &self.slots {
+            if slot.busy.load(Ordering::Relaxed)
+                && !slot.unhealthy.load(Ordering::Relaxed)
+                && !slot.recovering.load(Ordering::Relaxed)
+            {
+                let _ = slot.cmd_tx.try_send(PuppetCommand::VerifyConnected);
+            }
+        }
     }
 
     fn set_muted(&self, bridge: &str, key: &str, muted: bool) {
@@ -1870,6 +1956,9 @@ async fn puppet_command_loop(
             tok.cancel(); // task self-terminates within one GATE_POLL; don't await it
         }
     };
+    // Monotonic join generation: bumped on every (re)join so a `DriverDisconnect`
+    // tagged with an older epoch (from a connection we already replaced) is ignored.
+    let mut epoch: u64 = 0;
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             PuppetCommand::Assign { ctx: chan, display_name } => {
@@ -1878,9 +1967,19 @@ async fn puppet_command_loop(
                 // also no longer anchoring whatever it anchored before.
                 cancel_gate(&mut puppet_gate);
                 cancel_gate(&mut overflow_gate);
-                let handle =
-                    puppet_join(&chan, idx, &ctx, &mixer, &current_ssrc, &nickname_prefix, &display_name)
-                        .await;
+                epoch += 1;
+                let handle = puppet_join(
+                    &chan,
+                    idx,
+                    &ctx,
+                    &mixer,
+                    &current_ssrc,
+                    &nickname_prefix,
+                    &display_name,
+                    epoch,
+                    &pool.slots[idx].cmd_tx,
+                )
+                .await;
                 let bridge = chan.bridge.clone();
                 current = Some(chan);
                 if let Some(handle) = handle {
@@ -1948,6 +2047,61 @@ async fn puppet_command_loop(
                     puppet_leave(&ctx, idx, &chan, &current_ssrc).await;
                 }
                 let _ = done.send(());
+            }
+            // An unexpected voice drop (event-driven) or a reconcile probe finding
+            // the bot out of voice → rejoin the SAME bot, keeping its participant +
+            // anchor role. `should_recover_disconnect` gates on `busy` (a deliberate
+            // leave already cleared it) and claims the recovery latch.
+            cmd @ (PuppetCommand::DriverDropped { .. } | PuppetCommand::VerifyConnected) => {
+                let proceed = match &cmd {
+                    PuppetCommand::DriverDropped { epoch: ev } => {
+                        // Ignore a stale disconnect from a replaced connection.
+                        *ev == epoch && pool.should_recover_disconnect(idx)
+                    }
+                    PuppetCommand::VerifyConnected => {
+                        pool.should_recover_disconnect(idx)
+                            && match &current {
+                                Some(chan) => {
+                                    let gone = voice_channel_gone(&ctx, chan.guild_id).await;
+                                    if !gone {
+                                        pool.finish_recovery(idx);
+                                    }
+                                    gone
+                                }
+                                None => {
+                                    pool.finish_recovery(idx);
+                                    false
+                                }
+                            }
+                    }
+                    _ => unreachable!(),
+                };
+                if proceed {
+                    if let Some(chan) = current.clone() {
+                        tracing::warn!(idx, "puppet voice dropped unexpectedly — recovering (rejoin)");
+                        cancel_gate(&mut puppet_gate);
+                        cancel_gate(&mut overflow_gate);
+                        epoch += 1;
+                        let handle = rejoin_puppet(
+                            &ctx, idx, &mixer, &current_ssrc, &nickname_prefix, &pool, &chan, epoch,
+                        )
+                        .await;
+                        if let Some(handle) = handle {
+                            let tok = CancellationToken::new();
+                            let jh = spawn_speaking_gate(
+                                handle,
+                                mixer.clone(),
+                                tok.clone(),
+                                chan.bridge.clone(),
+                                "puppet",
+                            );
+                            puppet_gate = Some((tok, jh));
+                        }
+                    } else {
+                        // Latch was claimed but there's no channel to rejoin.
+                        pool.finish_recovery(idx);
+                    }
+                }
             }
         }
     }
@@ -2082,6 +2236,7 @@ fn spawn_speaking_gate(
 /// Returns `true` if the bot actually joined the voice channel. `false` on a join
 /// failure (e.g. the gateway timed out after a channel hop) — the caller fails the
 /// participant over to another pool bot.
+#[allow(clippy::too_many_arguments)]
 async fn puppet_join(
     channel: &ChannelCtx,
     idx: usize,
@@ -2090,6 +2245,8 @@ async fn puppet_join(
     current_ssrc: &Arc<StdMutex<Option<u32>>>,
     nickname_prefix: &str,
     display_name: &str,
+    epoch: u64,
+    cmd_tx: &mpsc::Sender<PuppetCommand>,
 ) -> Option<TrackHandle> {
     let Some(manager) = songbird::get(ctx).await else {
         tracing::error!(idx, "songbird not registered on puppet client");
@@ -2117,11 +2274,19 @@ async fn puppet_join(
             CoreEvent::SpeakingStateUpdate.into(),
             SpeakingLogger::new(channel.bridge.clone(), channel.ssrc_map.clone()),
         );
-        for ev in [
-            CoreEvent::DriverReconnect,
-            CoreEvent::DriverDisconnect,
-            CoreEvent::ClientDisconnect,
-        ] {
+        // An unexpected DriverDisconnect drives voice recovery (rejoin), tagged
+        // with this join's `epoch` so a stale disconnect from a replaced
+        // connection is ignored. DriverReconnect/ClientDisconnect stay log-only.
+        call.add_global_event(
+            CoreEvent::DriverDisconnect.into(),
+            DriverFaultHandler {
+                bridge: channel.bridge.clone(),
+                idx,
+                epoch,
+                cmd_tx: cmd_tx.clone(),
+            },
+        );
+        for ev in [CoreEvent::DriverReconnect, CoreEvent::ClientDisconnect] {
             call.add_global_event(
                 ev.into(),
                 ConnectionLogger::new(channel.bridge.clone(), channel.ssrc_map.clone()),
@@ -2175,6 +2340,88 @@ async fn puppet_leave(
     tracing::info!(idx, bridge = %channel.bridge, "puppet left voice and released");
 }
 
+/// Recover a bot whose voice connection dropped mid-session: drop the dead Call,
+/// rejoin the SAME bot to its current channel (re-registering handlers + replaying
+/// playback), and re-activate its anchor role if it was the anchor. Unlike
+/// `on_join_failed`, this keeps the bot serving its participant and keeps its
+/// route/anchor — the only correct recovery when the bot is the sole one serving
+/// the channel (no spare to fail over to). On a failed rejoin it falls back to the
+/// existing quarantine→failover→recover machinery. Returns the new playback handle
+/// (so the caller respawns the speaking gate). Clears the recovery latch.
+#[allow(clippy::too_many_arguments)]
+async fn rejoin_puppet(
+    ctx: &Context,
+    idx: usize,
+    mixer: &Arc<PlaybackMixer>,
+    current_ssrc: &Arc<StdMutex<Option<u32>>>,
+    nickname_prefix: &str,
+    pool: &Arc<SharedPool>,
+    chan: &ChannelCtx,
+    epoch: u64,
+) -> Option<TrackHandle> {
+    // Drop the dead Call so the rejoin starts clean (mirrors puppet_join's reset
+    // on a failed join).
+    if let Some(manager) = songbird::get(ctx).await {
+        let _ = manager.remove(chan.guild_id).await;
+    }
+    // Drop the dead connection's SSRC from echo-exclusion; the fresh join
+    // re-registers a new one via DriverConnect (mirrors puppet_leave's cleanup,
+    // which this path bypasses).
+    let stale_ssrc = current_ssrc.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let Some(s) = stale_ssrc {
+        chan.exclude.write().unwrap_or_else(PoisonError::into_inner).remove(&s);
+    }
+    let display_name = pool.slots[idx]
+        .name
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+        .unwrap_or_default();
+    let handle = puppet_join(
+        chan,
+        idx,
+        ctx,
+        mixer,
+        current_ssrc,
+        nickname_prefix,
+        &display_name,
+        epoch,
+        &pool.slots[idx].cmd_tx,
+    )
+    .await;
+    if handle.is_some() {
+        tracing::info!(idx, bridge = %chan.bridge, "puppet voice connection recovered — rejoined");
+        // Re-activate the anchor role if this bot is still the channel's anchor.
+        pool.on_join_succeeded(idx);
+        pool.finish_recovery(idx);
+    } else {
+        tracing::warn!(idx, bridge = %chan.bridge, "puppet rejoin failed — quarantining + failing over");
+        pool.finish_recovery(idx);
+        let backoff = pool.on_join_failed(idx);
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(backoff).await;
+            pool.recover_bot(idx);
+        });
+    }
+    handle
+}
+
+/// Whether this bot is genuinely out of the voice channel. `current_channel()` is
+/// `None` only when not joined / kicked and STAYS `Some` through a transient
+/// reconnect — so this never false-fires on a benign blip (unlike
+/// `current_connection()`). Returns `true` (treat as gone) if songbird/the Call is
+/// missing entirely.
+async fn voice_channel_gone(ctx: &Context, guild_id: GuildId) -> bool {
+    let Some(manager) = songbird::get(ctx).await else {
+        return true;
+    };
+    match manager.get(guild_id) {
+        Some(call) => call.lock().await.current_channel().is_none(),
+        None => true,
+    }
+}
+
 /// Songbird handler that records a puppet's own SSRC into its channel's
 /// echo-exclusion set as soon as its voice driver connects.
 struct PuppetSsrcRegistrar {
@@ -2195,6 +2442,41 @@ impl SongbirdEventHandler for PuppetSsrcRegistrar {
                 .insert(c.ssrc);
             *self.current_ssrc.lock().unwrap_or_else(PoisonError::into_inner) = Some(c.ssrc);
             tracing::info!(idx = self.idx, ssrc = c.ssrc, "puppet SSRC registered for echo-exclusion");
+        }
+        None
+    }
+}
+
+/// Songbird handler that turns an UNEXPECTED voice `DriverDisconnect` into a
+/// rejoin request for this bot. songbird only emits `DriverDisconnect` once it
+/// has given up its own reconnect attempts, so it is the right moment to
+/// re-establish the connection at the application level. `epoch` ties the signal
+/// to the join generation that registered this handler, so a disconnect from a
+/// connection we have already torn down/replaced is ignored by the command loop.
+/// Logs the event (replacing `ConnectionLogger` for this one event) and signals
+/// the bot's loop; the loop's `busy`-gate decides expected-vs-unexpected.
+struct DriverFaultHandler {
+    bridge: Arc<str>,
+    idx: usize,
+    epoch: u64,
+    cmd_tx: mpsc::Sender<PuppetCommand>,
+}
+
+#[async_trait]
+impl SongbirdEventHandler for DriverFaultHandler {
+    #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        if let EventContext::DriverDisconnect(d) = ctx {
+            // Diagnostic only — fires on EVERY disconnect incl. deliberate leaves. The
+            // command loop's `busy`-gate decides expected-vs-unexpected and logs the
+            // actual recovery at the decision point.
+            tracing::debug!(
+                idx = self.idx, kind = ?d.kind, reason = ?d.reason, channel_id = ?d.channel_id,
+                "songbird DriverDisconnect observed"
+            );
+            let _ = self
+                .cmd_tx
+                .try_send(PuppetCommand::DriverDropped { epoch: self.epoch });
         }
         None
     }
@@ -2229,6 +2511,12 @@ impl SharedPool {
     }
     fn test_is_unhealthy(&self, idx: usize) -> bool {
         self.slots[idx].unhealthy.load(Ordering::Relaxed)
+    }
+    fn test_is_busy(&self, idx: usize) -> bool {
+        self.slots[idx].busy.load(Ordering::Relaxed)
+    }
+    fn test_is_recovering(&self, idx: usize) -> bool {
+        self.slots[idx].recovering.load(Ordering::Relaxed)
     }
 }
 
@@ -2427,6 +2715,44 @@ mod tests {
         assert!(!p.test_is_unhealthy(sa));
         assert_eq!(p.test_anchor("A"), Some(sa), "re-anchored after recovery");
         assert_eq!(p.test_slot_of("A", "alice"), Some(sa));
+    }
+
+    #[test]
+    fn driver_disconnect_recovery_gate() {
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        let sink = p.assign("A", "alice", "Alice"); // alice → dedicated puppet + anchor
+        let sa = p.test_slot_of("A", "alice").unwrap();
+        let free = (0..2).find(|i| !p.test_is_busy(*i)).expect("a spare bot");
+
+        // An active, healthy bot claims recovery once; repeats are debounced until
+        // the in-flight attempt finishes (so concurrent DriverDisconnect + sweep
+        // can't launch two rejoins).
+        assert!(p.should_recover_disconnect(sa), "active bot: claim recovery");
+        assert!(p.test_is_recovering(sa));
+        assert!(!p.should_recover_disconnect(sa), "debounced while recovering");
+        p.finish_recovery(sa);
+        assert!(!p.test_is_recovering(sa));
+        assert!(p.should_recover_disconnect(sa), "claimable again after finish");
+        p.finish_recovery(sa);
+
+        // An idle bot has nothing to recover.
+        assert!(!p.should_recover_disconnect(free), "idle bot: skip");
+
+        // A quarantined bot is left to the join-timeout/backoff machinery.
+        p.slots[sa].unhealthy.store(true, Ordering::Relaxed);
+        assert!(!p.should_recover_disconnect(sa), "unhealthy bot: skip");
+        p.slots[sa].unhealthy.store(false, Ordering::Relaxed);
+
+        // The crux: a deliberate release clears `busy` BEFORE its DriverDisconnect
+        // fires, so a late disconnect for that bot must NOT trigger a spurious rejoin.
+        drop(sink);
+        p.release("A", "alice");
+        assert!(!p.test_is_busy(sa), "released → not busy");
+        assert!(
+            !p.should_recover_disconnect(sa),
+            "deliberate leave must not be mistaken for a fault"
+        );
     }
 
     #[test]
