@@ -23,7 +23,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use matrix_sdk::{
     encryption::identities::Device,
-    ruma::{events::AnyToDeviceEventContent, serde::Raw, OwnedDeviceId, OwnedUserId, UserId},
+    ruma::{events::AnyToDeviceEventContent, serde::Raw, OwnedDeviceId, OwnedUserId},
     Client,
 };
 use matrix_sdk_crypto::CollectStrategy;
@@ -50,6 +50,19 @@ pub(crate) struct KeySendOutcome {
     pub failed: Vec<FailedRecipient>,
 }
 
+/// A single call-member device to deliver the media key to. The bridge targets the
+/// EXACT device(s) actually in the call (from each `m.call.member`), not every device
+/// a user owns: most users carry several other logged-in/offline sessions that aren't
+/// in the call, and keying those wastes Olm one-time-key claims (frequently doomed —
+/// offline devices run out of OTKs) and slows delivery to the device that matters.
+/// Mirrors what Element Call itself does. `Eq`/`Hash` let the loop dedup and detect
+/// new joiners.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct KeyRecipient {
+    pub user_id: OwnedUserId,
+    pub device_id: OwnedDeviceId,
+}
+
 /// Delivers a ghost's 16-byte LiveKit frame key to the call's human members.
 #[async_trait]
 pub(crate) trait KeyTransport: Send + Sync {
@@ -58,7 +71,7 @@ pub(crate) trait KeyTransport: Send + Sync {
     /// failures); `Err` is a hard send failure (nothing delivered).
     async fn send_key(
         &self,
-        recipients: &[OwnedUserId],
+        recipients: &[KeyRecipient],
         key: &[u8; 16],
         key_index: u8,
     ) -> Result<KeySendOutcome>;
@@ -109,7 +122,7 @@ impl PlaintextTransport {
 impl KeyTransport for PlaintextTransport {
     async fn send_key(
         &self,
-        recipients: &[OwnedUserId],
+        recipients: &[KeyRecipient],
         key: &[u8; 16],
         key_index: u8,
     ) -> Result<KeySendOutcome> {
@@ -126,11 +139,16 @@ impl KeyTransport for PlaintextTransport {
         let content_json =
             serde_json::to_value(&content).context("serializing encryption key content")?;
 
-        // { messages: { "@user:hs": { "*": <content> } } }
-        let per_device = serde_json::json!({ "*": content_json });
-        let mut messages = serde_json::Map::new();
-        for recipient in recipients {
-            messages.insert(recipient.to_string(), per_device.clone());
+        // { messages: { "@user:hs": { "<device>": <content>, ... } } } — target the
+        // exact call-member devices (not "*"), mirroring the Olm path.
+        let mut messages: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        for r in recipients {
+            let user_entry = messages
+                .entry(r.user_id.to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(obj) = user_entry.as_object_mut() {
+                obj.insert(r.device_id.to_string(), content_json.clone());
+            }
         }
         let body = serde_json::json!({ "messages": serde_json::Value::Object(messages) });
 
@@ -192,7 +210,7 @@ impl OlmTransport {
 impl KeyTransport for OlmTransport {
     async fn send_key(
         &self,
-        recipients: &[OwnedUserId],
+        recipients: &[KeyRecipient],
         key: &[u8; 16],
         key_index: u8,
     ) -> Result<KeySendOutcome> {
@@ -210,17 +228,22 @@ impl KeyTransport for OlmTransport {
         let raw: Raw<AnyToDeviceEventContent> =
             Raw::from_json_string(json).context("building Raw to-device content")?;
 
-        // Resolve every recipient's devices from THIS ghost's crypto store (kept
-        // current by its sync task). A device the ghost hasn't tracked yet is simply
-        // absent here; the caller's burst/heartbeat retries once sync catches up.
+        // Resolve the EXACT call-member devices from THIS ghost's crypto store (kept
+        // current by its sync task) — not every device the user owns. A device the
+        // ghost hasn't tracked yet is simply absent here; the caller's burst/heartbeat
+        // retries once sync catches up.
         let mut devices: Vec<Device> = Vec::new();
-        for user in recipients {
-            let uid: &UserId = user;
-            match self.client.encryption().get_user_devices(uid).await {
-                Ok(user_devices) => devices.extend(user_devices.devices()),
-                Err(e) => {
-                    tracing::warn!(user = %user, error = %e, "olm: get_user_devices failed");
-                }
+        for r in recipients {
+            match self.client.encryption().get_device(&r.user_id, &r.device_id).await {
+                Ok(Some(dev)) => devices.push(dev),
+                Ok(None) => tracing::debug!(
+                    user = %r.user_id, device = %r.device_id,
+                    "olm: call-member device not tracked yet (will retry)"
+                ),
+                Err(e) => tracing::warn!(
+                    user = %r.user_id, device = %r.device_id, error = %e,
+                    "olm: get_device failed"
+                ),
             }
         }
         if devices.is_empty() {

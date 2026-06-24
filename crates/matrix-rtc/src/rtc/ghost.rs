@@ -74,7 +74,7 @@ use nvb_audio::routing::{CaptureRouter, CaptureSink};
 use nvb_audio::wav::WavMonoWriter;
 use nvb_config::{KeyTransport as KeyTransportMode, LiveKitConfig, MatrixConfig};
 
-use super::key_transport::{KeyTransport, OlmTransport, PlaintextTransport};
+use super::key_transport::{KeyRecipient, KeyTransport, OlmTransport, PlaintextTransport};
 use super::keys;
 use super::lk_jwt;
 use super::openid::OpenIdToken;
@@ -1151,7 +1151,7 @@ async fn distribute_key_task(
 /// without a live homeserver (tests supply a scripted source).
 #[async_trait]
 trait RecipientSource: Send + Sync {
-    async fn recipients(&self) -> Result<Vec<OwnedUserId>>;
+    async fn recipients(&self) -> Result<Vec<KeyRecipient>>;
 }
 
 /// Production source: reads call memberships via the bridge bot's joined client.
@@ -1162,7 +1162,7 @@ struct CallRecipients {
 
 #[async_trait]
 impl RecipientSource for CallRecipients {
-    async fn recipients(&self) -> Result<Vec<OwnedUserId>> {
+    async fn recipients(&self) -> Result<Vec<KeyRecipient>> {
         enumerate_key_recipients(&self.client, &self.cfg).await
     }
 }
@@ -1317,7 +1317,7 @@ async fn distribute_key_loop(
 ) {
     // Recipients keyed so far — used only to detect a NEW human (which restarts a
     // burst); the sends themselves are not gated by it (we re-send to all current).
-    let mut keyed: HashSet<OwnedUserId> = HashSet::new();
+    let mut keyed: HashSet<KeyRecipient> = HashSet::new();
     // Burst re-sends still owed after the last membership change. >0 ⇒ wake fast.
     let mut burst: u32 = 0;
     loop {
@@ -1335,7 +1335,7 @@ async fn distribute_key_loop(
             Ok(current) => {
                 // A newly-seen recipient (re)starts the burst to cover its client's
                 // call-setup window, during which it may drop the to-device key.
-                if current.iter().any(|u| !keyed.contains(u)) {
+                if current.iter().any(|r| !keyed.contains(r)) {
                     burst = KEY_BURST_COUNT;
                 }
                 if current.is_empty() {
@@ -1345,7 +1345,7 @@ async fn distribute_key_loop(
                         // Every targeted device got the key.
                         Ok(o) if o.failed.is_empty() => {
                             tracing::info!(
-                                recipients = ?current.iter().map(|u| u.as_str()).collect::<Vec<_>>(),
+                                recipients = ?current.iter().map(|r| format!("{}:{}", r.user_id, r.device_id)).collect::<Vec<_>>(),
                                 transport = transport.kind(),
                                 delivered = o.delivered,
                                 burst,
@@ -1434,7 +1434,7 @@ async fn distribute_key_loop(
 /// bot's joined client. Excludes our ghosts ([`is_ghost_identity`], which also
 /// drops *this* ghost) and the bridge bot itself (the subscriber skips ghost
 /// tracks, so it never needs ghost keys — constraint #5). Deduplicated by MXID.
-async fn enumerate_key_recipients(client: &Client, cfg: &GhostConfig) -> Result<Vec<OwnedUserId>> {
+async fn enumerate_key_recipients(client: &Client, cfg: &GhostConfig) -> Result<Vec<KeyRecipient>> {
     let room_id = RoomId::parse(&cfg.room_id)
         .with_context(|| format!("parsing room_id '{}'", cfg.room_id))?;
     let Some(room) = client.get_room(&room_id) else {
@@ -1445,23 +1445,28 @@ async fn enumerate_key_recipients(client: &Client, cfg: &GhostConfig) -> Result<
         .await
         .context("reading call memberships for key distribution")?;
 
-    let mut recipients: Vec<OwnedUserId> = Vec::new();
+    // One recipient per ACTIVE membership = one (user, device) actually in the call.
+    // m.call.member is per-device, so this targets exactly the in-call device(s) — not
+    // every device the user owns (which would waste Olm OTK claims on offline sessions).
+    let mut recipients: Vec<KeyRecipient> = Vec::new();
     for raw in raws {
         let Ok(ev) = raw.deserialize() else { continue };
         let orig = match ev {
             SyncOrStrippedState::Sync(SyncStateEvent::Original(o)) => o,
             _ => continue,
         };
-        // Skip retracted/expired memberships.
-        if orig.content.active_memberships(Some(orig.origin_server_ts)).is_empty() {
-            continue;
-        }
         let sender = orig.sender;
         if is_bridge_excluded_identity(sender.as_str(), &cfg.ghost_localpart_prefix) || sender.as_str() == cfg.bot_user_id {
             continue;
         }
-        if !recipients.contains(&sender) {
-            recipients.push(sender);
+        for m in orig.content.active_memberships(Some(orig.origin_server_ts)) {
+            let r = KeyRecipient {
+                user_id: sender.clone(),
+                device_id: m.device_id().to_owned(),
+            };
+            if !recipients.contains(&r) {
+                recipients.push(r);
+            }
         }
     }
     Ok(recipients)
@@ -1937,19 +1942,27 @@ mod tests {
 
     // ── distribute_key_loop, driven with mock transport + recipient source ──────
 
-    use super::super::key_transport::{FailedRecipient, KeySendOutcome};
+    use super::super::key_transport::{FailedRecipient, KeyRecipient, KeySendOutcome};
+
+    /// Test helper: a call-member recipient with a fixed device id.
+    fn rcpt(user: &str) -> KeyRecipient {
+        KeyRecipient {
+            user_id: user.parse().unwrap(),
+            device_id: "DEV1".into(),
+        }
+    }
 
     /// Records the recipient lists passed to each `send_key`.
     #[derive(Default)]
     struct MockTransport {
-        sends: StdMutex<Vec<Vec<OwnedUserId>>>,
+        sends: StdMutex<Vec<Vec<KeyRecipient>>>,
     }
 
     #[async_trait]
     impl KeyTransport for MockTransport {
         async fn send_key(
             &self,
-            recipients: &[OwnedUserId],
+            recipients: &[KeyRecipient],
             _key: &[u8; 16],
             _key_index: u8,
         ) -> Result<KeySendOutcome> {
@@ -1966,21 +1979,21 @@ mod tests {
 
     /// Returns a fixed recipient list every poll.
     struct MockSource {
-        users: Vec<OwnedUserId>,
+        recipients: Vec<KeyRecipient>,
     }
 
     #[async_trait]
     impl RecipientSource for MockSource {
-        async fn recipients(&self) -> Result<Vec<OwnedUserId>> {
-            Ok(self.users.clone())
+        async fn recipients(&self) -> Result<Vec<KeyRecipient>> {
+            Ok(self.recipients.clone())
         }
     }
 
     #[tokio::test]
     async fn key_loop_sends_to_current_recipients_then_stops_on_cancel() {
-        let alice: OwnedUserId = "@alice:nether.im".parse().unwrap();
+        let alice = rcpt("@alice:nether.im");
         let source = Arc::new(MockSource {
-            users: vec![alice.clone()],
+            recipients: vec![alice.clone()],
         });
         let transport = Arc::new(MockTransport::default());
         let (_gen_tx, gen_rx) = watch::channel(0u64);
@@ -2008,7 +2021,7 @@ mod tests {
 
     #[tokio::test]
     async fn key_loop_skips_send_when_no_recipients() {
-        let source = Arc::new(MockSource { users: vec![] });
+        let source = Arc::new(MockSource { recipients: vec![] });
         let transport = Arc::new(MockTransport::default());
         let (_gen_tx, gen_rx) = watch::channel(0u64);
         let cancel = CancellationToken::new();
@@ -2041,7 +2054,7 @@ mod tests {
     impl KeyTransport for ColdThenWarmTransport {
         async fn send_key(
             &self,
-            recipients: &[OwnedUserId],
+            recipients: &[KeyRecipient],
             _key: &[u8; 16],
             _key_index: u8,
         ) -> Result<KeySendOutcome> {
@@ -2054,9 +2067,9 @@ mod tests {
                     delivered: 0,
                     failed: recipients
                         .iter()
-                        .map(|u| FailedRecipient {
-                            user_id: u.clone(),
-                            device_id: "DEAD".into(),
+                        .map(|r| FailedRecipient {
+                            user_id: r.user_id.clone(),
+                            device_id: r.device_id.clone(),
                         })
                         .collect(),
                 })
@@ -2081,9 +2094,8 @@ mod tests {
     /// then a 60s gap). `>= 10` cleanly separates the two.
     #[tokio::test(start_paused = true)]
     async fn key_loop_fast_retries_until_crypto_sync_catches_up() {
-        let alice: OwnedUserId = "@alice:nether.im".parse().unwrap();
         let source = Arc::new(MockSource {
-            users: vec![alice],
+            recipients: vec![rcpt("@alice:nether.im")],
         });
         // Stays cold for the whole window so we measure the sustained retry cadence.
         let transport = Arc::new(ColdThenWarmTransport {
