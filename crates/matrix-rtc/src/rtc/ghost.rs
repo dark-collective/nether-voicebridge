@@ -1214,6 +1214,40 @@ async fn bootstrap_olm_transport(
 /// ghost) so its device lists stay fresh for `encrypt_and_send_raw_to_device`.
 /// Mirrors the bridge bot's `build_client`; we add no crypto of our own. The store
 /// persists across rejoins so Olm sessions + uploaded keys are reused.
+/// A lean `/sync` filter for ghost crypto clients. A ghost only needs `device_lists`
+/// (delivered top-level in the sync response, unaffected by this filter) + to-device,
+/// plus the room's membership/encryption STATE so the SDK knows whose devices to
+/// track. It never needs the room timeline (message backfill), ephemeral data
+/// (typing/receipts), presence, or account data — dropping those sharply cuts the
+/// sync payload, wall-time, and homeserver load vs. `SyncSettings::default()` (the
+/// full sync is what makes a ghost's cold start ~20s). Matrix filter semantics:
+/// `types: Some([])` includes NO event types (drops them); `None` includes all — so
+/// we leave room `state` at default (keep members + `m.room.encryption`) and empty
+/// the rest.
+fn ghost_sync_settings() -> SyncSettings {
+    use matrix_sdk::ruma::api::client::{
+        filter::{Filter as EventFilter, FilterDefinition, RoomEventFilter, RoomFilter},
+        sync::sync_events::v3::Filter as SyncFilter,
+    };
+    let mut timeline = RoomEventFilter::default();
+    timeline.limit = Some(0u32.into()); // no message backfill
+    let mut drop_room = RoomEventFilter::default();
+    drop_room.types = Some(Vec::new());
+    let mut drop_ev = EventFilter::default();
+    drop_ev.types = Some(Vec::new());
+
+    let mut room = RoomFilter::default();
+    room.timeline = timeline;
+    room.ephemeral = drop_room.clone();
+    room.account_data = drop_room;
+
+    let mut filter = FilterDefinition::default();
+    filter.room = room;
+    filter.presence = drop_ev.clone();
+    filter.account_data = drop_ev;
+    SyncSettings::default().filter(SyncFilter::FilterDefinition(filter))
+}
+
 async fn build_ghost_crypto_client(
     cfg: &GhostConfig,
     localpart: &str,
@@ -1264,7 +1298,7 @@ async fn build_ghost_crypto_client(
     // can't hang key distribution forever.
     match tokio::time::timeout(
         Duration::from_secs(60),
-        client.sync_once(SyncSettings::default()),
+        client.sync_once(ghost_sync_settings()),
     )
     .await
     {
@@ -1280,7 +1314,7 @@ async fn build_ghost_crypto_client(
         async move {
             tokio::select! {
                 _ = sync_cancel.cancelled() => {}
-                r = sync_client.sync(SyncSettings::default()) => {
+                r = sync_client.sync(ghost_sync_settings()) => {
                     if let Err(e) = r {
                         tracing::warn!(error = %e, "ghost crypto sync loop ended");
                     }
