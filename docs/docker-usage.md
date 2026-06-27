@@ -14,6 +14,12 @@ Fill in `config.toml` with your credentials. See the comments in `config.example
 
 You do **not** need to set `store_path`. The image sets `NVB_DATA_DIR=/app/data`, so any bridge that omits `matrix.store_path` gets `/app/data/<bridge>` automatically — landing on the persistent volume (below) with a distinct path per bridge. Only set `store_path` explicitly if you want a custom location.
 
+`matrix_domain` (or `NETHER_MATRIX_DOMAIN`) is an optional field that lets you
+explicitly set the Matrix domain used to construct user IDs (e.g. `nether.im`).
+When omitted, the bridge derives it from `homeserver_url`. Set it when those two
+differ — for example, when `homeserver_url` points to an internal address rather
+than the public domain.
+
 ### 2. Build the image
 
 ```bash

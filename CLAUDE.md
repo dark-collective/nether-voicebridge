@@ -128,7 +128,7 @@ test.
   happens in `Config::resolve_store_paths` (`crates/config/src/lib.rs`); an
   explicit `store_path` always wins. **Server/appservice profiles:** the
   homeserver/appservice fields shared across bridges (`homeserver_url`,
-  `bot_user_id`, `appservice_id`, `appservice_token`)
+  `matrix_domain`, `bot_user_id`, `appservice_id`, `appservice_token`)
   live once in a named `[server.<name>]` profile; a bridge sets `server =
   "<name>"` + its own `room_id` (bridge-level) + `[bridge.discord]` and inherits
   the rest (`Config::resolve_servers` — an explicit `[bridge.matrix]` value still
@@ -136,9 +136,11 @@ test.
   from the bridge `name` (same slug as `store_path`, so device + store stay
   consistent and unique-per-bridge) via `Config::resolve_device_ids`.
   `bot_user_id` stays required (its appservice localpart can't be derived from
-  `appservice_id`). `validate()` rejects unknown `server` references, any required
-  matrix field still empty after merge, and duplicate
-  `(homeserver_url, bot_user_id, device_id)` across bridges.
+  `appservice_id`). `matrix_domain` is **optional**: when omitted, the Matrix
+  domain is extracted from `homeserver_url`; set it explicitly when those differ
+  (e.g. `homeserver_url` is an internal proxy address). `validate()` rejects
+  unknown `server` references, any required matrix field still empty after merge,
+  and duplicate `(homeserver_url, bot_user_id, device_id)` across bridges.
 - **Device ids are minted unique-per-crypto-store, not just per-bridge (#30).** At
   runtime the configured/derived device id is only a *base*: the bot mints
   `<base>-<rand>` paired with its crypto store (`matrix.rs::resolve_store_device_id`,

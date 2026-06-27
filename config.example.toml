@@ -74,6 +74,13 @@ capture_wav = false
 # Fixed: your Tuwunel homeserver.
 homeserver_url = "https://nether.im"
 
+# Matrix domain (e.g. "nether.im"). OPTIONAL — when omitted, it is extracted
+# from homeserver_url (hostname after stripping the scheme). Only needed when
+# homeserver_url is an internal proxy address that differs from the public
+# Matrix domain, which is typical in Docker/Ansible deployments where
+# homeserver_url might be "http://matrix-traefik:8008".
+# matrix_domain = "nether.im"
+
 # Internal room ID — NOT the #alias form.
 # Element: open the room → Settings → Advanced → "Internal room ID" (!abc:nether.im)
 #
@@ -186,6 +193,7 @@ appservice_token = "your_appservice_hs_token_here"
 #
 # [bridge.matrix]
 # homeserver_url = "https://nether.im"
+# # matrix_domain = "nether.im"   # set only when homeserver_url is an internal proxy address
 # room_id = "!anotherroomid:nether.im"
 # sender_localpart = "nether-voicebridge"   # = the AS namespace stem; derives bot @{stem}_bot + ghosts
 # # bot_user_id = "@voicebridge_as:nether.im"  # explicit override (skips _bot derivation)

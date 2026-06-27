@@ -79,8 +79,16 @@ pub struct PuppetsConfig {
 #[derive(Debug, Deserialize)]
 pub struct ServerProfile {
     pub homeserver_url: String,
+    /// The public Matrix server domain (e.g. `nether.im`), used when constructing MXIDs
+    /// from `sender_localpart`. Optional: when omitted, the server domain is extracted
+    /// from `homeserver_url`. Needed in Docker deployments where `homeserver_url` is
+    /// an internal proxy address (e.g. `http://matrix-traefik:8008`) whose hostname
+    /// differs from the public server domain. Inherited by bridges that reference this
+    /// profile; an explicit `matrix.matrix_domain` on the bridge always wins.
+    #[serde(default)]
+    pub matrix_domain: Option<String>,
     /// The bot's full MXID (e.g. `@voicebridge:example.com`). Optional: when omitted,
-    /// it is derived from `sender_localpart` + the homeserver domain via
+    /// it is derived from `sender_localpart` + the resolved server domain via
     /// `resolve_bot_user_ids`. An explicit value always wins. Separately configurable
     /// from `sender_localpart` so the namespace anchor and the bot account can differ.
     #[serde(default)]
@@ -183,12 +191,20 @@ pub struct MatrixConfig {
     /// "not set" sentinel that `resolve_servers` fills.
     #[serde(default)]
     pub homeserver_url: String,
+    /// The public Matrix server domain (e.g. `nether.im`), used when constructing MXIDs
+    /// from `sender_localpart`. Optional: when omitted, the server domain is extracted
+    /// from `homeserver_url`. Needed in Docker deployments where `homeserver_url` is
+    /// an internal proxy address (e.g. `http://matrix-traefik:8008`) whose hostname
+    /// differs from the public server domain. Inherited from the `[server.<name>]`
+    /// profile when omitted; an explicit value here always wins.
+    #[serde(default)]
+    pub matrix_domain: Option<String>,
     /// Genuinely per-bridge; normally set at the bridge level (copied here by
     /// `resolve_servers`). Empty = "not set".
     #[serde(default)]
     pub room_id: String,
     /// The bot's full MXID. Inherited from the `[server.<name>]` profile or derived
-    /// from `sender_localpart` + homeserver domain via `resolve_bot_user_ids` when
+    /// from `sender_localpart` + resolved server domain via `resolve_bot_user_ids` when
     /// omitted. An explicit value always wins. Empty = "not set".
     #[serde(default)]
     pub bot_user_id: String,
@@ -338,6 +354,9 @@ impl Config {
             if m.homeserver_url.is_empty() {
                 m.homeserver_url = profile.homeserver_url.clone();
             }
+            if m.matrix_domain.is_none() {
+                m.matrix_domain = profile.matrix_domain.clone();
+            }
             if m.bot_user_id.is_empty() {
                 m.bot_user_id = profile.bot_user_id.clone();
             }
@@ -354,11 +373,19 @@ impl Config {
     }
 
     /// Fill each bridge's empty `matrix.bot_user_id` by deriving it from
-    /// `matrix.sender_localpart` and the homeserver domain. Runs after `resolve_servers`
-    /// so inherited fields are in place. An explicit `bot_user_id` is left as-is.
-    /// Silently skips a bridge when derivation can't complete (unparseable
-    /// `homeserver_url` or no `sender_localpart`) — `validate()` will surface the
-    /// remaining empty `bot_user_id` as a clear error.
+    /// `matrix.sender_localpart` and the resolved server domain. Runs after
+    /// `resolve_servers` so inherited fields are in place. An explicit `bot_user_id`
+    /// is left as-is. Silently skips a bridge when derivation can't complete (no
+    /// `sender_localpart`, and neither `server_name` nor a parseable `homeserver_url`
+    /// is available) — `validate()` will surface the remaining empty `bot_user_id` as
+    /// a clear error.
+    ///
+    /// server domain resolution order:
+    ///   1. Explicit `matrix.matrix_domain` (or inherited from `[server.<name>]`) — use as-is.
+    ///   2. Extract host from `matrix.homeserver_url` (the original behaviour).
+    /// The explicit field is needed when `homeserver_url` is an internal proxy address
+    /// (e.g. `http://matrix-traefik:8008` in Docker) whose hostname is not the public
+    /// Matrix server name.
     ///
     /// The derived localpart is `{sender_localpart}_bot`, NOT `{sender_localpart}` itself.
     /// On Synapse, the exact sender_localpart user is blocked from all sync endpoints
@@ -372,7 +399,11 @@ impl Config {
                 continue;
             }
             let Some(localpart) = &m.sender_localpart else { continue };
-            let Some(server_name) = server_name_from_url(&m.homeserver_url) else { continue };
+            let Some(server_name) = m.matrix_domain.clone()
+                .or_else(|| server_name_from_url(&m.homeserver_url))
+            else {
+                continue;
+            };
             m.bot_user_id = format!("@{localpart}_bot:{server_name}");
         }
     }
@@ -430,6 +461,8 @@ impl Config {
     ///   NETHER_BRIDGE_NAME
     ///   NETHER_DISCORD_CAPTURE_WAV (default false)
     ///   NETHER_MATRIX_DEVICE_ID (auto-derived from bridge name when absent)
+    ///   NETHER_MATRIX_DOMAIN — public Matrix domain name (e.g. `nether.im`); derived
+    ///     from HOMESERVER_URL when absent
     ///   NETHER_MATRIX_BOT_USER_ID — full bot MXID; derived from SENDER_LOCALPART when absent
     ///   NETHER_MATRIX_SENDER_LOCALPART — bot localpart; derives bot MXID when BOT_USER_ID absent
     ///   NETHER_MATRIX_STORE_PATH (auto-derived from bridge name when absent)
@@ -478,10 +511,11 @@ impl Config {
             .unwrap_or(false);
 
         let homeserver_url = require!("NETHER_MATRIX_HOMESERVER_URL");
+        let matrix_domain = optional!("NETHER_MATRIX_DOMAIN");
         let room_id = require!("NETHER_MATRIX_ROOM_ID");
         // bot_user_id and sender_localpart are independently optional: at least one must
         // be present. When bot_user_id is absent, resolve_bot_user_ids derives it from
-        // sender_localpart + homeserver domain.
+        // sender_localpart + resolved server name (matrix_domain field, else homeserver_url host).
         let bot_user_id = optional!("NETHER_MATRIX_BOT_USER_ID");
         let sender_localpart = optional!("NETHER_MATRIX_SENDER_LOCALPART");
         if bot_user_id.is_none() && sender_localpart.is_none() {
@@ -539,6 +573,7 @@ impl Config {
                 },
                 matrix: MatrixConfig {
                     homeserver_url: homeserver_url.unwrap(),
+                    matrix_domain,
                     room_id: room_id.unwrap(),
                     bot_user_id: bot_user_id.unwrap_or_default(),
                     sender_localpart,
@@ -740,6 +775,7 @@ impl Config {
             tracing::info!(
                 server = %name,
                 homeserver_url = %p.homeserver_url,
+                matrix_domain = ?p.matrix_domain,
                 bot_user_id = %p.bot_user_id,
                 sender_localpart = ?p.sender_localpart,
                 appservice_id = %p.appservice_id,
@@ -765,6 +801,7 @@ impl BridgeConfig {
             discord_guild_id = %self.discord.guild_id,
             discord_channel_id = %self.discord.channel_id,
             matrix_homeserver_url = %self.matrix.homeserver_url,
+            matrix_domain = ?self.matrix.matrix_domain,
             matrix_room_id = %self.matrix.room_id,
             matrix_bot_user_id = %self.matrix.bot_user_id,
             matrix_sender_localpart = ?self.matrix.sender_localpart,
@@ -1374,6 +1411,37 @@ appservice_token = "hs_tok"
         let m = &cfg.bridges[0].matrix;
         assert_eq!(m.bot_user_id, "@bot-account:nether.im");
         assert_eq!(m.sender_localpart.as_deref(), Some("namespace-anchor"));
+        cfg.validate().expect("should validate");
+    }
+
+    // ---- matrix_domain overrides homeserver_url host for MXID derivation ----
+
+    #[test]
+    fn matrix_domain_inline_overrides_url_host() {
+        // homeserver_url is an internal proxy; matrix_domain gives the real server name.
+        let raw = format!(
+            "{}[[bridge]]\nname = \"a\"\nroom_id = \"!r:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n[bridge.matrix]\nhomeserver_url = \"http://matrix-traefik:8008\"\nmatrix_domain = \"nether.im\"\nsender_localpart = \"voicebridge-bot\"\ndevice_id = \"DEV\"\nappservice_id = \"voicebridge\"\nappservice_token = \"hs_tok\"\nstore_path = \"./s\"\n",
+            puppets_block(&["Bot a"]),
+        );
+        let cfg = loaded(&raw);
+        let m = &cfg.bridges[0].matrix;
+        assert_eq!(m.matrix_domain.as_deref(), Some("nether.im"));
+        assert_eq!(m.bot_user_id, "@voicebridge-bot_bot:nether.im");
+        cfg.validate().expect("should validate");
+    }
+
+    #[test]
+    fn matrix_domain_in_profile_overrides_url_host() {
+        // Same but matrix_domain is in the server profile and inherited by the bridge.
+        let raw = format!(
+            "{}[server.nether]\nhomeserver_url = \"http://matrix-traefik:8008\"\nmatrix_domain = \"nether.im\"\nsender_localpart = \"voicebridge-bot\"\nappservice_id = \"voicebridge\"\nappservice_token = \"hs_tok\"\n\n{}[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!r:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n",
+            puppets_block(&["Bot a"]),
+            "",
+        );
+        let cfg = loaded(&raw);
+        let m = &cfg.bridges[0].matrix;
+        assert_eq!(m.matrix_domain.as_deref(), Some("nether.im"));
+        assert_eq!(m.bot_user_id, "@voicebridge-bot_bot:nether.im");
         cfg.validate().expect("should validate");
     }
 
