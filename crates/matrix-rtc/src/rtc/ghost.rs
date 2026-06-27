@@ -250,6 +250,11 @@ pub struct GhostPool {
 struct GhostConfig {
     http: reqwest::Client,
     homeserver_url: String,
+    /// Base URL for `.well-known/matrix/client` discovery. Equals
+    /// `https://<matrix_domain>` when that field is set (Docker/proxy deployments
+    /// where `homeserver_url` is an internal address), otherwise equals
+    /// `homeserver_url`. See `MatrixConfig::well_known_base_url`.
+    well_known_base_url: String,
     room_id: String,
     /// Appservice `as_token` (config `matrix.appservice_token`).
     as_token: String,
@@ -313,6 +318,7 @@ impl GhostPool {
             cfg: GhostConfig {
                 http,
                 homeserver_url: matrix_cfg.homeserver_url.trim_end_matches('/').to_owned(),
+                well_known_base_url: matrix_cfg.well_known_base_url(),
                 room_id: matrix_cfg.room_id.clone(),
                 as_token: matrix_cfg.appservice_token.clone(),
                 server_name: bot_user.server_name().as_str().to_owned(),
@@ -491,7 +497,7 @@ impl GhostPool {
                     if focus.is_none() {
                         match well_known::discover_livekit_focus(
                             &self.cfg.http,
-                            &self.cfg.homeserver_url,
+                            &self.cfg.well_known_base_url,
                             &self.cfg.room_id,
                         )
                         .await

@@ -99,7 +99,7 @@ pub(crate) async fn run(
     // Discover the LiveKit SFU focus once at startup.
     let focus = well_known::discover_livekit_focus(
         &http,
-        &mx_cfg.homeserver_url,
+        &mx_cfg.well_known_base_url(),
         &mx_cfg.room_id,
     )
     .await?;

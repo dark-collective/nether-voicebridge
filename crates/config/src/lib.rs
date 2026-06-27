@@ -246,6 +246,21 @@ pub struct MatrixConfig {
     pub bot_avatar_path: Option<String>,
 }
 
+impl MatrixConfig {
+    /// Base URL to use for `.well-known/matrix/client` discovery.
+    ///
+    /// When `matrix_domain` is set, returns `https://<matrix_domain>` — the public
+    /// address that actually serves `.well-known`. Falls back to `homeserver_url`
+    /// when `matrix_domain` is absent (non-proxy deployments where the two are the
+    /// same host).
+    pub fn well_known_base_url(&self) -> String {
+        match &self.matrix_domain {
+            Some(domain) => format!("https://{domain}"),
+            None => self.homeserver_url.trim_end_matches('/').to_owned(),
+        }
+    }
+}
+
 /// How a ghost delivers its LiveKit frame key to the call's human members.
 /// Only meaningful when `media_e2ee` resolves to true.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
