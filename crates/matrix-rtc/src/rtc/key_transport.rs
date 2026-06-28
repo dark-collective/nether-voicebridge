@@ -218,6 +218,9 @@ impl KeyTransport for PlaintextTransport {
 /// matrix-sdk-crypto. We only carry the machine's outgoing requests to the
 /// homeserver and feed the responses back — exactly what `matrix_sdk::Client` did
 /// for us behind `encrypt_and_send_raw_to_device`, now lower-level.
+///
+/// One [`GhostCrypto`] is reused across a ghost's rejoins via [`GhostCryptoCache`];
+/// see that alias for why the crypto device must stay stable within a process run.
 pub(crate) struct GhostCrypto {
     machine: OlmMachine,
     /// Shared reqwest pool (cloned from the ghost config) — opens no new connection
@@ -234,6 +237,24 @@ pub(crate) struct GhostCrypto {
     /// enforces that.
     req_lock: Mutex<()>,
 }
+
+/// Process-lifetime cache of per-ghost [`GhostCrypto`] keyed by ghost MXID. A ghost
+/// that leaves and rejoins (or returns from AFK) tears down and respawns; without
+/// this, the respawn would mint a **new** in-memory `OlmMachine` with a new crypto
+/// device, and Element Call — which already has that participant keyed from the old
+/// device — would not apply the media key from the new sender device, leaving the
+/// rejoiner inaudible. Reusing the same `GhostCrypto` keeps the crypto device (and
+/// its established Olm sessions) stable across rejoins within one process run, so EC
+/// just refreshes the key — matching the old persistent-store behaviour, but still
+/// in-memory (zero FDs). A fresh device is minted only on a full process restart
+/// (which tears down all calls anyway), keeping it `SigningKeyChanged`-safe (#30).
+///
+/// Bounded by the number of distinct Discord speakers seen in one run; entries are
+/// small (an in-memory account + its Olm sessions) and intentionally never evicted,
+/// since eviction would reintroduce the rejoin bug.
+pub(crate) type GhostCryptoCache = std::sync::Arc<
+    tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<GhostCrypto>>>,
+>;
 
 /// Bound on `drain_outgoing` rounds — a backstop against a request that perpetually
 /// re-queues. A send-only ghost converges in 1–2 rounds (upload, then query/claim).

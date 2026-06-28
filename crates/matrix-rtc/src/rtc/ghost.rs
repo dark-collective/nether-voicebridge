@@ -72,7 +72,9 @@ use nvb_audio::routing::{CaptureRouter, CaptureSink};
 use nvb_audio::wav::WavMonoWriter;
 use nvb_config::{KeyTransport as KeyTransportMode, LiveKitConfig, MatrixConfig};
 
-use super::key_transport::{GhostCrypto, KeyRecipient, KeyTransport, OlmTransport, PlaintextTransport};
+use super::key_transport::{
+    GhostCrypto, GhostCryptoCache, KeyRecipient, KeyTransport, OlmTransport, PlaintextTransport,
+};
 use super::keys;
 use super::lk_jwt;
 use super::openid::OpenIdToken;
@@ -448,6 +450,10 @@ impl GhostPool {
         // are present).
         let mut focus: Option<LivekitFocusInfo> = None;
         let mut ghosts: HashMap<String, GhostHandle> = HashMap::new();
+        // Per-ghost crypto reused across rejoins for this bridge's process lifetime
+        // (keeps the Olm device stable so a rejoiner stays audible) — see
+        // [`GhostCryptoCache`].
+        let crypto_cache: GhostCryptoCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
         loop {
             let cmd = tokio::select! {
@@ -510,7 +516,7 @@ impl GhostPool {
                     cfg.key_transport = key_transport;
                     let focus = focus.clone().expect("focus set above");
                     let join = tokio::spawn(
-                        run_ghost(cfg, focus, client.clone(), members_gen_rx.clone(), call_active_rx.clone(), key.clone(), display_name, avatar_url, frame_rx, mute_rx, cancel.clone())
+                        run_ghost(cfg, focus, client.clone(), members_gen_rx.clone(), call_active_rx.clone(), key.clone(), display_name, avatar_url, frame_rx, mute_rx, cancel.clone(), crypto_cache.clone())
                             .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
                     );
                     ghosts.insert(key, GhostHandle { cancel, join, mute_tx });
@@ -657,6 +663,7 @@ async fn run_ghost(
     frame_rx: mpsc::Receiver<Vec<i16>>,
     mute_rx: watch::Receiver<bool>,
     cancel: CancellationToken,
+    crypto_cache: GhostCryptoCache,
 ) {
     let ghost_mxid = format!("@{}{key}:{}", cfg.ghost_localpart_prefix, cfg.server_name);
     let localpart = format!("{}{key}", cfg.ghost_localpart_prefix);
@@ -726,6 +733,7 @@ async fn run_ghost(
                     media_key,
                     members_gen_rx,
                     cancel.clone(),
+                    crypto_cache,
                 )
                 .instrument(tracing::Span::current()),
             );
@@ -1132,6 +1140,7 @@ async fn distribute_key_task(
     key: [u8; 16],
     members_gen: watch::Receiver<u64>,
     cancel: CancellationToken,
+    crypto_cache: GhostCryptoCache,
 ) {
     let transport: Arc<dyn KeyTransport> = match cfg.key_transport {
         KeyTransportMode::Plaintext => Arc::new(PlaintextTransport::new(
@@ -1143,7 +1152,16 @@ async fn distribute_key_task(
             device_id.clone(),
         )),
         KeyTransportMode::Olm => {
-            match bootstrap_olm_transport(&cfg, &localpart, &ghost_mxid, &device_id, &cancel).await {
+            match bootstrap_olm_transport(
+                &cfg,
+                &localpart,
+                &ghost_mxid,
+                &device_id,
+                &cancel,
+                &crypto_cache,
+            )
+            .await
+            {
                 Some(t) => t,
                 None => return, // bootstrap failed or cancelled; already logged.
             }
@@ -1182,7 +1200,26 @@ async fn bootstrap_olm_transport(
     ghost_mxid: &str,
     device_id: &str,
     cancel: &CancellationToken,
+    crypto_cache: &GhostCryptoCache,
 ) -> Option<Arc<dyn KeyTransport>> {
+    // Reuse this ghost's crypto across rejoins: a respawn with a NEW crypto device
+    // would not be picked up by Element Call for an already-keyed participant (the
+    // rejoiner goes silent). The cache keeps the device + Olm sessions stable for the
+    // process lifetime — see [`GhostCryptoCache`].
+    if let Some(crypto) = crypto_cache
+        .lock()
+        .await
+        .get(ghost_mxid)
+        .cloned()
+    {
+        tracing::info!("ghost Olm key transport ready (reused cached OlmMachine across rejoin)");
+        return Some(Arc::new(OlmTransport::new(
+            crypto,
+            cfg.room_id.clone(),
+            device_id.to_owned(),
+        )));
+    }
+
     for attempt in 1..=OLM_BOOTSTRAP_ATTEMPTS {
         if cancel.is_cancelled() {
             return None;
@@ -1198,8 +1235,16 @@ async fn bootstrap_olm_transport(
         {
             Ok(crypto) => {
                 tracing::info!("ghost Olm key transport ready (send-only OlmMachine)");
+                let crypto = Arc::new(crypto);
+                // Cache for this ghost's future rejoins (insert-if-absent; a racing
+                // insert would only have built an equivalent fresh device).
+                crypto_cache
+                    .lock()
+                    .await
+                    .entry(ghost_mxid.to_owned())
+                    .or_insert_with(|| crypto.clone());
                 return Some(Arc::new(OlmTransport::new(
-                    Arc::new(crypto),
+                    crypto,
                     cfg.room_id.clone(),
                     device_id.to_owned(),
                 )));
