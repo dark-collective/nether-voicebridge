@@ -3,6 +3,28 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.1] - 2026-06-28
+
+Opens the **0.3.x development line** toward hosted, configure-without-install
+bridging (issue #43). Unstable/alpha — expect rough edges.
+
+### Changed
+- **Encrypted-call ghosts no longer each run a full matrix-sdk crypto client,
+  retiring the file-descriptor exhaustion behind "certain users don't come through
+  under load."** Each Discord speaker's ghost delivered its media key via a complete
+  `matrix_sdk::Client` — its own SQLite crypto store (a deadpool pool of ~32 file
+  descriptors), an initial `sync_once`, and a *perpetual* `/sync` loop — so a roomful
+  of encrypted speakers blew past the open-file limit, crypto sync died, and those
+  speakers went inaudible (previously only worked around by raising `LimitNOFILE` to
+  65536). A ghost is send-only (it never receives or decrypts), so each now uses a
+  lean in-memory `matrix-sdk-crypto` `OlmMachine`, driven by an on-demand `/keys/query`
+  right before a key send instead of a persistent store and a standing sync. Per-ghost
+  crypto file-descriptor cost is now **zero** (independent of speaker count) and the
+  per-ghost homeserver `/sync` fan-out is gone. A ghost's crypto identity is reused
+  across rejoins for the process lifetime, so a speaker who leaves and rejoins (or
+  returns from AFK) is re-keyed seamlessly and stays audible. No configuration change;
+  encrypted calls behave the same (#44).
+
 ## [0.2.4] - 2026-06-24
 
 ### Fixed
