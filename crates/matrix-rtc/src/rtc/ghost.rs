@@ -47,8 +47,6 @@ use livekit::webrtc::audio_frame::AudioFrame;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::{Room, RoomOptions};
 use matrix_sdk::{
-    authentication::{matrix::MatrixSession, SessionTokens},
-    config::SyncSettings,
     deserialized_responses::SyncOrStrippedState,
     ruma::{
         events::{
@@ -60,7 +58,7 @@ use matrix_sdk::{
         },
         OwnedDeviceId, OwnedUserId, RoomId, UserId,
     },
-    Client, SessionMeta,
+    Client,
 };
 use reqwest::Url;
 use std::borrow::Cow;
@@ -74,7 +72,7 @@ use nvb_audio::routing::{CaptureRouter, CaptureSink};
 use nvb_audio::wav::WavMonoWriter;
 use nvb_config::{KeyTransport as KeyTransportMode, LiveKitConfig, MatrixConfig};
 
-use super::key_transport::{KeyRecipient, KeyTransport, OlmTransport, PlaintextTransport};
+use super::key_transport::{GhostCrypto, KeyRecipient, KeyTransport, OlmTransport, PlaintextTransport};
 use super::keys;
 use super::lk_jwt;
 use super::openid::OpenIdToken;
@@ -268,11 +266,6 @@ struct GhostConfig {
     /// How ghosts deliver their media key when `media_e2ee` is on (plaintext Path 2
     /// or Olm Path 3). Mirrors `livekit.key_transport`.
     key_transport: KeyTransportMode,
-    /// Base directory of the bridge's matrix-sdk store (`matrix.store_path`). Each
-    /// Olm-transport ghost nests its own persistent crypto store under
-    /// `<store_path>/ghosts/<device_id>` so Olm sessions + uploaded keys survive
-    /// rejoins (no OTK re-upload churn).
-    store_path: String,
     /// Per-store salt (resolved once via [`crate::matrix::resolve_ghost_device_salt`])
     /// folded into every ghost device id as `D{key}-{salt}`, making the otherwise
     /// machine-deterministic `D{key}` unique to this crypto store (the #30 fix,
@@ -329,7 +322,6 @@ impl GhostPool {
                 // overwrites both per ghost from its resolved arguments (#14).
                 media_e2ee: false,
                 key_transport: KeyTransportMode::Plaintext,
-                store_path: matrix_cfg.store_path.clone(),
                 // Resolve once here (not per-ghost) so concurrent ghost spawns never race
                 // on the marker file; rides on `cfg`, cloned per assign.
                 ghost_device_salt: crate::matrix::resolve_ghost_device_salt(&matrix_cfg.store_path),
@@ -1195,11 +1187,19 @@ async fn bootstrap_olm_transport(
         if cancel.is_cancelled() {
             return None;
         }
-        match build_ghost_crypto_client(cfg, localpart, ghost_mxid, device_id, cancel).await {
-            Ok(crypto_client) => {
-                tracing::info!("ghost Olm key transport ready (per-ghost crypto client)");
+        match GhostCrypto::bootstrap(
+            cfg.http.clone(),
+            &cfg.homeserver_url,
+            &cfg.as_token,
+            localpart,
+            ghost_mxid,
+        )
+        .await
+        {
+            Ok(crypto) => {
+                tracing::info!("ghost Olm key transport ready (send-only OlmMachine)");
                 return Some(Arc::new(OlmTransport::new(
-                    crypto_client,
+                    Arc::new(crypto),
                     cfg.room_id.clone(),
                     device_id.to_owned(),
                 )));
@@ -1222,126 +1222,11 @@ async fn bootstrap_olm_transport(
     None
 }
 
-/// Make a ghost a crypto-capable client: appservice-login it (asserting its stable
-/// `device_id`), open a persistent SQLite crypto store under
-/// `<store_path>/ghosts/<device_id>`, restore the session, sync once to upload its
-/// device keys + one-time keys, and spawn a background sync (cancelled with the
-/// ghost) so its device lists stay fresh for `encrypt_and_send_raw_to_device`.
-/// Mirrors the bridge bot's `build_client`; we add no crypto of our own. The store
-/// persists across rejoins so Olm sessions + uploaded keys are reused.
-/// A lean `/sync` filter for ghost crypto clients. A ghost only needs `device_lists`
-/// (delivered top-level in the sync response, unaffected by this filter) + to-device,
-/// plus the room's membership/encryption STATE so the SDK knows whose devices to
-/// track. It never needs the room timeline (message backfill), ephemeral data
-/// (typing/receipts), presence, or account data — dropping those sharply cuts the
-/// sync payload, wall-time, and homeserver load vs. `SyncSettings::default()` (the
-/// full sync is what makes a ghost's cold start ~20s). Matrix filter semantics:
-/// `types: Some([])` includes NO event types (drops them); `None` includes all — so
-/// we leave room `state` at default (keep members + `m.room.encryption`) and empty
-/// the rest.
-fn ghost_sync_settings() -> SyncSettings {
-    use matrix_sdk::ruma::api::client::{
-        filter::{Filter as EventFilter, FilterDefinition, RoomEventFilter, RoomFilter},
-        sync::sync_events::v3::Filter as SyncFilter,
-    };
-    let mut timeline = RoomEventFilter::default();
-    timeline.limit = Some(0u32.into()); // no message backfill
-    let mut drop_room = RoomEventFilter::default();
-    drop_room.types = Some(Vec::new());
-    let mut drop_ev = EventFilter::default();
-    drop_ev.types = Some(Vec::new());
-
-    let mut room = RoomFilter::default();
-    room.timeline = timeline;
-    room.ephemeral = drop_room.clone();
-    room.account_data = drop_room;
-
-    let mut filter = FilterDefinition::default();
-    filter.room = room;
-    filter.presence = drop_ev.clone();
-    filter.account_data = drop_ev;
-    SyncSettings::default().filter(SyncFilter::FilterDefinition(filter))
-}
-
-async fn build_ghost_crypto_client(
-    cfg: &GhostConfig,
-    localpart: &str,
-    ghost_mxid: &str,
-    device_id: &str,
-    cancel: &CancellationToken,
-) -> Result<Client> {
-    // Key the crypto store by device_id (not localpart): a new per-store salt yields a
-    // new device id → a fresh store dir → fresh signing keys/OTKs, self-migrating off the
-    // poisoned pre-fix `D{key}` identity. device_id is a safe path segment (`D`+digits[+`-`+alnum]).
-    let store_dir = format!("{}/ghosts/{}", cfg.store_path.trim_end_matches('/'), device_id);
-    tokio::fs::create_dir_all(&store_dir)
-        .await
-        .with_context(|| format!("creating ghost crypto store dir '{store_dir}'"))?;
-
-    let access_token =
-        crate::matrix::appservice_login_as(&cfg.homeserver_url, &cfg.as_token, localpart, device_id)
-            .await
-            .context("ghost appservice login")?;
-
-    let client = Client::builder()
-        .homeserver_url(&cfg.homeserver_url)
-        .sqlite_store(&store_dir, None)
-        .build()
-        .await
-        .context("building ghost crypto client")?;
-
-    let user_id: OwnedUserId = ghost_mxid
-        .parse()
-        .with_context(|| format!("parsing ghost mxid '{ghost_mxid}'"))?;
-    let session = MatrixSession {
-        meta: SessionMeta {
-            user_id,
-            device_id: device_id.into(),
-        },
-        tokens: SessionTokens {
-            access_token,
-            refresh_token: None,
-        },
-    };
-    client
-        .restore_session(session)
-        .await
-        .context("restoring ghost crypto session")?;
-
-    // First sync uploads this ghost's device keys + one-time keys so peers can
-    // Olm-encrypt to it and it can claim theirs. Bounded so a wedged homeserver
-    // can't hang key distribution forever.
-    match tokio::time::timeout(
-        Duration::from_secs(60),
-        client.sync_once(ghost_sync_settings()),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => return Err(anyhow!("ghost initial sync failed: {e}")),
-        Err(_) => return Err(anyhow!("ghost initial sync timed out after 60s")),
-    }
-
-    // Perpetual sync for ongoing device-list tracking; dies with the ghost.
-    let sync_client = client.clone();
-    let sync_cancel = cancel.clone();
-    tokio::spawn(
-        async move {
-            tokio::select! {
-                _ = sync_cancel.cancelled() => {}
-                r = sync_client.sync(ghost_sync_settings()) => {
-                    if let Err(e) = r {
-                        tracing::warn!(error = %e, "ghost crypto sync loop ended");
-                    }
-                }
-            }
-        }
-        .instrument(tracing::Span::current()),
-    );
-
-    tracing::info!(device_id, store = %store_dir, "ghost crypto client ready (device keys + OTKs uploaded)");
-    Ok(client)
-}
+// The send-only Olm crypto engine (`GhostCrypto`, in `key_transport.rs`) replaced
+// the old per-ghost full `matrix_sdk::Client` here (its SQLite crypto store,
+// `sync_once`, and perpetual `/sync`) — issue #44. The bootstrap now lives in
+// `GhostCrypto::bootstrap` and uses an in-memory `OlmMachine` with on-demand
+// `/keys/query`, so there is no per-ghost crypto store or sync loop.
 
 /// Distribute this ghost's media key to the call's humans until cancelled, over the
 /// given [`KeyTransport`].

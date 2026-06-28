@@ -26,6 +26,11 @@ futures-util = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 mime = "0.3"
+# Build `http::Response` from a raw reqwest response so ruma's
+# `IncomingResponse::try_from_http_response` can parse the four crypto endpoints
+# the send-only ghost `OlmMachine` drives by hand. "1" resolves to the same
+# http 1.x ruma itself uses, so the response types match.
+http = "1"
 
 [dev-dependencies]
 # `test-util` enables tokio's paused clock (`#[tokio::test(start_paused = true)]`)
