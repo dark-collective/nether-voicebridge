@@ -37,7 +37,9 @@ use matrix_sdk::ruma::{
     OwnedDeviceId, OwnedUserId, UserId,
 };
 use matrix_sdk_crypto::{
+    store::MemoryStore,
     types::requests::{AnyOutgoingRequest, OutgoingRequest},
+    vodozemac::olm::{Account, AccountPickle},
     CollectStrategy, DeviceData, OlmMachine,
 };
 use tokio::sync::Mutex;
@@ -77,17 +79,32 @@ pub(crate) struct KeyRecipient {
     pub device_id: OwnedDeviceId,
 }
 
+/// Whether a key send should first force a fresh device-list `/keys/query` for the
+/// recipients before encrypting. `Force` is used on the first send after a membership
+/// change (a human (re)joined): a same-user rejoin is otherwise a no-op for
+/// `update_tracked_users`, so the ghost never re-fetches the returning device's
+/// (possibly rotated) keys and re-delivery stalls (issue #51). `Steady` is the normal
+/// path (burst ticks + heartbeat) — no extra query. Ignored by transports without a
+/// crypto session step (plaintext Path 2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RefreshMode {
+    Steady,
+    Force,
+}
+
 /// Delivers a ghost's 16-byte LiveKit frame key to the call's human members.
 #[async_trait]
 pub(crate) trait KeyTransport: Send + Sync {
     /// Deliver `key` (index `key_index`) to all `recipients`. `Ok(outcome)` reports
     /// how many devices got it and which didn't (the caller may keep bursting for the
-    /// failures); `Err` is a hard send failure (nothing delivered).
+    /// failures); `Err` is a hard send failure (nothing delivered). `refresh` forces a
+    /// fresh device-list query first (see [`RefreshMode`]).
     async fn send_key(
         &self,
         recipients: &[KeyRecipient],
         key: &[u8; 16],
         key_index: u8,
+        refresh: RefreshMode,
     ) -> Result<KeySendOutcome>;
 
     /// Short label for logs ("plaintext" / "olm").
@@ -139,6 +156,7 @@ impl KeyTransport for PlaintextTransport {
         recipients: &[KeyRecipient],
         key: &[u8; 16],
         key_index: u8,
+        _refresh: RefreshMode, // no crypto session step to re-warm
     ) -> Result<KeySendOutcome> {
         if recipients.is_empty() {
             return Ok(KeySendOutcome::default());
@@ -273,13 +291,17 @@ impl GhostCrypto {
         as_token: &str,
         localpart: &str,
         ghost_mxid: &str,
+        store_path: &str,
     ) -> Result<Self> {
         let user_id: OwnedUserId = ghost_mxid
             .parse()
             .with_context(|| format!("parsing ghost mxid '{ghost_mxid}'"))?;
-        // Fresh, unique crypto device id per lifecycle (e.g. `Cab12cd34`). NOT the
-        // stable `D{key}-{salt}` call device id.
-        let crypto_device_id = mint_crypto_device_id();
+        // #35: load (or first-time provision) this ghost's STABLE crypto identity —
+        // device id + Olm account — from a per-ghost blob, so it reuses ONE device
+        // across restarts instead of minting a throwaway per run. Reusing the device
+        // stops the device-list pile-up on peers that poisons signatures + drains
+        // one-time keys and wedges the Olm session. `reused` is only for logging.
+        let (crypto_device_id, account, reused) = load_or_create_ghost_identity(store_path, localpart)?;
 
         let access_token = crate::matrix::appservice_login_as(
             homeserver_url,
@@ -290,7 +312,18 @@ impl GhostCrypto {
         .await
         .context("ghost crypto appservice login")?;
 
-        let machine = OlmMachine::new(&user_id, crypto_device_id.as_str().into()).await;
+        // Inject the persisted account into a fresh in-memory `MemoryStore` (zero FDs —
+        // keeps #44's property). The `custom_account` is accepted because a MemoryStore
+        // starts empty; the stable identity keys make peers keep their session across
+        // restarts (no `SigningKeyChanged`). OTKs/sessions re-establish on demand.
+        let machine = OlmMachine::with_store(
+            &user_id,
+            crypto_device_id.as_str().into(),
+            MemoryStore::new(),
+            Some(account),
+        )
+        .await
+        .context("building ghost OlmMachine with persisted account")?;
 
         let me = Self {
             machine,
@@ -309,7 +342,8 @@ impl GhostCrypto {
         }
         tracing::info!(
             crypto_device_id,
-            "ghost crypto ready (in-memory OlmMachine; device keys + OTKs uploaded, no /sync)"
+            reused,
+            "ghost crypto ready (stable persisted device; in-memory OlmMachine, no /sync)"
         );
         Ok(me)
     }
@@ -322,10 +356,11 @@ impl GhostCrypto {
         &self,
         recipients: &[KeyRecipient],
         content: &serde_json::Value,
+        refresh: RefreshMode,
     ) -> Result<KeySendOutcome> {
         let _g = self.req_lock.lock().await;
 
-        let devices = self.ensure_tracked_and_sessions(recipients).await?;
+        let devices = self.ensure_tracked_and_sessions(recipients, refresh).await?;
         if devices.is_empty() {
             return Err(anyhow!(
                 "no recipient devices known yet (ghost /keys/query not caught up)"
@@ -388,6 +423,7 @@ impl GhostCrypto {
     async fn ensure_tracked_and_sessions(
         &self,
         recipients: &[KeyRecipient],
+        refresh: RefreshMode,
     ) -> Result<Vec<DeviceData>> {
         let mut users: Vec<OwnedUserId> = recipients.iter().map(|r| r.user_id.clone()).collect();
         users.sort_unstable();
@@ -396,6 +432,22 @@ impl GhostCrypto {
         // concrete lifetime). A borrowed `.iter()` or a `|u| &**u` closure makes the
         // lifetime late-bound, which trips the async_trait Send / HRTB inference.
         let user_refs = || -> Vec<&UserId> { users.iter().map(|u| u.as_ref()).collect() };
+
+        // On a membership change (issue #51), mark already-tracked recipients dirty so
+        // the drain's /keys/query re-fetches their (possibly rotated) device keys — a
+        // same-user rejoin is otherwise a no-op for update_tracked_users below, so the
+        // stale returning device is never refreshed and get_missing_sessions never
+        // claims its OTK, stalling re-delivery for up to a heartbeat. For a send-only
+        // ghost the only tracked users ARE the recipients, so this queries no wider than
+        // the current call. This refreshes device keys, not live sessions: an unchanged
+        // session still encrypts fine; a rotated identity key makes the old session
+        // mismatch, so the fresh query then yields the device and a new session is claimed.
+        if refresh == RefreshMode::Force {
+            self.machine
+                .mark_all_tracked_users_as_dirty()
+                .await
+                .context("mark_all_tracked_users_as_dirty (force refresh)")?;
+        }
 
         // Track newly-seen users (a no-op for already-tracked ones), then run the
         // resulting /keys/query.
@@ -408,8 +460,9 @@ impl GhostCrypto {
         let mut devices = self.resolve_devices(recipients).await;
         // If a requested device is missing (e.g. a known user rejoined on a NEW
         // device, so update_tracked_users didn't re-query that user), force a fresh
-        // /keys/query and retry once. Steady-state sends skip this entirely.
-        if devices.len() < recipients.len() {
+        // /keys/query and retry once. Skipped on a forced refresh (we just queried —
+        // an immediate second query won't help) and on steady-state sends.
+        if refresh != RefreshMode::Force && devices.len() < recipients.len() {
             self.machine
                 .mark_all_tracked_users_as_dirty()
                 .await
@@ -612,6 +665,7 @@ impl GhostCrypto {
             .await
             .with_context(|| format!("POST /_matrix/client/v3/{}", segments.join("/")))
     }
+
 }
 
 /// Mint a fresh, unique crypto device id (`C` + 8 lowercase-alnum). Unique per ghost
@@ -632,6 +686,62 @@ fn mint_crypto_device_id() -> String {
         })
         .collect();
     format!("C{suffix}")
+}
+
+/// A ghost's persisted stable crypto identity: a randomly-minted device id paired with
+/// its Olm account pickle, stored at `<store_path>/ghosts/<localpart>.json`.
+///
+/// CRITICAL (#30/#44 multi-machine safety): the device id is minted RANDOMLY per blob and
+/// travels WITH the account keys. Two machines (a dev box + the VPS) therefore provision
+/// DISTINCT `(device_id, keys)` pairs — never the same id presenting different keys, which
+/// peers reject as `SigningKeyChanged`. Never derive the id deterministically. Contract:
+/// separate data dirs per machine; don't run two instances on one blob simultaneously.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GhostIdentity {
+    device_id: String,
+    account: AccountPickle,
+}
+
+fn ghost_identity_path(store_path: &str, localpart: &str) -> std::path::PathBuf {
+    std::path::Path::new(store_path)
+        .join("ghosts")
+        .join(format!("{localpart}.json"))
+}
+
+/// Load a ghost's persisted `(device_id, account, reused=true)`, or first-time provision
+/// and persist a fresh one (`reused=false`). Reusing a stable identity across restarts is
+/// what stops the per-run device pile-up that wedges listener Olm sessions (#35). If no
+/// store is configured, falls back to an ephemeral identity (the old per-run behaviour).
+fn load_or_create_ghost_identity(store_path: &str, localpart: &str) -> Result<(String, Account, bool)> {
+    if store_path.is_empty() {
+        return Ok((mint_crypto_device_id(), Account::new(), false));
+    }
+    let path = ghost_identity_path(store_path, localpart);
+    if let Ok(bytes) = std::fs::read(&path) {
+        match serde_json::from_slice::<GhostIdentity>(&bytes) {
+            Ok(id) => return Ok((id.device_id, Account::from_pickle(id.account), true)),
+            Err(e) => tracing::warn!(
+                error = %e, path = %path.display(),
+                "ghost identity blob unreadable — reprovisioning a fresh device"
+            ),
+        }
+    }
+    let device_id = mint_crypto_device_id();
+    let account = Account::new();
+    let blob = GhostIdentity {
+        device_id: device_id.clone(),
+        account: account.pickle(),
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating ghost identity dir '{}'", dir.display()))?;
+    }
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&blob).context("serializing ghost identity")?,
+    )
+    .with_context(|| format!("writing ghost identity '{}'", path.display()))?;
+    Ok((device_id, account, false))
 }
 
 /// Parse a raw reqwest response into a typed ruma response via
@@ -686,6 +796,7 @@ impl KeyTransport for OlmTransport {
         recipients: &[KeyRecipient],
         key: &[u8; 16],
         key_index: u8,
+        refresh: RefreshMode,
     ) -> Result<KeySendOutcome> {
         if recipients.is_empty() {
             return Ok(KeySendOutcome::default());
@@ -699,7 +810,7 @@ impl KeyTransport for OlmTransport {
         );
         let content_value =
             serde_json::to_value(&content).context("serializing encryption key content")?;
-        self.crypto.encrypt_and_send_key(recipients, &content_value).await
+        self.crypto.encrypt_and_send_key(recipients, &content_value, refresh).await
     }
 
     fn kind(&self) -> &'static str {

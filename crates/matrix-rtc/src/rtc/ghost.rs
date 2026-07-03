@@ -74,6 +74,7 @@ use nvb_config::{KeyTransport as KeyTransportMode, LiveKitConfig, MatrixConfig};
 
 use super::key_transport::{
     GhostCrypto, GhostCryptoCache, KeyRecipient, KeyTransport, OlmTransport, PlaintextTransport,
+    RefreshMode,
 };
 use super::keys;
 use super::lk_jwt;
@@ -273,6 +274,11 @@ struct GhostConfig {
     /// machine-deterministic `D{key}` unique to this crypto store (the #30 fix,
     /// extended to ghosts). Empty ⇒ no store ⇒ ghosts fall back to bare `D{key}`.
     ghost_device_salt: String,
+    /// Bridge crypto store base (`matrix.store_path`). Each ghost persists its stable
+    /// crypto identity (device id + Olm account pickle) at `<store_path>/ghosts/
+    /// <localpart>.json` so it reuses ONE device across restarts instead of minting a
+    /// throwaway per run (#35). Empty ⇒ no store ⇒ fall back to an in-memory device.
+    store_path: String,
     /// Optional config overrides, mirroring the subscriber path. `None` ⇒ derive
     /// the lk-jwt endpoint from the focus and the SFU ws URL from the lk-jwt
     /// response. Set only to override (non-Nether deploy / no `rtc_foci`).
@@ -327,6 +333,7 @@ impl GhostPool {
                 // Resolve once here (not per-ghost) so concurrent ghost spawns never race
                 // on the marker file; rides on `cfg`, cloned per assign.
                 ghost_device_salt: crate::matrix::resolve_ghost_device_salt(&matrix_cfg.store_path),
+                store_path: matrix_cfg.store_path.clone(),
                 lk_jwt_url: livekit_cfg.lk_jwt_url.clone(),
                 lk_url: livekit_cfg.url.clone(),
                 capture_wav,
@@ -454,6 +461,8 @@ impl GhostPool {
         // (keeps the Olm device stable so a rejoiner stays audible) — see
         // [`GhostCryptoCache`].
         let crypto_cache: GhostCryptoCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        // Per-ghost media key reused across respawns — see [`GhostKeyCache`].
+        let key_cache: GhostKeyCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
         loop {
             let cmd = tokio::select! {
@@ -516,7 +525,7 @@ impl GhostPool {
                     cfg.key_transport = key_transport;
                     let focus = focus.clone().expect("focus set above");
                     let join = tokio::spawn(
-                        run_ghost(cfg, focus, client.clone(), members_gen_rx.clone(), call_active_rx.clone(), key.clone(), display_name, avatar_url, frame_rx, mute_rx, cancel.clone(), crypto_cache.clone())
+                        run_ghost(cfg, focus, client.clone(), members_gen_rx.clone(), call_active_rx.clone(), key.clone(), display_name, avatar_url, frame_rx, mute_rx, cancel.clone(), crypto_cache.clone(), key_cache.clone())
                             .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
                     );
                     ghosts.insert(key, GhostHandle { cancel, join, mute_tx });
@@ -647,6 +656,15 @@ fn ghost_device_id(key: &str, salt: &str) -> String {
     }
 }
 
+/// Per-ghost media key reused across respawns, mirroring [`GhostCryptoCache`]: a Discord
+/// speaker leaving and rejoining voice respawns `run_ghost`, which must reuse the SAME
+/// 16-byte key under the SAME LiveKit identity at index 0. Otherwise a listener already
+/// holding the old key at `(identity, 0)` has to re-receive the new one, and any missed
+/// delivery (a known EC reliability gap) leaves that publisher silent until the identity
+/// changes. Keyed by ghost MXID; never evicted (fresh only on full process restart, which
+/// tears down all calls anyway).
+type GhostKeyCache = Arc<tokio::sync::Mutex<HashMap<String, [u8; 16]>>>;
+
 /// One ghost's full lifecycle: register/join/connect/publish, post call
 /// membership, then publish the speaker's audio until cancelled, retracting
 /// membership and disconnecting on the way out.
@@ -664,6 +682,7 @@ async fn run_ghost(
     mute_rx: watch::Receiver<bool>,
     cancel: CancellationToken,
     crypto_cache: GhostCryptoCache,
+    key_cache: GhostKeyCache,
 ) {
     let ghost_mxid = format!("@{}{key}:{}", cfg.ghost_localpart_prefix, cfg.server_name);
     let localpart = format!("{}{key}", cfg.ghost_localpart_prefix);
@@ -676,7 +695,29 @@ async fn run_ghost(
     // crypto + start key distribution during the presence window AND install the
     // same key on the LiveKit frame crypto when we publish. Decouples the ~10-20s
     // crypto bootstrap from `call_active` (see the early distribute_key_task spawn).
-    let media_key = cfg.media_e2ee.then(keys::generate_key);
+    // E2EE rooms only. Reuse this ghost's key across respawns (get-or-insert keyed by
+    // MXID) so a Discord speaker's leave→rejoin keeps the SAME key at the SAME identity
+    // — a listener already holding it stays able to decrypt, with nothing to re-deliver.
+    // The key feeds BOTH the frame-encryptor install (connect_and_publish) and the
+    // to-device send; the fp is logged here + at both consumers to prove send==encrypt.
+    let media_key = if cfg.media_e2ee {
+        use std::collections::hash_map::Entry;
+        let mut cache = key_cache.lock().await;
+        match cache.entry(ghost_mxid.clone()) {
+            Entry::Occupied(e) => {
+                let k = *e.get();
+                tracing::info!(mxid = %ghost_mxid, key_fp = %keys::key_fp(&k), "ghost media key reused from cache (stable across respawn)");
+                Some(k)
+            }
+            Entry::Vacant(e) => {
+                let k = keys::generate_key();
+                tracing::info!(mxid = %ghost_mxid, key_fp = %keys::key_fp(&k), "ghost media key generated");
+                Some(*e.insert(k))
+            }
+        }
+    } else {
+        None
+    };
 
     let span = tracing::info_span!("ghost", mxid = %ghost_mxid);
     async {
@@ -1060,6 +1101,15 @@ async fn connect_and_publish(
         if !key_provider.set_key(&ParticipantIdentity::from(identity.clone()), 0, key.to_vec()) {
             return Err(anyhow!("failed to set ghost media key on key provider"));
         }
+        // #51 follow-up: fp of the key our OWN frames encrypt under, at index 0.
+        // Must match this ghost's "media key generated" + "ghost media key sent" fps;
+        // and peers' "installed peer media key" fp for this identity must match too.
+        tracing::info!(
+            identity = %identity,
+            key_index = 0,
+            key_fp = %keys::key_fp(&key),
+            "ghost frame-encrypt key installed"
+        );
         room_opts.encryption = Some(E2eeOptions {
             encryption_type: EncryptionType::Gcm,
             key_provider,
@@ -1092,6 +1142,11 @@ async fn connect_and_publish(
                     Some(livekit::RoomEvent::Disconnected { reason }) => {
                         tracing::warn!(reason = ?reason, "ghost LiveKit room disconnected");
                         break;
+                    }
+                    // The ghost's own frame-ENCRYPT state (it's a pure publisher). Surfaced
+                    // at INFO to correlate with a listener that can't decrypt this ghost.
+                    Some(livekit::RoomEvent::E2eeStateChanged { participant, state }) => {
+                        tracing::info!(identity = %participant.identity(), ?state, "ghost LiveKit E2EE state changed");
                     }
                     Some(other) => tracing::trace!(event = ?other, "ghost LiveKit room event"),
                     None => break,
@@ -1230,6 +1285,7 @@ async fn bootstrap_olm_transport(
             &cfg.as_token,
             localpart,
             ghost_mxid,
+            &cfg.store_path,
         )
         .await
         {
@@ -1299,6 +1355,14 @@ async fn distribute_key_loop(
     let mut keyed: HashSet<KeyRecipient> = HashSet::new();
     // Burst re-sends still owed after the last membership change. >0 ⇒ wake fast.
     let mut burst: u32 = 0;
+    // Whether the NEXT send forces a fresh /keys/query for the recipients (issue #51).
+    // The first send forces (humans may already be present); thereafter only a
+    // membership-generation bump re-arms it — one forced query per membership change,
+    // not per 3s burst tick.
+    let mut refresh = RefreshMode::Force;
+    // When the current re-key attempt began (a new joiner or a membership bump), so we
+    // can log per-ghost "membership change → key delivered" latency (the #51 symptom).
+    let mut rekey_started: Option<tokio::time::Instant> = None;
     loop {
         // Did this iteration deliver the key to at least one device? A send that
         // reaches NOBODY is almost always a cold-start race: this ghost's own crypto
@@ -1316,17 +1380,21 @@ async fn distribute_key_loop(
                 // call-setup window, during which it may drop the to-device key.
                 if current.iter().any(|r| !keyed.contains(r)) {
                     burst = KEY_BURST_COUNT;
+                    if rekey_started.is_none() {
+                        rekey_started = Some(tokio::time::Instant::now());
+                    }
                 }
                 if current.is_empty() {
                     keyed.clear();
                 } else {
-                    reached_someone = match transport.send_key(&current, &key, 0).await {
+                    reached_someone = match transport.send_key(&current, &key, 0, refresh).await {
                         // Every targeted device got the key.
                         Ok(o) if o.failed.is_empty() => {
                             tracing::info!(
                                 recipients = ?current.iter().map(|r| format!("{}:{}", r.user_id, r.device_id)).collect::<Vec<_>>(),
                                 transport = transport.kind(),
                                 delivered = o.delivered,
+                                key_fp = %keys::key_fp(&key),
                                 burst,
                                 "ghost media key sent"
                             );
@@ -1373,10 +1441,22 @@ async fn distribute_key_loop(
                             false
                         }
                     };
+                    // Whether it reached anyone or not, one send has now consumed the
+                    // forced refresh: a genuine cold start is re-covered by the burst,
+                    // and re-forcing every 3s tick would multiply /keys/query needlessly.
+                    // The members_gen bump arm below re-arms it on the next membership change.
+                    refresh = RefreshMode::Steady;
                     if reached_someone {
                         // Progress: remember who we've keyed and spend one burst slot.
                         keyed = current.into_iter().collect();
                         burst = burst.saturating_sub(1);
+                        if let Some(t) = rekey_started.take() {
+                            tracing::info!(
+                                latency_ms = t.elapsed().as_millis() as u64,
+                                transport = transport.kind(),
+                                "ghost re-key delivered after membership change"
+                            );
+                        }
                     }
                     // else: reached nobody — leave `keyed` and `burst` untouched, so the
                     // new-recipient check re-arms the burst next loop and we retry at the
@@ -1401,6 +1481,13 @@ async fn distribute_key_loop(
                     // for it rather than busy-looping on a closed channel.
                     cancel.cancelled().await;
                     break;
+                }
+                // Force ONE fresh /keys/query on the next send so a same-user rejoin's
+                // (possibly rotated) returning device is re-fetched and re-keyed at once
+                // rather than after the slow burst/heartbeat convergence (issue #51).
+                refresh = RefreshMode::Force;
+                if rekey_started.is_none() {
+                    rekey_started = Some(tokio::time::Instant::now());
                 }
             }
             _ = tokio::time::sleep(wait) => {}
@@ -1921,7 +2008,7 @@ mod tests {
 
     // ── distribute_key_loop, driven with mock transport + recipient source ──────
 
-    use super::super::key_transport::{FailedRecipient, KeyRecipient, KeySendOutcome};
+    use super::super::key_transport::{FailedRecipient, KeyRecipient, KeySendOutcome, RefreshMode};
 
     /// Test helper: a call-member recipient with a fixed device id.
     fn rcpt(user: &str) -> KeyRecipient {
@@ -1931,10 +2018,11 @@ mod tests {
         }
     }
 
-    /// Records the recipient lists passed to each `send_key`.
+    /// Records the recipient lists and `refresh` mode passed to each `send_key`.
     #[derive(Default)]
     struct MockTransport {
         sends: StdMutex<Vec<Vec<KeyRecipient>>>,
+        refreshes: StdMutex<Vec<RefreshMode>>,
     }
 
     #[async_trait]
@@ -1944,8 +2032,10 @@ mod tests {
             recipients: &[KeyRecipient],
             _key: &[u8; 16],
             _key_index: u8,
+            refresh: RefreshMode,
         ) -> Result<KeySendOutcome> {
             self.sends.lock().unwrap().push(recipients.to_vec());
+            self.refreshes.lock().unwrap().push(refresh);
             Ok(KeySendOutcome {
                 delivered: recipients.len(),
                 failed: Vec::new(),
@@ -2036,6 +2126,7 @@ mod tests {
             recipients: &[KeyRecipient],
             _key: &[u8; 16],
             _key_index: u8,
+            _refresh: RefreshMode,
         ) -> Result<KeySendOutcome> {
             let mut n = self.calls.lock().unwrap();
             *n += 1;
@@ -2116,9 +2207,63 @@ mod tests {
             "@nether-voicebridge_1:nether.im".into(),
             "D1".into(),
         );
-        let outcome = t.send_key(&[], &[0u8; 16], 0).await.unwrap();
+        let outcome = t
+            .send_key(&[], &[0u8; 16], 0, RefreshMode::Steady)
+            .await
+            .unwrap();
         assert!(outcome.failed.is_empty());
         assert_eq!(outcome.delivered, 0);
         assert_eq!(t.kind(), "plaintext");
+    }
+
+    /// Issue #51: the first send forces a fresh device-list query, steady burst ticks
+    /// do NOT, and a membership-generation bump re-arms exactly one forced query — so a
+    /// same-user rejoin re-fetches the returning device instead of stalling.
+    #[tokio::test(start_paused = true)]
+    async fn key_loop_forces_refresh_on_first_send_and_after_gen_bump() {
+        let source = Arc::new(MockSource {
+            recipients: vec![rcpt("@alice:nether.im")],
+        });
+        let transport = Arc::new(MockTransport::default());
+        let (gen_tx, gen_rx) = watch::channel(0u64);
+        let cancel = CancellationToken::new();
+
+        let handle = tokio::spawn(distribute_key_loop(
+            source,
+            [7u8; 16],
+            transport.clone(),
+            gen_rx,
+            cancel.clone(),
+        ));
+
+        // Let the first send fire, then advance one burst interval for a steady tick.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::advance(KEY_BURST_INTERVAL).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Simulate a listener rejoin: bump the membership generation.
+        gen_tx.send_modify(|g| *g = g.wrapping_add(1));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel.cancel();
+        handle.await.unwrap();
+
+        let refreshes = transport.refreshes.lock().unwrap().clone();
+        assert!(
+            refreshes.len() >= 3,
+            "expected first send + a steady burst tick + a post-bump send; got {refreshes:?}"
+        );
+        assert_eq!(
+            refreshes[0],
+            RefreshMode::Force,
+            "first send must force a fresh /keys/query"
+        );
+        assert_eq!(
+            refreshes[1],
+            RefreshMode::Steady,
+            "an ordinary burst tick must NOT force a query"
+        );
+        assert!(
+            refreshes[2..].contains(&RefreshMode::Force),
+            "a membership-generation bump must re-arm one forced query; got {refreshes:?}"
+        );
     }
 }
