@@ -78,6 +78,18 @@ pub fn encode_key(key: &[u8]) -> String {
     general_purpose::STANDARD.encode(key)
 }
 
+/// A short, non-reversible fingerprint of a media key for diagnostics: it lets us
+/// correlate "the key a ghost sends", "the key it encrypts frames under", and "the
+/// key a subscriber installs" WITHOUT logging the key bytes. Two logs sharing a
+/// `key_fp` carry the same key; a mismatch is a bug. Non-cryptographic (std hasher)
+/// and only 8 hex chars, so it reveals nothing usable about the key material.
+pub(crate) fn key_fp(key: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    format!("{:08x}", (h.finish() as u32))
+}
+
 /// Decode a base64-encoded key (accepts padded or unpadded standard base64).
 pub fn decode_key(s: &str) -> Result<Vec<u8>> {
     // Try padded first, then no-pad — be liberal on receive.
@@ -175,10 +187,11 @@ pub fn install_peer_key(
         }
     };
 
-    let ok = key_provider.set_key(&identity, key_index as i32, key_bytes);
+    let ok = key_provider.set_key(&identity, key_index as i32, key_bytes.clone());
     tracing::info!(
         peer_identity = %identity_str,
         key_index,
+        key_fp = %key_fp(&key_bytes),
         installed = ok,
         "installed peer media key"
     );

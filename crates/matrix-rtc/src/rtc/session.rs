@@ -406,6 +406,14 @@ async fn handle_room_events(
                 tracing::warn!(reason = ?reason, "LiveKit: room disconnected");
                 break;
             }
+            // Per-participant frame-decrypt state (MissingKey / KeyRatcheted /
+            // DecryptionFailed / Ok). This subscriber decrypts HUMAN publishers (ghost
+            // tracks are echo-skipped above), so it reports the human→bridge direction —
+            // useful for general E2EE health; the ghost→listener direction is observed on
+            // the listener's own client. Surfaced at INFO so a stuck identity is visible.
+            RoomEvent::E2eeStateChanged { participant, state } => {
+                tracing::info!(identity = %participant.identity(), ?state, "LiveKit: E2EE state changed");
+            }
             other => {
                 tracing::debug!(event = ?other, "LiveKit room event");
             }
