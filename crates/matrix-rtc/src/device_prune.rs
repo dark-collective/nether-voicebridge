@@ -133,14 +133,20 @@ pub(crate) async fn query_device_keys_present(
     device_keys_present(&json, user_mxid, device_id)
 }
 
-/// Delete the given retired device ids of `user_mxid` (appservice-asserted
-/// masquerade). Returns the ids that could NOT be deleted (to keep in history for a
-/// later pass); a 404 counts as deleted.
+/// Delete the given retired device ids of `user_mxid`. Returns the ids that could NOT
+/// be deleted (kept in history for a later pass); an id already absent server-side
+/// counts as pruned.
 ///
-/// UIA handling: the CS-API may gate `DELETE /devices/{id}` behind interactive auth.
-/// On a 401 the delete is retried once with `m.login.application_service` as the
-/// auth stage; if the server still refuses, pruning is abandoned for this pass with
-/// one WARN (delete manually via the homeserver admin interface in that case).
+/// Server behaviors probed live on Tuwunel 2026-07-03 (they drive the shape of
+/// [`delete_device`]):
+/// - A body-less `DELETE /devices/{id}` is `400 M_NOT_JSON` — always send `{}`.
+/// - The appservice-masqueraded delete is `403 "user must be authenticated and device
+///   identified"` (NOT a 401 UIA challenge). MSC4190 servers accept exactly this
+///   request UIA-free, so it stays attempt 1.
+/// - Even a self-delete by the device's own session gets `401` with EMPTY UIA flows —
+///   Tuwunel today offers no completable client-API path; the admin room is the only
+///   way. Policy refusals therefore abandon the pass with one WARN, and the retained
+///   history flushes automatically once the homeserver gains MSC4190.
 pub(crate) async fn prune_retired(
     http: &reqwest::Client,
     homeserver_url: &str,
@@ -148,19 +154,32 @@ pub(crate) async fn prune_retired(
     user_mxid: &str,
     retired: Vec<String>,
 ) -> Vec<String> {
+    // One masqueraded device listing up front: ids already gone (deleted manually, or
+    // by a prior pass that failed to persist) are dropped without any DELETE churn —
+    // and without the login-as-dead-device fallback, which would otherwise RE-CREATE
+    // an already-gone device just to fail deleting it.
+    let existing = match list_device_ids(http, homeserver_url, as_token, user_mxid).await {
+        Some(ids) => ids,
+        None => return retired, // listing failed — retry everything next pass
+    };
+
     let mut pending: Vec<String> = Vec::new();
     let mut iter = retired.into_iter();
     while let Some(id) = iter.next() {
+        if !existing.contains(&id) {
+            tracing::info!(user = %user_mxid, device_id = %id, "retired device already absent server-side");
+            continue;
+        }
         match delete_device(http, homeserver_url, as_token, user_mxid, &id).await {
             DeleteOutcome::Gone => {
                 tracing::info!(user = %user_mxid, device_id = %id, "pruned retired device");
             }
             DeleteOutcome::Retry => pending.push(id),
-            DeleteOutcome::UiaRefused => {
-                // No point hammering the remaining ids — same policy will refuse them.
+            DeleteOutcome::Refused => {
+                // Server policy — the remaining ids would be refused identically.
                 tracing::warn!(
                     user = %user_mxid,
-                    "homeserver requires interactive auth for device deletion — prune skipped (ids kept for a later pass; delete manually via the admin interface if the policy never changes)"
+                    "homeserver refuses appservice device deletion (no MSC4190 / empty UIA flows) — retired ids kept; they will flush when the homeserver allows it, or delete them via the admin interface"
                 );
                 pending.push(id);
                 pending.extend(iter);
@@ -171,13 +190,38 @@ pub(crate) async fn prune_retired(
     pending
 }
 
+/// Masqueraded `GET /devices` → the user's current device ids; `None` on any failure.
+async fn list_device_ids(
+    http: &reqwest::Client,
+    homeserver_url: &str,
+    as_token: &str,
+    user_mxid: &str,
+) -> Option<std::collections::HashSet<String>> {
+    let url = cs_url(homeserver_url, &["devices"], Some(user_mxid)).ok()?;
+    let resp = http.get(url).bearer_auth(as_token).send().await.ok()?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = err_body(resp).await;
+        tracing::warn!(%status, %body, user = %user_mxid, "device prune: GET /devices failed");
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    Some(
+        json.get("devices")?
+            .as_array()?
+            .iter()
+            .filter_map(|d| d.get("device_id")?.as_str().map(str::to_owned))
+            .collect(),
+    )
+}
+
 enum DeleteOutcome {
     /// Deleted, or was already gone (404).
     Gone,
     /// Transient/unexpected failure — keep the id and try again next start.
     Retry,
-    /// The server demands UIA we cannot satisfy — abandon this pass.
-    UiaRefused,
+    /// Server policy refuses appservice device deletion — abandon this pass.
+    Refused,
 }
 
 async fn delete_device(
@@ -187,6 +231,8 @@ async fn delete_device(
     user_mxid: &str,
     device_id: &str,
 ) -> DeleteOutcome {
+    // Attempt 1: appservice-masqueraded DELETE with `{}` body — the MSC4190 shape,
+    // UIA-free on servers that implement it.
     let url = match cs_url(homeserver_url, &["devices", device_id], Some(user_mxid)) {
         Ok(u) => u,
         Err(e) => {
@@ -194,32 +240,71 @@ async fn delete_device(
             return DeleteOutcome::Retry;
         }
     };
-    // First attempt without auth; on a UIA challenge retry once asserting the
-    // appservice login type (accepted by homeservers that exempt appservices).
-    for auth in [None, Some(serde_json::json!({"auth": {"type": "m.login.application_service"}}))] {
-        let mut req = http.delete(url.clone()).bearer_auth(as_token);
-        if let Some(body) = &auth {
-            req = req.json(body);
-        }
-        let resp = match req.send().await {
-            Ok(r) => r,
+    match send_delete(http, url, as_token).await {
+        DeleteStatus::Gone => return DeleteOutcome::Gone,
+        DeleteStatus::AuthRejected => {} // fall through to attempt 2
+        DeleteStatus::Other => return DeleteOutcome::Retry,
+    }
+
+    // Attempt 2: log in AS the dead device (the appservice may assert any device id in
+    // its namespace — this only mints a token for the EXISTING device, it cannot
+    // create one because the listing above proved it exists) and self-delete.
+    let localpart = user_mxid
+        .strip_prefix('@')
+        .and_then(|s| s.split(':').next())
+        .unwrap_or_default();
+    let own_token =
+        match crate::matrix::appservice_login_as(homeserver_url, as_token, localpart, device_id)
+            .await
+        {
+            Ok(t) => t,
             Err(e) => {
-                tracing::warn!(error = %e, device_id, "device prune: DELETE failed (will retry next start)");
+                tracing::warn!(error = %e, device_id, "device prune: login-as-retired-device failed");
                 return DeleteOutcome::Retry;
             }
         };
-        match resp.status().as_u16() {
-            200 | 404 => return DeleteOutcome::Gone,
-            401 => continue, // UIA challenge — fall through to the auth-asserting attempt.
-            _ => {
-                let status = resp.status();
-                let body = err_body(resp).await;
-                tracing::warn!(%status, device_id, %body, "device prune: DELETE refused (kept in history)");
-                return DeleteOutcome::Retry;
-            }
+    let url = match cs_url(homeserver_url, &["devices", device_id], None) {
+        Ok(u) => u,
+        Err(_) => return DeleteOutcome::Retry,
+    };
+    match send_delete(http, url, &own_token).await {
+        DeleteStatus::Gone => DeleteOutcome::Gone,
+        DeleteStatus::AuthRejected => DeleteOutcome::Refused,
+        DeleteStatus::Other => DeleteOutcome::Retry,
+    }
+}
+
+enum DeleteStatus {
+    Gone,
+    /// 401 (UIA challenge, possibly with empty flows) or 403 (policy).
+    AuthRejected,
+    Other,
+}
+
+async fn send_delete(http: &reqwest::Client, url: reqwest::Url, token: &str) -> DeleteStatus {
+    let resp = match http
+        .delete(url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "device prune: DELETE failed (will retry next start)");
+            return DeleteStatus::Other;
+        }
+    };
+    match resp.status().as_u16() {
+        200 | 404 => DeleteStatus::Gone,
+        401 | 403 => DeleteStatus::AuthRejected,
+        _ => {
+            let status = resp.status();
+            let body = err_body(resp).await;
+            tracing::warn!(%status, %body, "device prune: DELETE refused (kept in history)");
+            DeleteStatus::Other
         }
     }
-    DeleteOutcome::UiaRefused
 }
 
 #[cfg(test)]
