@@ -43,6 +43,7 @@ use matrix_sdk_crypto::{
     CollectStrategy, DeviceData, OlmMachine,
 };
 use tokio::sync::Mutex;
+use tracing::Instrument as _;
 
 use super::ghost::{cs_url, err_body};
 use super::keys;
@@ -292,6 +293,7 @@ impl GhostCrypto {
         localpart: &str,
         ghost_mxid: &str,
         store_path: &str,
+        prune_stale_devices: bool,
     ) -> Result<Self> {
         let user_id: OwnedUserId = ghost_mxid
             .parse()
@@ -301,7 +303,44 @@ impl GhostCrypto {
         // across restarts instead of minting a throwaway per run. Reusing the device
         // stops the device-list pile-up on peers that poisons signatures + drains
         // one-time keys and wedges the Olm session. `reused` is only for logging.
-        let (crypto_device_id, account, reused) = load_or_create_ghost_identity(store_path, localpart)?;
+        let (mut crypto_device_id, mut account, mut reused, retired) =
+            load_or_create_ghost_identity(store_path, localpart)?;
+
+        // Deletion self-heal (#53): a reused device whose keys have vanished
+        // server-side must NOT be resurrected — peers that saw the deletion never
+        // re-learn a re-upload with unchanged keys and drop this ghost's key sends.
+        // Re-mint instead (one-time re-key, peer-safe). Indeterminate ⇒ fail open.
+        if reused
+            && crate::device_prune::query_device_keys_present(
+                &http,
+                homeserver_url,
+                as_token,
+                ghost_mxid,
+                &crypto_device_id,
+            )
+            .await
+                == Some(false)
+        {
+            let dead = std::mem::replace(&mut crypto_device_id, mint_crypto_device_id());
+            account = Account::new();
+            reused = false;
+            tracing::warn!(
+                old = %dead,
+                crypto_device_id,
+                "ghost device was deleted server-side while offline — re-provisioning a fresh device (retired id queued for prune)"
+            );
+            let mut retired = retired.clone();
+            retired.push(dead);
+            persist_ghost_identity(
+                store_path,
+                localpart,
+                &GhostIdentity {
+                    device_id: crypto_device_id.clone(),
+                    account: account.pickle(),
+                    retired,
+                },
+            )?;
+        }
 
         let access_token = crate::matrix::appservice_login_as(
             homeserver_url,
@@ -345,6 +384,44 @@ impl GhostCrypto {
             reused,
             "ghost crypto ready (stable persisted device; in-memory OlmMachine, no /sync)"
         );
+
+        // Device hygiene (#53): delete ids THIS blob retired (history-scoped — other
+        // deployments' ghost devices are structurally untouchable). Spawned: bootstrap
+        // is on the first-key-send hot path. Reads the blob fresh so it always prunes
+        // the authoritative list (incl. an id retired by the self-heal above);
+        // failures stay recorded for the next bootstrap.
+        if prune_stale_devices && !store_path.is_empty() {
+            let http = me.http.clone();
+            let homeserver_url = homeserver_url.to_owned();
+            let as_token = as_token.to_owned();
+            let ghost_mxid = ghost_mxid.to_owned();
+            let store_path = store_path.to_owned();
+            let localpart = localpart.to_owned();
+            tokio::spawn(
+                async move {
+                    let path = ghost_identity_path(&store_path, &localpart);
+                    let Some(mut blob) = load_ghost_identity(&path) else { return };
+                    if blob.retired.is_empty() {
+                        return;
+                    }
+                    let pending = crate::device_prune::prune_retired(
+                        &http,
+                        &homeserver_url,
+                        &as_token,
+                        &ghost_mxid,
+                        blob.retired.clone(),
+                    )
+                    .await;
+                    if pending != blob.retired {
+                        blob.retired = pending;
+                        if let Err(e) = persist_ghost_identity(&store_path, &localpart, &blob) {
+                            tracing::warn!(error = %e, "failed to persist pruned ghost retired-id history");
+                        }
+                    }
+                }
+                .in_current_span(),
+            );
+        }
         Ok(me)
     }
 
@@ -700,6 +777,11 @@ fn mint_crypto_device_id() -> String {
 struct GhostIdentity {
     device_id: String,
     account: AccountPickle,
+    /// Device ids this blob re-minted away from (#53) — queued for the
+    /// history-scoped prune, which only ever deletes ids recorded here.
+    /// `default` keeps pre-#53 blobs loadable.
+    #[serde(default)]
+    retired: Vec<String>,
 }
 
 fn ghost_identity_path(store_path: &str, localpart: &str) -> std::path::PathBuf {
@@ -708,20 +790,52 @@ fn ghost_identity_path(store_path: &str, localpart: &str) -> std::path::PathBuf 
         .join(format!("{localpart}.json"))
 }
 
-/// Load a ghost's persisted `(device_id, account, reused=true)`, or first-time provision
-/// and persist a fresh one (`reused=false`). Reusing a stable identity across restarts is
-/// what stops the per-run device pile-up that wedges listener Olm sessions (#35). If no
-/// store is configured, falls back to an ephemeral identity (the old per-run behaviour).
-fn load_or_create_ghost_identity(store_path: &str, localpart: &str) -> Result<(String, Account, bool)> {
+/// Read a ghost identity blob; `None` when missing or unreadable.
+fn load_ghost_identity(path: &std::path::Path) -> Option<GhostIdentity> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice::<GhostIdentity>(&bytes).ok()
+}
+
+/// Persist a ghost identity blob (creates the `ghosts/` dir on first write).
+fn persist_ghost_identity(store_path: &str, localpart: &str, blob: &GhostIdentity) -> Result<()> {
+    let path = ghost_identity_path(store_path, localpart);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating ghost identity dir '{}'", dir.display()))?;
+    }
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(blob).context("serializing ghost identity")?,
+    )
+    .with_context(|| format!("writing ghost identity '{}'", path.display()))
+}
+
+/// Load a ghost's persisted `(device_id, account, reused=true, retired)`, or first-time
+/// provision and persist a fresh one (`reused=false`). Reusing a stable identity across
+/// restarts is what stops the per-run device pile-up that wedges listener Olm sessions
+/// (#35). If no store is configured, falls back to an ephemeral identity (the old
+/// per-run behaviour). An unreadable blob re-provisions but cannot retire the lost id
+/// (it is unknown) — acceptable: prune is best-effort hygiene.
+fn load_or_create_ghost_identity(
+    store_path: &str,
+    localpart: &str,
+) -> Result<(String, Account, bool, Vec<String>)> {
     if store_path.is_empty() {
-        return Ok((mint_crypto_device_id(), Account::new(), false));
+        return Ok((mint_crypto_device_id(), Account::new(), false, Vec::new()));
     }
     let path = ghost_identity_path(store_path, localpart);
-    if let Ok(bytes) = std::fs::read(&path) {
-        match serde_json::from_slice::<GhostIdentity>(&bytes) {
-            Ok(id) => return Ok((id.device_id, Account::from_pickle(id.account), true)),
-            Err(e) => tracing::warn!(
-                error = %e, path = %path.display(),
+    if path.exists() {
+        match load_ghost_identity(&path) {
+            Some(id) => {
+                return Ok((
+                    id.device_id,
+                    Account::from_pickle(id.account),
+                    true,
+                    id.retired,
+                ));
+            }
+            None => tracing::warn!(
+                path = %path.display(),
                 "ghost identity blob unreadable — reprovisioning a fresh device"
             ),
         }
@@ -731,17 +845,10 @@ fn load_or_create_ghost_identity(store_path: &str, localpart: &str) -> Result<(S
     let blob = GhostIdentity {
         device_id: device_id.clone(),
         account: account.pickle(),
+        retired: Vec::new(),
     };
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating ghost identity dir '{}'", dir.display()))?;
-    }
-    std::fs::write(
-        &path,
-        serde_json::to_vec_pretty(&blob).context("serializing ghost identity")?,
-    )
-    .with_context(|| format!("writing ghost identity '{}'", path.display()))?;
-    Ok((device_id, account, false))
+    persist_ghost_identity(store_path, localpart, &blob)?;
+    Ok((device_id, account, false, Vec::new()))
 }
 
 /// Parse a raw reqwest response into a typed ruma response via
@@ -821,6 +928,33 @@ impl KeyTransport for OlmTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pre-#53 identity blob (no `retired` field) must still deserialize — the
+    /// stable ghost identities on disk predate the retired-id history, and failing
+    /// to load one would re-provision the device (churn we shipped #35 to stop).
+    #[test]
+    fn ghost_identity_blob_backcompat_and_round_trip() {
+        let account = Account::new();
+        let old_shape = serde_json::json!({
+            "device_id": "Cabcd1234",
+            "account": account.pickle(),
+        });
+        let parsed: GhostIdentity =
+            serde_json::from_value(old_shape).expect("pre-#53 blob must load");
+        assert_eq!(parsed.device_id, "Cabcd1234");
+        assert!(parsed.retired.is_empty(), "missing field defaults to empty");
+
+        // Round-trip with retired ids populated (the #53 self-heal path writes these).
+        let blob = GhostIdentity {
+            device_id: "Cnew56789".into(),
+            account: account.pickle(),
+            retired: vec!["Cabcd1234".into()],
+        };
+        let json = serde_json::to_vec(&blob).unwrap();
+        let back: GhostIdentity = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.device_id, "Cnew56789");
+        assert_eq!(back.retired, vec!["Cabcd1234"]);
+    }
 
     /// The minted crypto device id must be a fresh, unique, path-safe token. A new
     /// one per lifecycle is what keeps the in-memory account's fresh signing keys

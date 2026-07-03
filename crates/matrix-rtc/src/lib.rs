@@ -15,6 +15,7 @@
 //! to both sides — to the Discord side as a `CaptureRouter`, and back here to be
 //! driven — mirroring how the Discord `PuppetPool` is shared.
 
+mod device_prune;
 mod matrix;
 mod rtc;
 
@@ -24,6 +25,7 @@ use anyhow::{Context, Result};
 use matrix_sdk::ruma::RoomId;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 use nvb_audio::routing::PlaybackRouter;
 use nvb_config::{LiveKitConfig, MatrixConfig};
@@ -55,13 +57,70 @@ pub async fn run(
     // persisted one otherwise. Shadow `matrix_cfg` so build_client, the sync loop, and
     // the subscriber membership all assert the SAME effective device_id.
     let mut owned_cfg = matrix_cfg.clone();
-    owned_cfg.device_id = matrix::resolve_store_device_id(&matrix_cfg.store_path, &matrix_cfg.device_id);
+    let resolved = matrix::resolve_store_device_id(&matrix_cfg.store_path, &matrix_cfg.device_id);
+    owned_cfg.device_id = resolved.id;
+
+    // Deletion self-heal (#53): a reused id whose device keys have vanished server-side
+    // must NOT be resurrected — clients that saw the deletion never re-learn a re-upload
+    // with unchanged keys and silently withhold the call media key (the 2026-07-03
+    // outage). Only a reused id can be affected (a fresh mint has no server keys yet),
+    // and an indeterminate answer fails open: never churn the identity on a flake.
+    if resolved.reused {
+        let http = reqwest::Client::builder().use_rustls_tls().build().ok();
+        if let Some(http) = http {
+            let present = device_prune::query_device_keys_present(
+                &http,
+                &matrix_cfg.homeserver_url,
+                &matrix_cfg.appservice_token,
+                &matrix_cfg.bot_user_id,
+                &owned_cfg.device_id,
+            )
+            .await;
+            if present == Some(false) {
+                let dead = owned_cfg.device_id.clone();
+                owned_cfg.device_id =
+                    matrix::remint_bot_device(&matrix_cfg.store_path, &matrix_cfg.device_id, &dead);
+            }
+        }
+    }
     let matrix_cfg = &owned_cfg;
 
     // Build the client first (surfaces login/restore errors before the loops). It
     // always opens the persistent store and does the initial sync, so room state
     // (incl. `m.room.encryption`) is local by the time it returns.
     let client = matrix::build_client(matrix_cfg, &bridge).await?;
+
+    // Device hygiene (#53): delete ids this store itself retired (history-scoped, so
+    // another deployment's devices are structurally untouchable). After build_client so
+    // the current device exists server-side with keys; spawned so startup never blocks
+    // on it. Failures stay in the history file for the next start.
+    if matrix_cfg.prune_stale_devices.unwrap_or(true) {
+        let retired = device_prune::read_retired(&matrix_cfg.store_path);
+        if !retired.is_empty() {
+            let homeserver_url = matrix_cfg.homeserver_url.clone();
+            let as_token = matrix_cfg.appservice_token.clone();
+            let user_mxid = matrix_cfg.bot_user_id.clone();
+            let store_path = matrix_cfg.store_path.clone();
+            let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
+            tokio::spawn(
+                async move {
+                    let Ok(http) = reqwest::Client::builder().use_rustls_tls().build() else {
+                        return;
+                    };
+                    let pending = device_prune::prune_retired(
+                        &http,
+                        &homeserver_url,
+                        &as_token,
+                        &user_mxid,
+                        retired,
+                    )
+                    .await;
+                    device_prune::write_retired(&store_path, &pending);
+                }
+                .instrument(span),
+            );
+        }
+    }
 
     // Resolve media-E2EE for this bridge (#14): auto-detect from the room's
     // `m.room.encryption` state, unless the config pins an override. An encrypted

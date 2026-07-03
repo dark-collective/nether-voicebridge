@@ -292,6 +292,9 @@ struct GhostConfig {
     /// appservice namespace regex. Derived once in `GhostPool::new` from
     /// `matrix.sender_localpart` so all ghosts use the same prefix.
     ghost_localpart_prefix: String,
+    /// Delete ids each ghost's identity blob retired (#53, history-scoped).
+    /// Mirrors `matrix.prune_stale_devices` (default on).
+    prune_stale_devices: bool,
 }
 
 impl GhostPool {
@@ -338,6 +341,7 @@ impl GhostPool {
                 lk_url: livekit_cfg.url.clone(),
                 capture_wav,
                 ghost_localpart_prefix: ghost_localpart_prefix(matrix_cfg.sender_localpart.as_deref()),
+                prune_stale_devices: matrix_cfg.prune_stale_devices.unwrap_or(true),
             },
         }))
     }
@@ -1286,6 +1290,7 @@ async fn bootstrap_olm_transport(
             localpart,
             ghost_mxid,
             &cfg.store_path,
+            cfg.prune_stale_devices,
         )
         .await
         {

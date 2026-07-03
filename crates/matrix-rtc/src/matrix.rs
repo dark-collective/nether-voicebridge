@@ -337,9 +337,14 @@ fn reset_bot_crypto_store(dir: &std::path::Path) {
 ///
 /// Applies to every bridge: all Matrix auth is now appservice login (the bridge
 /// self-provisions an un-pinned device), so the device id is always store-paired here.
-pub(crate) fn resolve_store_device_id(store_path: &str, configured: &str) -> String {
+///
+/// Every branch that abandons an old id records it in the store's retired-id history
+/// (#53) so the prune pass can delete it server-side later; `reused` tells the caller
+/// whether the id came from a persisted marker (only then can it have been deleted
+/// server-side while we were away — the deletion self-heal is gated on it).
+pub(crate) fn resolve_store_device_id(store_path: &str, configured: &str) -> ResolvedDeviceId {
     if store_path.is_empty() {
-        return configured.to_owned();
+        return ResolvedDeviceId { id: configured.to_owned(), reused: false };
     }
     let dir = std::path::Path::new(store_path);
     let marker = dir.join("device_id");
@@ -350,14 +355,18 @@ pub(crate) fn resolve_store_device_id(store_path: &str, configured: &str) -> Str
         let s = s.trim();
         if !s.is_empty() && s != configured {
             tracing::info!(device_id = %s, "device identity: reusing persisted id from store");
-            return s.to_owned();
+            return ResolvedDeviceId { id: s.to_owned(), reused: true };
         }
         if s == configured {
             let id = mint_fresh_device_id(configured);
             tracing::warn!(old = %s, device_id = %id, "device identity: migrating plain-poison marker to a unique id");
+            // The plain id may still be live under ANOTHER pre-migration deployment; if so,
+            // pruning it is self-healing there too (that deployment migrates off it on its
+            // next start regardless, and its self-heal covers an early prune).
+            crate::device_prune::append_retired(store_path, s);
             reset_bot_crypto_store(dir);
             persist_device_marker(&marker, dir, &id);
-            return id;
+            return ResolvedDeviceId { id, reused: false };
         }
     }
 
@@ -366,13 +375,45 @@ pub(crate) fn resolve_store_device_id(store_path: &str, configured: &str) -> Str
     let id = mint_fresh_device_id(configured);
     if crypto_pre_existing {
         // A pre-#30 store's first upgrade: its crypto belongs to the old plain identity, so the
-        // freshly-minted id needs a clean crypto store (mint → reset → persist marker).
+        // freshly-minted id needs a clean crypto store (mint → reset → persist marker). The old
+        // identity was the bare configured id — retire it.
         tracing::warn!(device_id = %id, "device identity: minted unique id for pre-existing store (re-provisioning crypto)");
+        crate::device_prune::append_retired(store_path, configured);
         reset_bot_crypto_store(dir);
     } else {
         tracing::info!(device_id = %id, "device identity: minted fresh unique id for new store");
     }
     persist_device_marker(&marker, dir, &id);
+    ResolvedDeviceId { id, reused: false }
+}
+
+/// Result of [`resolve_store_device_id`]: the effective device id, and whether it was
+/// reused from a persisted marker (vs freshly minted this start).
+pub(crate) struct ResolvedDeviceId {
+    pub(crate) id: String,
+    pub(crate) reused: bool,
+}
+
+/// Deletion self-heal (#53): the store wants to reuse `dead_id` but its device keys are
+/// gone server-side (deleted by an operator or another deployment's mistake). Resurrecting
+/// it would wedge every client that saw the deletion — they drop the device and never
+/// re-learn a re-upload with unchanged keys, so they silently withhold the call media key
+/// (the 2026-07-03 outage). Instead: retire the dead id (queued for prune), reset the
+/// crypto store, and mint a fresh device — one-time and peer-safe, exactly like a store wipe.
+///
+/// SAFETY: like [`resolve_store_device_id`], this must run before `build_client` opens the
+/// sqlite store (see `reset_bot_crypto_store`).
+pub(crate) fn remint_bot_device(store_path: &str, configured: &str, dead_id: &str) -> String {
+    let dir = std::path::Path::new(store_path);
+    let id = mint_fresh_device_id(configured);
+    tracing::warn!(
+        old = %dead_id,
+        device_id = %id,
+        "bot device was deleted server-side while offline — re-provisioning a fresh device (one-time re-key; peers see a new device)"
+    );
+    crate::device_prune::append_retired(store_path, dead_id);
+    reset_bot_crypto_store(dir);
+    persist_device_marker(&dir.join("device_id"), dir, &id);
     id
 }
 
@@ -1092,12 +1133,16 @@ mod tests {
     #[test]
     fn fresh_store_mints_unique_id() {
         let tmp = TmpDir::new();
-        let id = resolve_store_device_id(tmp.path(), "dark-voice");
+        let r = resolve_store_device_id(tmp.path(), "dark-voice");
+        let id = &r.id;
         assert!(id.starts_with("dark-voice-"), "expected a minted id, got {id}");
         assert!(id.len() > "dark-voice-".len(), "expected a random suffix, got {id}");
+        assert!(!r.reused, "a fresh mint must not report reused");
         // The minted id is persisted so the next restart reuses it.
         let marker = fs::read_to_string(tmp.0.join("device_id")).unwrap();
-        assert_eq!(marker.trim(), id);
+        assert_eq!(marker.trim(), *id);
+        // Nothing was retired: a fresh store has no prior identity.
+        assert!(!tmp.0.join("retired_device_ids").exists());
     }
 
     #[test]
@@ -1108,13 +1153,17 @@ mod tests {
         // reset the crypto store so the new device gets a clean Olm account.
         fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"x").unwrap();
         fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3-wal"), b"x").unwrap();
-        let id = resolve_store_device_id(tmp.path(), "dark-voice");
+        let r = resolve_store_device_id(tmp.path(), "dark-voice");
+        let id = &r.id;
         assert!(id.starts_with("dark-voice-"), "expected a minted id, got {id}");
-        assert_ne!(id, "dark-voice");
+        assert_ne!(*id, "dark-voice");
+        assert!(!r.reused);
         // Crypto files removed for re-provision; marker holds the new id.
         assert!(!tmp.0.join("matrix-sdk-crypto.sqlite3").exists());
         assert!(!tmp.0.join("matrix-sdk-crypto.sqlite3-wal").exists());
-        assert_eq!(fs::read_to_string(tmp.0.join("device_id")).unwrap().trim(), id);
+        assert_eq!(fs::read_to_string(tmp.0.join("device_id")).unwrap().trim(), *id);
+        // The abandoned plain identity is queued for prune (#53).
+        assert_eq!(crate::device_prune::read_retired(tmp.path()), vec!["dark-voice"]);
     }
 
     #[test]
@@ -1123,16 +1172,20 @@ mod tests {
         // The "plain poison" written by the old adopt path: marker == configured.
         fs::write(tmp.0.join("device_id"), "dark-voice").unwrap();
         fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"x").unwrap();
-        let id = resolve_store_device_id(tmp.path(), "dark-voice");
+        let r = resolve_store_device_id(tmp.path(), "dark-voice");
+        let id = r.id;
         assert!(id.starts_with("dark-voice-") && id != "dark-voice", "expected migration, got {id}");
+        assert!(!r.reused, "a migration mints, it does not reuse");
         assert!(!tmp.0.join("matrix-sdk-crypto.sqlite3").exists(), "crypto store must be reset on migrate");
         assert_eq!(fs::read_to_string(tmp.0.join("device_id")).unwrap().trim(), id);
+        assert_eq!(crate::device_prune::read_retired(tmp.path()), vec!["dark-voice"]);
 
         // Idempotent: a second start (marker now != configured) reuses the healed id and does
         // NOT touch a freshly-recreated crypto store.
         fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"y").unwrap();
-        let id2 = resolve_store_device_id(tmp.path(), "dark-voice");
-        assert_eq!(id2, id, "healed id must be stable across restarts");
+        let r2 = resolve_store_device_id(tmp.path(), "dark-voice");
+        assert_eq!(r2.id, id, "healed id must be stable across restarts");
+        assert!(r2.reused, "a persisted minted id must report reused");
         assert!(tmp.0.join("matrix-sdk-crypto.sqlite3").exists(), "must not reset crypto on a healed store");
     }
 
@@ -1142,15 +1195,36 @@ mod tests {
         // A properly-minted/custom marker (!= configured) is reused, crypto untouched.
         fs::write(tmp.0.join("device_id"), "persisted-xyz").unwrap();
         fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"x").unwrap();
-        let id = resolve_store_device_id(tmp.path(), "dark-voice");
-        assert_eq!(id, "persisted-xyz");
+        let r = resolve_store_device_id(tmp.path(), "dark-voice");
+        assert_eq!(r.id, "persisted-xyz");
+        assert!(r.reused);
         assert!(tmp.0.join("matrix-sdk-crypto.sqlite3").exists(), "minted/custom marker must not trigger reset");
     }
 
     #[test]
     fn empty_store_path_returns_configured() {
         // Defensive: no store path → just the configured id, no filesystem writes.
-        assert_eq!(resolve_store_device_id("", "dark-voice"), "dark-voice");
+        let r = resolve_store_device_id("", "dark-voice");
+        assert_eq!(r.id, "dark-voice");
+        assert!(!r.reused);
+    }
+
+    #[test]
+    fn remint_retires_dead_id_and_provisions_fresh() {
+        let tmp = TmpDir::new();
+        // A store whose persisted device was deleted server-side (#53 self-heal).
+        fs::write(tmp.0.join("device_id"), "dark-voice-dead1234").unwrap();
+        fs::write(tmp.0.join("matrix-sdk-crypto.sqlite3"), b"x").unwrap();
+        let id = super::remint_bot_device(tmp.path(), "dark-voice", "dark-voice-dead1234");
+        assert!(id.starts_with("dark-voice-") && id != "dark-voice-dead1234");
+        // Dead id queued for prune; crypto reset; marker rewritten to the fresh id.
+        assert_eq!(crate::device_prune::read_retired(tmp.path()), vec!["dark-voice-dead1234"]);
+        assert!(!tmp.0.join("matrix-sdk-crypto.sqlite3").exists());
+        assert_eq!(fs::read_to_string(tmp.0.join("device_id")).unwrap().trim(), id);
+        // The next resolve reuses the fresh id.
+        let r = resolve_store_device_id(tmp.path(), "dark-voice");
+        assert_eq!(r.id, id);
+        assert!(r.reused);
     }
 
     #[test]

@@ -100,6 +100,10 @@ pub struct ServerProfile {
     pub sender_localpart: Option<String>,
     pub appservice_id: String,
     pub appservice_token: String,
+    /// See `MatrixConfig::prune_stale_devices`; bridges referencing this profile
+    /// inherit it unless they set their own value.
+    #[serde(default)]
+    pub prune_stale_devices: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,6 +248,13 @@ pub struct MatrixConfig {
     /// `mxc://`), only if the bot has no avatar yet.
     #[serde(default)]
     pub bot_avatar_path: Option<String>,
+    /// Delete this store's *retired* device ids from the homeserver at startup
+    /// (device hygiene, #53). History-scoped: only ids this store itself re-minted
+    /// away from are ever deleted, so another deployment's devices are structurally
+    /// safe. Optional override; unset defaults to on. Inherited from the
+    /// `[server.<name>]` profile when omitted.
+    #[serde(default)]
+    pub prune_stale_devices: Option<bool>,
 }
 
 impl MatrixConfig {
@@ -383,6 +394,9 @@ impl Config {
             }
             if m.appservice_token.is_empty() {
                 m.appservice_token = profile.appservice_token.clone();
+            }
+            if m.prune_stale_devices.is_none() {
+                m.prune_stale_devices = profile.prune_stale_devices;
             }
         }
     }
@@ -598,6 +612,7 @@ impl Config {
                     store_path,
                     bot_display_name,
                     bot_avatar_path,
+                    prune_stale_devices: None,
                 },
                 livekit: LiveKitConfig {
                     lk_jwt_url,
@@ -1258,7 +1273,21 @@ appservice_token = "hs_tok"
         assert_eq!(m.room_id, "!d:nether.im"); // bridge-level room_id → matrix.room_id
         assert_eq!(m.device_id, "dark-voice"); // auto-derived from name
         assert_eq!(m.store_path, "./nether-store/dark-voice");
+        assert_eq!(m.prune_stale_devices, None); // unset everywhere → default-on at use site
         cfg.validate().expect("should validate");
+    }
+
+    #[test]
+    fn prune_stale_devices_inherits_from_profile_and_bridge_wins() {
+        // Profile-level prune_stale_devices flows to the bridge; an inline
+        // [bridge.matrix] value beats it (the standard profile-merge contract).
+        let raw = format!(
+            "{}[server.nether]\nhomeserver_url = \"https://nether.im\"\nbot_user_id = \"@voicebridge_as:nether.im\"\nappservice_id = \"voicebridge\"\nappservice_token = \"hs_tok\"\nprune_stale_devices = false\n\n[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!a:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n\n[[bridge]]\nname = \"b\"\nserver = \"nether\"\nroom_id = \"!b:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"333\"\n[bridge.matrix]\nprune_stale_devices = true\n",
+            puppets_block(&["Bot a"]),
+        );
+        let cfg = loaded(&raw);
+        assert_eq!(cfg.bridges[0].matrix.prune_stale_devices, Some(false)); // inherited
+        assert_eq!(cfg.bridges[1].matrix.prune_stale_devices, Some(true)); // override wins
     }
 
     #[test]

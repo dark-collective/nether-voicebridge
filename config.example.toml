@@ -137,6 +137,13 @@ appservice_token = "your_appservice_hs_token_here"
 # bot_display_name = "Nether Voice Bridge"
 # bot_avatar_path  = "/path/to/your/avatar.png"   # uploaded once; persists as mxc://
 
+# Device hygiene (#53). OPTIONAL, defaults to on. At startup the bridge deletes
+# from the homeserver the device ids this store itself RETIRED (re-minted away
+# from) — and only those, so devices belonging to another deployment (a dev box
+# vs a VPS) are structurally safe. Also settable once in the [server.<name>]
+# profile. Set false to keep retired devices on the homeserver.
+# prune_stale_devices = true
+
 [bridge.livekit]
 # The lk-jwt-service endpoint and the LiveKit SFU WebSocket URL are BOTH
 # auto-derived at runtime — the bridge reads the homeserver's
