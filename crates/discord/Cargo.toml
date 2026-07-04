@@ -22,3 +22,9 @@ futures-util = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
+
+[dev-dependencies]
+# For examples (the #46 multiguild spike): log output + a multi-thread runtime
+# with Ctrl-C handling.
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
