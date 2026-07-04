@@ -1,26 +1,40 @@
 //! Shared puppet pool — a process-wide pool of Discord bots, dynamically
-//! allocated across all bridged channels.
+//! allocated across all bridged channels, **per guild** (#46).
 //!
 //! Each configured token is a generic "voice worker" bot that can join any
-//! channel on demand. The Matrix side of each bridge drives a per-channel
-//! [`ChannelView`] (a [`PlaybackRouter`]): `assign` on call membership (a bot
-//! joins, takes the participant's display name), `release` on leave, `set_muted`
-//! to mirror mute. Per active channel, one bot is the **anchor**: it captures
-//! all Discord speakers (Discord→Matrix) and plays that channel's shared
-//! **overflow** mix. Speakers beyond the bots available to a channel are mixed
-//! into that overflow (no audio lost) and the anchor is relabeled.
+//! channel on demand. A Discord bot holds one independent voice connection PER
+//! GUILD, and the pool exploits that: the allocation unit is `(bot, guild)` —
+//! one bot multiplexes engagements in several guilds at once (each its own
+//! songbird `Call`, playback mixer, SSRC, and speaking gates), so N bots serve
+//! up to N simultaneous puppets per guild across unlimited guilds. Two bridged
+//! channels in the SAME guild still need distinct bots (one Call per guild per
+//! bot). The Matrix side of each bridge drives a per-channel [`ChannelView`]
+//! (a [`PlaybackRouter`]): `assign` on call membership (a bot joins, takes the
+//! participant's display name), `release` on leave, `set_muted` to mirror mute.
+//! Per active channel, one bot is the **anchor**: it captures all Discord
+//! speakers (Discord→Matrix) and plays that channel's shared **overflow** mix.
+//! Speakers beyond the bots available to a channel are mixed into that overflow
+//! (no audio lost) and the anchor is relabeled.
 //!
-//! Allocation (single global lock, [`SharedPool::alloc`]):
-//! - A channel's first speaker takes a free bot as the anchor. If none is free,
-//!   a spare (non-anchor) bot is **stolen** from the channel with the most slack
-//!   (its most-recently-assigned dedicated speaker is demoted to overflow); if no
-//!   channel has slack, the channel waits until a bot frees (logged).
+//! Allocation (single global lock, [`SharedPool::alloc`]; a bot is free for a
+//! channel iff it has no session in that channel's guild, is healthy there, and
+//! is a guild member):
+//! - A channel's first speaker takes a free bot as the anchor. If none is free
+//!   in the guild, a spare (non-anchor) bot is **stolen** from the channel with
+//!   the most slack — under per-guild allocation effectively always a channel
+//!   of the same guild (its most-recently-assigned dedicated speaker is demoted
+//!   to overflow); if no channel has slack, the channel waits until a bot frees
+//!   (logged).
 //! - Within an active channel, extra speakers take free bots (dedicated puppets)
 //!   or fall to overflow; freed bots promote the oldest overflow speaker (FCFS).
+//! - Voice-session health (join-timeout quarantine, disconnect recovery) is
+//!   tracked per `(bot, guild)` too — a broken voice server in one guild never
+//!   sidelines the bot's engagements elsewhere.
 //!
-//! Echo prevention (constraint #5): each puppet registers its own SSRC into its
-//! channel's [`SharedExclude`] set on `DriverConnect`, so the anchor — which
-//! hears every speaker including the puppets' own playback — never re-captures it.
+//! Echo prevention (constraint #5): each puppet registers its own per-connection
+//! SSRC into its channel's [`SharedExclude`] set on `DriverConnect`, so the
+//! anchor — which hears every speaker including the puppets' own playback —
+//! never re-captures it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

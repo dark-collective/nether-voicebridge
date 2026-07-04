@@ -3,6 +3,28 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- **Per-guild puppet allocation & multiplexing: one guild's calls no longer starve
+  every other guild of bots (#46).** A Discord bot maintains an independent voice
+  connection per guild (how public music bots scale), but the allocator previously
+  treated each bot as a single indivisible resource — if one guild's channel claimed
+  all N pool bots, every other guild waited. The allocation unit is now
+  **(bot, guild)**: each bot multiplexes engagements across guilds (its own songbird
+  Call, playback mixer, SSRC, and speaking gates per guild), so N bots serve up to N
+  simultaneous puppets *per guild* across unlimited guilds. Two bridged channels in
+  the same guild still need distinct bots (one voice Call per guild per bot), and
+  bot-stealing now effectively only occurs between channels of one guild — the
+  scarce resource. Join-timeout quarantine and disconnect recovery are per
+  (bot, guild) too, so a broken voice server in one guild never sidelines a bot's
+  engagements elsewhere. Groundwork for multi-tenant hosting (#43/#45/#47).
+
+### Added
+- `multiguild_spike` example (`cargo run -p nvb-discord --example multiguild_spike`):
+  live GO/NO-GO probe that one bot can hold two concurrent DAVE voice sessions —
+  per-guild capture WAVs, distinct playback tones, soak logging.
+
 ## [0.3.0-alpha.4] - 2026-07-04
 
 ### Added
