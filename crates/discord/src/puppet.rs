@@ -637,16 +637,15 @@ impl SharedPool {
 
     // ── Allocation (all under `self.alloc`) ──────────────────────────────────
 
-    /// Claim the first idle bot that is a member of `guild`, inserting a fresh
-    /// [`PuppetSession`] for `(bot, guild)` — session presence IS the claim.
-    /// `None` if no capable bot is free.
+    /// Claim a bot for `guild`: the first bot that is a member, healthy, and has
+    /// no session in **that guild**, inserting a fresh [`PuppetSession`] for
+    /// `(bot, guild)` — session presence IS the claim. Engagements in other
+    /// guilds don't block a claim (#46): a bot holds one independent voice Call
+    /// per guild, so per-(bot, guild) is the true allocation unit. `None` if no
+    /// capable bot is free in this guild.
     fn take_free_bot(&self, guard: &mut AllocState, guild: GuildId) -> Option<usize> {
         for (i, slot) in self.slots.iter().enumerate() {
-            // TODO(#46): temporary one-session-per-bot cap — keeps behavior
-            // identical to the per-bot busy-flag era until the command loop can
-            // multiplex guilds. The per-guild flip relaxes this to
-            // `sessions.contains_key(&(i, guild))`.
-            if guard.sessions.keys().any(|(idx, _)| *idx == i) {
+            if guard.sessions.contains_key(&(i, guild)) {
                 continue;
             }
             // Skip bots quarantined after a join timeout — picking one of those
@@ -737,11 +736,17 @@ impl SharedPool {
 
     /// Steal a spare bot for **activation** of a channel in `target_guild`: find
     /// the channel with the most slack (most dedicated puppets) that has a
-    /// non-anchor dedicated bot **also a member of `target_guild`**, demote that
-    /// bot's (most-recently-assigned) speaker into the donor's overflow, and
-    /// return the freed bot (still marked busy — the caller repurposes it). The
-    /// bot is sent a `Release` so its loop leaves the donor channel first.
-    /// `None` if no donor has a guild-capable spare bot.
+    /// non-anchor dedicated bot usable in `target_guild`, demote that bot's
+    /// (most-recently-assigned) speaker into the donor's overflow, and return
+    /// the freed bot (still claimed — the caller repurposes it). The bot is sent
+    /// a `Release` so its loop leaves the donor channel first. `None` if no
+    /// donor has a usable spare bot.
+    ///
+    /// Under per-guild allocation (#46) steals effectively happen only BETWEEN
+    /// channels of the same guild: a bot free-in-target-guild would have been
+    /// claimed by `take_free_bot` directly, so a cross-guild donor's victims are
+    /// (almost) always already engaged in the target guild and filtered out —
+    /// exactly right, since (bot, guild) is the scarce resource.
     fn steal_for_activation(
         &self,
         guard: &mut AllocState,
@@ -761,7 +766,15 @@ impl SharedPool {
                     .iter()
                     .filter_map(|(vk, a)| match a {
                         Assign::Puppet { idx, seq }
-                            if *idx != donor_anchor && self.bot_in_guild(*idx, target_guild) =>
+                            if *idx != donor_anchor
+                                && self.bot_in_guild(*idx, target_guild)
+                                && !self.slots[*idx].unhealthy.load(Ordering::Relaxed)
+                                // A cross-guild victim must be idle in the target
+                                // guild — stealing it there would clobber its
+                                // existing engagement. (A same-guild steal hands
+                                // over the donor session itself.)
+                                && (ch.guild_id == target_guild
+                                    || !guard.sessions.contains_key(&(*idx, target_guild))) =>
                         {
                             Some((vk.clone(), *idx, *seq))
                         }
@@ -1732,10 +1745,10 @@ impl SharedPool {
             .remove(&guild);
     }
 
-    /// Whether bot `idx` currently holds any session (i.e. is allocated somewhere).
-    fn bot_has_session(&self, idx: usize) -> bool {
+    /// Whether bot `idx` currently holds a session in `guild`.
+    fn bot_has_session_in(&self, idx: usize, guild: GuildId) -> bool {
         let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
-        guard.sessions.keys().any(|(i, _)| *i == idx)
+        guard.sessions.contains_key(&(idx, guild))
     }
 
     /// Display name of the participant bot `idx` voices in `guild` (empty if none —
@@ -1905,7 +1918,7 @@ impl EventHandler for PuppetHandler {
                     .set_muted(&user_id.to_string(), vs.self_mute || vs.mute);
             }
         }
-        if self.pool.bot_has_session(self.idx) {
+        if self.pool.bot_has_session_in(self.idx, guild.id) {
             return;
         }
         if let Err(e) = guild.id.edit_nickname(&ctx.http, None).await {
@@ -2814,12 +2827,14 @@ mod tests {
 
     #[test]
     fn steals_from_donor_with_slack_to_activate_new_channel() {
+        // Same-guild steal: the only kind that still occurs under per-guild
+        // allocation (#46) — two channels of ONE guild contend for its bots.
         let p = pool(3);
         channel(&p, "A", 1, 10);
-        channel(&p, "B", 2, 20); // different guild
+        channel(&p, "B", 1, 20); // same guild, different channel
         p.assign("A", "a1", "A1");
         p.assign("A", "a2", "A2");
-        p.assign("A", "a3", "A3"); // A uses all 3 bots
+        p.assign("A", "a3", "A3"); // A uses all 3 bots (in guild 1)
         assert_eq!(p.test_free_count(), 0);
         let anchor_a = p.test_anchor("A").unwrap();
         // B activates by stealing A's newest non-anchor dedicated speaker (a3).
@@ -2838,9 +2853,11 @@ mod tests {
         // speaker to overflow; when the stealing channel later frees the bot, the
         // donor's demoted speaker must be re-promoted to a dedicated puppet (it was
         // previously left in overflow forever — no cross-channel re-promotion).
+        // Same-guild since #46 (cross-guild contention no longer steals — see
+        // guild_not_starved_when_other_guild_holds_all_bots).
         let p = pool(3);
         channel(&p, "A", 1, 10);
-        channel(&p, "B", 2, 20); // different guild; all 3 bots are in both
+        channel(&p, "B", 1, 20); // same guild, different channel
         p.assign("A", "a1", "A1");
         p.assign("A", "a2", "A2");
         p.assign("A", "a3", "A3"); // A uses all 3 bots
@@ -2855,6 +2872,120 @@ mod tests {
             "a3 re-promoted to a dedicated puppet after the bot freed"
         );
         assert!(!p.test_is_overflow("A", "a3"), "a3 no longer in overflow");
+    }
+
+    #[test]
+    fn one_bot_serves_two_guilds_concurrently() {
+        // The #46 headline capability: one bot holds an independent voice
+        // engagement per guild, so a single-bot pool serves two guilds at once.
+        let p = pool(1);
+        channel(&p, "A", 1, 10);
+        channel(&p, "B", 2, 20);
+        p.assign("A", "alice", "Alice");
+        p.assign("B", "bob", "Bob");
+        assert_eq!(p.test_slot_of("A", "alice"), Some(0));
+        assert_eq!(p.test_slot_of("B", "bob"), Some(0), "same bot, second guild");
+        assert_eq!(p.test_anchor("A"), Some(0));
+        assert_eq!(p.test_anchor("B"), Some(0));
+        assert!(!p.test_is_overflow("A", "alice"));
+        assert!(!p.test_is_overflow("B", "bob"));
+    }
+
+    #[test]
+    fn guild_not_starved_when_other_guild_holds_all_bots() {
+        // The #46 headline regression: guild 1 claiming every bot must not starve
+        // guild 2 — the bots are still free PER GUILD 2, no steal, no overflow.
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        channel(&p, "B", 2, 20);
+        p.assign("A", "a1", "A1");
+        p.assign("A", "a2", "A2"); // both bots engaged in guild 1
+        p.assign("B", "b1", "B1");
+        assert!(p.test_slot_of("B", "b1").is_some(), "B got a dedicated puppet");
+        assert!(p.test_anchor("B").is_some(), "B anchored immediately");
+        // A is completely undisturbed — nothing was stolen or demoted.
+        assert!(p.test_slot_of("A", "a1").is_some());
+        assert!(p.test_slot_of("A", "a2").is_some());
+        assert!(!p.test_is_overflow("A", "a1"));
+        assert!(!p.test_is_overflow("A", "a2"));
+    }
+
+    #[test]
+    fn same_guild_channels_still_need_distinct_bots() {
+        // One voice Call per guild per bot: two bridged channels in the SAME
+        // guild can never share a bot (constraint pinned).
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        channel(&p, "B", 1, 20);
+        p.assign("A", "a", "A");
+        p.assign("B", "b", "B");
+        let sa = p.test_slot_of("A", "a").unwrap();
+        let sb = p.test_slot_of("B", "b").unwrap();
+        assert_ne!(sa, sb, "same-guild channels use distinct bots");
+    }
+
+    #[test]
+    fn release_in_one_guild_preserves_other_guild_session() {
+        let p = pool(1);
+        channel(&p, "A", 1, 10);
+        channel(&p, "B", 2, 20);
+        p.assign("A", "alice", "Alice");
+        p.assign("B", "bob", "Bob"); // bot 0 multiplexes guilds 1 + 2
+        p.release("A", "alice");
+        // Guild 1 engagement gone; guild 2 untouched.
+        assert!(p.test_session_mixer(0, 1).is_none(), "guild-1 session released");
+        assert_eq!(p.test_slot_of("B", "bob"), Some(0), "guild-2 puppet intact");
+        assert_eq!(p.test_anchor("B"), Some(0), "guild-2 anchor intact");
+        assert_eq!(p.test_anchor("A"), None);
+        // The bot is claimable again in guild 1 without disturbing guild 2.
+        p.assign("A", "carol", "Carol");
+        assert_eq!(p.test_slot_of("A", "carol"), Some(0));
+        assert_eq!(p.test_slot_of("B", "bob"), Some(0));
+    }
+
+    #[test]
+    fn steal_skips_bot_already_serving_target_guild() {
+        // A cross-guild donor's spare bot that is already engaged in the target
+        // guild must not be stolen (it would clobber that engagement); the steal
+        // takes a same-guild donor's spare instead.
+        let p = pool(2);
+        channel(&p, "A", 1, 10); // guild 1
+        channel(&p, "B", 2, 20); // guild 2
+        channel(&p, "C", 2, 30); // guild 2, second channel
+        p.assign("A", "a1", "A1");
+        p.assign("A", "a2", "A2"); // A: both bots engaged in guild 1 (has slack)
+        p.assign("B", "b1", "B1");
+        p.assign("B", "b2", "B2"); // B: both bots ALSO engaged in guild 2
+        // C (guild 2) finds no free bot in guild 2 → must steal. A has slack but
+        // its spare is busy in guild 2 (via B) → only B is a valid donor.
+        p.assign("C", "c1", "C1");
+        assert!(p.test_anchor("C").is_some(), "C activated via same-guild steal");
+        assert!(p.test_is_overflow("B", "b2"), "B's newest speaker demoted");
+        // A (guild 1) is completely untouched.
+        assert!(p.test_slot_of("A", "a1").is_some());
+        assert!(p.test_slot_of("A", "a2").is_some());
+        assert!(!p.test_is_overflow("A", "a1"));
+        assert!(!p.test_is_overflow("A", "a2"));
+    }
+
+    #[test]
+    fn cross_guild_release_does_not_promote_where_bot_still_busy() {
+        // Bot 0 serves guild 1 (a1) and guild 2 (b1); a2 waits in guild 1's
+        // overflow. Releasing the guild-2 engagement frees the bot FOR GUILD 2
+        // only — it must not "promote" a2, whose guild still has the bot busy.
+        let p = pool(1);
+        channel(&p, "A", 1, 10);
+        channel(&p, "B", 2, 20);
+        p.assign("A", "a1", "A1");
+        p.assign("B", "b1", "B1");
+        p.assign("A", "a2", "A2");
+        assert!(p.test_is_overflow("A", "a2"), "no second guild-1 bot → overflow");
+        p.release("B", "b1");
+        assert!(p.test_is_overflow("A", "a2"), "a2 stays overflow — bot still busy in guild 1");
+        assert_eq!(p.test_slot_of("A", "a1"), Some(0), "a1 undisturbed");
+        // Releasing a1 promotes a2 within the channel as usual.
+        p.release("A", "a1");
+        assert_eq!(p.test_slot_of("A", "a2"), Some(0), "a2 promoted once guild 1 frees");
     }
 
     #[test]
