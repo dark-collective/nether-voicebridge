@@ -3,6 +3,50 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.3] - 2026-07-04
+
+### Added
+- **Device hygiene: the bridge now cleans up after its own device identities and
+  survives having them deleted out from under it (#53).** Two mechanisms, born from a
+  production outage where a manual homeserver device cleanup deleted the bridges' LIVE
+  devices — on restart the bridge resurrected the same ids with identical keys, the
+  homeserver never re-announced them, and clients silently refused to send call media
+  keys forever (encrypted Matrix→Discord went mute with zero errors anywhere):
+  - *Deletion self-heal:* before reusing a persisted identity (bot or ghost), the
+    bridge checks whether its device keys still exist server-side; if they were
+    deleted while offline it re-provisions a fresh device instead of resurrecting the
+    old id — a one-time, peer-safe re-key instead of permanent silence. Fails open on
+    transient errors (an unreachable homeserver never churns the identity).
+  - *History-scoped pruning:* every re-mint records the abandoned id (bot:
+    `<store>/retired_device_ids`; ghost: a new `retired` field in its identity blob),
+    and at startup the bridge deletes exactly those ids from the homeserver. A store
+    can only ever delete ids **it itself retired** — never age-based guesses — so
+    parallel deployments (a dev machine and a VPS sharing one appservice) can never
+    prune each other's live devices. Configurable via `prune_stale_devices`
+    (bridge or `[server.<name>]` level; default on; gates pruning only — the
+    self-heal is unconditional).
+  - Caveat: Tuwunel currently offers no client-API device deletion for appservice
+    users (no MSC4190; even a self-delete gets an unsatisfiable UIA challenge), so
+    pruning there logs one WARN and retains the history — it flushes automatically
+    if the homeserver ever allows it. Verified against live Tuwunel behavior.
+
+## [0.3.0-alpha.2] - 2026-07-03
+
+### Fixed
+- **Rejoining Matrix listeners are re-keyed in ~250 ms instead of up to ~35 s** (#51):
+  ghost media-key sends force a device-list re-fetch on the first send and on every
+  membership change, so a listener who leaves and rejoins an encrypted call hears all
+  Discord speakers near-instantly.
+- **Ghost media keys survive ghost respawns** (respawn media-key cache), and each ghost
+  keeps ONE stable crypto identity persisted across process restarts (#35: vodozemac
+  account pickle per ghost) — ending the per-restart device churn that piled stale
+  devices onto peers' device lists and wedged their Olm sessions.
+
+### Added
+- E2EE decrypt-state observability and media-key fingerprint logging: `generated`,
+  `frame-encrypt`, and `sent` fingerprints can be correlated per ghost to prove
+  key-path integrity without ever logging key material.
+
 ## [0.3.0-alpha.1] - 2026-06-28
 
 Opens the **0.3.x development line** toward hosted, configure-without-install
