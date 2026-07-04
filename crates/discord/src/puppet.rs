@@ -141,11 +141,13 @@ struct ChannelCtx {
 
 /// Commands sent from the (sync) allocator to a puppet's async command loop.
 enum PuppetCommand {
-    /// Join `ctx`'s channel, start playback from this bot's own mixer, set the
-    /// nickname. The loop stores `ctx` as its current channel.
+    /// Join `ctx`'s channel, start playback from the session's `mixer`, set the
+    /// nickname. The loop stores `ctx` (and the mixer) as its current channel.
     Assign {
         ctx: Box<ChannelCtx>,
         display_name: String,
+        /// The [`PuppetSession`]'s playback buffer (routes already point at it).
+        mixer: Arc<PlaybackMixer>,
     },
     /// Become the capture **anchor** of the current channel: register the
     /// Discord→Matrix capture handler + overflow playback, and seed ghosts for
@@ -181,25 +183,15 @@ enum Assign {
     Overflow { name: String, muted: bool, seq: u64 },
 }
 
-/// One puppet bot's shared state. `cmd_tx`/`cmd_rx` connect the sync allocator to
-/// the bot's async serenity task; `mixer` is its single-participant playback
-/// buffer (reused across channels); `current_ssrc` remembers the SSRC inserted
-/// into its current channel's exclude set so it can be removed on release.
+/// One puppet bot's gateway-level state. `cmd_tx`/`cmd_rx` connect the sync
+/// allocator to the bot's async serenity task. Everything tied to a specific
+/// voice engagement (mixer, name, mute) lives in the bot's [`PuppetSession`]
+/// inside [`AllocState`], keyed by `(slot index, guild)`.
 struct PuppetSlot {
     token: String,
-    mixer: Arc<PlaybackMixer>,
     cmd_tx: mpsc::Sender<PuppetCommand>,
     /// Taken (once) by [`SharedPool::run`] to drive this puppet's client.
     cmd_rx: StdMutex<Option<mpsc::Receiver<PuppetCommand>>>,
-    current_ssrc: Arc<StdMutex<Option<u32>>>,
-    /// Current participant display name — used to restore the anchor's nickname
-    /// after the overflow relabel, and to carry the name on a steal-demotion.
-    name: StdMutex<Option<String>>,
-    /// The participant's intended mute (mirrored from Matrix). Tracked even when
-    /// not *applied* — the anchor stays unmuted while hosting overflow.
-    muted: AtomicBool,
-    /// True while allocated to some channel. Mutated only under the alloc lock.
-    busy: AtomicBool,
     /// Guilds this bot is a member of (learned from `ready`/`guild_create`). The
     /// allocator only assigns/steals a bot for a channel whose guild is in here,
     /// so a partitioned pool (some bots per guild) works and a missing invite
@@ -280,12 +272,41 @@ impl ChannelState {
     }
 }
 
+/// A bot's live engagement in one guild: presence of a `(slot, guild)` entry in
+/// [`AllocState::sessions`] IS the "busy" state (#46 — the allocation unit is
+/// per-(bot, guild), not per-bot). All fields mutated only under the alloc lock.
+struct PuppetSession {
+    /// This session's playback buffer — fresh per session, so a reclaimed bot can
+    /// never replay a previous participant's audio. Routes point here; the bot's
+    /// command loop receives it with the `Assign` and plays it on the Call.
+    mixer: Arc<PlaybackMixer>,
+    /// Display name of the participant this session voices (`None` while
+    /// capture-only) — used to restore the anchor's nickname after the overflow
+    /// relabel, and to carry the name on a steal-demotion.
+    name: Option<String>,
+    /// The participant's intended mute (mirrored from Matrix). Tracked even when
+    /// not *applied* — the anchor stays unmuted while hosting overflow.
+    muted: bool,
+}
+
+impl PuppetSession {
+    fn fresh() -> Self {
+        Self { mixer: Arc::new(PlaybackMixer::new()), name: None, muted: false }
+    }
+}
+
+/// `(slot index, guild)` → that bot's live session there. See [`PuppetSession`].
+type SessionMap = HashMap<(usize, GuildId), PuppetSession>;
+
 /// The global allocation state, guarded by [`SharedPool::alloc`].
 struct AllocState {
     /// Channel key (bridge label) → its state.
     channels: HashMap<String, ChannelState>,
     /// Monotonic arrival counter for FCFS ordering.
     next_seq: u64,
+    /// Live per-(bot, guild) sessions — entry present ⇔ that bot is allocated in
+    /// that guild.
+    sessions: SessionMap,
 }
 
 /// The shared puppet pool. Built once per process; every bridge's Discord side is
@@ -312,13 +333,8 @@ impl SharedPool {
                 let (cmd_tx, cmd_rx) = mpsc::channel(8);
                 PuppetSlot {
                     token: tok.clone(),
-                    mixer: Arc::new(PlaybackMixer::new()),
                     cmd_tx,
                     cmd_rx: StdMutex::new(Some(cmd_rx)),
-                    current_ssrc: Arc::new(StdMutex::new(None)),
-                    name: StdMutex::new(None),
-                    muted: AtomicBool::new(false),
-                    busy: AtomicBool::new(false),
                     guilds: RwLock::new(HashSet::new()),
                     connected: Arc::new(AtomicBool::new(false)),
                     unhealthy: Arc::new(AtomicBool::new(false)),
@@ -350,6 +366,7 @@ impl SharedPool {
             alloc: StdMutex::new(AllocState {
                 channels: HashMap::new(),
                 next_seq: 0,
+                sessions: HashMap::new(),
             }),
         })
     }
@@ -597,12 +614,16 @@ impl SharedPool {
 
     // ── Allocation (all under `self.alloc`) ──────────────────────────────────
 
-    /// Claim the first idle bot that is a member of `guild`, marking it busy.
-    /// `None` if no capable bot is free. Called only under the alloc lock, so the
-    /// load-then-store on `busy` is race-free.
-    fn take_free_bot(&self, guild: GuildId) -> Option<usize> {
+    /// Claim the first idle bot that is a member of `guild`, inserting a fresh
+    /// [`PuppetSession`] for `(bot, guild)` — session presence IS the claim.
+    /// `None` if no capable bot is free.
+    fn take_free_bot(&self, guard: &mut AllocState, guild: GuildId) -> Option<usize> {
         for (i, slot) in self.slots.iter().enumerate() {
-            if slot.busy.load(Ordering::Relaxed) {
+            // TODO(#46): temporary one-session-per-bot cap — keeps behavior
+            // identical to the per-bot busy-flag era until the command loop can
+            // multiplex guilds. The per-guild flip relaxes this to
+            // `sessions.contains_key(&(i, guild))`.
+            if guard.sessions.keys().any(|(idx, _)| *idx == i) {
                 continue;
             }
             // Skip bots quarantined after a join timeout — picking one of those
@@ -618,7 +639,7 @@ impl SharedPool {
             {
                 continue;
             }
-            slot.busy.store(true, Ordering::Relaxed);
+            guard.sessions.insert((i, guild), PuppetSession::fresh());
             return Some(i);
         }
         None
@@ -650,7 +671,7 @@ impl SharedPool {
 
     /// Set the anchor's nickname to reflect overflow state: the overflow label
     /// while it hosts ≥1 overflow speaker, else its own participant's name.
-    fn reconcile_anchor_label(&self, ch: &ChannelState) {
+    fn reconcile_anchor_label(&self, sessions: &SessionMap, ch: &ChannelState) {
         let anchor = ch.anchor.load(Ordering::Relaxed);
         if anchor == NO_ANCHOR {
             return;
@@ -658,11 +679,9 @@ impl SharedPool {
         let name = if ch.overflow_count() > 0 {
             OVERFLOW_LABEL.to_string()
         } else {
-            self.slots[anchor]
-                .name
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone()
+            sessions
+                .get(&(anchor, ch.guild_id))
+                .and_then(|s| s.name.clone())
                 .unwrap_or_default()
         };
         let _ = self.slots[anchor]
@@ -673,13 +692,15 @@ impl SharedPool {
     /// Apply the anchor's mute: forced **unmuted** while it hosts the overflow mix
     /// (so muting its own participant never silences the others), else its
     /// participant's intended mute.
-    fn reconcile_anchor_mute(&self, ch: &ChannelState) {
+    fn reconcile_anchor_mute(&self, sessions: &SessionMap, ch: &ChannelState) {
         let anchor = ch.anchor.load(Ordering::Relaxed);
         if anchor == NO_ANCHOR {
             return;
         }
-        let applied =
-            ch.overflow_count() == 0 && self.slots[anchor].muted.load(Ordering::Relaxed);
+        let applied = ch.overflow_count() == 0
+            && sessions
+                .get(&(anchor, ch.guild_id))
+                .is_some_and(|s| s.muted);
         let _ = self.slots[anchor]
             .cmd_tx
             .try_send(PuppetCommand::SetMuted(applied));
@@ -724,27 +745,27 @@ impl SharedPool {
 
         let (donor_key, _slack, (vkey, vidx, vseq)) = pick?;
         let donor = guard.channels.get_mut(&donor_key)?;
+        let donor_guild = donor.guild_id;
 
         // Demote the victim into the donor's overflow (route-swap = promotion in
-        // reverse). The Matrix side keeps pushing to the same RoutedSink.
-        let name = self.slots[vidx]
-            .name
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        // reverse). The Matrix side keeps pushing to the same RoutedSink. The
+        // victim bot's donor-guild session ends here; a fresh one is minted below
+        // under the target guild (the caller repurposes the still-claimed bot).
+        let (name, muted) = guard
+            .sessions
+            .remove(&(vidx, donor_guild))
+            .map(|s| (s.name.unwrap_or_default(), s.muted))
             .unwrap_or_default();
-        let muted = self.slots[vidx].muted.load(Ordering::Relaxed);
         donor
             .assignments
             .insert(vkey.clone(), Assign::Overflow { name, muted, seq: vseq });
         Self::route_to(&mut donor.routes, &vkey, donor.overflow_mixer.clone());
-        self.slots[vidx].mixer.clear();
-        *self.slots[vidx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        guard.sessions.insert((vidx, target_guild), PuppetSession::fresh());
 
         // The donor anchor now hosts ≥1 overflow speaker → relabel + unmute it.
         let donor_ref = &guard.channels[&donor_key];
-        self.reconcile_anchor_label(donor_ref);
-        self.reconcile_anchor_mute(donor_ref);
+        self.reconcile_anchor_label(&guard.sessions, donor_ref);
+        self.reconcile_anchor_mute(&guard.sessions, donor_ref);
 
         // Send the bot away from the donor; the caller will Assign it elsewhere.
         let _ = self.slots[vidx].cmd_tx.try_send(PuppetCommand::Release);
@@ -773,7 +794,7 @@ impl SharedPool {
             .map(|(k, ch)| (k.clone(), ch.guild_id))
             .collect();
         for (key, guild) in pending {
-            if let Some(idx) = self.take_free_bot(guild) {
+            if let Some(idx) = self.take_free_bot(guard, guild) {
                 self.activate_channel_with(guard, &key, idx);
             }
         }
@@ -811,7 +832,7 @@ impl SharedPool {
                 })
                 .min_by_key(|(_, _, seq)| *seq);
             let Some((key, guild, _)) = pick else { break };
-            let Some(idx) = self.take_free_bot(guild) else {
+            let Some(idx) = self.take_free_bot(guard, guild) else {
                 exhausted.insert(guild);
                 continue;
             };
@@ -819,7 +840,7 @@ impl SharedPool {
             // dedicated (non-anchor) puppet — mirrors the free-bot path in `assign`.
             let promoted = {
                 let Some(ch) = guard.channels.get_mut(&key) else {
-                    self.slots[idx].busy.store(false, Ordering::Relaxed);
+                    guard.sessions.remove(&(idx, guild));
                     continue;
                 };
                 let promote = ch
@@ -834,24 +855,30 @@ impl SharedPool {
                     .min_by_key(|(_, _, _, seq)| *seq);
                 let Some((pkey, pname, pmuted, pseq)) = promote else {
                     // Raced away (speaker left); return the bot and re-evaluate.
-                    self.slots[idx].busy.store(false, Ordering::Relaxed);
+                    guard.sessions.remove(&(idx, guild));
                     continue;
                 };
                 ch.overflow_mixer.remove(&pkey);
                 ch.assignments
                     .insert(pkey.clone(), Assign::Puppet { idx, seq: pseq });
-                self.slots[idx].mixer.clear();
-                Self::route_to(&mut ch.routes, &pkey, self.slots[idx].mixer.clone());
-                *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
-                    Some(pname.clone());
-                self.slots[idx].muted.store(pmuted, Ordering::Relaxed);
+                let mixer = {
+                    let sess = guard
+                        .sessions
+                        .get_mut(&(idx, guild))
+                        .expect("session inserted by take_free_bot");
+                    sess.name = Some(pname.clone());
+                    sess.muted = pmuted;
+                    sess.mixer.clone()
+                };
+                Self::route_to(&mut ch.routes, &pkey, mixer.clone());
                 tracing::info!(channel = %key, promoted = %pkey, idx, "promoted overflow speaker into freed pool bot (cross-channel)");
-                (self.ctx_for(ch), pname, pmuted)
+                (self.ctx_for(ch), pname, pmuted, mixer)
             };
-            let (ctx, name, pmuted) = promoted;
+            let (ctx, name, pmuted, mixer) = promoted;
             let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Assign {
                 ctx: Box::new(ctx),
                 display_name: name,
+                mixer,
             });
             // A fresh Assign joins unmuted; restore the speaker's mute if it was
             // muted while demoted (the join applies the nickname, not the mute).
@@ -860,8 +887,8 @@ impl SharedPool {
             }
             // Overflow count dropped → the anchor may no longer host overflow.
             let ch = &guard.channels[&key];
-            self.reconcile_anchor_label(ch);
-            self.reconcile_anchor_mute(ch);
+            self.reconcile_anchor_label(&guard.sessions, ch);
+            self.reconcile_anchor_mute(&guard.sessions, ch);
         }
     }
 
@@ -877,11 +904,12 @@ impl SharedPool {
     /// Make bot `idx` the anchor of channel `key`, promoting that channel's oldest
     /// waiting (overflow) speaker into it. Sends the bot Assign + BecomeAnchor.
     fn activate_channel_with(&self, guard: &mut AllocState, key: &str, idx: usize) {
-        let ctx = {
+        let (ctx, name, mixer) = {
             let ch = match guard.channels.get_mut(key) {
                 Some(c) => c,
                 None => return,
             };
+            let guild = ch.guild_id;
             // Oldest waiting speaker (lowest seq) becomes the anchor's participant.
             let promote = ch
                 .assignments
@@ -895,28 +923,29 @@ impl SharedPool {
                 .min_by_key(|(_, _, _, seq)| *seq);
             let Some((pkey, pname, pmuted, pseq)) = promote else {
                 // No waiting speaker after all — return the bot to the pool.
-                self.slots[idx].busy.store(false, Ordering::Relaxed);
+                guard.sessions.remove(&(idx, guild));
                 return;
             };
             ch.overflow_mixer.remove(&pkey);
-            self.slots[idx].mixer.clear();
-            Self::route_to(&mut ch.routes, &pkey, self.slots[idx].mixer.clone());
+            let mixer = {
+                let sess = guard
+                    .sessions
+                    .get_mut(&(idx, guild))
+                    .expect("session inserted by take_free_bot");
+                sess.name = Some(pname.clone());
+                sess.muted = pmuted;
+                sess.mixer.clone()
+            };
+            Self::route_to(&mut ch.routes, &pkey, mixer.clone());
             ch.assignments
                 .insert(pkey.clone(), Assign::Puppet { idx, seq: pseq });
-            *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = Some(pname);
-            self.slots[idx].muted.store(pmuted, Ordering::Relaxed);
             ch.anchor.store(idx, Ordering::Relaxed);
-            self.ctx_for(ch)
+            (self.ctx_for(ch), pname, mixer)
         };
-        let name = self.slots[idx]
-            .name
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-            .unwrap_or_default();
         let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Assign {
             ctx: Box::new(ctx),
             display_name: name,
+            mixer,
         });
         // Anchor activation is deferred to `on_join_succeeded` (sent once the bot's
         // `manager.join` actually completes), so a join timeout can fail over
@@ -924,13 +953,15 @@ impl SharedPool {
         // The promoted speaker is the anchor's own participant now; remaining
         // overflow (if any) is reconciled by the caller's normal path.
         let ch = &guard.channels[key];
-        self.reconcile_anchor_label(ch);
-        self.reconcile_anchor_mute(ch);
+        self.reconcile_anchor_label(&guard.sessions, ch);
+        self.reconcile_anchor_mute(&guard.sessions, ch);
         tracing::info!(channel = key, idx, "channel activated — anchor assigned");
     }
 
     fn assign(&self, bridge: &str, key: &str, display_name: &str) -> Arc<dyn ParticipantSink> {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        // Reborrow as `&mut AllocState` so `channels`/`sessions` split-borrow.
+        let guard = &mut *guard;
 
         // Idempotent: a re-subscribe for the same participant reuses its route.
         if let Some(ch) = guard.channels.get(bridge) {
@@ -954,7 +985,7 @@ impl SharedPool {
 
         // A Matrix participant is (re)joining → cancel any pending idle-release grace
         // on this channel's capture-only anchor.
-        Self::cancel_anchor_idle_release(&mut guard, bridge);
+        Self::cancel_anchor_idle_release(guard, bridge);
 
         // (Fix 2c) Reuse a capture-only anchor — one held in voice with no
         // participant of its own — for this participant instead of taking a fresh
@@ -974,45 +1005,58 @@ impl SharedPool {
                 let ch = guard.channels.get_mut(bridge).unwrap();
                 ch.assignments
                     .insert(key.to_owned(), Assign::Puppet { idx, seq });
-                *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
-                    Some(display_name.to_owned());
-                self.slots[idx].muted.store(false, Ordering::Relaxed);
-                self.slots[idx].mixer.clear();
-                Self::route_to(&mut ch.routes, key, self.slots[idx].mixer.clone())
+                // A live session swaps participants: KEEP its mixer (the bot's
+                // playback track reads it) — just flush the old audio.
+                let mixer = {
+                    let sess = guard
+                        .sessions
+                        .get_mut(&(idx, guild))
+                        .expect("capture-only anchor has a session");
+                    sess.name = Some(display_name.to_owned());
+                    sess.muted = false;
+                    sess.mixer.clear();
+                    sess.mixer.clone()
+                };
+                Self::route_to(&mut ch.routes, key, mixer)
             };
             let ch = &guard.channels[bridge];
-            self.reconcile_anchor_label(ch);
-            self.reconcile_anchor_mute(ch);
+            self.reconcile_anchor_label(&guard.sessions, ch);
+            self.reconcile_anchor_mute(&guard.sessions, ch);
             tracing::info!(bridge, key, display_name, idx, "assigned participant to capture-only anchor (reused, no new bot)");
             return Arc::new(RoutedSink { route, key: key.to_owned() });
         }
 
         // Try to claim a free bot (in this guild) for a dedicated puppet.
-        if let Some(idx) = self.take_free_bot(guild) {
+        if let Some(idx) = self.take_free_bot(guard, guild) {
             let ctx = {
                 let Some(ch) = guard.channels.get_mut(bridge) else {
-                    self.slots[idx].busy.store(false, Ordering::Relaxed);
+                    guard.sessions.remove(&(idx, guild));
                     return Arc::new(NullSink);
                 };
                 ch.assignments
                     .insert(key.to_owned(), Assign::Puppet { idx, seq });
-                *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
-                    Some(display_name.to_owned());
-                self.slots[idx].muted.store(false, Ordering::Relaxed);
-                self.slots[idx].mixer.clear();
-                Self::route_to(&mut ch.routes, key, self.slots[idx].mixer.clone());
+                let mixer = {
+                    let sess = guard
+                        .sessions
+                        .get_mut(&(idx, guild))
+                        .expect("session inserted by take_free_bot");
+                    sess.name = Some(display_name.to_owned());
+                    sess.mixer.clone()
+                };
+                Self::route_to(&mut ch.routes, key, mixer.clone());
                 let elect = ch.anchor.load(Ordering::Relaxed) == NO_ANCHOR;
                 if elect {
                     ch.anchor.store(idx, Ordering::Relaxed);
                 }
                 let ctx = self.ctx_for(ch);
-                (ctx, elect)
+                (ctx, elect, mixer)
             };
-            let (ctx, elect) = ctx;
+            let (ctx, elect, mixer) = ctx;
             let route = guard.channels[bridge].routes[key].clone();
             let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Assign {
                 ctx: Box::new(ctx),
                 display_name: display_name.to_owned(),
+                mixer,
             });
             tracing::info!(bridge, key, display_name, idx, "assigned participant to puppet");
             if elect {
@@ -1032,28 +1076,34 @@ impl SharedPool {
             .unwrap_or(false);
 
         if !has_anchor {
-            if let Some(idx) = self.steal_for_activation(&mut guard, bridge, guild) {
-                // Bot freed from a donor (Release already sent). Assign it here as
-                // the anchor for this participant.
-                let ctx = {
+            if let Some(idx) = self.steal_for_activation(guard, bridge, guild) {
+                // Bot freed from a donor (Release already sent; the steal minted a
+                // fresh session for it under THIS guild). Assign it here as the
+                // anchor for this participant.
+                let (ctx, mixer) = {
                     let Some(ch) = guard.channels.get_mut(bridge) else {
-                        self.slots[idx].busy.store(false, Ordering::Relaxed);
+                        guard.sessions.remove(&(idx, guild));
                         return Arc::new(NullSink);
                     };
                     ch.assignments
                         .insert(key.to_owned(), Assign::Puppet { idx, seq });
-                    *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
-                        Some(display_name.to_owned());
-                    self.slots[idx].muted.store(false, Ordering::Relaxed);
-                    self.slots[idx].mixer.clear();
-                    Self::route_to(&mut ch.routes, key, self.slots[idx].mixer.clone());
+                    let mixer = {
+                        let sess = guard
+                            .sessions
+                            .get_mut(&(idx, guild))
+                            .expect("session inserted by steal_for_activation");
+                        sess.name = Some(display_name.to_owned());
+                        sess.mixer.clone()
+                    };
+                    Self::route_to(&mut ch.routes, key, mixer.clone());
                     ch.anchor.store(idx, Ordering::Relaxed);
-                    self.ctx_for(ch)
+                    (self.ctx_for(ch), mixer)
                 };
                 let route = guard.channels[bridge].routes[key].clone();
                 let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Assign {
                     ctx: Box::new(ctx),
                     display_name: display_name.to_owned(),
+                    mixer,
                 });
                 // `BecomeAnchor` deferred to `on_join_succeeded` (see assign above).
                 tracing::info!(bridge, key, idx, "stole bot to activate channel anchor");
@@ -1086,8 +1136,8 @@ impl SharedPool {
         tracing::info!(bridge, key, display_name, "overflow to anchor mix");
         if !was_overflowing {
             let ch = &guard.channels[bridge];
-            self.reconcile_anchor_label(ch);
-            self.reconcile_anchor_mute(ch);
+            self.reconcile_anchor_label(&guard.sessions, ch);
+            self.reconcile_anchor_mute(&guard.sessions, ch);
         }
         Arc::new(RoutedSink { route, key: key.to_owned() })
     }
@@ -1126,6 +1176,7 @@ impl SharedPool {
     /// before scheduling a recovery (`recover_bot`).
     fn on_join_failed(&self, idx: usize) -> Duration {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = &mut *guard;
 
         // Quarantine the stuck bot regardless (cleared after the backoff cooldown).
         self.slots[idx].unhealthy.store(true, Ordering::Relaxed);
@@ -1145,19 +1196,11 @@ impl SharedPool {
         });
         let Some((bridge, key)) = found else {
             // Participant already left during the join — just free the bot.
-            self.slots[idx].mixer.clear();
-            self.slots[idx].busy.store(false, Ordering::Relaxed);
-            *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            guard.sessions.retain(|(i, _), _| *i != idx);
             tracing::warn!(idx, "puppet join failed; assignment already gone — quarantined");
             return backoff;
         };
 
-        let display_name = self.slots[idx]
-            .name
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-            .unwrap_or_default();
         let (guild, was_anchor) = {
             let ch = &guard.channels[&bridge];
             (ch.guild_id, ch.anchor.load(Ordering::Relaxed) == idx)
@@ -1165,9 +1208,11 @@ impl SharedPool {
 
         // Free the stuck bot (its route entry is kept — we re-point it below) and
         // tell it to leave voice so its songbird Call is reset.
-        self.slots[idx].mixer.clear();
-        self.slots[idx].busy.store(false, Ordering::Relaxed);
-        *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        let display_name = guard
+            .sessions
+            .remove(&(idx, guild))
+            .and_then(|s| s.name)
+            .unwrap_or_default();
         let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Release);
         if was_anchor {
             guard
@@ -1185,24 +1230,29 @@ impl SharedPool {
         };
 
         // Fail over to a healthy free bot in the same guild.
-        if let Some(new_idx) = self.take_free_bot(guild) {
-            let ctx = {
+        if let Some(new_idx) = self.take_free_bot(guard, guild) {
+            let (ctx, mixer) = {
                 let ch = guard.channels.get_mut(&bridge).unwrap();
                 ch.assignments
                     .insert(key.clone(), Assign::Puppet { idx: new_idx, seq });
-                *self.slots[new_idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
-                    Some(display_name.clone());
-                self.slots[new_idx].muted.store(false, Ordering::Relaxed);
-                self.slots[new_idx].mixer.clear();
-                Self::route_to(&mut ch.routes, &key, self.slots[new_idx].mixer.clone());
+                let mixer = {
+                    let sess = guard
+                        .sessions
+                        .get_mut(&(new_idx, guild))
+                        .expect("session inserted by take_free_bot");
+                    sess.name = Some(display_name.clone());
+                    sess.mixer.clone()
+                };
+                Self::route_to(&mut ch.routes, &key, mixer.clone());
                 if was_anchor {
                     ch.anchor.store(new_idx, Ordering::Relaxed);
                 }
-                self.ctx_for(ch)
+                (self.ctx_for(ch), mixer)
             };
             let _ = self.slots[new_idx].cmd_tx.try_send(PuppetCommand::Assign {
                 ctx: Box::new(ctx),
                 display_name,
+                mixer,
             });
             // BecomeAnchor (if new_idx is the anchor) is deferred to its own
             // on_join_succeeded — same as the normal assign paths.
@@ -1218,9 +1268,9 @@ impl SharedPool {
             );
             Self::route_to(&mut ch.routes, &key, ch.overflow_mixer.clone());
             let ch = &guard.channels[&bridge];
-            self.reconcile_anchor_label(ch);
-            self.reconcile_anchor_mute(ch);
-            self.rebalance(&mut guard);
+            self.reconcile_anchor_label(&guard.sessions, ch);
+            self.reconcile_anchor_mute(&guard.sessions, ch);
+            self.rebalance(guard);
             tracing::error!(
                 bridge = %bridge,
                 key = %key,
@@ -1243,16 +1293,16 @@ impl SharedPool {
 
     /// Decide whether an unexpected voice disconnect for `idx` warrants a rejoin,
     /// and claim the recovery latch if so. Returns `true` (and sets `recovering`)
-    /// only when the allocator still believes this bot is live (`busy`), it is not
-    /// already quarantined (`unhealthy`), and no recovery is already in flight.
-    /// A deliberate leave sets `busy=false` *before* `manager.remove` fires its
-    /// `DriverDisconnect`, so that path returns `false` here — no spurious rejoin.
-    /// Caller MUST pair a `true` with exactly one [`finish_recovery`] (directly or
-    /// via the rejoin path / `on_join_succeeded`).
+    /// only when the allocator still believes this bot is live (it has a session),
+    /// it is not already quarantined (`unhealthy`), and no recovery is already in
+    /// flight. A deliberate leave removes the session *before* `manager.remove`
+    /// fires its `DriverDisconnect`, so that path returns `false` here — no
+    /// spurious rejoin. Caller MUST pair a `true` with exactly one
+    /// [`finish_recovery`] (directly or via the rejoin path / `on_join_succeeded`).
     fn should_recover_disconnect(&self, idx: usize) -> bool {
-        // Serialize against the allocator's own busy/anchor mutations.
-        let _guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
-        if !self.slots[idx].busy.load(Ordering::Relaxed)
+        // Serialize against the allocator's own session/anchor mutations.
+        let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        if !guard.sessions.keys().any(|(i, _)| *i == idx)
             || self.slots[idx].unhealthy.load(Ordering::Relaxed)
         {
             return false;
@@ -1271,8 +1321,9 @@ impl SharedPool {
     /// `Call`). A backstop for a silent connection death that fired no
     /// `DriverDisconnect`. Skips bots already quarantined or mid-recovery.
     fn sweep_voice_health(&self) {
-        for slot in &self.slots {
-            if slot.busy.load(Ordering::Relaxed)
+        let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        for (i, slot) in self.slots.iter().enumerate() {
+            if guard.sessions.keys().any(|(idx, _)| *idx == i)
                 && !slot.unhealthy.load(Ordering::Relaxed)
                 && !slot.recovering.load(Ordering::Relaxed)
             {
@@ -1283,14 +1334,18 @@ impl SharedPool {
 
     fn set_muted(&self, bridge: &str, key: &str, muted: bool) {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = &mut *guard;
         let Some(ch) = guard.channels.get_mut(bridge) else { return };
+        let guild = ch.guild_id;
         match ch.assignments.get_mut(key) {
             Some(Assign::Puppet { idx, .. }) => {
                 let idx = *idx;
-                self.slots[idx].muted.store(muted, Ordering::Relaxed);
+                if let Some(sess) = guard.sessions.get_mut(&(idx, guild)) {
+                    sess.muted = muted;
+                }
                 if idx == ch.anchor.load(Ordering::Relaxed) {
                     let ch = &guard.channels[bridge];
-                    self.reconcile_anchor_mute(ch);
+                    self.reconcile_anchor_mute(&guard.sessions, ch);
                 } else {
                     let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetMuted(muted));
                 }
@@ -1302,9 +1357,10 @@ impl SharedPool {
 
     fn release(self: &Arc<Self>, bridge: &str, key: &str) {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = &mut *guard;
         // Remove the assignment; act on what it was.
-        let removed = match guard.channels.get_mut(bridge) {
-            Some(ch) => ch.assignments.remove(key),
+        let (removed, guild) = match guard.channels.get_mut(bridge) {
+            Some(ch) => (ch.assignments.remove(key), ch.guild_id),
             None => return,
         };
         match removed {
@@ -1332,11 +1388,19 @@ impl SharedPool {
                         ch.assignments
                             .insert(yk.clone(), Assign::Puppet { idx, seq: yseq });
                         ch.overflow_mixer.remove(&yk);
-                        self.slots[idx].mixer.clear();
-                        Self::route_to(&mut ch.routes, &yk, self.slots[idx].mixer.clone());
-                        *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
-                            Some(yname.clone());
-                        self.slots[idx].muted.store(ymuted, Ordering::Relaxed);
+                        // The bot's session stays live (it remains in voice); the
+                        // participant swaps → keep the mixer, flush the old audio.
+                        let mixer = {
+                            let sess = guard
+                                .sessions
+                                .get_mut(&(idx, guild))
+                                .expect("promoted-into bot has a live session");
+                            sess.name = Some(yname.clone());
+                            sess.muted = ymuted;
+                            sess.mixer.clear();
+                            sess.mixer.clone()
+                        };
+                        Self::route_to(&mut ch.routes, &yk, mixer);
                         let is_anchor = idx == ch.anchor.load(Ordering::Relaxed);
                         let overflow_cleared = ch.overflow_count() == 0;
                         tracing::info!(bridge, key, promoted = %yk, idx, "promoted overflow speaker into freed slot");
@@ -1346,8 +1410,8 @@ impl SharedPool {
                         }
                         if overflow_cleared {
                             let ch = &guard.channels[bridge];
-                            self.reconcile_anchor_label(ch);
-                            self.reconcile_anchor_mute(ch);
+                            self.reconcile_anchor_label(&guard.sessions, ch);
+                            self.reconcile_anchor_mute(&guard.sessions, ch);
                         }
                     }
                     None => {
@@ -1372,34 +1436,35 @@ impl SharedPool {
                                 })
                                 .min_by_key(|(_, _, seq)| *seq);
                             if let Some((vkey, vidx, vseq)) = victim {
-                                let vname = self.slots[vidx]
-                                    .name
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .clone()
+                                // Free the now-spare bot's session; its participant
+                                // moves onto the anchor's (live) session.
+                                let (vname, vmuted) = guard
+                                    .sessions
+                                    .remove(&(vidx, guild))
+                                    .map(|s| (s.name.unwrap_or_default(), s.muted))
                                     .unwrap_or_default();
-                                let vmuted = self.slots[vidx].muted.load(Ordering::Relaxed);
                                 {
                                     let ch = guard.channels.get_mut(bridge).unwrap();
                                     ch.assignments
                                         .insert(vkey.clone(), Assign::Puppet { idx, seq: vseq });
-                                    self.slots[idx].mixer.clear();
-                                    Self::route_to(&mut ch.routes, &vkey, self.slots[idx].mixer.clone());
-                                    *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) =
-                                        Some(vname);
-                                    self.slots[idx].muted.store(vmuted, Ordering::Relaxed);
+                                    let mixer = {
+                                        let sess = guard
+                                            .sessions
+                                            .get_mut(&(idx, guild))
+                                            .expect("anchor has a live session");
+                                        sess.name = Some(vname);
+                                        sess.muted = vmuted;
+                                        sess.mixer.clear();
+                                        sess.mixer.clone()
+                                    };
+                                    Self::route_to(&mut ch.routes, &vkey, mixer);
                                 }
-                                // Free the now-spare bot.
-                                self.slots[vidx].mixer.clear();
-                                self.slots[vidx].busy.store(false, Ordering::Relaxed);
-                                *self.slots[vidx].name.lock().unwrap_or_else(PoisonError::into_inner) =
-                                    None;
                                 let _ = self.slots[vidx].cmd_tx.try_send(PuppetCommand::Release);
                                 let ch = &guard.channels[bridge];
-                                self.reconcile_anchor_label(ch);
-                                self.reconcile_anchor_mute(ch);
+                                self.reconcile_anchor_label(&guard.sessions, ch);
+                                self.reconcile_anchor_mute(&guard.sessions, ch);
                                 tracing::info!(bridge, moved = %vkey, freed = vidx, onto_anchor = idx, "consolidated participant onto capture anchor; freed spare bot");
-                                self.rebalance(&mut guard);
+                                self.rebalance(guard);
                                 return;
                             }
                         }
@@ -1418,20 +1483,21 @@ impl SharedPool {
                             .unwrap_or_else(PoisonError::into_inner)
                             .is_empty();
                         if is_anchor && speakers_present {
-                            // Drop only its playback identity; keep busy + anchor so
-                            // it stays un-allocatable and still the elected anchor.
-                            self.slots[idx].mixer.clear();
-                            *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                            // Drop only its playback identity; keep the session +
+                            // anchor so it stays un-allocatable and still the
+                            // elected anchor.
+                            if let Some(sess) = guard.sessions.get_mut(&(idx, guild)) {
+                                sess.mixer.clear();
+                                sess.name = None;
+                            }
                             let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetNickname(String::new()));
                             let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::SetMuted(false));
                             tracing::info!(bridge, key, idx, "last puppet released but Discord speakers remain — keeping capture-only anchor (grace before release)");
-                            self.schedule_anchor_idle_release(&mut guard, bridge);
+                            self.schedule_anchor_idle_release(guard, bridge);
                             return;
                         }
                         // No overflow waiting, no capture need → free the bot.
-                        self.slots[idx].mixer.clear();
-                        self.slots[idx].busy.store(false, Ordering::Relaxed);
-                        *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                        guard.sessions.remove(&(idx, guild));
                         let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Release);
                         tracing::info!(bridge, key, idx, "released puppet");
                         // Hand the anchor off to another puppet in this channel.
@@ -1456,7 +1522,7 @@ impl SharedPool {
                             }
                         }
                         // A freed bot can activate a channel waiting for an anchor.
-                        self.rebalance(&mut guard);
+                        self.rebalance(guard);
                     }
                 }
             }
@@ -1467,8 +1533,8 @@ impl SharedPool {
                 tracing::info!(bridge, key, "released overflow participant");
                 if ch.overflow_count() == 0 {
                     let ch = &guard.channels[bridge];
-                    self.reconcile_anchor_label(ch);
-                    self.reconcile_anchor_mute(ch);
+                    self.reconcile_anchor_label(&guard.sessions, ch);
+                    self.reconcile_anchor_mute(&guard.sessions, ch);
                 }
             }
             None => {}
@@ -1477,15 +1543,15 @@ impl SharedPool {
 
     fn release_all(&self, bridge: &str) {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = &mut *guard;
         {
             let Some(ch) = guard.channels.get_mut(bridge) else { return };
+            let guild = ch.guild_id;
             let anchor = ch.anchor.load(Ordering::Relaxed);
             let mut anchor_freed = false;
             for (_key, assign) in ch.assignments.drain() {
                 if let Assign::Puppet { idx, .. } = assign {
-                    self.slots[idx].mixer.clear();
-                    self.slots[idx].busy.store(false, Ordering::Relaxed);
-                    *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                    guard.sessions.remove(&(idx, guild));
                     let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Release);
                     if idx == anchor {
                         anchor_freed = true;
@@ -1496,9 +1562,7 @@ impl SharedPool {
             // drain above won't free it — release it explicitly so teardown returns
             // to baseline (Phase 9 guarantee).
             if anchor != NO_ANCHOR && !anchor_freed {
-                self.slots[anchor].mixer.clear();
-                self.slots[anchor].busy.store(false, Ordering::Relaxed);
-                *self.slots[anchor].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                guard.sessions.remove(&(anchor, guild));
                 let _ = self.slots[anchor].cmd_tx.try_send(PuppetCommand::Release);
             }
             ch.routes.clear();
@@ -1506,7 +1570,7 @@ impl SharedPool {
             ch.overflow_mixer.clear();
         }
         // The bots just freed can activate channels waiting for an anchor.
-        self.rebalance(&mut guard);
+        self.rebalance(guard);
     }
 
     /// Release a capture-only-held anchor once its channel is idle on BOTH sides:
@@ -1515,7 +1579,7 @@ impl SharedPool {
     /// anchor or either side is still active.
     fn maybe_release_idle_anchor(&self, bridge: &str) {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
-        let idx = {
+        let (idx, guild) = {
             let Some(ch) = guard.channels.get(bridge) else { return };
             let anchor = ch.anchor.load(Ordering::Relaxed);
             if anchor == NO_ANCHOR {
@@ -1529,11 +1593,9 @@ impl SharedPool {
             if has_puppet || speakers {
                 return; // still in use on one side — keep the anchor
             }
-            anchor
+            (anchor, ch.guild_id)
         };
-        self.slots[idx].mixer.clear();
-        self.slots[idx].busy.store(false, Ordering::Relaxed);
-        *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        guard.sessions.remove(&(idx, guild));
         let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Release);
         {
             let ch = guard.channels.get_mut(bridge).unwrap();
@@ -1582,7 +1644,7 @@ impl SharedPool {
     /// anchor in the meantime (then it serves someone and must stay).
     fn release_capture_only_anchor_if_idle(&self, bridge: &str) {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
-        let idx = {
+        let (idx, guild) = {
             let Some(ch) = guard.channels.get(bridge) else { return };
             let anchor = ch.anchor.load(Ordering::Relaxed);
             if anchor == NO_ANCHOR {
@@ -1595,11 +1657,9 @@ impl SharedPool {
             if any_puppet {
                 return; // a Matrix participant is present — keep the capture path
             }
-            anchor
+            (anchor, ch.guild_id)
         };
-        self.slots[idx].mixer.clear();
-        self.slots[idx].busy.store(false, Ordering::Relaxed);
-        *self.slots[idx].name.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        guard.sessions.remove(&(idx, guild));
         let _ = self.slots[idx].cmd_tx.try_send(PuppetCommand::Release);
         {
             let ch = guard.channels.get_mut(bridge).unwrap();
@@ -1634,6 +1694,24 @@ impl SharedPool {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&guild);
+    }
+
+    /// Whether bot `idx` currently holds any session (i.e. is allocated somewhere).
+    fn bot_has_session(&self, idx: usize) -> bool {
+        let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.sessions.keys().any(|(i, _)| *i == idx)
+    }
+
+    /// Display name of the participant bot `idx` voices in `guild` (empty if none —
+    /// e.g. a capture-only anchor). Used by the rejoin path, which runs in the
+    /// bot's command loop and has no live reference into the alloc state.
+    fn session_display_name(&self, idx: usize, guild: GuildId) -> String {
+        let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .sessions
+            .get(&(idx, guild))
+            .and_then(|s| s.name.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -1718,8 +1796,6 @@ impl EventHandler for PuppetHandler {
         tokio::spawn(puppet_command_loop(
             ctx,
             self.idx,
-            slot.mixer.clone(),
-            slot.current_ssrc.clone(),
             self.pool.nickname_prefix.clone(),
             self.pool.clone(),
             rx,
@@ -1793,7 +1869,7 @@ impl EventHandler for PuppetHandler {
                     .set_muted(&user_id.to_string(), vs.self_mute || vs.mute);
             }
         }
-        if self.pool.slots[self.idx].busy.load(Ordering::Relaxed) {
+        if self.pool.bot_has_session(self.idx) {
             return;
         }
         if let Err(e) = guild.id.edit_nickname(&ctx.http, None).await {
@@ -1932,19 +2008,31 @@ fn member_avatar_url(m: &Member) -> Option<String> {
     m.avatar_url().or_else(|| m.user.avatar_url())
 }
 
+/// A bot's live voice engagement as seen by its command loop: the channel
+/// context plus this session's playback mixer and connection SSRC. Proto
+/// per-guild session — #46's multiplexing step turns the loop's single
+/// `Option<GuildConn>` into a `HashMap<GuildId, GuildConn>`.
+#[derive(Clone)]
+struct GuildConn {
+    chan: ChannelCtx,
+    /// The session's playback buffer (received with the `Assign`).
+    mixer: Arc<PlaybackMixer>,
+    /// This connection's own SSRC (registered into the channel's exclude set on
+    /// `DriverConnect`; removed again on leave/rejoin). Minted fresh per `Assign`.
+    current_ssrc: Arc<StdMutex<Option<u32>>>,
+}
+
 /// Drain commands for one puppet, driving its voice connection. The loop is
 /// channel-agnostic: each `Assign` carries the channel context, which the loop
 /// remembers (`current`) for subsequent commands and shutdown.
 async fn puppet_command_loop(
     ctx: Context,
     idx: usize,
-    mixer: Arc<PlaybackMixer>,
-    current_ssrc: Arc<StdMutex<Option<u32>>>,
     nickname_prefix: Arc<str>,
     pool: Arc<SharedPool>,
     mut cmd_rx: mpsc::Receiver<PuppetCommand>,
 ) {
-    let mut current: Option<ChannelCtx> = None;
+    let mut current: Option<GuildConn> = None;
     // Per-track speaking gates (see `spawn_speaking_gate`). The puppet gate covers
     // this bot's own dedicated track; the overflow gate covers the channel overflow
     // mix it plays *while it is the anchor*. Cancelled on Release / re-Assign so each
@@ -1961,13 +2049,16 @@ async fn puppet_command_loop(
     let mut epoch: u64 = 0;
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
-            PuppetCommand::Assign { ctx: chan, display_name } => {
+            PuppetCommand::Assign { ctx: chan, display_name, mixer } => {
                 let chan = *chan;
                 // A reused bot starts a fresh track; drop any prior gates first. It is
                 // also no longer anchoring whatever it anchored before.
                 cancel_gate(&mut puppet_gate);
                 cancel_gate(&mut overflow_gate);
                 epoch += 1;
+                // Fresh per engagement: each voice connection has its own SSRC (a
+                // prior channel's entry was already removed by its Release).
+                let current_ssrc = Arc::new(StdMutex::new(None));
                 let handle = puppet_join(
                     &chan,
                     idx,
@@ -1981,10 +2072,11 @@ async fn puppet_command_loop(
                 )
                 .await;
                 let bridge = chan.bridge.clone();
-                current = Some(chan);
+                let gate_mixer = mixer.clone();
+                current = Some(GuildConn { chan, mixer, current_ssrc });
                 if let Some(handle) = handle {
                     let tok = CancellationToken::new();
-                    let jh = spawn_speaking_gate(handle, mixer.clone(), tok.clone(), bridge, "puppet");
+                    let jh = spawn_speaking_gate(handle, gate_mixer, tok.clone(), bridge, "puppet");
                     puppet_gate = Some((tok, jh));
                     // Activate this bot as anchor iff the allocator elected it.
                     pool.on_join_succeeded(idx);
@@ -2000,16 +2092,16 @@ async fn puppet_command_loop(
                 }
             }
             PuppetCommand::BecomeAnchor => {
-                if let Some(chan) = &current {
+                if let Some(conn) = &current {
                     // Idempotent: drop any prior overflow gate before (re)anchoring.
                     cancel_gate(&mut overflow_gate);
-                    if let Some(handle) = puppet_become_anchor(chan, idx, &ctx).await {
+                    if let Some(handle) = puppet_become_anchor(&conn.chan, idx, &ctx).await {
                         let tok = CancellationToken::new();
                         let jh = spawn_speaking_gate(
                             handle,
-                            chan.overflow_mixer.clone(),
+                            conn.chan.overflow_mixer.clone(),
                             tok.clone(),
-                            chan.bridge.clone(),
+                            conn.chan.bridge.clone(),
                             "overflow",
                         );
                         overflow_gate = Some((tok, jh));
@@ -2019,14 +2111,14 @@ async fn puppet_command_loop(
                 }
             }
             PuppetCommand::SetMuted(muted) => {
-                if let Some(chan) = &current {
-                    puppet_set_muted(&ctx, idx, chan.guild_id, muted).await;
+                if let Some(conn) = &current {
+                    puppet_set_muted(&ctx, idx, conn.chan.guild_id, muted).await;
                 }
             }
             PuppetCommand::SetNickname(name) => {
-                if let Some(chan) = &current {
+                if let Some(conn) = &current {
                     let nick = build_nickname(&nickname_prefix, &name);
-                    if let Err(e) = chan.guild_id.edit_nickname(&ctx.http, Some(nick.as_str())).await {
+                    if let Err(e) = conn.chan.guild_id.edit_nickname(&ctx.http, Some(nick.as_str())).await {
                         tracing::warn!(idx, error = %e, "failed to relabel puppet nickname");
                     } else {
                         tracing::info!(idx, nick = %nick, "puppet relabeled");
@@ -2036,15 +2128,15 @@ async fn puppet_command_loop(
             PuppetCommand::Release => {
                 cancel_gate(&mut puppet_gate);
                 cancel_gate(&mut overflow_gate);
-                if let Some(chan) = current.take() {
-                    puppet_leave(&ctx, idx, &chan, &current_ssrc).await;
+                if let Some(conn) = current.take() {
+                    puppet_leave(&ctx, idx, &conn.chan, &conn.current_ssrc).await;
                 }
             }
             PuppetCommand::ReleaseAndAck { done } => {
                 cancel_gate(&mut puppet_gate);
                 cancel_gate(&mut overflow_gate);
-                if let Some(chan) = current.take() {
-                    puppet_leave(&ctx, idx, &chan, &current_ssrc).await;
+                if let Some(conn) = current.take() {
+                    puppet_leave(&ctx, idx, &conn.chan, &conn.current_ssrc).await;
                 }
                 let _ = done.send(());
             }
@@ -2061,8 +2153,8 @@ async fn puppet_command_loop(
                     PuppetCommand::VerifyConnected => {
                         pool.should_recover_disconnect(idx)
                             && match &current {
-                                Some(chan) => {
-                                    let gone = voice_channel_gone(&ctx, chan.guild_id).await;
+                                Some(conn) => {
+                                    let gone = voice_channel_gone(&ctx, conn.chan.guild_id).await;
                                     if !gone {
                                         pool.finish_recovery(idx);
                                     }
@@ -2077,22 +2169,29 @@ async fn puppet_command_loop(
                     _ => unreachable!(),
                 };
                 if proceed {
-                    if let Some(chan) = current.clone() {
+                    if let Some(conn) = current.clone() {
                         tracing::warn!(idx, "puppet voice dropped unexpectedly — recovering (rejoin)");
                         cancel_gate(&mut puppet_gate);
                         cancel_gate(&mut overflow_gate);
                         epoch += 1;
                         let handle = rejoin_puppet(
-                            &ctx, idx, &mixer, &current_ssrc, &nickname_prefix, &pool, &chan, epoch,
+                            &ctx,
+                            idx,
+                            &conn.mixer,
+                            &conn.current_ssrc,
+                            &nickname_prefix,
+                            &pool,
+                            &conn.chan,
+                            epoch,
                         )
                         .await;
                         if let Some(handle) = handle {
                             let tok = CancellationToken::new();
                             let jh = spawn_speaking_gate(
                                 handle,
-                                mixer.clone(),
+                                conn.mixer.clone(),
                                 tok.clone(),
-                                chan.bridge.clone(),
+                                conn.chan.bridge.clone(),
                                 "puppet",
                             );
                             puppet_gate = Some((tok, jh));
@@ -2371,12 +2470,7 @@ async fn rejoin_puppet(
     if let Some(s) = stale_ssrc {
         chan.exclude.write().unwrap_or_else(PoisonError::into_inner).remove(&s);
     }
-    let display_name = pool.slots[idx]
-        .name
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
-        .unwrap_or_default();
+    let display_name = pool.session_display_name(idx, chan.guild_id);
     let handle = puppet_join(
         chan,
         idx,
@@ -2507,16 +2601,24 @@ impl SharedPool {
         (a != NO_ANCHOR).then_some(a)
     }
     fn test_free_count(&self) -> usize {
-        self.slots.iter().filter(|s| !s.busy.load(Ordering::Relaxed)).count()
+        let g = self.alloc.lock().unwrap();
+        (0..self.slots.len())
+            .filter(|i| !g.sessions.keys().any(|(idx, _)| idx == i))
+            .count()
     }
     fn test_is_unhealthy(&self, idx: usize) -> bool {
         self.slots[idx].unhealthy.load(Ordering::Relaxed)
     }
     fn test_is_busy(&self, idx: usize) -> bool {
-        self.slots[idx].busy.load(Ordering::Relaxed)
+        self.alloc.lock().unwrap().sessions.keys().any(|(i, _)| *i == idx)
     }
     fn test_is_recovering(&self, idx: usize) -> bool {
         self.slots[idx].recovering.load(Ordering::Relaxed)
+    }
+    /// The session mixer for `(idx, guild)`, if that session exists.
+    fn test_session_mixer(&self, idx: usize, guild: u64) -> Option<Arc<PlaybackMixer>> {
+        let g = self.alloc.lock().unwrap();
+        g.sessions.get(&(idx, GuildId::new(guild))).map(|s| s.mixer.clone())
     }
 }
 
@@ -2927,6 +3029,24 @@ mod tests {
         p.assign("A", "dave", "Dave");
         assert_eq!(p.test_slot_of("A", "dave"), Some(anchor), "dave reused the anchor bot");
         assert_eq!(p.test_free_count(), 1, "the spare bot stayed free (no fresh allocation)");
+    }
+
+    #[test]
+    fn reclaimed_bot_gets_a_fresh_session_mixer() {
+        // A released bot's session (and its mixer) is dropped; a later claim mints
+        // a fresh session with a NEW mixer, so a reclaimed bot can never replay a
+        // previous participant's buffered audio.
+        let p = pool(1);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        let idx = p.test_slot_of("A", "alice").unwrap();
+        let first = p.test_session_mixer(idx, 1).expect("live session has a mixer");
+        p.release("A", "alice");
+        assert!(p.test_session_mixer(idx, 1).is_none(), "session gone after release");
+        p.assign("A", "bob", "Bob");
+        assert_eq!(p.test_slot_of("A", "bob"), Some(idx));
+        let second = p.test_session_mixer(idx, 1).expect("new session has a mixer");
+        assert!(!Arc::ptr_eq(&first, &second), "fresh mixer per session");
     }
 
     #[test]
