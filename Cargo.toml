@@ -80,3 +80,13 @@ nvb-config = { path = "crates/config" }
 nvb-audio = { path = "crates/audio" }
 nvb-discord = { path = "crates/discord" }
 nvb-matrix-rtc = { path = "crates/matrix-rtc" }
+
+# songbird 0.6.0 + the DAVE-supplemental-trailer decode fix (#36): upstream
+# feeds the 12-16 trailing non-audio bytes of every DAVE-decrypted packet to
+# the opus decoder, silently corrupting CELT/hybrid frames ("robotic"
+# speakers). Vendored + patched until fixed upstream (no songbird release
+# past 0.6.0 exists yet). Patch: StoredPacket carries the corrected payload
+# tail so the decode slice excludes the DAVE trailer (udp_rx/{mod,
+# playout_buffer,ssrc_state}.rs).
+[patch.crates-io]
+songbird = { path = "vendor/songbird" }
