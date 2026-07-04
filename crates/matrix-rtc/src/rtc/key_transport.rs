@@ -110,6 +110,15 @@ pub(crate) trait KeyTransport: Send + Sync {
 
     /// Short label for logs ("plaintext" / "olm").
     fn kind(&self) -> &'static str;
+
+    /// Rotate the transport's outbound crypto sessions (#52) so the next send
+    /// re-establishes them from fresh one-time keys — the send-only self-heal for a
+    /// recipient whose inbound session died (undetectable from `delivered`). Returns
+    /// whether a rotation actually happened; transports without sessions (plaintext)
+    /// are a no-op.
+    async fn rotate_sessions(&self, _reason: &'static str) -> bool {
+        false
+    }
 }
 
 // ── Path 2: plaintext to-device (masqueraded raw CS-API) ────────────────────────
@@ -241,7 +250,19 @@ impl KeyTransport for PlaintextTransport {
 /// One [`GhostCrypto`] is reused across a ghost's rejoins via [`GhostCryptoCache`];
 /// see that alias for why the crypto device must stay stable within a process run.
 pub(crate) struct GhostCrypto {
-    machine: OlmMachine,
+    /// The Olm engine. Behind a `RwLock` solely so [`Self::rotate_sessions`] (#52)
+    /// can swap in a rebuilt machine; every path that touches it already serializes
+    /// on `req_lock`, so readers never contend.
+    machine: tokio::sync::RwLock<OlmMachine>,
+    user_id: OwnedUserId,
+    /// The stable crypto device id this engine logged in as. The access token is
+    /// bound to it, so a rotation must rebuild with this exact id.
+    crypto_device_id: String,
+    /// The account pickle the machine was built from, serialized at bootstrap.
+    /// Rotation (#52) rebuilds from this in-memory copy rather than re-reading the
+    /// identity blob: the async #53 prune task may rewrite the blob concurrently
+    /// (`std::fs::write` is not atomic), and store-less ghosts have no blob at all.
+    account_pickle_json: String,
     /// Shared reqwest pool (cloned from the ghost config) — opens no new connection
     /// pool per ghost, so crypto FD cost stays independent of ghost count.
     http: reqwest::Client,
@@ -351,6 +372,9 @@ impl GhostCrypto {
         .await
         .context("ghost crypto appservice login")?;
 
+        let account_pickle_json = serde_json::to_string(&account.pickle())
+            .context("serializing ghost account pickle for rotation")?;
+
         // Inject the persisted account into a fresh in-memory `MemoryStore` (zero FDs —
         // keeps #44's property). The `custom_account` is accepted because a MemoryStore
         // starts empty; the stable identity keys make peers keep their session across
@@ -365,7 +389,10 @@ impl GhostCrypto {
         .context("building ghost OlmMachine with persisted account")?;
 
         let me = Self {
-            machine,
+            machine: tokio::sync::RwLock::new(machine),
+            user_id,
+            crypto_device_id: crypto_device_id.clone(),
+            account_pickle_json,
             http,
             homeserver_url: homeserver_url.to_owned(),
             access_token,
@@ -377,7 +404,8 @@ impl GhostCrypto {
         // so we just send what the machine yields.
         {
             let _g = me.req_lock.lock().await;
-            me.drain_outgoing().await.context("ghost crypto initial key upload")?;
+            let machine = me.machine.read().await;
+            me.drain_outgoing(&machine).await.context("ghost crypto initial key upload")?;
         }
         tracing::info!(
             crypto_device_id,
@@ -425,6 +453,55 @@ impl GhostCrypto {
         Ok(me)
     }
 
+    /// Rotate this ghost's outbound Olm sessions (#52): rebuild the machine from the
+    /// bootstrap account pickle with a fresh `MemoryStore`, dropping every established
+    /// session so the next send claims fresh one-time keys — exactly what a process
+    /// restart does, which is the proven remedy for a listener-side dead inbound
+    /// session (`delivered=1` cannot detect one, and a send-only ghost never receives
+    /// the listener's `m.dummy` recovery). Device id and identity keys are unchanged,
+    /// so peers see the same device (no `SigningKeyChanged`) and the re-uploaded
+    /// device keys are byte-identical (idempotent server-side).
+    ///
+    /// Fail-open: on any error the existing machine (working-but-possibly-wedged
+    /// sessions) is kept and `false` is returned; the caller just retries later.
+    pub(crate) async fn rotate_sessions(&self, reason: &'static str) -> bool {
+        let _g = self.req_lock.lock().await;
+        let pickle: AccountPickle = match serde_json::from_str(&self.account_pickle_json) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, reason, "session rotation skipped: account pickle unreadable");
+                return false;
+            }
+        };
+        let machine = match OlmMachine::with_store(
+            &self.user_id,
+            self.crypto_device_id.as_str().into(),
+            MemoryStore::new(),
+            Some(Account::from_pickle(pickle)),
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, reason, "session rotation failed: machine rebuild (keeping existing sessions)");
+                return false;
+            }
+        };
+        // Re-upload (identical) device keys + fresh OTKs on the new machine BEFORE
+        // swapping, so a failed upload keeps the old machine fully intact.
+        if let Err(e) = self.drain_outgoing(&machine).await {
+            tracing::warn!(error = %e, reason, "session rotation failed: key upload (keeping existing sessions)");
+            return false;
+        }
+        *self.machine.write().await = machine;
+        tracing::info!(
+            reason,
+            crypto_device_id = %self.crypto_device_id,
+            "rotated Olm outbound sessions (fresh machine, same device identity)"
+        );
+        true
+    }
+
     /// Olm-encrypt `content` (the `io.element.call.encryption_keys` payload) to
     /// `recipients` and send it. Refreshes device lists + Olm sessions on demand
     /// first. `delivered`/`failed` mirror the old transport so the distribution
@@ -436,8 +513,11 @@ impl GhostCrypto {
         refresh: RefreshMode,
     ) -> Result<KeySendOutcome> {
         let _g = self.req_lock.lock().await;
+        let machine = self.machine.read().await;
 
-        let devices = self.ensure_tracked_and_sessions(recipients, refresh).await?;
+        let devices = self
+            .ensure_tracked_and_sessions(&machine, recipients, refresh)
+            .await?;
         if devices.is_empty() {
             return Err(anyhow!(
                 "no recipient devices known yet (ghost /keys/query not caught up)"
@@ -449,8 +529,7 @@ impl GhostCrypto {
         // not verify devices, and a stricter strategy would silently drop unverified
         // recipients → they would hear static. `withheld` are devices the strategy
         // blocked; treated as failed so the caller keeps retrying.
-        let (requests, withheld) = self
-            .machine
+        let (requests, withheld) = machine
             .encrypt_content_for_devices(
                 devices,
                 "io.element.call.encryption_keys",
@@ -499,6 +578,7 @@ impl GhostCrypto {
     /// simply absent from the result; the caller's burst/heartbeat retries.
     async fn ensure_tracked_and_sessions(
         &self,
+        machine: &OlmMachine,
         recipients: &[KeyRecipient],
         refresh: RefreshMode,
     ) -> Result<Vec<DeviceData>> {
@@ -520,7 +600,7 @@ impl GhostCrypto {
         // session still encrypts fine; a rotated identity key makes the old session
         // mismatch, so the fresh query then yields the device and a new session is claimed.
         if refresh == RefreshMode::Force {
-            self.machine
+            machine
                 .mark_all_tracked_users_as_dirty()
                 .await
                 .context("mark_all_tracked_users_as_dirty (force refresh)")?;
@@ -528,29 +608,28 @@ impl GhostCrypto {
 
         // Track newly-seen users (a no-op for already-tracked ones), then run the
         // resulting /keys/query.
-        self.machine
+        machine
             .update_tracked_users(user_refs())
             .await
             .context("update_tracked_users")?;
-        self.drain_outgoing().await?;
+        self.drain_outgoing(machine).await?;
 
-        let mut devices = self.resolve_devices(recipients).await;
+        let mut devices = self.resolve_devices(machine, recipients).await;
         // If a requested device is missing (e.g. a known user rejoined on a NEW
         // device, so update_tracked_users didn't re-query that user), force a fresh
         // /keys/query and retry once. Skipped on a forced refresh (we just queried —
         // an immediate second query won't help) and on steady-state sends.
         if refresh != RefreshMode::Force && devices.len() < recipients.len() {
-            self.machine
+            machine
                 .mark_all_tracked_users_as_dirty()
                 .await
                 .context("mark_all_tracked_users_as_dirty")?;
-            self.drain_outgoing().await?;
-            devices = self.resolve_devices(recipients).await;
+            self.drain_outgoing(machine).await?;
+            devices = self.resolve_devices(machine, recipients).await;
         }
 
         // Establish Olm sessions (claim one-time keys) for these users.
-        if let Some((txn_id, claim)) = self
-            .machine
+        if let Some((txn_id, claim)) = machine
             .get_missing_sessions(user_refs().into_iter())
             .await
             .context("get_missing_sessions")?
@@ -567,7 +646,7 @@ impl GhostCrypto {
                 .post(&["keys", "claim"], &serde_json::Value::Object(body))
                 .await?;
             let parsed: KeysClaimResponse = parse_response(resp, "/keys/claim").await?;
-            self.machine
+            machine
                 .mark_request_as_sent(&txn_id, &parsed)
                 .await
                 .context("mark /keys/claim sent")?;
@@ -579,10 +658,14 @@ impl GhostCrypto {
     /// Look up each recipient's in-call device in the machine's store (populated by
     /// `/keys/query`), returning the [`DeviceData`] to encrypt to. Missing/errored
     /// devices are skipped (logged) — same semantics as the old `get_device` path.
-    async fn resolve_devices(&self, recipients: &[KeyRecipient]) -> Vec<DeviceData> {
+    async fn resolve_devices(
+        &self,
+        machine: &OlmMachine,
+        recipients: &[KeyRecipient],
+    ) -> Vec<DeviceData> {
         let mut out = Vec::with_capacity(recipients.len());
         for r in recipients {
-            match self.machine.get_device(&r.user_id, &r.device_id, None).await {
+            match machine.get_device(&r.user_id, &r.device_id, None).await {
                 Ok(Some(dev)) => out.push((*dev).clone()),
                 Ok(None) => tracing::debug!(
                     user = %r.user_id, device = %r.device_id,
@@ -598,11 +681,11 @@ impl GhostCrypto {
     }
 
     /// Carry the machine's pending outgoing requests to the homeserver and feed the
-    /// responses back, until none remain. The caller must hold `req_lock`.
-    async fn drain_outgoing(&self) -> Result<()> {
+    /// responses back, until none remain. The caller must hold `req_lock`. Takes the
+    /// machine explicitly so `rotate_sessions` can drain a not-yet-swapped-in rebuild.
+    async fn drain_outgoing(&self, machine: &OlmMachine) -> Result<()> {
         for _ in 0..DRAIN_MAX_ROUNDS {
-            let reqs = self
-                .machine
+            let reqs = machine
                 .outgoing_requests()
                 .await
                 .context("outgoing_requests")?;
@@ -610,7 +693,7 @@ impl GhostCrypto {
                 return Ok(());
             }
             for req in &reqs {
-                self.dispatch(req).await?;
+                self.dispatch(machine, req).await?;
             }
         }
         tracing::warn!(
@@ -624,7 +707,7 @@ impl GhostCrypto {
     /// send-only subset is expected (upload / query / claim / to-device); anything
     /// else is logged and dropped (it will not be marked, but a send-only ghost
     /// never produces signature/room-message requests).
-    async fn dispatch(&self, req: &OutgoingRequest) -> Result<()> {
+    async fn dispatch(&self, machine: &OlmMachine, req: &OutgoingRequest) -> Result<()> {
         match req.request() {
             AnyOutgoingRequest::KeysUpload(r) => {
                 let mut body = serde_json::Map::new();
@@ -646,7 +729,7 @@ impl GhostCrypto {
                     .post(&["keys", "upload"], &serde_json::Value::Object(body))
                     .await?;
                 let parsed: KeysUploadResponse = parse_response(resp, "/keys/upload").await?;
-                self.machine
+                machine
                     .mark_request_as_sent(req.request_id(), &parsed)
                     .await
                     .context("mark /keys/upload sent")?;
@@ -664,7 +747,7 @@ impl GhostCrypto {
                     .post(&["keys", "query"], &serde_json::Value::Object(body))
                     .await?;
                 let parsed: KeysQueryResponse = parse_response(resp, "/keys/query").await?;
-                self.machine
+                machine
                     .mark_request_as_sent(req.request_id(), &parsed)
                     .await
                     .context("mark /keys/query sent")?;
@@ -682,7 +765,7 @@ impl GhostCrypto {
                     .post(&["keys", "claim"], &serde_json::Value::Object(body))
                     .await?;
                 let parsed: KeysClaimResponse = parse_response(resp, "/keys/claim").await?;
-                self.machine
+                machine
                     .mark_request_as_sent(req.request_id(), &parsed)
                     .await
                     .context("mark /keys/claim sent")?;
@@ -692,7 +775,7 @@ impl GhostCrypto {
                 // ToDevice has an empty response; the machine needs it marked so the
                 // request isn't re-emitted.
                 let parsed = ToDeviceResponse::new();
-                self.machine
+                machine
                     .mark_request_as_sent(req.request_id(), &parsed)
                     .await
                     .context("mark /sendToDevice sent")?;
@@ -922,6 +1005,10 @@ impl KeyTransport for OlmTransport {
 
     fn kind(&self) -> &'static str {
         "olm"
+    }
+
+    async fn rotate_sessions(&self, reason: &'static str) -> bool {
+        self.crypto.rotate_sessions(reason).await
     }
 }
 
