@@ -23,7 +23,7 @@
 //! hears every speaker including the puppets' own playback — never re-captures it.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -219,21 +219,9 @@ struct PuppetSlot {
     guilds: RwLock<HashSet<GuildId>>,
     /// Set true once this puppet's gateway `ready` fired and its command loop is
     /// live. The shutdown drain only awaits `ReleaseAndAck` from connected bots.
+    /// Gateway-level (per-bot); voice-session health is per-(bot, guild) in
+    /// [`AllocState::health`].
     connected: Arc<AtomicBool>,
-    /// Set true when this bot's `manager.join` timed out (a stuck voice gateway —
-    /// seen after hopping channels in one guild). The allocator skips an unhealthy
-    /// bot so failover picks a different one; a recovery timer clears it after
-    /// the backoff cooldown so the bot becomes eligible again.
-    unhealthy: Arc<AtomicBool>,
-    /// Consecutive `manager.join` failures with no intervening success. Drives the
-    /// exponential quarantine backoff (`QUARANTINE_BASE * 2^n`, capped at
-    /// `QUARANTINE_MAX`); reset to 0 on a successful join.
-    fail_count: Arc<AtomicU32>,
-    /// True while a mid-session voice-disconnect recovery (rejoin) is in flight.
-    /// Debounces repeated `DriverDisconnect`/sweep signals so only one rejoin runs
-    /// at a time; gated on (and cleared by) `should_recover_disconnect` /
-    /// `finish_recovery`.
-    recovering: Arc<AtomicBool>,
 }
 
 /// A swappable audio route: the mixer a participant's frames currently flow into.
@@ -318,6 +306,27 @@ impl PuppetSession {
 /// `(slot index, guild)` → that bot's live session there. See [`PuppetSession`].
 type SessionMap = HashMap<(usize, GuildId), PuppetSession>;
 
+/// Voice-session health for one `(bot, guild)` pair (#46). Join timeouts and
+/// `DriverDisconnect`s are properties of ONE guild's voice connection, so
+/// quarantine/recovery are scoped there — a broken voice server in one guild
+/// must not sideline the bot everywhere (that would recreate the cross-guild
+/// starvation this issue removes). Entries OUTLIVE sessions (a bot is
+/// quarantined precisely while it has none) and are pruned once fully clear.
+#[derive(Default)]
+struct SessionHealth {
+    /// This guild's `manager.join` timed out — the allocator skips the pair
+    /// until a recovery timer clears it after the backoff cooldown.
+    unhealthy: bool,
+    /// Consecutive join failures here with no intervening success. Drives the
+    /// exponential quarantine backoff (`QUARANTINE_BASE * 2^n`, capped at
+    /// `QUARANTINE_MAX`); reset only by a successful join.
+    fail_count: u32,
+    /// A mid-session voice-disconnect recovery (rejoin) is in flight for this
+    /// guild's Call. Debounces repeated `DriverDisconnect`/sweep signals; gated
+    /// on (and cleared by) `should_recover_disconnect` / `finish_recovery`.
+    recovering: bool,
+}
+
 /// The global allocation state, guarded by [`SharedPool::alloc`].
 struct AllocState {
     /// Channel key (bridge label) → its state.
@@ -327,6 +336,8 @@ struct AllocState {
     /// Live per-(bot, guild) sessions — entry present ⇔ that bot is allocated in
     /// that guild.
     sessions: SessionMap,
+    /// Per-(bot, guild) voice-session health. See [`SessionHealth`].
+    health: HashMap<(usize, GuildId), SessionHealth>,
 }
 
 /// The shared puppet pool. Built once per process; every bridge's Discord side is
@@ -360,9 +371,6 @@ impl SharedPool {
                     cmd_rx: StdMutex::new(Some(cmd_rx)),
                     guilds: RwLock::new(HashSet::new()),
                     connected: Arc::new(AtomicBool::new(false)),
-                    unhealthy: Arc::new(AtomicBool::new(false)),
-                    fail_count: Arc::new(AtomicU32::new(0)),
-                    recovering: Arc::new(AtomicBool::new(false)),
                 }
             })
             .collect();
@@ -390,6 +398,7 @@ impl SharedPool {
                 channels: HashMap::new(),
                 next_seq: 0,
                 sessions: HashMap::new(),
+                health: HashMap::new(),
             }),
         })
     }
@@ -648,9 +657,9 @@ impl SharedPool {
             if guard.sessions.contains_key(&(i, guild)) {
                 continue;
             }
-            // Skip bots quarantined after a join timeout — picking one of those
-            // would just fail to join again. A recovery timer clears the flag.
-            if slot.unhealthy.load(Ordering::Relaxed) {
+            // Skip pairs quarantined after a join timeout in THIS guild — picking
+            // one would just fail again. A recovery timer clears the flag.
+            if guard.health.get(&(i, guild)).is_some_and(|h| h.unhealthy) {
                 continue;
             }
             if !slot
@@ -768,7 +777,10 @@ impl SharedPool {
                         Assign::Puppet { idx, seq }
                             if *idx != donor_anchor
                                 && self.bot_in_guild(*idx, target_guild)
-                                && !self.slots[*idx].unhealthy.load(Ordering::Relaxed)
+                                && !guard
+                                    .health
+                                    .get(&(*idx, target_guild))
+                                    .is_some_and(|h| h.unhealthy)
                                 // A cross-guild victim must be idle in the target
                                 // guild — stealing it there would clobber its
                                 // existing engagement. (A same-guild steal hands
@@ -1189,7 +1201,7 @@ impl SharedPool {
     /// is deferred from the assign paths so a timed-out join never falsely reports
     /// the anchor live.
     fn on_join_succeeded(&self, idx: usize, guild: GuildId) {
-        let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
         for ch in guard.channels.values().filter(|ch| ch.guild_id == guild) {
             let serves = ch
                 .assignments
@@ -1201,10 +1213,9 @@ impl SharedPool {
                 break;
             }
         }
-        // A successful join proves the bot healthy → reset its quarantine backoff
-        // and clear any in-flight recovery latch.
-        self.slots[idx].fail_count.store(0, Ordering::Relaxed);
-        self.slots[idx].recovering.store(false, Ordering::Relaxed);
+        // A successful join proves the pair healthy → drop its health record
+        // entirely (quarantine, backoff count, and recovery latch all reset).
+        guard.health.remove(&(idx, guild));
     }
 
     /// Called by a puppet's command loop after `manager.join` FAILS (e.g. the voice
@@ -1220,14 +1231,17 @@ impl SharedPool {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
         let guard = &mut *guard;
 
-        // Quarantine the stuck bot regardless (cleared after the backoff cooldown).
-        self.slots[idx].unhealthy.store(true, Ordering::Relaxed);
-        // Exponential backoff: QUARANTINE_BASE * 2^n, capped at QUARANTINE_MAX.
-        // `n` = prior consecutive failures; clamp the shift so it can't overflow.
-        let n = self.slots[idx].fail_count.fetch_add(1, Ordering::Relaxed);
-        let backoff = QUARANTINE_BASE
-            .saturating_mul(1u32 << n.min(6))
-            .min(QUARANTINE_MAX);
+        // Quarantine the stuck (bot, guild) regardless (cleared after the backoff
+        // cooldown). Exponential backoff: QUARANTINE_BASE * 2^n, capped at
+        // QUARANTINE_MAX. `n` = prior consecutive failures here; clamp the shift
+        // so it can't overflow.
+        let backoff = {
+            let h = guard.health.entry((idx, guild)).or_default();
+            h.unhealthy = true;
+            let shift = h.fail_count.min(6);
+            h.fail_count += 1;
+            QUARANTINE_BASE.saturating_mul(1u32 << shift).min(QUARANTINE_MAX)
+        };
 
         // Locate the (bridge, key) this bot was serving in the failed guild.
         let found = guard
@@ -1325,13 +1339,25 @@ impl SharedPool {
         backoff
     }
 
-    /// Clear a bot's join-timeout quarantine (after the backoff cooldown) and try
-    /// to activate any channel left without an anchor while it was unavailable.
-    fn recover_bot(&self, idx: usize) {
-        self.slots[idx].unhealthy.store(false, Ordering::Relaxed);
+    /// Clear a (bot, guild) join-timeout quarantine (after the backoff cooldown)
+    /// and try to activate any channel left without an anchor while it was
+    /// unavailable. `fail_count` deliberately survives — the backoff keeps
+    /// growing across repeat failures and resets only on a successful join.
+    fn recover_bot(&self, idx: usize, guild: GuildId) {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
-        self.rebalance(&mut guard);
-        tracing::info!(idx, "puppet join-timeout quarantine cleared — eligible again");
+        let guard = &mut *guard;
+        let clear = match guard.health.get_mut(&(idx, guild)) {
+            Some(h) => {
+                h.unhealthy = false;
+                !h.recovering && h.fail_count == 0
+            }
+            None => false,
+        };
+        if clear {
+            guard.health.remove(&(idx, guild));
+        }
+        self.rebalance(guard);
+        tracing::info!(idx, guild = guild.get(), "puppet join-timeout quarantine cleared — eligible again");
     }
 
     /// Decide whether an unexpected voice disconnect for `idx` warrants a rejoin,
@@ -1346,19 +1372,35 @@ impl SharedPool {
     /// still being live in another guild.
     fn should_recover_disconnect(&self, idx: usize, guild: GuildId) -> bool {
         // Serialize against the allocator's own session/anchor mutations.
-        let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
-        if !guard.sessions.contains_key(&(idx, guild))
-            || self.slots[idx].unhealthy.load(Ordering::Relaxed)
-        {
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = &mut *guard;
+        if !guard.sessions.contains_key(&(idx, guild)) {
             return false;
         }
-        // swap returns the prior value: claim the latch iff it was clear.
-        !self.slots[idx].recovering.swap(true, Ordering::Relaxed)
+        let h = guard.health.entry((idx, guild)).or_default();
+        if h.unhealthy || h.recovering {
+            return false;
+        }
+        // Claim the latch (it was clear).
+        h.recovering = true;
+        true
     }
 
-    /// Release the recovery latch claimed by [`should_recover_disconnect`].
-    fn finish_recovery(&self, idx: usize) {
-        self.slots[idx].recovering.store(false, Ordering::Relaxed);
+    /// Release the recovery latch claimed by [`should_recover_disconnect`],
+    /// pruning the health record if nothing else keeps it alive.
+    fn finish_recovery(&self, idx: usize, guild: GuildId) {
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = &mut *guard;
+        let clear = match guard.health.get_mut(&(idx, guild)) {
+            Some(h) => {
+                h.recovering = false;
+                !h.unhealthy && h.fail_count == 0
+            }
+            None => false,
+        };
+        if clear {
+            guard.health.remove(&(idx, guild));
+        }
     }
 
     /// Reconcile sweep: ask every bot the allocator believes is live to verify it
@@ -1371,9 +1413,11 @@ impl SharedPool {
             guard
                 .sessions
                 .keys()
-                .filter(|(i, _)| {
-                    !self.slots[*i].unhealthy.load(Ordering::Relaxed)
-                        && !self.slots[*i].recovering.load(Ordering::Relaxed)
+                .filter(|k| {
+                    !guard
+                        .health
+                        .get(k)
+                        .is_some_and(|h| h.unhealthy || h.recovering)
                 })
                 .copied()
                 .collect()
@@ -2181,7 +2225,7 @@ async fn puppet_command_loop(
                     let pool = pool.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(backoff).await;
-                        pool.recover_bot(idx);
+                        pool.recover_bot(idx, guild);
                     });
                 }
             }
@@ -2249,11 +2293,11 @@ async fn puppet_command_loop(
                             && if active.contains_key(guild) {
                                 let gone = voice_channel_gone(&ctx, *guild).await;
                                 if !gone {
-                                    pool.finish_recovery(idx);
+                                    pool.finish_recovery(idx, *guild);
                                 }
                                 gone
                             } else {
-                                pool.finish_recovery(idx);
+                                pool.finish_recovery(idx, *guild);
                                 false
                             };
                         (*guild, proceed)
@@ -2299,7 +2343,7 @@ async fn puppet_command_loop(
                         }
                     } else {
                         // Latch was claimed but there's no engagement to rejoin.
-                        pool.finish_recovery(idx);
+                        pool.finish_recovery(idx, guild);
                     }
                 }
             }
@@ -2589,15 +2633,16 @@ async fn rejoin_puppet(
         tracing::info!(idx, bridge = %chan.bridge, "puppet voice connection recovered — rejoined");
         // Re-activate the anchor role if this bot is still the channel's anchor.
         pool.on_join_succeeded(idx, chan.guild_id);
-        pool.finish_recovery(idx);
+        pool.finish_recovery(idx, chan.guild_id);
     } else {
         tracing::warn!(idx, bridge = %chan.bridge, "puppet rejoin failed — quarantining + failing over");
-        pool.finish_recovery(idx);
-        let backoff = pool.on_join_failed(idx, chan.guild_id);
+        pool.finish_recovery(idx, chan.guild_id);
+        let guild = chan.guild_id;
+        let backoff = pool.on_join_failed(idx, guild);
         let pool = pool.clone();
         tokio::spawn(async move {
             tokio::time::sleep(backoff).await;
-            pool.recover_bot(idx);
+            pool.recover_bot(idx, guild);
         });
     }
     handle
@@ -2712,14 +2757,24 @@ impl SharedPool {
             .filter(|i| !g.sessions.keys().any(|(idx, _)| idx == i))
             .count()
     }
-    fn test_is_unhealthy(&self, idx: usize) -> bool {
-        self.slots[idx].unhealthy.load(Ordering::Relaxed)
+    fn test_is_unhealthy(&self, idx: usize, guild: u64) -> bool {
+        let g = self.alloc.lock().unwrap();
+        g.health
+            .get(&(idx, GuildId::new(guild)))
+            .is_some_and(|h| h.unhealthy)
+    }
+    fn test_set_unhealthy(&self, idx: usize, guild: u64, unhealthy: bool) {
+        let mut g = self.alloc.lock().unwrap();
+        g.health.entry((idx, GuildId::new(guild))).or_default().unhealthy = unhealthy;
     }
     fn test_is_busy(&self, idx: usize) -> bool {
         self.alloc.lock().unwrap().sessions.keys().any(|(i, _)| *i == idx)
     }
-    fn test_is_recovering(&self, idx: usize) -> bool {
-        self.slots[idx].recovering.load(Ordering::Relaxed)
+    fn test_is_recovering(&self, idx: usize, guild: u64) -> bool {
+        let g = self.alloc.lock().unwrap();
+        g.health
+            .get(&(idx, GuildId::new(guild)))
+            .is_some_and(|h| h.recovering)
     }
     /// The session mixer for `(idx, guild)`, if that session exists.
     fn test_session_mixer(&self, idx: usize, guild: u64) -> Option<Arc<PlaybackMixer>> {
@@ -3018,11 +3073,11 @@ mod tests {
         assert_eq!(p.test_anchor("A"), Some(sa));
         // The anchor bot's join times out → fail over to the other pool bot.
         p.on_join_failed(sa, GuildId::new(1));
-        assert!(p.test_is_unhealthy(sa), "stuck bot quarantined");
+        assert!(p.test_is_unhealthy(sa, 1), "stuck bot quarantined in guild 1");
         let sb = p.test_slot_of("A", "alice").expect("alice re-assigned");
         assert_ne!(sb, sa, "moved to a different bot");
         assert_eq!(p.test_anchor("A"), Some(sb), "anchor handed to replacement");
-        assert!(!p.test_is_unhealthy(sb));
+        assert!(!p.test_is_unhealthy(sb, 1));
     }
 
     #[test]
@@ -3033,12 +3088,12 @@ mod tests {
         let sa = p.test_slot_of("A", "alice").unwrap();
         // Sole bot's join times out, no spare → degrade to overflow + no anchor.
         p.on_join_failed(sa, GuildId::new(1));
-        assert!(p.test_is_unhealthy(sa));
+        assert!(p.test_is_unhealthy(sa, 1));
         assert!(p.test_is_overflow("A", "alice"), "dropped to overflow");
         assert_eq!(p.test_anchor("A"), None, "channel has no anchor (degraded)");
         // Quarantine clears → service_pending re-activates the channel on that bot.
-        p.recover_bot(sa);
-        assert!(!p.test_is_unhealthy(sa));
+        p.recover_bot(sa, GuildId::new(1));
+        assert!(!p.test_is_unhealthy(sa, 1));
         assert_eq!(p.test_anchor("A"), Some(sa), "re-anchored after recovery");
         assert_eq!(p.test_slot_of("A", "alice"), Some(sa));
     }
@@ -3056,20 +3111,20 @@ mod tests {
         // the in-flight attempt finishes (so concurrent DriverDisconnect + sweep
         // can't launch two rejoins).
         assert!(p.should_recover_disconnect(sa, g), "active bot: claim recovery");
-        assert!(p.test_is_recovering(sa));
+        assert!(p.test_is_recovering(sa, 1));
         assert!(!p.should_recover_disconnect(sa, g), "debounced while recovering");
-        p.finish_recovery(sa);
-        assert!(!p.test_is_recovering(sa));
+        p.finish_recovery(sa, g);
+        assert!(!p.test_is_recovering(sa, 1));
         assert!(p.should_recover_disconnect(sa, g), "claimable again after finish");
-        p.finish_recovery(sa);
+        p.finish_recovery(sa, g);
 
         // An idle bot has nothing to recover.
         assert!(!p.should_recover_disconnect(free, g), "idle bot: skip");
 
-        // A quarantined bot is left to the join-timeout/backoff machinery.
-        p.slots[sa].unhealthy.store(true, Ordering::Relaxed);
-        assert!(!p.should_recover_disconnect(sa, g), "unhealthy bot: skip");
-        p.slots[sa].unhealthy.store(false, Ordering::Relaxed);
+        // A quarantined pair is left to the join-timeout/backoff machinery.
+        p.test_set_unhealthy(sa, 1, true);
+        assert!(!p.should_recover_disconnect(sa, g), "unhealthy pair: skip");
+        p.test_set_unhealthy(sa, 1, false);
 
         // The crux: a deliberate release drops the session BEFORE its
         // DriverDisconnect fires, so a late disconnect for that bot must NOT
@@ -3081,6 +3136,31 @@ mod tests {
             !p.should_recover_disconnect(sa, g),
             "deliberate leave must not be mistaken for a fault"
         );
+    }
+
+    #[test]
+    fn quarantine_in_one_guild_leaves_bot_usable_in_another() {
+        // Health is per-(bot, guild) (#46): a broken voice connection in guild 1
+        // must not sideline the bot's engagements (or claimability) in guild 2.
+        let p = pool(1);
+        channel(&p, "A", 1, 10);
+        channel(&p, "B", 2, 20);
+        p.assign("A", "alice", "Alice");
+        p.on_join_failed(0, GuildId::new(1)); // guild-1 join timed out
+        assert!(p.test_is_unhealthy(0, 1), "quarantined in guild 1");
+        assert!(!p.test_is_unhealthy(0, 2), "guild 2 unaffected");
+        assert_eq!(p.test_anchor("A"), None, "A degraded (sole bot)");
+        // The bot is still claimable — and recoverable — in guild 2.
+        p.assign("B", "bob", "Bob");
+        assert_eq!(p.test_slot_of("B", "bob"), Some(0), "claimed in guild 2 while quarantined in guild 1");
+        assert!(p.should_recover_disconnect(0, GuildId::new(2)), "guild-2 recovery unaffected");
+        p.finish_recovery(0, GuildId::new(2));
+        // Guild 1's quarantine clears → its pending channel re-anchors on the bot.
+        p.recover_bot(0, GuildId::new(1));
+        assert!(!p.test_is_unhealthy(0, 1));
+        assert_eq!(p.test_anchor("A"), Some(0), "A re-anchored after guild-1 recovery");
+        assert_eq!(p.test_slot_of("A", "alice"), Some(0));
+        assert_eq!(p.test_slot_of("B", "bob"), Some(0), "guild-2 engagement undisturbed throughout");
     }
 
     #[test]
