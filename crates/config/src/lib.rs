@@ -104,6 +104,10 @@ pub struct ServerProfile {
     /// inherit it unless they set their own value.
     #[serde(default)]
     pub prune_stale_devices: Option<bool>,
+    /// See `MatrixConfig::rotate_ghost_sessions`; bridges referencing this profile
+    /// inherit it unless they set their own value.
+    #[serde(default)]
+    pub rotate_ghost_sessions: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,6 +259,15 @@ pub struct MatrixConfig {
     /// `[server.<name>]` profile when omitted.
     #[serde(default)]
     pub prune_stale_devices: Option<bool>,
+    /// Opportunistically rotate each ghost's outbound Olm sessions (#52): on call
+    /// membership changes (rate-limited) and when the sessions age past a bound.
+    /// A listener whose inbound session for a ghost died can otherwise never hear
+    /// that Discord speaker again until the bridge restarts (send-only ghosts never
+    /// receive the client's `m.dummy` recovery). Only affects the `olm` transport.
+    /// Optional override; unset defaults to on. Inherited from the
+    /// `[server.<name>]` profile when omitted.
+    #[serde(default)]
+    pub rotate_ghost_sessions: Option<bool>,
 }
 
 impl MatrixConfig {
@@ -397,6 +410,9 @@ impl Config {
             }
             if m.prune_stale_devices.is_none() {
                 m.prune_stale_devices = profile.prune_stale_devices;
+            }
+            if m.rotate_ghost_sessions.is_none() {
+                m.rotate_ghost_sessions = profile.rotate_ghost_sessions;
             }
         }
     }
@@ -613,6 +629,7 @@ impl Config {
                     bot_display_name,
                     bot_avatar_path,
                     prune_stale_devices: None,
+                    rotate_ghost_sessions: None,
                 },
                 livekit: LiveKitConfig {
                     lk_jwt_url,
@@ -1288,6 +1305,18 @@ appservice_token = "hs_tok"
         let cfg = loaded(&raw);
         assert_eq!(cfg.bridges[0].matrix.prune_stale_devices, Some(false)); // inherited
         assert_eq!(cfg.bridges[1].matrix.prune_stale_devices, Some(true)); // override wins
+    }
+
+    #[test]
+    fn rotate_ghost_sessions_inherits_from_profile_and_bridge_wins() {
+        // Same profile-merge contract as prune_stale_devices (#52 knob).
+        let raw = format!(
+            "{}[server.nether]\nhomeserver_url = \"https://nether.im\"\nbot_user_id = \"@voicebridge_as:nether.im\"\nappservice_id = \"voicebridge\"\nappservice_token = \"hs_tok\"\nrotate_ghost_sessions = false\n\n[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!a:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n\n[[bridge]]\nname = \"b\"\nserver = \"nether\"\nroom_id = \"!b:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"333\"\n[bridge.matrix]\nrotate_ghost_sessions = true\n",
+            puppets_block(&["Bot a"]),
+        );
+        let cfg = loaded(&raw);
+        assert_eq!(cfg.bridges[0].matrix.rotate_ghost_sessions, Some(false)); // inherited
+        assert_eq!(cfg.bridges[1].matrix.rotate_ghost_sessions, Some(true)); // override wins
     }
 
     #[test]
