@@ -3,7 +3,7 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0-alpha.4] - 2026-07-04
 
 ### Added
 - **Ghost Olm session rotation: a listener whose client loses the ability to decrypt
