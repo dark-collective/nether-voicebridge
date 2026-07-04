@@ -3,6 +3,23 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Ghost Olm session rotation: a listener whose client loses the ability to decrypt
+  one ghost's key messages now self-heals instead of staying silent until a bridge
+  restart (#52).** A listener-side dead inbound Olm session is invisible to the bridge
+  (`delivered=1` — the send succeeds, the decrypt fails) and unrecoverable by the
+  protocol: the client's `m.dummy` recovery is a to-device message our send-only
+  ghosts never receive. Each ghost therefore opportunistically rebuilds its Olm
+  machine — same device identity, fresh sessions from fresh one-time keys, exactly
+  what a restart does — on call-membership changes (rate-limited to one per 90 s) and
+  whenever its sessions age past 15 minutes. Worst-case one-speaker silence drops
+  from "until the next bridge restart" to ~90 s in an active call (a rejoin now
+  actually heals the rejoiner) and ~16 min in a fully static one. Configurable via
+  `rotate_ghost_sessions` (bridge or `[server.<name>]` level; default on; Olm
+  transport only).
+
 ## [0.3.0-alpha.3] - 2026-07-04
 
 ### Added

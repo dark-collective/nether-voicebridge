@@ -295,6 +295,10 @@ struct GhostConfig {
     /// Delete ids each ghost's identity blob retired (#53, history-scoped).
     /// Mirrors `matrix.prune_stale_devices` (default on).
     prune_stale_devices: bool,
+    /// Opportunistically rotate ghost outbound Olm sessions (#52) on membership
+    /// changes + max-age. Mirrors `matrix.rotate_ghost_sessions` (default on);
+    /// only effective on the Olm transport.
+    rotate_ghost_sessions: bool,
 }
 
 impl GhostPool {
@@ -342,6 +346,7 @@ impl GhostPool {
                 capture_wav,
                 ghost_localpart_prefix: ghost_localpart_prefix(matrix_cfg.sender_localpart.as_deref()),
                 prune_stale_devices: matrix_cfg.prune_stale_devices.unwrap_or(true),
+                rotate_ghost_sessions: matrix_cfg.rotate_ghost_sessions.unwrap_or(true),
             },
         }))
     }
@@ -1174,6 +1179,16 @@ const KEY_BURST_INTERVAL: Duration = Duration::from_secs(3);
 /// dropped even by the burst. Mild (≈1/ghost/min) vs. the old 5s spam.
 const KEY_HEARTBEAT: Duration = Duration::from_secs(60);
 
+/// Minimum spacing between Olm session rotations (#52). Membership-driven rotations
+/// are rate-limited to this so Element Call's ~90s membership flaps don't churn
+/// one-time keys on every flap.
+const SESSION_ROTATE_MIN_INTERVAL: Duration = Duration::from_secs(90);
+/// Maximum age of a ghost's outbound Olm sessions before the heartbeat rotates them
+/// anyway (#52). This is what bounds a listener-side dead-session wedge in a static
+/// call (no membership changes): worst-case inaudibility ≈ this + one heartbeat,
+/// instead of "until the bridge restarts".
+const SESSION_ROTATE_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+
 /// Olm crypto-client bootstrap attempts before giving up (no plaintext downgrade —
 /// see [`distribute_key_task`]).
 const OLM_BOOTSTRAP_ATTEMPTS: u32 = 3;
@@ -1226,8 +1241,12 @@ async fn distribute_key_task(
             }
         }
     };
+    // Session rotation (#52) only applies to the Olm transport (plaintext has no
+    // sessions); the config knob can turn it off entirely.
+    let rotate_sessions =
+        cfg.rotate_ghost_sessions && matches!(cfg.key_transport, KeyTransportMode::Olm);
     let source: Arc<dyn RecipientSource> = Arc::new(CallRecipients { client, cfg });
-    distribute_key_loop(source, key, transport, members_gen, cancel).await;
+    distribute_key_loop(source, key, transport, rotate_sessions, members_gen, cancel).await;
 }
 
 /// Source of the current key-send recipients (the call's human members). Abstracted
@@ -1352,6 +1371,7 @@ async fn distribute_key_loop(
     source: Arc<dyn RecipientSource>,
     key: [u8; 16],
     transport: Arc<dyn KeyTransport>,
+    rotate_sessions: bool,
     mut members_gen: watch::Receiver<u64>,
     cancel: CancellationToken,
 ) {
@@ -1368,6 +1388,13 @@ async fn distribute_key_loop(
     // When the current re-key attempt began (a new joiner or a membership bump), so we
     // can log per-ghost "membership change → key delivered" latency (the #51 symptom).
     let mut rekey_started: Option<tokio::time::Instant> = None;
+    // Olm session rotation (#52). A membership bump requests a rotation (a wedged
+    // listener's natural remedy is rejoining the call — rotation is what actually
+    // heals them, unlike today where a rejoin keeps the dead session); the max-age
+    // check bounds a wedge in a static call. Bootstrap/cache-reuse just (re)built or
+    // reused a machine, so the loop starts with the clock at "now".
+    let mut rotate_pending = false;
+    let mut last_rotation = tokio::time::Instant::now();
     loop {
         // Did this iteration deliver the key to at least one device? A send that
         // reaches NOBODY is almost always a cold-start race: this ghost's own crypto
@@ -1392,6 +1419,26 @@ async fn distribute_key_loop(
                 if current.is_empty() {
                     keyed.clear();
                 } else {
+                    // Rotate BEFORE the send so the fresh sessions carry this very
+                    // key delivery. Membership-driven rotations wait out the
+                    // min-interval (`rotate_pending` persists, so a deferred one
+                    // fires on a later tick); the max-age path needs no pending flag.
+                    if rotate_sessions {
+                        let elapsed = last_rotation.elapsed();
+                        let reason = if rotate_pending && elapsed >= SESSION_ROTATE_MIN_INTERVAL {
+                            Some("membership")
+                        } else if elapsed >= SESSION_ROTATE_MAX_AGE {
+                            Some("max-age")
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = reason {
+                            if transport.rotate_sessions(reason).await {
+                                last_rotation = tokio::time::Instant::now();
+                                rotate_pending = false;
+                            }
+                        }
+                    }
                     reached_someone = match transport.send_key(&current, &key, 0, refresh).await {
                         // Every targeted device got the key.
                         Ok(o) if o.failed.is_empty() => {
@@ -1491,6 +1538,9 @@ async fn distribute_key_loop(
                 // (possibly rotated) returning device is re-fetched and re-keyed at once
                 // rather than after the slow burst/heartbeat convergence (issue #51).
                 refresh = RefreshMode::Force;
+                // And request a session rotation (#52): a rejoining listener may hold
+                // a dead inbound session for this ghost that only fresh sessions fix.
+                rotate_pending = true;
                 if rekey_started.is_none() {
                     rekey_started = Some(tokio::time::Instant::now());
                 }
@@ -2023,11 +2073,13 @@ mod tests {
         }
     }
 
-    /// Records the recipient lists and `refresh` mode passed to each `send_key`.
+    /// Records the recipient lists, `refresh` mode, and session rotations (#52)
+    /// passed to the transport.
     #[derive(Default)]
     struct MockTransport {
         sends: StdMutex<Vec<Vec<KeyRecipient>>>,
         refreshes: StdMutex<Vec<RefreshMode>>,
+        rotations: StdMutex<Vec<&'static str>>,
     }
 
     #[async_trait]
@@ -2048,6 +2100,10 @@ mod tests {
         }
         fn kind(&self) -> &'static str {
             "mock"
+        }
+        async fn rotate_sessions(&self, reason: &'static str) -> bool {
+            self.rotations.lock().unwrap().push(reason);
+            true
         }
     }
 
@@ -2077,6 +2133,7 @@ mod tests {
             source,
             [7u8; 16],
             transport.clone(),
+            false,
             gen_rx,
             cancel.clone(),
         ));
@@ -2104,6 +2161,7 @@ mod tests {
             source,
             [0u8; 16],
             transport.clone(),
+            false,
             gen_rx,
             cancel.clone(),
         ));
@@ -2184,6 +2242,7 @@ mod tests {
             source,
             [1u8; 16],
             transport.clone(),
+            false,
             gen_rx,
             cancel.clone(),
         ));
@@ -2237,6 +2296,7 @@ mod tests {
             source,
             [7u8; 16],
             transport.clone(),
+            false,
             gen_rx,
             cancel.clone(),
         ));
@@ -2269,6 +2329,115 @@ mod tests {
         assert!(
             refreshes[2..].contains(&RefreshMode::Force),
             "a membership-generation bump must re-arm one forced query; got {refreshes:?}"
+        );
+    }
+
+    /// #52: a membership bump requests a session rotation, but it must wait out the
+    /// min-interval (no rotation right at the bump — EC membership flaps would churn
+    /// one-time keys) and then fire on a later send tick with reason "membership".
+    #[tokio::test(start_paused = true)]
+    async fn key_loop_rotates_on_membership_after_min_interval() {
+        let source = Arc::new(MockSource {
+            recipients: vec![rcpt("@alice:nether.im")],
+        });
+        let transport = Arc::new(MockTransport::default());
+        let (gen_tx, gen_rx) = watch::channel(0u64);
+        let cancel = CancellationToken::new();
+
+        let handle = tokio::spawn(distribute_key_loop(
+            source,
+            [7u8; 16],
+            transport.clone(),
+            true,
+            gen_rx,
+            cancel.clone(),
+        ));
+
+        // First send fires; a fresh loop must not rotate (bootstrap just built the
+        // machine).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        gen_tx.send_modify(|g| *g = g.wrapping_add(1));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            transport.rotations.lock().unwrap().is_empty(),
+            "a bump inside the min-interval must NOT rotate yet"
+        );
+
+        // Once the min-interval has passed, the still-pending request fires.
+        tokio::time::advance(SESSION_ROTATE_MIN_INTERVAL).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel.cancel();
+        handle.await.unwrap();
+
+        let rotations = transport.rotations.lock().unwrap().clone();
+        assert_eq!(
+            rotations,
+            vec!["membership"],
+            "exactly one deferred membership rotation"
+        );
+    }
+
+    /// #52: with no membership changes at all, the max-age bound still rotates —
+    /// this is what caps a listener-side dead-session wedge in a static call.
+    #[tokio::test(start_paused = true)]
+    async fn key_loop_rotates_at_max_age_in_static_call() {
+        let source = Arc::new(MockSource {
+            recipients: vec![rcpt("@alice:nether.im")],
+        });
+        let transport = Arc::new(MockTransport::default());
+        let (_gen_tx, gen_rx) = watch::channel(0u64);
+        let cancel = CancellationToken::new();
+
+        let handle = tokio::spawn(distribute_key_loop(
+            source,
+            [7u8; 16],
+            transport.clone(),
+            true,
+            gen_rx,
+            cancel.clone(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(transport.rotations.lock().unwrap().is_empty());
+
+        tokio::time::advance(SESSION_ROTATE_MAX_AGE).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel.cancel();
+        handle.await.unwrap();
+
+        let rotations = transport.rotations.lock().unwrap().clone();
+        assert_eq!(rotations, vec!["max-age"], "one age-driven rotation");
+    }
+
+    /// #52: the config knob off ⇒ no rotation ever, regardless of bumps or age.
+    #[tokio::test(start_paused = true)]
+    async fn key_loop_never_rotates_when_disabled() {
+        let source = Arc::new(MockSource {
+            recipients: vec![rcpt("@alice:nether.im")],
+        });
+        let transport = Arc::new(MockTransport::default());
+        let (gen_tx, gen_rx) = watch::channel(0u64);
+        let cancel = CancellationToken::new();
+
+        let handle = tokio::spawn(distribute_key_loop(
+            source,
+            [7u8; 16],
+            transport.clone(),
+            false,
+            gen_rx,
+            cancel.clone(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        gen_tx.send_modify(|g| *g = g.wrapping_add(1));
+        tokio::time::advance(SESSION_ROTATE_MAX_AGE + SESSION_ROTATE_MIN_INTERVAL).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel.cancel();
+        handle.await.unwrap();
+
+        assert!(
+            transport.rotations.lock().unwrap().is_empty(),
+            "rotation disabled by config must never fire"
         );
     }
 }
