@@ -456,6 +456,14 @@ impl SharedPool {
             anchor_idle_release: None,
         };
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        // A silently-replaced ChannelState would orphan the old channel's
+        // assignments and routes; with runtime registration (#45) a duplicate
+        // label is a real possibility, so refuse it.
+        if guard.channels.contains_key(bridge.as_ref()) {
+            return Err(anyhow!(
+                "channel key '{bridge}' is already registered — bridge labels must be unique"
+            ));
+        }
         guard.channels.insert(bridge.to_string(), state);
         Ok(Arc::new(ChannelView {
             pool: self.clone(),
@@ -1651,31 +1659,61 @@ impl SharedPool {
     fn release_all(&self, bridge: &str) {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
         let guard = &mut *guard;
-        {
-            let Some(ch) = guard.channels.get_mut(bridge) else { return };
-            let guild = ch.guild_id;
-            let anchor = ch.anchor.load(Ordering::Relaxed);
-            let mut anchor_freed = false;
-            for (_key, assign) in ch.assignments.drain() {
-                if let Assign::Puppet { idx, .. } = assign {
-                    guard.sessions.remove(&(idx, guild));
-                    self.send_cmd(idx, PuppetCommand::Release { guild });
-                    if idx == anchor {
-                        anchor_freed = true;
-                    }
+        self.release_all_locked(guard, bridge);
+        // The bots just freed can activate channels waiting for an anchor.
+        self.rebalance(guard);
+    }
+
+    /// Body of [`release_all`](Self::release_all), shared with
+    /// [`unregister_channel`](Self::unregister_channel): release every bot serving
+    /// this channel. Only this channel's own `(bot, guild)` sessions are removed —
+    /// a bot serving another channel in the same guild holds a different entry and
+    /// is untouched (#46). Idempotent: a second pass finds nothing to drain.
+    /// Caller rebalances.
+    fn release_all_locked(&self, guard: &mut AllocState, bridge: &str) {
+        let Some(ch) = guard.channels.get_mut(bridge) else { return };
+        let guild = ch.guild_id;
+        let anchor = ch.anchor.load(Ordering::Relaxed);
+        let mut anchor_freed = false;
+        for (_key, assign) in ch.assignments.drain() {
+            if let Assign::Puppet { idx, .. } = assign {
+                guard.sessions.remove(&(idx, guild));
+                self.send_cmd(idx, PuppetCommand::Release { guild });
+                if idx == anchor {
+                    anchor_freed = true;
                 }
             }
-            // A capture-only-held anchor has no Assign::Puppet of its own, so the
-            // drain above won't free it — release it explicitly so teardown returns
-            // to baseline (Phase 9 guarantee).
-            if anchor != NO_ANCHOR && !anchor_freed {
-                guard.sessions.remove(&(anchor, guild));
-                self.send_cmd(anchor, PuppetCommand::Release { guild });
-            }
-            ch.routes.clear();
-            ch.anchor.store(NO_ANCHOR, Ordering::Relaxed);
-            ch.overflow_mixer.clear();
         }
+        // A capture-only-held anchor has no Assign::Puppet of its own, so the
+        // drain above won't free it — release it explicitly so teardown returns
+        // to baseline (Phase 9 guarantee).
+        if anchor != NO_ANCHOR && !anchor_freed {
+            guard.sessions.remove(&(anchor, guild));
+            self.send_cmd(anchor, PuppetCommand::Release { guild });
+        }
+        ch.routes.clear();
+        ch.anchor.store(NO_ANCHOR, Ordering::Relaxed);
+        ch.overflow_mixer.clear();
+    }
+
+    /// Runtime counterpart to [`register_channel`](Self::register_channel) (#45):
+    /// release every bot serving this channel, cancel its pending idle-anchor
+    /// timer, remove its `ChannelState`, and rebalance so freed bots can activate
+    /// waiting channels. Idempotent (unknown label is a no-op) and safe to call
+    /// after the Matrix side's own teardown already released participants —
+    /// gateway handlers tolerate a vanished channel key, and `ChannelCtx` clones
+    /// held by in-flight bot commands keep their `Arc`s alive until they finish.
+    /// Per-(bot, guild) `health` entries are intentionally kept: they describe the
+    /// guild's voice server, not this channel, and prune on their own schedule.
+    pub fn unregister_channel(&self, bridge: &str) {
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = &mut *guard;
+        self.release_all_locked(guard, bridge);
+        let Some(mut ch) = guard.channels.remove(bridge) else { return };
+        if let Some(token) = ch.anchor_idle_release.take() {
+            token.cancel();
+        }
+        tracing::info!(bridge, "channel unregistered from puppet pool");
         // The bots just freed can activate channels waiting for an anchor.
         self.rebalance(guard);
     }
@@ -2795,6 +2833,17 @@ impl SharedPool {
         let g = self.alloc.lock().unwrap();
         g.sessions.get(&(idx, GuildId::new(guild))).map(|s| s.mixer.clone())
     }
+    fn test_has_channel(&self, bridge: &str) -> bool {
+        self.alloc.lock().unwrap().channels.contains_key(bridge)
+    }
+    /// Arm a fresh `anchor_idle_release` token on the channel and return a clone,
+    /// standing in for the grace timer the gateway path would have started.
+    fn test_arm_idle_token(&self, bridge: &str) -> CancellationToken {
+        let mut g = self.alloc.lock().unwrap();
+        let token = CancellationToken::new();
+        g.channels.get_mut(bridge).unwrap().anchor_idle_release = Some(token.clone());
+        token
+    }
 }
 
 #[cfg(test)]
@@ -2844,6 +2893,74 @@ mod tests {
                 .unwrap()
                 .insert(GuildId::new(g));
         }
+    }
+
+    #[test]
+    fn unregister_releases_bots_and_removes_channel() {
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        p.assign("A", "bob", "Bob");
+        assert_eq!(p.test_free_count(), 0);
+        p.unregister_channel("A");
+        assert_eq!(p.test_free_count(), 2, "all bots freed");
+        assert!(!p.test_has_channel("A"), "channel state removed");
+        // Double-unregister is a no-op.
+        p.unregister_channel("A");
+        assert_eq!(p.test_free_count(), 2);
+    }
+
+    #[test]
+    fn unregister_leaves_same_guild_neighbor_intact() {
+        let p = pool(3);
+        channel(&p, "A", 1, 10);
+        channel(&p, "B", 1, 20);
+        p.assign("A", "alice", "Alice");
+        p.assign("B", "bob", "Bob");
+        let sb = p.test_slot_of("B", "bob").unwrap();
+        p.unregister_channel("A");
+        // B's per-(bot, guild) session, assignment and anchor are untouched.
+        assert_eq!(p.test_slot_of("B", "bob"), Some(sb));
+        assert_eq!(p.test_anchor("B"), Some(sb));
+        assert!(p.test_session_mixer(sb, 1).is_some(), "B's session survives");
+        assert!(p.test_has_channel("B"));
+    }
+
+    #[test]
+    fn unregister_activates_pending_channel() {
+        let p = pool(1);
+        channel(&p, "A", 1, 10);
+        channel(&p, "B", 1, 20);
+        p.assign("A", "alice", "Alice"); // takes the only bot
+        p.assign("B", "bob", "Bob"); // pending — no bot free
+        assert_eq!(p.test_anchor("B"), None);
+        p.unregister_channel("A");
+        assert!(p.test_anchor("B").is_some(), "B activated by the freed bot");
+        assert!(p.test_slot_of("B", "bob").is_some());
+    }
+
+    #[test]
+    fn unregister_cancels_armed_idle_anchor_token() {
+        let p = pool(1);
+        channel(&p, "A", 1, 10);
+        let token = p.test_arm_idle_token("A");
+        p.unregister_channel("A");
+        assert!(token.is_cancelled(), "pending idle-release timer cancelled");
+    }
+
+    #[test]
+    fn duplicate_register_is_an_error() {
+        let p = pool(1);
+        channel(&p, "A", 1, 10);
+        let Err(err) =
+            p.register_channel(Arc::from("A"), "1", "10", Arc::new(NoopCapture), None)
+        else {
+            panic!("duplicate register_channel must fail");
+        };
+        assert!(
+            err.to_string().contains("already registered"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
