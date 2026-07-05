@@ -28,6 +28,7 @@ use nvb_audio::routing::{CaptureRouter, PlaybackRouter};
 use nvb_config::{BridgeConfig, LiveKeys, ServerProfile, validate_bridge_against};
 use nvb_discord::{CaptureSink, SharedPool};
 use nvb_matrix_rtc::GhostPool;
+use nvb_matrix_rtc::mgmt::{BridgeStatus, ControlMsg, ControlTx, ReconcileSummary};
 
 /// How long a cancelled bridge gets to unwind (leave voice, retract ghost
 /// memberships, close LiveKit) before its future is force-dropped. The
@@ -97,6 +98,10 @@ pub struct Supervisor {
     /// Once the operator shutdown begins, completions must not respawn pending
     /// replacements — a fresh bridge mid-drain would hang the drain.
     shutting_down: bool,
+    /// Control-plane requests from the management bot (#4), selected in
+    /// [`run`](Self::run) alongside the signals. `None` when no frontend was
+    /// attached, or after the frontend hung up.
+    control_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ControlMsg>>,
 }
 
 impl Supervisor {
@@ -108,7 +113,17 @@ impl Supervisor {
             bridges: FuturesUnordered::new(),
             ctx,
             shutting_down: false,
+            control_rx: None,
         }
+    }
+
+    /// Attach a control frontend (the management bot): creates the channel,
+    /// keeps the receiver for [`run`](Self::run)'s select loop, and returns the
+    /// sender for the frontend task.
+    pub fn control_handle(&mut self) -> ControlTx {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.control_rx = Some(rx);
+        tx
     }
 
     /// Build and start one bridge: ghost pool, channel registration in the shared
@@ -249,26 +264,24 @@ impl Supervisor {
         }
     }
 
-    /// SIGHUP: re-read `tenants.toml` and reconcile the running tenant bridges
-    /// against it — all-or-nothing. A load or validation failure rejects the
-    /// whole reload and leaves the running set untouched (partial application
-    /// would make the desired-state file lie); per-entry spawn failures after a
-    /// plan is accepted only log, the file being the retry vehicle.
-    fn reconcile_tenants(&mut self) {
+    /// Re-read `tenants.toml` and reconcile the running tenant bridges against
+    /// it — all-or-nothing. A load or validation failure rejects the whole
+    /// reload and leaves the running set untouched (partial application would
+    /// make the desired-state file lie); per-entry spawn failures after a plan
+    /// is accepted are reported in the summary AND logged, the file being the
+    /// retry vehicle. Shared by SIGHUP and the control channel (#4) — the only
+    /// difference is whether the caller can relay the outcome.
+    fn reconcile_tenants(&mut self) -> Result<ReconcileSummary, String> {
         let path = nvb_config::tenants_path(&self.ctx.data_dir);
-        let desired =
-            match nvb_config::load_tenants(&path, &self.ctx.servers, &self.ctx.data_dir) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!(error = %e, path,
-                        "tenants reload REJECTED — running set unchanged");
-                    return;
-                }
-            };
-        if let Err(e) = validate_desired(&desired, &self.ctx) {
+        let desired = nvb_config::load_tenants(&path, &self.ctx.servers, &self.ctx.data_dir)
+            .map_err(|e| {
+                tracing::error!(error = %e, path, "tenants reload REJECTED — running set unchanged");
+                e.to_string()
+            })?;
+        validate_desired(&desired, &self.ctx).map_err(|e| {
             tracing::error!(error = %e, path, "tenants reload REJECTED — running set unchanged");
-            return;
-        }
+            e
+        })?;
 
         // Diff desired against the running tenant subset (static bridges are
         // never in `desired`, hence never stopped here).
@@ -279,22 +292,28 @@ impl Supervisor {
             .map(|(l, rb)| (l.clone(), rb.effective_cfg().clone()))
             .collect();
         let plan = diff_tenants(&running, desired);
+        let mut summary = ReconcileSummary {
+            unchanged: running.len() - plan.remove.len() - plan.replace.len(),
+            ..ReconcileSummary::default()
+        };
         tracing::info!(
             add = plan.add.len(),
             remove = plan.remove.len(),
             replace = plan.replace.len(),
-            unchanged = running.len() - plan.remove.len() - plan.replace.len(),
+            unchanged = summary.unchanged,
             "tenants reload accepted — applying"
         );
         for label in &plan.remove {
             tracing::info!(bridge = %label, "tenant removed — stopping bridge");
             self.stop_bridge(label, None);
+            summary.removed.push(label.clone());
         }
         for cfg in plan.replace {
             // Loader guarantees every tenant has a name.
             let label = cfg.name.clone().unwrap_or_default();
             tracing::info!(bridge = %label, "tenant changed — stopping for respawn");
             self.stop_bridge(&label, Some(cfg));
+            summary.replaced.push(label);
         }
         for cfg in plan.add {
             let label: Arc<str> = Arc::from(cfg.name.clone().unwrap_or_default().as_str());
@@ -302,6 +321,39 @@ impl Supervisor {
             if let Err(e) = self.spawn_bridge(label.clone(), cfg, Origin::Tenant) {
                 tracing::error!(bridge = %label, error = %e,
                     "failed to start added tenant — fix and reload");
+                summary.failed.push((label.to_string(), format!("{e:#}")));
+            } else {
+                summary.added.push(label.to_string());
+            }
+        }
+        Ok(summary)
+    }
+
+    /// Serve one control-plane request (#4).
+    fn handle_control(&mut self, msg: ControlMsg) {
+        match msg {
+            ControlMsg::Reconcile { reply } => {
+                tracing::info!("control: reconciling tenants against tenants.toml");
+                // A dropped reply just means the frontend gave up waiting.
+                let _ = reply.send(self.reconcile_tenants());
+            }
+            ControlMsg::Status { reply } => {
+                let mut out: Vec<BridgeStatus> = self
+                    .running
+                    .iter()
+                    .map(|(label, rb)| {
+                        let cfg = rb.effective_cfg();
+                        BridgeStatus {
+                            label: label.clone(),
+                            is_tenant: rb.origin == Origin::Tenant,
+                            room_id: cfg.matrix.room_id.clone(),
+                            guild_id: cfg.discord.guild_id.clone(),
+                            channel_id: cfg.discord.channel_id.clone(),
+                        }
+                    })
+                    .collect();
+                out.sort_by(|a, b| a.label.cmp(&b.label));
+                let _ = reply.send(out);
             }
         }
     }
@@ -366,7 +418,19 @@ impl Supervisor {
                 // tenants.toml (systemd: ExecReload=/bin/kill -HUP $MAINPID).
                 _ = recv_signal(&mut sighup) => {
                     tracing::info!("SIGHUP — reconciling tenants against tenants.toml");
-                    self.reconcile_tenants();
+                    // Outcome (including rejection) is logged inside.
+                    let _ = self.reconcile_tenants();
+                }
+                // Management-bot request (#4). A closed channel (frontend died)
+                // detaches the receiver so this arm stops firing.
+                msg = recv_control(&mut self.control_rx) => {
+                    match msg {
+                        Some(msg) => self.handle_control(msg),
+                        None => {
+                            tracing::warn!("control frontend disconnected");
+                            self.control_rx = None;
+                        }
+                    }
                 }
             }
             // All work ended on its own (errors already logged per bridge). Note
@@ -439,6 +503,17 @@ async fn recv_signal(sig: &mut Option<Signal>) {
         Some(s) => {
             s.recv().await;
         }
+        None => std::future::pending().await,
+    }
+}
+
+/// Await the next control message; pends forever when no frontend is attached
+/// (or after it hung up and the receiver was detached).
+async fn recv_control(
+    rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<ControlMsg>>,
+) -> Option<ControlMsg> {
+    match rx {
+        Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
 }

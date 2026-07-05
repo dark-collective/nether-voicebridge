@@ -17,6 +17,7 @@
 
 mod device_prune;
 mod matrix;
+pub mod mgmt;
 mod rtc;
 
 use std::sync::Arc;

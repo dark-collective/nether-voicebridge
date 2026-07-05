@@ -784,7 +784,7 @@ pub(crate) async fn appservice_login_as(
 /// `sender_localpart` or a namespaced user); on the appservice-auth path the bot
 /// always is. Join rules are still enforced (a restricted/non-public room needs an
 /// invite or allow-space membership) — only the guest check is bypassed.
-async fn appservice_join_room(
+pub(crate) async fn appservice_join_room(
     homeserver_url: &str,
     appservice_token: &str,
     room_id: &str,
