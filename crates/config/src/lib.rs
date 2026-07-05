@@ -110,7 +110,7 @@ pub struct ServerProfile {
     pub rotate_ghost_sessions: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct BridgeConfig {
     /// Optional human label, used in logs/spans. Falls back to the index. Also the
     /// source for the auto-derived `matrix.device_id` and `store_path` leaf (slug).
@@ -135,7 +135,7 @@ pub struct BridgeConfig {
     pub livekit: LiveKitConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct DiscordConfig {
     pub guild_id: String,
     pub channel_id: String,
@@ -193,7 +193,7 @@ fn server_name_from_url(homeserver_url: &str) -> Option<String> {
     if host_port.is_empty() { None } else { Some(host_port.to_owned()) }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 pub struct MatrixConfig {
     /// Inherited from the `[server.<name>]` profile when omitted. Empty string is the
     /// "not set" sentinel that `resolve_servers` fills.
@@ -301,7 +301,7 @@ pub enum KeyTransport {
     Olm,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 pub struct LiveKitConfig {
     /// Optional override for the lk-jwt-service endpoint. When absent (the
     /// default), it is auto-derived from the homeserver's `.well-known`
@@ -352,6 +352,257 @@ impl LiveKitConfig {
     }
 }
 
+/// The stable auto-derive leaf for a bridge's device_id / store_path: the slug of
+/// its `name` when set, else the positional `bridge-{i}` fallback. Runtime-added
+/// bridges must always carry a name (positions renumber across add/remove), so the
+/// fallback only exists for static configs.
+fn bridge_leaf(b: &BridgeConfig, i: usize) -> String {
+    match &b.name {
+        Some(name) => slugify(name),
+        None => format!("bridge-{i}"),
+    }
+}
+
+/// Per-bridge body of [`Config::resolve_servers`]: merge the referenced
+/// `[server.<name>]` profile + bridge-level `room_id` into `matrix`. An explicit
+/// per-bridge value (non-empty) always wins over the profile.
+pub fn resolve_bridge_server(
+    b: &mut BridgeConfig,
+    servers: &std::collections::HashMap<String, ServerProfile>,
+) {
+    let m = &mut b.matrix;
+    // Bridge-level room_id is the preferred spelling; it wins over any
+    // `[bridge.matrix].room_id` only when the latter wasn't set.
+    if m.room_id.is_empty() && !b.room_id.is_empty() {
+        m.room_id = b.room_id.clone();
+    }
+    let Some(profile) = b.server.as_ref().and_then(|name| servers.get(name)) else {
+        return;
+    };
+    if m.homeserver_url.is_empty() {
+        m.homeserver_url = profile.homeserver_url.clone();
+    }
+    if m.matrix_domain.is_none() {
+        m.matrix_domain = profile.matrix_domain.clone();
+    }
+    if m.bot_user_id.is_empty() {
+        m.bot_user_id = profile.bot_user_id.clone();
+    }
+    if m.sender_localpart.is_none() {
+        m.sender_localpart = profile.sender_localpart.clone();
+    }
+    if m.appservice_id.is_empty() {
+        m.appservice_id = profile.appservice_id.clone();
+    }
+    if m.appservice_token.is_empty() {
+        m.appservice_token = profile.appservice_token.clone();
+    }
+    if m.prune_stale_devices.is_none() {
+        m.prune_stale_devices = profile.prune_stale_devices;
+    }
+    if m.rotate_ghost_sessions.is_none() {
+        m.rotate_ghost_sessions = profile.rotate_ghost_sessions;
+    }
+}
+
+/// Per-bridge body of [`Config::resolve_bot_user_ids`]: derive an omitted
+/// `bot_user_id` from `sender_localpart` + the resolved server domain
+/// (`{sender_localpart}_bot` localpart — see the method docs for why `_bot`).
+pub fn resolve_bridge_bot_user_id(b: &mut BridgeConfig) {
+    let m = &mut b.matrix;
+    if !m.bot_user_id.is_empty() {
+        return;
+    }
+    let Some(localpart) = &m.sender_localpart else { return };
+    let Some(server_name) = m
+        .matrix_domain
+        .clone()
+        .or_else(|| server_name_from_url(&m.homeserver_url))
+    else {
+        return;
+    };
+    m.bot_user_id = format!("@{localpart}_bot:{server_name}");
+}
+
+/// Per-bridge body of [`Config::resolve_device_ids`]: fill an omitted `device_id`
+/// with the given leaf (the same leaf as `store_path`, so device + store stay
+/// consistent). An explicit `device_id` is left as-is.
+pub fn resolve_bridge_device_id(b: &mut BridgeConfig, leaf: &str) {
+    if b.matrix.device_id.is_empty() {
+        b.matrix.device_id = leaf.to_string();
+    }
+}
+
+/// Per-bridge body of [`Config::resolve_store_paths`]: fill an omitted
+/// `store_path` with `<data_dir>/<leaf>`. An explicit `store_path` is left as-is.
+pub fn resolve_bridge_store_path(b: &mut BridgeConfig, data_dir: &str, leaf: &str) {
+    if b.matrix.store_path.is_empty() {
+        let base = data_dir.trim_end_matches('/');
+        b.matrix.store_path = format!("{base}/{leaf}");
+    }
+}
+
+/// The uniqueness-key sets of a set of live (or about-to-be-live) bridges, used to
+/// validate a further bridge against them without re-validating the whole set.
+/// Hard keys mirror `Config::validate`'s cross-bridge errors; soft keys mirror its
+/// warnings.
+#[derive(Debug, Default)]
+pub struct LiveKeys {
+    /// Bridge names (labels) — the supervisor keys running bridges by label, so a
+    /// duplicate would collide in its registry and in the puppet pool's channel map.
+    pub names: std::collections::HashSet<String>,
+    /// Hard: `(homeserver_url, bot_user_id, device_id)` — two matrix-sdk sessions
+    /// on one device steal each other's to-device messages.
+    pub devices: std::collections::HashSet<(String, String, String)>,
+    /// Hard: `store_path` — two bridges sharing one SQLite store lock/corrupt.
+    pub stores: std::collections::HashSet<String>,
+    /// Soft: Discord `(guild_id, channel_id)` — two bridges on one channel fight
+    /// over bots.
+    pub channels: std::collections::HashSet<(String, String)>,
+    /// Soft: Matrix room_id — almost always a copy-paste slip.
+    pub rooms: std::collections::HashSet<String>,
+}
+
+impl LiveKeys {
+    /// Collect the key sets of an existing bridge set (e.g. the static config's
+    /// bridges, or the supervisor's running set).
+    pub fn from_bridges<'a>(bridges: impl IntoIterator<Item = &'a BridgeConfig>) -> Self {
+        let mut keys = Self::default();
+        for b in bridges {
+            keys.insert(b);
+        }
+        keys
+    }
+
+    /// Add one bridge's keys (call after it passes `validate_bridge_against`).
+    pub fn insert(&mut self, b: &BridgeConfig) {
+        if let Some(name) = &b.name {
+            self.names.insert(name.clone());
+        }
+        let m = &b.matrix;
+        self.devices.insert((
+            m.homeserver_url.clone(),
+            m.bot_user_id.clone(),
+            m.device_id.clone(),
+        ));
+        self.stores.insert(m.store_path.clone());
+        self.channels.insert((
+            b.discord.guild_id.clone(),
+            b.discord.channel_id.clone(),
+        ));
+        self.rooms.insert(m.room_id.clone());
+    }
+}
+
+/// Validate one (already-resolved) bridge against a set of live bridges' keys.
+/// Hard failures error; likely-mistakes are logged as warnings. Does NOT mutate
+/// `live` — call [`LiveKeys::insert`] after acceptance. The per-bridge counterpart
+/// of `Config::validate`'s cross-bridge checks, with identical error text.
+pub fn validate_bridge_against(
+    b: &BridgeConfig,
+    servers: &std::collections::HashMap<String, ServerProfile>,
+    live: &LiveKeys,
+) -> Result<(), ConfigError> {
+    // Hard: a `server = "<name>"` reference must resolve to a defined
+    // `[server.<name>]` profile (otherwise the merge silently filled nothing).
+    if let Some(name) = &b.server {
+        if !servers.contains_key(name) {
+            return Err(ConfigError::Validation(format!(
+                "bridge '{}': references unknown server profile '{name}' — \
+                 define a [server.{name}] block (or set the fields inline in \
+                 [bridge.matrix])",
+                b.label()
+            )));
+        }
+    }
+
+    // Hard: after profile-merge + auto-derive, every required Matrix field must be
+    // present. Empty here means the bridge neither inherited it (no/empty profile)
+    // nor set it inline.
+    let m = &b.matrix;
+    let missing: Vec<&str> = [
+        ("homeserver_url", m.homeserver_url.is_empty()),
+        ("bot_user_id (or sender_localpart)", m.bot_user_id.is_empty()),
+        ("room_id", m.room_id.is_empty()),
+        ("device_id", m.device_id.is_empty()),
+        ("appservice_id", m.appservice_id.is_empty()),
+        ("appservice_token", m.appservice_token.is_empty()),
+    ]
+    .into_iter()
+    .filter_map(|(field, empty)| empty.then_some(field))
+    .collect();
+    if !missing.is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "bridge '{}': missing required matrix field(s): {} — set them in a \
+             [server.<name>] profile (and reference it via server = \"…\") or \
+             inline in [bridge.matrix]",
+            b.label(),
+            missing.join(", ")
+        )));
+    }
+
+    // Hard: distinct (homeserver_url, bot_user_id, device_id) per bridge — two
+    // matrix-sdk sessions on one device steal each other's to-device messages
+    // (the encrypted media key arrives once per device), silently breaking E2EE.
+    if live.devices.contains(&(
+        m.homeserver_url.clone(),
+        m.bot_user_id.clone(),
+        m.device_id.clone(),
+    )) {
+        return Err(ConfigError::Validation(format!(
+            "duplicate (homeserver_url, bot_user_id, device_id) across bridges \
+             for bot '{}' device '{}' — each bridge needs its own device_id \
+             (omit it to auto-derive a distinct one from the bridge name)",
+            m.bot_user_id, m.device_id
+        )));
+    }
+
+    // Hard: distinct store_path per bridge — a shared SQLite store locks/corrupts,
+    // and ghost Olm stores nest under it.
+    if live.stores.contains(&m.store_path) {
+        return Err(ConfigError::Validation(format!(
+            "duplicate matrix store_path '{}' across bridges — each bridge \
+             needs its own store",
+            m.store_path
+        )));
+    }
+
+    // Soft: explicitly pinning `key_transport = "olm"` while explicitly forcing
+    // `media_e2ee = false` is contradictory — Olm transport is ignored with E2EE off.
+    if b.livekit.key_transport == Some(KeyTransport::Olm) && b.livekit.media_e2ee == Some(false) {
+        tracing::warn!(
+            room_id = %m.room_id,
+            "key_transport = \"olm\" set but media_e2ee = false — Olm key transport \
+             is ignored; remove the media_e2ee override (auto-detect) or set it true"
+        );
+    }
+
+    // Soft: a room_id reused across bridges is almost always a copy-paste slip.
+    if live.rooms.contains(&m.room_id) {
+        tracing::warn!(
+            bridge = %b.label(),
+            room_id = %m.room_id,
+            "duplicate Matrix room_id across bridges"
+        );
+    }
+
+    // Soft: same Discord voice channel bridged twice (a bot can only be in one VC
+    // per guild — two bridges on one channel would fight over bots).
+    if live
+        .channels
+        .contains(&(b.discord.guild_id.clone(), b.discord.channel_id.clone()))
+    {
+        tracing::warn!(
+            bridge = %b.label(),
+            guild_id = %b.discord.guild_id,
+            channel_id = %b.discord.channel_id,
+            "duplicate Discord (guild, channel) across bridges"
+        );
+    }
+
+    Ok(())
+}
+
 impl Config {
     pub fn load(path: &str) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
@@ -366,9 +617,12 @@ impl Config {
         cfg.resolve_bot_user_ids();
         cfg.resolve_device_ids();
         // `NVB_DATA_DIR` (set to `/app/data` by the Docker image) overrides the
-        // configured `data_dir`; fall back to it otherwise.
+        // configured `data_dir`; fall back to it otherwise. Write the resolved value
+        // back so later consumers (e.g. the tenants.toml path) see the same base the
+        // store paths derived from.
         let data_dir = std::env::var("NVB_DATA_DIR").unwrap_or_else(|_| cfg.data_dir.clone());
         cfg.resolve_store_paths(&data_dir);
+        cfg.data_dir = data_dir;
         Ok(cfg)
     }
 
@@ -381,39 +635,7 @@ impl Config {
         // Disjoint borrows: `servers` (read) and `bridges` (write) are distinct fields.
         let servers = &self.servers;
         for b in self.bridges.iter_mut() {
-            let m = &mut b.matrix;
-            // Bridge-level room_id is the preferred spelling; it wins over any
-            // `[bridge.matrix].room_id` only when the latter wasn't set.
-            if m.room_id.is_empty() && !b.room_id.is_empty() {
-                m.room_id = b.room_id.clone();
-            }
-            let Some(profile) = b.server.as_ref().and_then(|name| servers.get(name)) else {
-                continue;
-            };
-            if m.homeserver_url.is_empty() {
-                m.homeserver_url = profile.homeserver_url.clone();
-            }
-            if m.matrix_domain.is_none() {
-                m.matrix_domain = profile.matrix_domain.clone();
-            }
-            if m.bot_user_id.is_empty() {
-                m.bot_user_id = profile.bot_user_id.clone();
-            }
-            if m.sender_localpart.is_none() {
-                m.sender_localpart = profile.sender_localpart.clone();
-            }
-            if m.appservice_id.is_empty() {
-                m.appservice_id = profile.appservice_id.clone();
-            }
-            if m.appservice_token.is_empty() {
-                m.appservice_token = profile.appservice_token.clone();
-            }
-            if m.prune_stale_devices.is_none() {
-                m.prune_stale_devices = profile.prune_stale_devices;
-            }
-            if m.rotate_ghost_sessions.is_none() {
-                m.rotate_ghost_sessions = profile.rotate_ghost_sessions;
-            }
+            resolve_bridge_server(b, servers);
         }
     }
 
@@ -439,17 +661,7 @@ impl Config {
     /// registration template) is treated as a regular Matrix user and can sync normally.
     pub fn resolve_bot_user_ids(&mut self) {
         for b in self.bridges.iter_mut() {
-            let m = &mut b.matrix;
-            if !m.bot_user_id.is_empty() {
-                continue;
-            }
-            let Some(localpart) = &m.sender_localpart else { continue };
-            let Some(server_name) = m.matrix_domain.clone()
-                .or_else(|| server_name_from_url(&m.homeserver_url))
-            else {
-                continue;
-            };
-            m.bot_user_id = format!("@{localpart}_bot:{server_name}");
+            resolve_bridge_bot_user_id(b);
         }
     }
 
@@ -460,13 +672,8 @@ impl Config {
     /// Call identity mapping require. An explicit `device_id` is left as-is.
     pub fn resolve_device_ids(&mut self) {
         for (i, b) in self.bridges.iter_mut().enumerate() {
-            if !b.matrix.device_id.is_empty() {
-                continue;
-            }
-            b.matrix.device_id = match &b.name {
-                Some(name) => slugify(name),
-                None => format!("bridge-{i}"),
-            };
+            let leaf = bridge_leaf(b, i);
+            resolve_bridge_device_id(b, &leaf);
         }
     }
 
@@ -480,16 +687,9 @@ impl Config {
     /// `name` derive the same path; `validate()`'s duplicate-store_path check then
     /// turns that into a clear error pointing at the real mistake.
     pub fn resolve_store_paths(&mut self, data_dir: &str) {
-        let base = data_dir.trim_end_matches('/');
         for (i, b) in self.bridges.iter_mut().enumerate() {
-            if !b.matrix.store_path.is_empty() {
-                continue;
-            }
-            let leaf = match &b.name {
-                Some(name) => slugify(name),
-                None => format!("bridge-{i}"),
-            };
-            b.matrix.store_path = format!("{base}/{leaf}");
+            let leaf = bridge_leaf(b, i);
+            resolve_bridge_store_path(b, data_dir, &leaf);
         }
     }
 
@@ -648,6 +848,7 @@ impl Config {
         // sqlite store + ghost Olm stores land off the persistent volume.
         let data_dir = std::env::var("NVB_DATA_DIR").unwrap_or_else(|_| cfg.data_dir.clone());
         cfg.resolve_store_paths(&data_dir);
+        cfg.data_dir = data_dir;
         Ok(cfg)
     }
 
@@ -668,118 +869,6 @@ impl Config {
             ));
         }
 
-        // Hard: a `server = "<name>"` reference must resolve to a defined
-        // `[server.<name>]` profile (otherwise the merge silently filled nothing).
-        for b in &self.bridges {
-            if let Some(name) = &b.server {
-                if !self.servers.contains_key(name) {
-                    return Err(ConfigError::Validation(format!(
-                        "bridge '{}': references unknown server profile '{name}' — \
-                         define a [server.{name}] block (or set the fields inline in \
-                         [bridge.matrix])",
-                        b.label()
-                    )));
-                }
-            }
-        }
-
-        // Hard: after profile-merge + auto-derive, every required Matrix field must be
-        // present. Empty here means the bridge neither inherited it (no/empty profile)
-        // nor set it inline.
-        for b in &self.bridges {
-            let m = &b.matrix;
-            let missing: Vec<&str> = [
-                ("homeserver_url", m.homeserver_url.is_empty()),
-                ("bot_user_id (or sender_localpart)", m.bot_user_id.is_empty()),
-                ("room_id", m.room_id.is_empty()),
-                ("device_id", m.device_id.is_empty()),
-                ("appservice_id", m.appservice_id.is_empty()),
-                ("appservice_token", m.appservice_token.is_empty()),
-            ]
-            .into_iter()
-            .filter_map(|(field, empty)| empty.then_some(field))
-            .collect();
-            if !missing.is_empty() {
-                return Err(ConfigError::Validation(format!(
-                    "bridge '{}': missing required matrix field(s): {} — set them in a \
-                     [server.<name>] profile (and reference it via server = \"…\") or \
-                     inline in [bridge.matrix]",
-                    b.label(),
-                    missing.join(", ")
-                )));
-            }
-        }
-
-        // Hard: distinct (homeserver_url, bot_user_id, device_id) per bridge — two
-        // matrix-sdk sessions on one device steal each other's to-device messages
-        // (the encrypted media key arrives once per device), silently breaking E2EE.
-        // Auto-derived device_ids are distinct-by-name; this catches explicit
-        // collisions (e.g. two bridges hand-set the same device_id on one bot).
-        let mut seen_devices = std::collections::HashSet::new();
-        for b in &self.bridges {
-            let m = &b.matrix;
-            if !seen_devices.insert((
-                m.homeserver_url.as_str(),
-                m.bot_user_id.as_str(),
-                m.device_id.as_str(),
-            )) {
-                return Err(ConfigError::Validation(format!(
-                    "duplicate (homeserver_url, bot_user_id, device_id) across bridges \
-                     for bot '{}' device '{}' — each bridge needs its own device_id \
-                     (omit it to auto-derive a distinct one from the bridge name)",
-                    m.bot_user_id, m.device_id
-                )));
-            }
-        }
-
-        // Hard: distinct store_path per bridge. `build_client` always opens a
-        // persistent SQLite store at `store_path`, and with Olm key transport each
-        // bridge's ghosts nest their own stores under it
-        // (`<store_path>/ghosts/<localpart>`); two bridges sharing one path would
-        // lock/corrupt. Auto-derivation (`resolve_store_paths`) already gives each
-        // bridge a distinct `<data_dir>/<bridge>` path, so this normally only fires
-        // for explicit collisions — e.g. two bridges sharing a `name` (identical
-        // derived path) or hand-set duplicate paths. Enforce uniqueness either way.
-        let mut seen_stores = std::collections::HashSet::new();
-        for b in &self.bridges {
-            if !seen_stores.insert(b.matrix.store_path.as_str()) {
-                return Err(ConfigError::Validation(format!(
-                    "duplicate matrix store_path '{}' across bridges — each bridge \
-                     needs its own store",
-                    b.matrix.store_path
-                )));
-            }
-        }
-
-        // Soft: explicitly pinning `key_transport = "olm"` while explicitly
-        // forcing `media_e2ee = false` is contradictory — Olm transport is ignored
-        // with E2EE off. (Both are now auto by default; only flag the deliberate
-        // both-set-and-conflicting case, not the auto path.)
-        for b in &self.bridges {
-            if b.livekit.key_transport == Some(KeyTransport::Olm)
-                && b.livekit.media_e2ee == Some(false)
-            {
-                tracing::warn!(
-                    room_id = %b.matrix.room_id,
-                    "key_transport = \"olm\" set but media_e2ee = false — Olm key transport \
-                     is ignored; remove the media_e2ee override (auto-detect) or set it true"
-                );
-            }
-        }
-
-        // Soft: a room_id reused across bridges is almost always a copy-paste slip.
-        let mut seen_rooms = std::collections::HashMap::new();
-        for (i, b) in self.bridges.iter().enumerate() {
-            if let Some(j) = seen_rooms.insert(b.matrix.room_id.as_str(), i) {
-                tracing::warn!(
-                    room_id = %b.matrix.room_id,
-                    first = j,
-                    second = i,
-                    "duplicate Matrix room_id across bridges"
-                );
-            }
-        }
-
         // Soft: a Discord bot token listed twice in the shared pool would build
         // two gateway connections for one bot identity, which Discord rejects.
         let mut seen_tokens = std::collections::HashMap::new();
@@ -793,18 +882,15 @@ impl Config {
             }
         }
 
-        // Soft: same Discord voice channel bridged twice (a bot can only be in
-        // one VC per guild — two bridges on one channel would fight over bots).
-        let mut seen_channels = std::collections::HashMap::new();
-        for (i, b) in self.bridges.iter().enumerate() {
-            let key = (b.discord.guild_id.as_str(), b.discord.channel_id.as_str());
-            if let Some(j) = seen_channels.insert(key, i) {
-                tracing::warn!(
-                    bridge = i,
-                    other = j,
-                    "duplicate Discord (guild, channel) across bridges"
-                );
-            }
+        // Per-bridge checks (hard: server refs, required matrix fields, unique
+        // (homeserver, bot, device) tuple, unique store_path; soft: olm/e2ee
+        // contradiction, duplicate room / (guild, channel)), folded so each bridge
+        // is validated against everything accepted before it — the same primitive
+        // the supervisor uses to admit a runtime-added bridge against the live set.
+        let mut live = LiveKeys::default();
+        for b in &self.bridges {
+            validate_bridge_against(b, &self.servers, &live)?;
+            live.insert(b);
         }
 
         Ok(())
@@ -908,6 +994,78 @@ store_path = "{store}"
 media_e2ee = false
 "#
         )
+    }
+
+    /// Parse a single resolved `BridgeConfig` out of a one-bridge TOML config.
+    fn one_bridge(name: Option<&str>, room: &str, store: &str, chan: &str) -> BridgeConfig {
+        let toml = format!(
+            "{}{}",
+            puppets_block(&["tok"]),
+            bridge_block(name, room, store, chan)
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        cfg.bridges.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn live_keys_collect_and_admit_a_distinct_bridge() {
+        let a = one_bridge(Some("a"), "!a:x", "/s/a", "1");
+        let b = one_bridge(Some("b"), "!b:x", "/s/b", "2");
+        let live = LiveKeys::from_bridges([&a]);
+        assert!(live.names.contains("a"));
+        assert!(live.stores.contains("/s/a"));
+        assert!(live.channels.contains(&("111".into(), "1".into())));
+        let servers = std::collections::HashMap::new();
+        validate_bridge_against(&b, &servers, &live).expect("distinct bridge admitted");
+    }
+
+    #[test]
+    fn validate_against_rejects_device_tuple_collision() {
+        let a = one_bridge(Some("a"), "!a:x", "/s/a", "1");
+        // Same homeserver/bot and an explicitly identical device_id.
+        let mut b = one_bridge(Some("b"), "!b:x", "/s/b", "2");
+        b.matrix.device_id = a.matrix.device_id.clone();
+        let live = LiveKeys::from_bridges([&a]);
+        let servers = std::collections::HashMap::new();
+        let err = validate_bridge_against(&b, &servers, &live).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate (homeserver_url, bot_user_id, device_id)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_against_rejects_store_collision() {
+        let a = one_bridge(Some("a"), "!a:x", "/s/shared", "1");
+        let mut b = one_bridge(Some("b"), "!b:x", "/s/b", "2");
+        b.matrix.store_path = "/s/shared".into();
+        let live = LiveKeys::from_bridges([&a]);
+        let servers = std::collections::HashMap::new();
+        let err = validate_bridge_against(&b, &servers, &live).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate matrix store_path '/s/shared'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_against_rejects_unknown_server_ref_and_missing_fields() {
+        let live = LiveKeys::default();
+        let servers = std::collections::HashMap::new();
+        let mut b = one_bridge(Some("b"), "!b:x", "/s/b", "2");
+        b.server = Some("nope".into());
+        let err = validate_bridge_against(&b, &servers, &live).unwrap_err();
+        assert!(
+            err.to_string().contains("references unknown server profile 'nope'"),
+            "unexpected error: {err}"
+        );
+        let mut c = one_bridge(Some("c"), "!c:x", "/s/c", "3");
+        c.matrix.appservice_token = String::new();
+        let err = validate_bridge_against(&c, &servers, &live).unwrap_err();
+        assert!(
+            err.to_string().contains("missing required matrix field(s): appservice_token"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
