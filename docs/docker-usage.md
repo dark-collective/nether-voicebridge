@@ -107,13 +107,13 @@ environment:
 
 ### Multi-architecture builds
 
-The published images and release artifacts are **amd64-only**. If you need arm64,
-build it yourself — to build for both `linux/amd64` and `linux/arm64` and push to a
-registry:
+The published images and release artifacts are **multi-arch: `linux/amd64` +
+`linux/arm64`** — `docker pull` picks your platform automatically. For any other
+platform, build it yourself:
 
 ```bash
 docker buildx build \
-  --platform linux/amd64,linux/arm64 \
+  --platform <your-platform> \
   --push \
   -t yourregistry/nether-voicebridge:latest \
   .
@@ -124,12 +124,14 @@ A plain `docker compose build` builds only for the host architecture.
 ## CI image builds (Forgejo Actions)
 
 `.forgejo/workflows/docker.yml` builds and pushes the image to the
-`nether.codes` container registry on every push to `master` and on `v*` tags. It
-needs a Forgejo runner with a `docker` label and a reachable Docker daemon
-(socket-mounted into the job container). The first build is heavy — the WebRTC
-download plus a full release compile. CI is **amd64-only** (the emulated arm64 leg
-is disabled — see the commented QEMU step in `docker.yml`), so a cold build is
-~12 min.
+`nether.codes` container registry on `v*` tags and manual dispatch. Each
+architecture compiles **natively in parallel** on its own Forgejo runner
+(labels `docker` / `docker-arm64` — no QEMU emulation; the arm64 runner setup
+is in [arm64-runner-setup.md](arm64-runner-setup.md)), each with a reachable
+Docker daemon (socket-mounted into the job container), and a `manifest` job
+combines the two into the public multi-arch tag. The first build is heavy —
+the WebRTC download plus a full release compile; a cold build is ~12 min on
+the amd64 runner and longer on the arm64 one.
 
 ### Limiting runner resources
 

@@ -20,7 +20,17 @@ if [ -z "${NVB_VERSION:-}" ]; then
         | python3 -c 'import sys,json; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="nether-voicebridge"))')"
 fi
 export NVB_VERSION
-echo ">> building nether-voicebridge $NVB_VERSION"
+
+# Arch: this script always packages a host-native build (nfpm.yaml reads it).
+if [ -z "${NVB_ARCH:-}" ]; then
+    case "$(uname -m)" in
+        x86_64)  NVB_ARCH=amd64 ;;
+        aarch64) NVB_ARCH=arm64 ;;
+        *) echo "unsupported arch $(uname -m); set NVB_ARCH explicitly" >&2; exit 1 ;;
+    esac
+fi
+export NVB_ARCH
+echo ">> building nether-voicebridge $NVB_VERSION ($NVB_ARCH)"
 
 cargo build --release --locked -p nether-voicebridge
 

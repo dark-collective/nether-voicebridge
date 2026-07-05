@@ -1,11 +1,14 @@
 name: Docker Build & Release
 
-# Single compile per ref. The `image` job is the ONLY place the binary is built
-# (inside the Dockerfile builder stage); the `packages` job reuses that exact
-# binary by copying it out of the pushed image — no second `cargo build`.
+# Single compile per (ref, arch). The two `image-*` jobs are the ONLY places the
+# binary gets built (inside the Dockerfile builder stage), each NATIVELY on a
+# runner of its own architecture — no QEMU emulation (#49). `manifest` stitches
+# the per-arch images into the public multi-arch tags, and `packages` reuses the
+# exact binaries by copying them out of the pushed images — no second
+# `cargo build` anywhere.
 on:
   # Releases only: the heavy image build runs on version tags, not on every push
-  # to master (the single self-hosted runner is reserved for releases).
+  # to master (the self-hosted runners are reserved for releases).
   push:
     tags: ['v*']
   # On-demand build from the Actions UI — publishes :edge for ad-hoc images
@@ -21,22 +24,24 @@ permissions:
 # failing mid-push with 502 / connection-reset. Forgejo stores the package by
 # owner/image regardless of the push host, so external users still
 # `docker pull nether.codes/dark/nether-voicebridge:...` (pulls go through CF
-# fine — only the large push was fragile). The runner's Docker daemon must list
-# this host under `insecure-registries` (it's plain HTTP on the tailnet).
+# fine — only the large push was fragile). Every runner's Docker daemon must
+# list this host under `insecure-registries` (it's plain HTTP on the tailnet),
+# and every runner host must be on the tailnet — see docs/arm64-runner-setup.md
+# for the arm64 runner's provisioning.
 env:
   REGISTRY: 100.64.0.13:3000
 
 jobs:
-  image:
+  # ── Per-arch native image builds ──────────────────────────────────────────
+  # Each pushes ONE arch-suffixed tag (…:<ref>-amd64 / …:<ref>-arm64); the
+  # `manifest` job below combines them into the public tags. The two jobs are
+  # spelled out (not a matrix) so `runs-on` stays a literal — the amd64 runner
+  # carries the `docker` label, the Oracle Ampere runner carries `docker-arm64`.
+  image-amd64:
     runs-on: docker
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      # arm64 is disabled for now (emulated build is very slow). To restore
-      # multi-arch: uncomment this step and add linux/arm64 to `platforms` below.
-      # - name: Set up QEMU (for arm64 cross-build)
-      #   uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -61,52 +66,113 @@ jobs:
           username: dark
           password: ${{ secrets.REGISTRY_TOKEN }}
 
-      # What to publish, by trigger:
-      #   stable tag (v1.2.3)        -> :v1.2.3 AND :latest
-      #   prerelease tag (v1.2.3-rc1) -> :v1.2.3 only (don't move :latest to an rc)
-      #   manual workflow_dispatch    -> :edge (ad-hoc build, not a release)
-      - name: Determine image tags
+      - name: Determine arch tag
         id: vars
         run: |
-          repo="${REGISTRY}/${{ github.repository }}"
-          {
-            echo "tags<<__EOF__"
-            if [ "${{ github.ref_type }}" = "tag" ]; then
-              ref="${{ github.ref_name }}"
-              echo "${repo}:${ref}"
-              case "$ref" in
-                *-*) : ;;                      # prerelease: version tag only
-                *)   echo "${repo}:latest" ;;  # stable: also move :latest
-              esac
-            else
-              echo "${repo}:edge"              # manual dispatch
-            fi
-            echo "__EOF__"
-          } >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref_type }}" = "tag" ]; then ref="${{ github.ref_name }}"; else ref=edge; fi
+          echo "tag=${REGISTRY}/${{ github.repository }}:${ref}-amd64" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      - name: Build and push (linux/amd64)
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
-          # amd64-only for now (see the commented QEMU step above to restore
-          # multi-arch: `platforms: linux/amd64,linux/arm64`).
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.vars.outputs.tags }}
+          tags: ${{ steps.vars.outputs.tag }}
           # No registry buildcache: cache-to mode=max pushes the huge cargo-chef
           # dependency layer, which exceeds Cloudflare's ~100 MB upload cap (413),
           # and cache-from never resolved it anyway. Cold builds are ~12 min amd64.
           # If incremental caching is wanted later, use a non-Cloudflare backend
           # (e.g. type=gha — the runner's actions cache is enabled).
 
-  # Builds the .deb and .rpm and attaches them to the Forgejo Release for the tag.
-  # Tag-only, and runs AFTER `image` so it can reuse that build's binary instead
-  # of compiling a second time (#29). The binary it packages is byte-identical to
-  # the one shipped in the Docker image.
+  image-arm64:
+    runs-on: docker-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."100.64.0.13:3000"]
+              http = true
+
+      - name: Log in to the Forgejo container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: dark
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Determine arch tag
+        id: vars
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then ref="${{ github.ref_name }}"; else ref=edge; fi
+          echo "tag=${REGISTRY}/${{ github.repository }}:${ref}-arm64" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push (linux/arm64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.vars.outputs.tag }}
+
+  # ── Multi-arch manifest ───────────────────────────────────────────────────
+  # Combines the two arch images into the public tags. What gets published,
+  # by trigger:
+  #   stable tag (v1.2.3)         -> :v1.2.3 AND :latest
+  #   prerelease tag (v1.2.3-rc1) -> :v1.2.3 only (don't move :latest to an rc)
+  #   manual workflow_dispatch    -> :edge (ad-hoc build, not a release)
+  manifest:
+    runs-on: docker
+    needs: [image-amd64, image-arm64]
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # `buildx imagetools` resolves the registry client-side using the
+          # current builder's registry config — without this it would insist on
+          # TLS to the plain-HTTP tailnet host. (Fallback if imagetools ever
+          # misbehaves here: `docker manifest create --insecure` +
+          # `docker manifest push --insecure` do the same job.)
+          buildkitd-config-inline: |
+            [registry."100.64.0.13:3000"]
+              http = true
+
+      - name: Log in to the Forgejo container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: dark
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Create and push the multi-arch tags
+        run: |
+          set -eu
+          repo="${REGISTRY}/${{ github.repository }}"
+          if [ "${{ github.ref_type }}" = "tag" ]; then ref="${{ github.ref_name }}"; else ref=edge; fi
+          tags="-t ${repo}:${ref}"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            case "$ref" in
+              *-*) : ;;                               # prerelease: version tag only
+              *)   tags="$tags -t ${repo}:latest" ;;  # stable: also move :latest
+            esac
+          fi
+          docker buildx imagetools create $tags "${repo}:${ref}-amd64" "${repo}:${ref}-arm64"
+          docker buildx imagetools inspect "${repo}:${ref}"
+
+  # ── Release packages ──────────────────────────────────────────────────────
+  # Builds the .deb/.rpm/tarball for BOTH architectures and attaches them to the
+  # Forgejo Release for the tag. Tag-only, and runs AFTER `manifest` so a release
+  # is never cut with a half-published image. The binaries it packages are
+  # byte-identical to the ones shipped in the Docker images (#29).
   packages:
     runs-on: docker
-    needs: [image]
+    needs: [manifest]
     if: github.ref_type == 'tag'
     steps:
       - name: Checkout
@@ -115,13 +181,13 @@ jobs:
       - name: Install packaging dependencies (nfpm)
         run: |
           # nfpm (pinned), installed as a static binary. No Rust toolchain needed
-          # here — the binary comes from the image, not a local compile.
+          # here — the binaries come from the images, not a local compile.
           NFPM_VERSION=2.46.3
           curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
             | tar -xz -C /usr/local/bin nfpm
 
-      # Auth so the pull below works regardless of package visibility (same
-      # `dark` / REGISTRY_TOKEN credentials the image job pushed with).
+      # Auth so the pulls below work regardless of package visibility (same
+      # `dark` / REGISTRY_TOKEN credentials the image jobs pushed with).
       - name: Log in to the Forgejo container registry
         uses: docker/login-action@v3
         with:
@@ -142,50 +208,47 @@ jobs:
           v="${GITHUB_REF_NAME#v}"
           echo "version=${v/-/\~}" >> "$GITHUB_OUTPUT"
 
-      # Reuse the binary the `image` job already compiled: pull the pushed image
-      # and copy /app/nether-voicebridge out to the path nfpm.yaml expects
-      # (target/release/nether-voicebridge). This is what eliminates the second
-      # `cargo build` that used to run here.
-      - name: Extract release binary from the pushed image
-        run: |
-          set -eu
-          img="${REGISTRY}/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}"
-          docker pull "$img"
-          cid=$(docker create "$img")
-          mkdir -p target/release
-          docker cp "$cid:/app/nether-voicebridge" target/release/nether-voicebridge
-          docker rm "$cid"
-          ls -l target/release/nether-voicebridge
-
-      - name: Build .deb and .rpm
-        env:
-          NVB_VERSION: ${{ steps.vars.outputs.version }}
-        run: |
-          mkdir -p dist
-          nfpm package -f packaging/nfpm.yaml -p deb -t dist/
-          nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
-          ls -l dist/
-
-      # Standalone tarball for non-deb/rpm distros: the same glibc/amd64 binary
-      # the image carries, bundled with the example config, systemd unit, license,
-      # and README so it's a self-contained drop-in. No recompile — reuses the
-      # binary extracted above.
-      - name: Build the standalone x86_64 tarball
+      # Per arch: pull the arch image the build jobs just pushed, copy its
+      # /app/nether-voicebridge out (this is what eliminates a second
+      # `cargo build`), then package it. nfpm names the outputs by arch
+      # (…_amd64.deb / …_arm64.deb, ….x86_64.rpm / ….aarch64.rpm) so the loop
+      # iterations never collide; the tarball gets the uname-style arch.
+      - name: Build .deb/.rpm/tarball for each architecture
         env:
           NVB_VERSION: ${{ steps.vars.outputs.version }}
         run: |
           set -eu
-          stage="nether-voicebridge-${NVB_VERSION}-x86_64-linux"
-          mkdir -p "dist/${stage}"
-          cp target/release/nether-voicebridge "dist/${stage}/"
-          cp config.example.toml packaging/nether-voicebridge.service LICENSE README.md "dist/${stage}/"
-          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
-          rm -rf "dist/${stage}"
+          mkdir -p dist target/release
+          for arch in amd64 arm64; do
+            img="${REGISTRY}/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}-${arch}"
+            docker pull "$img"
+            cid=$(docker create "$img")
+            docker cp "$cid:/app/nether-voicebridge" target/release/nether-voicebridge
+            docker rm "$cid"
+            ls -l target/release/nether-voicebridge
+
+            NVB_ARCH="$arch" nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+            NVB_ARCH="$arch" nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+
+            # Standalone tarball for non-deb/rpm distros: the same glibc binary
+            # the image carries, bundled with the example config, systemd unit,
+            # license, and README so it's a self-contained drop-in.
+            case "$arch" in
+              amd64) uarch=x86_64 ;;
+              arm64) uarch=aarch64 ;;
+            esac
+            stage="nether-voicebridge-${NVB_VERSION}-${uarch}-linux"
+            mkdir -p "dist/${stage}"
+            cp target/release/nether-voicebridge "dist/${stage}/"
+            cp config.example.toml packaging/nether-voicebridge.service LICENSE README.md "dist/${stage}/"
+            tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+            rm -rf "dist/${stage}"
+          done
           ls -l dist/
 
-      # Checksums over every release asset. Run last (after deb/rpm + tarball
-      # exist); `cd dist` so the file lists bare names → `sha256sum -c SHA256SUMS`
-      # works from inside the extracted/downloaded dir.
+      # Checksums over every release asset. Run last (after all debs/rpms +
+      # tarballs exist); `cd dist` so the file lists bare names →
+      # `sha256sum -c SHA256SUMS` works from inside the extracted/downloaded dir.
       - name: Generate SHA256SUMS
         run: |
           set -eu
@@ -193,7 +256,7 @@ jobs:
           sha256sum *.deb *.rpm *.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
-      # Create (or reuse) the Release for this tag, then upload both packages.
+      # Create (or reuse) the Release for this tag, then upload all packages.
       # RELEASE_TOKEN must be a Forgejo token with `write:repository` scope on this
       # repo (the Docker job's REGISTRY_TOKEN is package-scoped and won't work here).
       - name: Publish packages to the Forgejo Release
