@@ -17,6 +17,7 @@
 //!
 //! [`encrypt_and_send_raw_to_device`]: matrix_sdk::encryption::Encryption::encrypt_and_send_raw_to_device
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Context, Result};
@@ -29,6 +30,7 @@ use matrix_sdk::ruma::{
                 get_keys::v3::Response as KeysQueryResponse,
                 upload_keys::v3::Response as KeysUploadResponse,
             },
+            sync::sync_events::DeviceLists,
             to_device::send_event_to_device::v3::Response as ToDeviceResponse,
         },
         IncomingResponse,
@@ -40,7 +42,8 @@ use matrix_sdk_crypto::{
     store::MemoryStore,
     types::requests::{AnyOutgoingRequest, OutgoingRequest},
     vodozemac::olm::{Account, AccountPickle},
-    CollectStrategy, DeviceData, OlmMachine,
+    CollectStrategy, DecryptionSettings, DeviceData, EncryptionSyncChanges, OlmMachine,
+    TrustRequirement,
 };
 use tokio::sync::Mutex;
 use tracing::Instrument as _;
@@ -388,6 +391,10 @@ impl GhostCrypto {
         .await
         .context("building ghost OlmMachine with persisted account")?;
 
+        // #55: have the machine mint a fallback key before the initial upload, so
+        // client claims toward this device never run dry between restarts/rotations.
+        prime_fallback_key(&machine).await;
+
         let me = Self {
             machine: tokio::sync::RwLock::new(machine),
             user_id,
@@ -398,10 +405,12 @@ impl GhostCrypto {
             access_token,
             req_lock: Mutex::new(()),
         };
-        // Upload device keys + OTKs so peers can Olm-encrypt to us / we can be
-        // attributed. The OTKs are not strictly needed (the ghost is a pure sender,
-        // never an Olm recipient) but `keys_for_upload` bundles them in one request,
-        // so we just send what the machine yields.
+        // Upload device keys + OTKs + the fallback key so peers can Olm-encrypt to
+        // us / we can be attributed. The OTKs and fallback key answer clients'
+        // `/keys/claim` toward this device — megolm room-key shares today, and an
+        // unwedging client's session re-establishment under #55 — so they ARE
+        // load-bearing, not just bundled along (a pre-#55 comment here said
+        // otherwise; the fallback key is what keeps claims from ever running dry).
         {
             let _g = me.req_lock.lock().await;
             let machine = me.machine.read().await;
@@ -487,8 +496,11 @@ impl GhostCrypto {
                 return false;
             }
         };
-        // Re-upload (identical) device keys + fresh OTKs on the new machine BEFORE
-        // swapping, so a failed upload keeps the old machine fully intact.
+        // Re-upload (identical) device keys + fresh OTKs + a fresh fallback key
+        // (#55; the pickle predates fallback generation, so each rebuild mints a
+        // new one) on the new machine BEFORE swapping, so a failed upload keeps
+        // the old machine fully intact.
+        prime_fallback_key(&machine).await;
         if let Err(e) = self.drain_outgoing(&machine).await {
             tracing::warn!(error = %e, reason, "session rotation failed: key upload (keeping existing sessions)");
             return false;
@@ -828,6 +840,40 @@ impl GhostCrypto {
 
 }
 
+/// Make `machine` mint a **fallback key** for its next `/keys/upload` (#55).
+///
+/// A send-only machine never sees `/sync`, so the SDK's normal fallback trigger —
+/// `device_unused_fallback_key_types` in a sync response — never fires, and the
+/// ghost's finite one-time-key pool is its only claim stock. Clients drain it
+/// steadily (every megolm room-key share Olm-sessions all room devices, ghosts
+/// included) and nothing replenishes it within a run, so an unwedging client's
+/// `/keys/claim` eventually comes back empty and its recovery fails silently.
+/// One synthetic "no unused fallback keys" sync signal makes the account generate
+/// a fallback key, which `drain_outgoing` then uploads and which answers
+/// unlimited claims. Failure is non-fatal: the ghost just stays OTK-only, i.e.
+/// exactly the pre-#55 behavior.
+async fn prime_fallback_key(machine: &OlmMachine) {
+    let settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+    };
+    let no_counts: BTreeMap<_, _> = BTreeMap::new();
+    if let Err(e) = machine
+        .receive_sync_changes(
+            EncryptionSyncChanges {
+                to_device_events: Vec::new(),
+                changed_devices: &DeviceLists::new(),
+                one_time_keys_counts: &no_counts,
+                unused_fallback_keys: Some(&[]),
+                next_batch_token: None,
+            },
+            &settings,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "failed to prime a ghost fallback key (claims stay OTK-only)");
+    }
+}
+
 /// Mint a fresh, unique crypto device id (`C` + 8 lowercase-alnum). Unique per ghost
 /// lifecycle so an in-memory account's fresh signing keys never collide with a prior
 /// device id (which peers would reject as `SigningKeyChanged`). Distinct from the
@@ -1083,6 +1129,43 @@ mod tests {
             .copied()
             .unwrap_or_default();
         assert_eq!(u64::from(count), 50);
+    }
+
+    /// `prime_fallback_key` must make the machine's next `/keys/upload` carry a
+    /// fallback key (#55). Without it a ghost's finite OTK pool is its only claim
+    /// stock and an unwedging client's `/keys/claim` runs dry between
+    /// restarts/rotations. Also pins that the synthetic sync signal does NOT
+    /// disturb the OTK batch (`Account::new` pre-generates it for the first upload).
+    #[tokio::test]
+    async fn prime_fallback_key_adds_fallback_to_next_upload() {
+        let user: OwnedUserId = "@ghost:example.org".parse().unwrap();
+        let machine = OlmMachine::with_store(
+            &user,
+            "Ctest0000".into(),
+            MemoryStore::new(),
+            Some(Account::new()),
+        )
+        .await
+        .expect("build machine");
+
+        prime_fallback_key(&machine).await;
+
+        let reqs = machine.outgoing_requests().await.expect("outgoing_requests");
+        let upload = reqs
+            .iter()
+            .find_map(|r| match r.request() {
+                AnyOutgoingRequest::KeysUpload(u) => Some(u),
+                _ => None,
+            })
+            .expect("a KeysUpload must be pending after priming");
+        assert!(
+            !upload.fallback_keys.is_empty(),
+            "the upload must carry a fallback key"
+        );
+        assert!(
+            !upload.one_time_keys.is_empty(),
+            "priming must not disturb the pre-generated OTK batch"
+        );
     }
 
     /// Same contract for `/keys/query` — the response that populates the machine's
