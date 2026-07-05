@@ -3,6 +3,22 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.6] - 2026-07-05
+
+### Fixed
+- **A reaped phantom call membership now releases its Discord puppet (#54).** When
+  a Matrix user's client died without leaving the call, the #25 reaper correctly
+  emptied their stale `m.call.member` after the 45s no-LiveKit grace — but the
+  retraction is a state event *sent by the bridge bot* on the phantom's state_key,
+  and the membership handler attributed it to its sender: the bot, which the echo-
+  exclusion then discarded. The phantom's participant entry survived, so the puppet
+  sat in the Discord voice channel until a bridge restart (voice recovery would
+  even re-seat it as the capture anchor). Retractions are now attributed to the
+  membership's *owner* (looked up by state_key), so a reap flows through the normal
+  12s leave grace and releases the puppet — verified live: force-killed client,
+  puppet gone in ~75s. Also covers any third-party retraction (e.g. a moderator
+  emptying someone's membership).
+
 ## [0.3.0-alpha.5] - 2026-07-05
 
 ### Fixed
