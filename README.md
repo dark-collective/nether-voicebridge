@@ -307,7 +307,12 @@ Bridges don't have to be static config. Two ways to add/remove them at runtime:
 The usual room prerequisites apply to every bridge however it's created: the
 Matrix room must allow PL 0 for `org.matrix.msc3401.call.member`, restricted
 rooms need the bot invited, and the puppet bots must be invited to the Discord
-guild.
+guild. The management bot's `link` verifies all of this up front — it joins the
+room, reads the raw power levels, and confirms MatrixRTC discovery before
+writing anything, replying with a specific fix if a prerequisite is missing
+(puppet-bot guild membership is a warning only, since bots learn their guilds
+as they connect). Note the bot must also be able to *speak* in the room you DM
+it from: in a room whose power levels block PL-0 message sends it stays mute.
 
 ## Community & contributing
 

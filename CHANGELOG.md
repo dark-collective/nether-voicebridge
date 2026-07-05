@@ -3,6 +3,21 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **`link` now verifies room prerequisites before writing anything (#47).** The
+  management bot's `link` command probes the room up front instead of replying
+  with an advisory checklist: it joins the room (restricted/invite-only rooms
+  get a friendly "invite the bot first"), reads the raw `m.room.power_levels`
+  to confirm ghosts may post `org.matrix.msc3401.call.member` (the classic
+  silent-failure misconfiguration), and confirms the homeserver publishes a
+  MatrixRTC LiveKit focus. Any of these failing replies with a specific,
+  actionable error and leaves `tenants.toml` untouched. Discord guild coverage
+  (is any puppet bot in the target guild?) is checked too but only warns —
+  bots learn their guilds as they connect, so a fresh process can't tell
+  "not invited" from "still connecting".
+
 ## [0.3.0-alpha.8] - 2026-07-05
 
 ### Added
