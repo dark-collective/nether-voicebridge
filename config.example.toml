@@ -29,6 +29,21 @@
 # /app/data so stores persist on the container's volume with no config change).
 # data_dir = "./nether-store"
 
+# ── Runtime-provisioned bridges (tenants) ────────────────────────────────────
+# Besides the static [[bridge]] blocks below, bridges can be added/removed at
+# RUNTIME via `<data_dir>/tenants.toml` — same [[bridge]] schema, with two rules:
+#   * every entry MUST set an explicit `name` (it keys the running bridge), and
+#   * no [server.*]/[puppets] blocks there — `server = "…"` references resolve
+#     against THIS file's profiles.
+# Reload with SIGHUP (systemd: `systemctl reload`, or `kill -HUP <pid>`): the
+# running tenant set is reconciled against the file — additions start, removals
+# stop cleanly, changed entries restart with the new config. A file that fails
+# validation is rejected whole (loudly, in the logs); the running set is
+# untouched. Static [[bridge]]s are never affected by a reload.
+# Write the file atomically (write a temp file, then `mv` over tenants.toml) so
+# a reload never reads a half-written file, and pre-flight your edits with:
+#   nether-voicebridge --check-tenants [PATH]   # prints per-entry verdicts
+
 [puppets]
 # One entry per puppet bot — each is a SEPARATE Discord application with its own
 # bot token, created deliberately at discord.com/developers/applications. This is

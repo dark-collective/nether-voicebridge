@@ -15,6 +15,10 @@ Environment=CONFIG_PATH=/etc/nether-voicebridge/config.toml
 Environment=NVB_DATA_DIR=/var/lib/nether-voicebridge
 WorkingDirectory=/var/lib/nether-voicebridge
 ExecStart=/usr/bin/nether-voicebridge
+# `systemctl reload` → SIGHUP → reconcile runtime bridges against
+# <NVB_DATA_DIR>/tenants.toml (#45). Pre-flight edits with:
+#   nether-voicebridge --check-tenants
+ExecReload=/bin/kill -HUP $MAINPID
 
 # systemd creates and chowns /var/lib/nether-voicebridge to the service user on
 # start (mode 0750), so the matrix-sdk SQLite stores survive restarts.

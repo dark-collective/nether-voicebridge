@@ -3,6 +3,26 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Runtime bridge provisioning (#45).** Bridges can now be added, removed, and
+  reconfigured while the process runs — the structural precondition for hosted
+  bridging (#43) and the management bot (#4). A new supervisor owns the running
+  bridge set; `<data_dir>/tenants.toml` (same `[[bridge]]` schema as the static
+  config, explicit `name` required, `server = "…"` refs resolve against the
+  static `[server.*]` profiles) declares the desired runtime set; **SIGHUP**
+  (`systemctl reload`) reconciles: additions start, removals tear down cleanly
+  to baseline, changed entries stop and respawn with the new config (only after
+  the old instance fully unwound — store handles closed, puppet-pool key freed).
+  A reload that fails validation is rejected whole and loudly; the running set
+  is never partially applied. Static `[[bridge]]`s are untouched by reloads, and
+  a deployment may run with zero static bridges (tenants-only). New pre-flight:
+  `nether-voicebridge --check-tenants [PATH]` prints per-entry verdicts and
+  exits 0/1. Runtime-added bridges are validated against the live set with the
+  same invariants as startup (unique store, unique (homeserver, bot, device),
+  duplicate room/channel warnings).
+
 ## [0.3.0-alpha.6] - 2026-07-05
 
 ### Fixed

@@ -10,6 +10,21 @@ use supervisor::Supervisor;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Minimal arg scan (the binary has no other CLI): `--check-tenants [PATH]`
+    // validates the static config + tenants file and exits — the pre-flight an
+    // operator runs before HUPing a reload (#45). Unknown flags fail loudly
+    // instead of silently starting the daemon on a typo.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let check_tenants_path: Option<Option<String>> = match args.as_slice() {
+        [] => None,
+        [flag] if flag == "--check-tenants" => Some(None),
+        [flag, path] if flag == "--check-tenants" => Some(Some(path.clone())),
+        _ => {
+            eprintln!("usage: nether-voicebridge [--check-tenants [PATH]]");
+            std::process::exit(2);
+        }
+    };
+
     // Two transitive deps (matrix-sdk via reqwest, serenity via tokio-tungstenite) each
     // pull in a different rustls crypto provider (aws-lc-rs and ring). rustls panics if
     // no default is installed before the first TLS connection. Pick ring explicitly.
@@ -44,34 +59,13 @@ async fn main() -> Result<()> {
         ),
     }
 
-    let cfg = match std::env::var("CONFIG_PATH") {
-        Ok(path) => match nvb_config::Config::load(&path) {
-            Ok(cfg) => cfg,
-            // File not found: CONFIG_PATH may be baked into the image as a default
-            // location (e.g. /app/config.toml) but no file was mounted — fall back to
-            // env vars just like the no-file path below.
-            Err(nvb_config::ConfigError::Io { .. }) => {
-                tracing::info!(
-                    "config file not found at {path}, \
-                     loading config from environment variables"
-                );
-                nvb_config::Config::from_env().context(
-                    "config file not found; supply all NETHER_* environment variables",
-                )?
-            }
-            Err(e) => return Err(e).with_context(|| format!("loading config from {path}")),
-        },
-        Err(_) => match nvb_config::Config::load("config.toml") {
-            Ok(cfg) => cfg,
-            Err(nvb_config::ConfigError::Io { .. }) => {
-                tracing::info!("no config.toml found, loading config from environment variables");
-                nvb_config::Config::from_env().context(
-                    "no config.toml found; set CONFIG_PATH or supply all NETHER_* environment variables",
-                )?
-            }
-            Err(e) => return Err(e).context("loading config from config.toml"),
-        },
-    };
+    let cfg = load_config()?;
+
+    // Pre-flight mode: validate the tenants file against this config and exit.
+    if let Some(path_override) = check_tenants_path {
+        std::process::exit(check_tenants(&cfg, path_override.as_deref()));
+    }
+
     // Boot-time tenants (#45): load BEFORE validation so a hosting deployment
     // whose bridges all come from tenants.toml (zero static [[bridge]]s) can
     // pass. An invalid tenants file at boot fails startup with the same rigor
@@ -156,4 +150,93 @@ async fn main() -> Result<()> {
     supervisor.run().await;
 
     Ok(())
+}
+
+/// Load the static config: CONFIG_PATH (default `config.toml`), falling back to
+/// `NETHER_*` environment variables when no file is present (the Docker image
+/// bakes CONFIG_PATH=/app/config.toml whether or not one is mounted).
+fn load_config() -> Result<nvb_config::Config> {
+    match std::env::var("CONFIG_PATH") {
+        Ok(path) => match nvb_config::Config::load(&path) {
+            Ok(cfg) => Ok(cfg),
+            // File not found: CONFIG_PATH may be baked into the image as a default
+            // location (e.g. /app/config.toml) but no file was mounted — fall back to
+            // env vars just like the no-file path below.
+            Err(nvb_config::ConfigError::Io { .. }) => {
+                tracing::info!(
+                    "config file not found at {path}, \
+                     loading config from environment variables"
+                );
+                nvb_config::Config::from_env()
+                    .context("config file not found; supply all NETHER_* environment variables")
+            }
+            Err(e) => Err(e).with_context(|| format!("loading config from {path}")),
+        },
+        Err(_) => match nvb_config::Config::load("config.toml") {
+            Ok(cfg) => Ok(cfg),
+            Err(nvb_config::ConfigError::Io { .. }) => {
+                tracing::info!("no config.toml found, loading config from environment variables");
+                nvb_config::Config::from_env().context(
+                    "no config.toml found; set CONFIG_PATH or supply all NETHER_* environment variables",
+                )
+            }
+            Err(e) => Err(e).context("loading config from config.toml"),
+        },
+    }
+}
+
+/// `--check-tenants [PATH]`: validate the tenants file against the static config
+/// — the same gate the boot path and a SIGHUP reload apply — printing a verdict
+/// per entry. Returns the process exit code: 0 all-OK, 1 any failure. Unlike the
+/// reload's all-or-nothing reject, this keeps going after an error so one run
+/// reports every problem.
+fn check_tenants(cfg: &nvb_config::Config, path_override: Option<&str>) -> i32 {
+    let default_path = nvb_config::tenants_path(&cfg.data_dir);
+    let path = path_override.unwrap_or(&default_path);
+
+    if let Err(e) = cfg.validate_allowing_no_bridges() {
+        println!("static config: ERROR {e}");
+        return 1;
+    }
+    let tenants = match nvb_config::load_tenants(path, &cfg.servers, &cfg.data_dir) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("{path}: ERROR {e}");
+            return 1;
+        }
+    };
+    if tenants.is_empty() {
+        println!("{path}: no tenants (missing or empty file) — nothing to check");
+        return 0;
+    }
+
+    let static_labels: std::collections::HashSet<String> = cfg
+        .bridges
+        .iter()
+        .enumerate()
+        .map(|(i, b)| b.name.clone().unwrap_or_else(|| format!("bridge-{i}")))
+        .collect();
+    let mut live = nvb_config::LiveKeys::from_bridges(&cfg.bridges);
+    let mut failed = false;
+    for t in &tenants {
+        // The loader guarantees a name.
+        let name = t.name.as_deref().unwrap_or_default();
+        if static_labels.contains(name) {
+            println!("tenant '{name}': ERROR collides with a static [[bridge]] of the same label");
+            failed = true;
+            continue;
+        }
+        match nvb_config::validate_bridge_against(t, &cfg.servers, &live) {
+            Ok(()) => {
+                println!("tenant '{name}': OK");
+                // Only accepted entries claim keys, mirroring the reload gate.
+                live.insert(t);
+            }
+            Err(e) => {
+                println!("tenant '{name}': ERROR {e}");
+                failed = true;
+            }
+        }
+    }
+    if failed { 1 } else { 0 }
 }
