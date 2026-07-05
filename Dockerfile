@@ -29,6 +29,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 # Note: livekit downloads a pre-built libwebrtc (~400–600 MB) on first build.
 FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
+# The [patch.crates-io] songbird fork is a path dependency the recipe can't
+# reconstruct — cook needs the real crate present.
+COPY vendor vendor
 RUN cargo chef cook --release --recipe-path recipe.json
 
 # Compile only the project's own code (deps already compiled above).
