@@ -3,6 +3,9 @@
 use serde::Deserialize;
 use thiserror::Error;
 
+mod tenants;
+pub use tenants::{TenantsFile, load_tenants, tenants_path};
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config file '{path}': {source}")]
