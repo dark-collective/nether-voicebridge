@@ -14,21 +14,15 @@ channel↔room pairs at once.
 > **not yet had a human code review**. It works in day-to-day use on the author's
 > homeserver, but expect rough edges, breaking changes, and bugs. Run it at your
 > own risk, and please report what breaks. Come say hi / get help in the Matrix
-> room [`#nether-voicebridge:nether.im`](https://matrix.to/#/%23nether-voicebridge:nether.im)
+> space [`#nether-voicebridge:nether.im`](https://matrix.to/#/%23nether-voicebridge:nether.im)
 > or on the [Discord server](https://discord.gg/BQYxEdu7s2).
 
 ## Community
 
 Development happens in the open on both platforms — fittingly, kept in sync by a
 bridge (the [mautrix-discord](https://github.com/mautrix/discord) text bridge; this
-project handles the voice side). The Matrix development-space rooms are bridged to
-the matching channels on the [Discord server](https://discord.gg/BQYxEdu7s2):
-
-- [`#nether-voicebridge-devel:nether.im`](https://matrix.to/#/%23nether-voicebridge-devel:nether.im)
-  ↔ `#voice-bridge-development` — development discussion
-- the *Git Update Spam* room ↔ `#git-update-spam` — commit / CI / release feed
-
-Same conversation on both sides; join from whichever platform you prefer.
+project handles the voice side). The [Matrix development-space rooms](https://matrix.to/#/%23nether-voicebridge:nether.im) are bridged to
+the matching channels on the [Discord server](https://discord.gg/BQYxEdu7s2). Same conversation on both sides; join from whichever platform you prefer.
 
 ## Screenshots
 
@@ -317,7 +311,7 @@ guild.
 
 ## Community & contributing
 
-- **Development & support room:**
+- **Development & support space:**
   [`#nether-voicebridge:nether.im`](https://matrix.to/#/%23nether-voicebridge:nether.im)
   — questions, help, and where the work happens.
 - Issues and roadmap: the project's Forgejo repo at
