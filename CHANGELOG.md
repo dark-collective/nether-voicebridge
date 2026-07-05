@@ -3,7 +3,7 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0-alpha.8] - 2026-07-05
 
 ### Added
 - **Matrix management bot (#4).** Tenant bridges can now be managed over Matrix
@@ -19,6 +19,15 @@ adheres to [Semantic Versioning](https://semver.org/).
   and hand edits never conflict. With `[management]` configured, a config with
   zero `[[bridge]]` blocks (and no tenants yet) is a valid boot — a hosted
   deployment can start empty and be provisioned entirely over DM.
+
+### Fixed
+- **Ghosts now publish an Olm fallback key at bootstrap and on session rotation
+  (#55).** Previously a ghost only uploaded a finite pool of one-time keys at
+  bootstrap, never replenished in-run and with no fallback — once drained, a
+  client attempting to (re-)establish an Olm session with the ghost (e.g. an
+  unwedge attempt) would fail its `/keys/claim` silently. With a fallback key
+  published, claims keep succeeding indefinitely (`fallback: true`), keeping
+  future client-side session recovery viable.
 
 ## [0.3.0-alpha.7] - 2026-07-05
 
