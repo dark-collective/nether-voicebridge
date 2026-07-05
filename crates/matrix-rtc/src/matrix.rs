@@ -73,6 +73,28 @@ async fn resolve_member_name(room: &Room, user_id: &UserId) -> String {
     }
 }
 
+/// Which user does a call-member event affect? An *active* membership belongs to
+/// its sender. A *retraction* (Empty content / all memberships expired) may be
+/// posted by someone other than the member it clears — the #25 reaper empties
+/// phantoms as the bridge bot (#54) — so resolve the owner from the participant
+/// set by state_key (its unique handle in both the legacy and per-device
+/// formats). An unknown state_key falls back to the sender: the normal
+/// clean-leave case, or a no-op retraction for an entry we never held.
+fn resolve_affected_user(
+    set: &HashSet<(OwnedUserId, String)>,
+    sender: OwnedUserId,
+    state_key: &str,
+    is_active: bool,
+) -> OwnedUserId {
+    if is_active {
+        return sender;
+    }
+    set.iter()
+        .find(|(_, key)| key.as_str() == state_key)
+        .map(|(owner, _)| owner.clone())
+        .unwrap_or(sender)
+}
+
 /// Apply a single call-member event (from sync or initial state scan) to the
 /// participant set, raise call-active transitions, and drive the per-participant
 /// puppet **presence** off membership (constraint: one Discord bot per Matrix
@@ -95,21 +117,6 @@ async fn apply_member_event(
     room: &Room,
     router: &Arc<dyn PlaybackRouter>,
 ) {
-    if &user_id == bot_user_id {
-        return; // echo-exclusion: bridge bot's own call membership never counted
-    }
-    // Echo-exclusion (constraint #5): a ghost is a Discord speaker WE publish into
-    // this call (Phase 8). Its m.call.member must never be counted as a Matrix
-    // participant — otherwise it would trip call-active and, worse, get a Discord
-    // puppet (a self-duplicate of the Discord user). Ghosts are driven entirely by
-    // the Discord side's voice-state handler, not by membership here.
-    // Excludes our current ghosts AND stale legacy `@discord_*` ghosts left in old
-    // room state (post-rename) — otherwise a leftover membership is miscounted as a
-    // real participant and gets a phantom Discord puppet.
-    if crate::rtc::ghost::is_bridge_excluded_identity(user_id.as_str(), ghost_prefix) {
-        return;
-    }
-
     let is_active = match content {
         CallMemberEventContent::Empty(_) => false,
         c => !c.active_memberships(Some(ts)).is_empty(),
@@ -125,8 +132,26 @@ async fn apply_member_event(
     let appeared;
     let gone;
     let became_nonempty;
-    {
+    let user_id = {
         let mut set = participants.lock().await;
+        // A retraction may be posted by someone other than the member it clears —
+        // the #25 reaper empties phantoms as the bridge bot (#54) — so attribute
+        // it to the membership's owner, looked up by state_key.
+        let user_id = resolve_affected_user(&set, user_id, &state_key, is_active);
+        if &user_id == bot_user_id {
+            return; // echo-exclusion: bridge bot's own call membership never counted
+        }
+        // Echo-exclusion (constraint #5): a ghost is a Discord speaker WE publish into
+        // this call (Phase 8). Its m.call.member must never be counted as a Matrix
+        // participant — otherwise it would trip call-active and, worse, get a Discord
+        // puppet (a self-duplicate of the Discord user). Ghosts are driven entirely by
+        // the Discord side's voice-state handler, not by membership here.
+        // Excludes our current ghosts AND stale legacy `@discord_*` ghosts left in old
+        // room state (post-rename) — otherwise a leftover membership is miscounted as a
+        // real participant and gets a phantom Discord puppet.
+        if crate::rtc::ghost::is_bridge_excluded_identity(user_id.as_str(), ghost_prefix) {
+            return;
+        }
         let prev_users = set.iter().map(|(u, _)| u).collect::<HashSet<_>>().len();
         let entry = (user_id.clone(), state_key.clone());
         let this_user_before = set.iter().filter(|(u, _)| u == &user_id).count();
@@ -141,7 +166,8 @@ async fn apply_member_event(
         let new_users = set.iter().map(|(u, _)| u).collect::<HashSet<_>>().len();
         became_nonempty = prev_users == 0 && new_users > 0;
         log_snapshot(&set);
-    }
+        user_id
+    };
 
     // Membership owns puppet presence: a member joining gets a (present, possibly
     // silent) named puppet keyed on their bare MXID; leaving releases it. Audio +
@@ -1106,7 +1132,8 @@ pub(crate) async fn reap_stale_memberships(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_ghost_device_salt, resolve_store_device_id};
+    use super::{resolve_affected_user, resolve_ghost_device_salt, resolve_store_device_id};
+    use matrix_sdk::ruma::OwnedUserId;
     use std::fs;
     use std::path::PathBuf;
 
@@ -1128,6 +1155,53 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn uid(s: &str) -> OwnedUserId {
+        OwnedUserId::try_from(s).unwrap()
+    }
+
+    /// Participant set with one modern per-device entry and one legacy entry.
+    fn participant_set() -> HashSet<(OwnedUserId, String)> {
+        HashSet::from([
+            (uid("@dark:nether.im"), "_@dark:nether.im_ABCDEF_m.call".to_owned()),
+            (uid("@legacy:nether.im"), "@legacy:nether.im".to_owned()),
+        ])
+    }
+
+    #[test]
+    fn active_event_keys_on_sender() {
+        // An active membership always belongs to its sender, even if the
+        // state_key matches someone else's entry.
+        let set = participant_set();
+        let got = resolve_affected_user(&set, uid("@dark:nether.im"), "_@dark:nether.im_ABCDEF_m.call", true);
+        assert_eq!(got, uid("@dark:nether.im"));
+        let got = resolve_affected_user(&set, uid("@other:nether.im"), "_@dark:nether.im_ABCDEF_m.call", true);
+        assert_eq!(got, uid("@other:nether.im"));
+    }
+
+    #[test]
+    fn foreign_retraction_resolves_to_owner() {
+        // The #25 reaper empties a phantom as the bridge bot (#54): the
+        // retraction must be attributed to the phantom's owner, not the bot.
+        let set = participant_set();
+        let got = resolve_affected_user(&set, uid("@bridgebot:nether.im"), "_@dark:nether.im_ABCDEF_m.call", false);
+        assert_eq!(got, uid("@dark:nether.im"));
+        // Same for a legacy-format entry.
+        let got = resolve_affected_user(&set, uid("@bridgebot:nether.im"), "@legacy:nether.im", false);
+        assert_eq!(got, uid("@legacy:nether.im"));
+    }
+
+    #[test]
+    fn unknown_state_key_retraction_falls_back_to_sender() {
+        // A retraction for an entry we never held (bot retracting its own stale
+        // self-membership, duplicate leave) stays keyed on the sender.
+        let set = participant_set();
+        let got = resolve_affected_user(&set, uid("@bridgebot:nether.im"), "_@bridgebot:nether.im_XYZ_m.call", false);
+        assert_eq!(got, uid("@bridgebot:nether.im"));
+        let empty: HashSet<(OwnedUserId, String)> = HashSet::new();
+        let got = resolve_affected_user(&empty, uid("@dark:nether.im"), "_@dark:nether.im_ABCDEF_m.call", false);
+        assert_eq!(got, uid("@dark:nether.im"));
     }
 
     #[test]
