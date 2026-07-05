@@ -3,6 +3,23 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Matrix management bot (#4).** Tenant bridges can now be managed over Matrix
+  DM instead of editing `tenants.toml` by hand. A new optional `[management]`
+  config block (requires a `[server.<name>]` profile; `allow` lists the
+  operator MXIDs) starts a bot on the appservice bot account with its own
+  device + store. It auto-joins room invites from allowlisted operators only,
+  and serves: `link <name> <matrix-room-id> <discord-guild-id>
+  <discord-channel-id> [server]`, `unlink <name>`, `list`, and `help`. Commands
+  atomically rewrite `tenants.toml` (comments and hand-edits preserved) and
+  trigger the same in-process reconcile SIGHUP uses — a rejected change rolls
+  the file back, so the file never lies about the running set, and bot edits
+  and hand edits never conflict. With `[management]` configured, a config with
+  zero `[[bridge]]` blocks (and no tenants yet) is a valid boot — a hosted
+  deployment can start empty and be provisioned entirely over DM.
+
 ## [0.3.0-alpha.7] - 2026-07-05
 
 ### Added

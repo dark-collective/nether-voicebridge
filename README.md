@@ -291,6 +291,30 @@ tar xzf nether-voicebridge-$ver-x86_64-linux.tar.gz
   `key_transport` likewise auto-selects (`olm` for an encrypted room, else
   plaintext).
 
+## Runtime bridges & the management bot
+
+Bridges don't have to be static config. Two ways to add/remove them at runtime:
+
+- **`tenants.toml`** (under `data_dir`): the same `[[bridge]]` schema (explicit
+  `name` required, `server = "…"` references the static config's profiles).
+  Reload with SIGHUP (`systemctl reload nether-voicebridge`); the running set is
+  reconciled — additions start, removals stop cleanly, changed entries restart.
+  Pre-flight edits with `nether-voicebridge --check-tenants`.
+- **The management bot** (`[management]` in config.toml): allowlisted operators
+  DM the bridge's bot user on Matrix and drive the same mechanism with commands
+  — `link <name> <room-id> <guild-id> <channel-id>`, `unlink <name>`, `list`,
+  `help`. The bot writes `tenants.toml` and triggers the reconcile in-process,
+  rolling the file back if validation rejects it, so bot edits and hand edits
+  never conflict. It only accepts room invites from allowlisted MXIDs. With
+  `[management]` set, a config with zero `[[bridge]]` blocks is valid — bridges
+  can be created entirely over DM. Requires at least one `[server.<name>]`
+  profile; see `config.example.toml`.
+
+The usual room prerequisites apply to every bridge however it's created: the
+Matrix room must allow PL 0 for `org.matrix.msc3401.call.member`, restricted
+rooms need the bot invited, and the puppet bots must be invited to the Discord
+guild.
+
 ## Community & contributing
 
 - **Development & support room:**

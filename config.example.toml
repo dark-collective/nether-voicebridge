@@ -44,6 +44,36 @@
 # a reload never reads a half-written file, and pre-flight your edits with:
 #   nether-voicebridge --check-tenants [PATH]   # prints per-entry verdicts
 
+# ── Server profiles (optional for static bridges, REQUIRED for management) ───
+# A named [server.<name>] block holds the homeserver/appservice fields that are
+# identical across bridges on one homeserver; a bridge (or tenants.toml entry)
+# sets `server = "<name>"` + its own room_id and inherits the rest. The
+# management bot below and every bot-`link`ed tenant resolve against these.
+#
+# [server.nether]
+# homeserver_url = "https://nether.im"
+# sender_localpart = "nether-voicebridge"
+# appservice_id = "voicebridge"
+# appservice_token = "your_appservice_hs_token_here"
+
+# ── Management bot (optional) ────────────────────────────────────────────────
+# A Matrix bot that lets the operators listed in `allow` manage the tenant
+# bridges over DM instead of editing tenants.toml by hand. Invite the bot user
+# (the same appservice bot the bridges use, e.g. @nether-voicebridge_bot:…) to
+# a room/DM — it only accepts invites from allowlisted MXIDs — and send `help`.
+# Commands: `list`, `link <name> <room-id> <guild-id> <channel-id> [server]`,
+# `unlink <name>`. Every change is written to tenants.toml and applied through
+# the same reconcile a SIGHUP runs (rolled back if rejected), so bot edits and
+# hand edits never conflict. With [management] configured, a config with ZERO
+# [[bridge]] blocks (and an empty tenants.toml) is valid — bridges can be
+# created entirely via `link`.
+#
+# [management]
+# server = "nether"              # [server.<name>] profile; optional with exactly one profile
+# allow = ["@you:nether.im"]     # operator MXIDs (commands + invite auto-join)
+# # display_name = "Voice Bridge Manager"   # optional; sets the shared bot account's name
+# # device_id / store_path auto-derive ("management", <data_dir>/management)
+
 [puppets]
 # One entry per puppet bot — each is a SEPARATE Discord application with its own
 # bot token, created deliberately at discord.com/developers/applications. This is

@@ -113,8 +113,14 @@ async fn main() -> Result<()> {
         management,
     } = cfg;
 
-    // The management bot itself wires up below once the supervisor exists.
-    let _ = &management;
+    // Captured before `servers`/`data_dir` move into the supervisor's ctx: the
+    // management bot only needs the profile NAMES (for `link`'s server
+    // argument) and the tenants path.
+    let mgmt_inputs = management.map(|m| {
+        let mut names: Vec<String> = servers.keys().cloned().collect();
+        names.sort();
+        (m, names, data_dir.clone())
+    });
 
     // The Discord puppet bots are a SHARED, process-wide pool: one set of gateway
     // clients started once (`pool.run`), dynamically allocated across every
@@ -153,6 +159,23 @@ async fn main() -> Result<()> {
     supervisor
         .spawn_boot_tenants(tenants)
         .context("starting tenants from tenants.toml")?;
+
+    // Management bot (#4): a plain tokio task (its future is Send, unlike the
+    // bridge futures) talking to the supervisor over the control channel. It
+    // shares the pool's shutdown token so the drain stops it too. A bot that
+    // fails (bad token, homeserver down) logs and stays down — bridges are
+    // unaffected; restart the process to retry.
+    if let Some((mgmt_cfg, server_names, data_dir)) = mgmt_inputs {
+        let control = supervisor.control_handle();
+        let shutdown = pool_shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                nvb_matrix_rtc::mgmt::run(mgmt_cfg, server_names, data_dir, control, shutdown).await
+            {
+                tracing::error!(error = %e, "management bot exited with error");
+            }
+        });
+    }
 
 
     // Drive everything. On SIGINT/SIGTERM the supervisor cancels every bridge
