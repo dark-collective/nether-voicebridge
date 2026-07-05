@@ -3,7 +3,7 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0-alpha.9] - 2026-07-05
 
 ### Added
 - **`link` now verifies room prerequisites before writing anything (#47).** The
