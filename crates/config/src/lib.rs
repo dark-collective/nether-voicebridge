@@ -4,7 +4,11 @@ use serde::Deserialize;
 use thiserror::Error;
 
 mod tenants;
-pub use tenants::{TenantsFile, load_tenants, tenants_path};
+mod tenants_edit;
+pub use tenants::{TenantsFile, list_tenant_names, load_tenants, tenants_path};
+pub use tenants_edit::{
+    NewTenant, PriorContent, add_tenant_entry, remove_tenant_entry, restore_tenants_file,
+};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -57,6 +61,52 @@ pub struct Config {
     /// wins over the derived value.
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
+    /// Optional Matrix management bot (#4): operators DM it to add/remove
+    /// tenant bridges at runtime (it rewrites `tenants.toml` and triggers the
+    /// same reconcile SIGHUP uses). TOML `[management]` maps here; absent means
+    /// no management bot runs.
+    #[serde(default)]
+    pub management: Option<ManagementConfig>,
+}
+
+/// The `[management]` block: a Matrix bot that lets allowlisted operators
+/// manage tenant bridges over DM (#4). Inherits its homeserver/appservice
+/// identity from a `[server.<name>]` profile like bridges do; runs as the same
+/// appservice bot account with its own device + store.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManagementConfig {
+    /// Name of the `[server.<name>]` profile supplying the homeserver/appservice
+    /// identity. Optional when exactly one profile is defined (it is implied);
+    /// required otherwise.
+    #[serde(default)]
+    pub server: Option<String>,
+    /// Operator MXIDs allowed to command the bot. Also gates room-invite
+    /// auto-join: the bot only joins rooms it is invited to by these users.
+    /// Must be non-empty — an empty allowlist would make the bot a no-op.
+    pub allow: Vec<String>,
+    /// Display name for the management bot account (best-effort, set at
+    /// startup). Defaults to a built-in name when omitted.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Device id base for the bot's crypto store. Auto-derives to `management`
+    /// when omitted (runtime mints `<base>-<rand>` per store, like bridges).
+    #[serde(default)]
+    pub device_id: String,
+    /// Crypto/state store directory. Auto-derives to `<data_dir>/management`
+    /// when omitted.
+    #[serde(default)]
+    pub store_path: String,
+    // --- resolved from the referenced [server.<name>] profile ---
+    #[serde(default)]
+    pub homeserver_url: String,
+    #[serde(default)]
+    pub matrix_domain: Option<String>,
+    #[serde(default)]
+    pub bot_user_id: String,
+    #[serde(default)]
+    pub sender_localpart: Option<String>,
+    #[serde(default)]
+    pub appservice_token: String,
 }
 
 /// The shared Discord puppet bot pool (process-wide, not per-bridge).
@@ -445,6 +495,57 @@ pub fn resolve_bridge_store_path(b: &mut BridgeConfig, data_dir: &str, leaf: &st
     }
 }
 
+/// Resolve the `[management]` block against the server profiles + `data_dir`:
+/// fill identity fields from the referenced profile (explicit values win),
+/// derive `bot_user_id` from `sender_localpart` the same way bridges do, and
+/// default `device_id`/`store_path` to the `management` leaf. When `server` is
+/// omitted and exactly one profile exists, that profile is implied (and the
+/// reference is written back so validation and logs see it).
+pub fn resolve_management(
+    m: &mut ManagementConfig,
+    servers: &std::collections::HashMap<String, ServerProfile>,
+    data_dir: &str,
+) {
+    if m.server.is_none() && servers.len() == 1 {
+        m.server = servers.keys().next().cloned();
+    }
+    if let Some(profile) = m.server.as_ref().and_then(|name| servers.get(name)) {
+        if m.homeserver_url.is_empty() {
+            m.homeserver_url = profile.homeserver_url.clone();
+        }
+        if m.matrix_domain.is_none() {
+            m.matrix_domain = profile.matrix_domain.clone();
+        }
+        if m.bot_user_id.is_empty() {
+            m.bot_user_id = profile.bot_user_id.clone();
+        }
+        if m.sender_localpart.is_none() {
+            m.sender_localpart = profile.sender_localpart.clone();
+        }
+        if m.appservice_token.is_empty() {
+            m.appservice_token = profile.appservice_token.clone();
+        }
+    }
+    // Same `{localpart}_bot` derivation as bridges (see resolve_bot_user_ids).
+    if m.bot_user_id.is_empty() {
+        if let (Some(localpart), Some(server_name)) = (
+            m.sender_localpart.as_ref(),
+            m.matrix_domain
+                .clone()
+                .or_else(|| server_name_from_url(&m.homeserver_url)),
+        ) {
+            m.bot_user_id = format!("@{localpart}_bot:{server_name}");
+        }
+    }
+    if m.device_id.is_empty() {
+        m.device_id = "management".to_string();
+    }
+    if m.store_path.is_empty() {
+        let base = data_dir.trim_end_matches('/');
+        m.store_path = format!("{base}/management");
+    }
+}
+
 /// The uniqueness-key sets of a set of live (or about-to-be-live) bridges, used to
 /// validate a further bridge against them without re-validating the whole set.
 /// Hard keys mirror `Config::validate`'s cross-bridge errors; soft keys mirror its
@@ -475,6 +576,17 @@ impl LiveKeys {
             keys.insert(b);
         }
         keys
+    }
+
+    /// Reserve the management bot's identity keys so no bridge (static or
+    /// runtime tenant) can claim its store or device.
+    pub fn reserve_management(&mut self, m: &ManagementConfig) {
+        self.devices.insert((
+            m.homeserver_url.clone(),
+            m.bot_user_id.clone(),
+            m.device_id.clone(),
+        ));
+        self.stores.insert(m.store_path.clone());
     }
 
     /// Add one bridge's keys (call after it passes `validate_bridge_against`).
@@ -626,6 +738,11 @@ impl Config {
         let data_dir = std::env::var("NVB_DATA_DIR").unwrap_or_else(|_| cfg.data_dir.clone());
         cfg.resolve_store_paths(&data_dir);
         cfg.data_dir = data_dir;
+        // Management bot identity resolves last: it needs the profiles AND the
+        // final data_dir (for its store_path default).
+        if let Some(m) = cfg.management.as_mut() {
+            resolve_management(m, &cfg.servers, &cfg.data_dir);
+        }
         Ok(cfg)
     }
 
@@ -811,6 +928,9 @@ impl Config {
             },
             servers: std::collections::HashMap::new(),
             data_dir: default_data_dir(),
+            // Env-var mode is the minimal single-bridge deployment; the
+            // management bot is a config-file feature.
+            management: None,
             bridges: vec![BridgeConfig {
                 name,
                 server: None,
@@ -893,17 +1013,84 @@ impl Config {
             }
         }
 
+        // Management bot (when configured) is validated first and its identity
+        // keys reserved, so no bridge — static here, or a runtime tenant later
+        // via the same seeded LiveKeys — can claim its store or device.
+        let mut live = LiveKeys::default();
+        if let Some(m) = &self.management {
+            self.validate_management(m)?;
+            live.reserve_management(m);
+        }
+
         // Per-bridge checks (hard: server refs, required matrix fields, unique
         // (homeserver, bot, device) tuple, unique store_path; soft: olm/e2ee
         // contradiction, duplicate room / (guild, channel)), folded so each bridge
         // is validated against everything accepted before it — the same primitive
         // the supervisor uses to admit a runtime-added bridge against the live set.
-        let mut live = LiveKeys::default();
         for b in &self.bridges {
             validate_bridge_against(b, &self.servers, &live)?;
             live.insert(b);
         }
 
+        Ok(())
+    }
+
+    /// Hard checks for the `[management]` block (already resolved): a usable
+    /// allowlist, a resolvable server reference, and a complete identity.
+    fn validate_management(&self, m: &ManagementConfig) -> Result<(), ConfigError> {
+        if m.allow.is_empty() {
+            return Err(ConfigError::Validation(
+                "[management]: `allow` must list at least one operator MXID — \
+                 an empty allowlist makes the management bot a no-op"
+                    .to_string(),
+            ));
+        }
+        for mxid in &m.allow {
+            if !mxid.starts_with('@') || !mxid.contains(':') {
+                return Err(ConfigError::Validation(format!(
+                    "[management]: allow entry '{mxid}' is not a full MXID \
+                     (expected @localpart:domain)"
+                )));
+            }
+        }
+        if self.servers.is_empty() {
+            return Err(ConfigError::Validation(
+                "[management] requires at least one [server.<name>] profile — the \
+                 bot and every `link`ed tenant inherit their Matrix identity from a \
+                 profile"
+                    .to_string(),
+            ));
+        }
+        match &m.server {
+            Some(name) if !self.servers.contains_key(name) => {
+                return Err(ConfigError::Validation(format!(
+                    "[management]: references unknown server profile '{name}' — \
+                     define a [server.{name}] block"
+                )));
+            }
+            None if self.servers.len() > 1 => {
+                return Err(ConfigError::Validation(format!(
+                    "[management]: `server` is required when {} [server.<name>] \
+                     profiles are defined (it is only implied with exactly one)",
+                    self.servers.len()
+                )));
+            }
+            _ => {}
+        }
+        let missing: Vec<&str> = [
+            ("homeserver_url", m.homeserver_url.is_empty()),
+            ("bot_user_id (or sender_localpart)", m.bot_user_id.is_empty()),
+            ("appservice_token", m.appservice_token.is_empty()),
+        ]
+        .into_iter()
+        .filter_map(|(field, empty)| empty.then_some(field))
+        .collect();
+        if !missing.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "[management]: missing required field(s) after profile merge: {}",
+                missing.join(", ")
+            )));
+        }
         Ok(())
     }
 
@@ -929,6 +1116,16 @@ impl Config {
         }
         for b in &self.bridges {
             b.log_redacted_summary();
+        }
+        if let Some(m) = &self.management {
+            tracing::info!(
+                server = ?m.server,
+                bot_user_id = %m.bot_user_id,
+                device_id = %m.device_id,
+                store_path = %m.store_path,
+                allow = ?m.allow,
+                "management bot configured"
+            );
         }
     }
 }
@@ -1438,6 +1635,9 @@ appservice_token = "hs_tok"
         cfg.resolve_bot_user_ids();
         cfg.resolve_device_ids();
         cfg.resolve_store_paths("./nether-store");
+        if let Some(m) = cfg.management.as_mut() {
+            resolve_management(m, &cfg.servers, "./nether-store");
+        }
         cfg
     }
 
@@ -1726,5 +1926,117 @@ appservice_token = "hs_tok"
             std::env::remove_var(k);
         }
         std::env::remove_var("NVB_DATA_DIR");
+    }
+
+    // ---- [management] (#4) ----
+
+    fn management_block(server: Option<&str>, allow: &[&str]) -> String {
+        let server_line = server.map(|s| format!("server = \"{s}\"\n")).unwrap_or_default();
+        let allow_list =
+            allow.iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(", ");
+        format!("[management]\n{server_line}allow = [{allow_list}]\n\n")
+    }
+
+    #[test]
+    fn management_resolves_from_sole_profile() {
+        // With exactly one [server.*] profile, `server` is implied; identity
+        // fields inherit and device/store derive to the `management` leaf.
+        let raw = format!(
+            "{}{}{}[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!a:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n",
+            puppets_block(&["Bot a"]),
+            server_block("nether"),
+            management_block(None, &["@dark:nether.im"]),
+        );
+        let cfg = loaded(&raw);
+        let m = cfg.management.as_ref().expect("management parsed");
+        assert_eq!(m.server.as_deref(), Some("nether"));
+        assert_eq!(m.homeserver_url, "https://nether.im");
+        assert_eq!(m.bot_user_id, "@voicebridge_as:nether.im");
+        assert_eq!(m.appservice_token, "hs_tok");
+        assert_eq!(m.device_id, "management");
+        assert_eq!(m.store_path, "./nether-store/management");
+        cfg.validate().expect("should validate");
+    }
+
+    #[test]
+    fn management_derives_bot_user_id_from_sender_localpart() {
+        let raw = format!(
+            "{}{}{}[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!a:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n",
+            puppets_block(&["Bot a"]),
+            server_block_localpart("nether", "voicebridge"),
+            management_block(None, &["@dark:nether.im"]),
+        );
+        let cfg = loaded(&raw);
+        let m = cfg.management.as_ref().unwrap();
+        assert_eq!(m.bot_user_id, "@voicebridge_bot:nether.im");
+        cfg.validate().expect("should validate");
+    }
+
+    #[test]
+    fn management_rejects_empty_allowlist() {
+        let raw = format!(
+            "{}{}[management]\nallow = []\n\n[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!a:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n",
+            puppets_block(&["Bot a"]),
+            server_block("nether"),
+        );
+        let err = loaded(&raw).validate().unwrap_err();
+        assert!(err.to_string().contains("allow"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn management_rejects_malformed_mxid() {
+        let raw = format!(
+            "{}{}{}[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!a:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n",
+            puppets_block(&["Bot a"]),
+            server_block("nether"),
+            management_block(None, &["dark:nether.im"]),
+        );
+        let err = loaded(&raw).validate().unwrap_err();
+        assert!(err.to_string().contains("not a full MXID"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn management_requires_server_ref_with_multiple_profiles() {
+        let raw = format!(
+            "{}{}{}{}[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!a:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n",
+            puppets_block(&["Bot a"]),
+            server_block("nether"),
+            server_block("other"),
+            management_block(None, &["@dark:nether.im"]),
+        );
+        let err = loaded(&raw).validate().unwrap_err();
+        assert!(err.to_string().contains("`server` is required"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn management_rejects_unknown_server_ref() {
+        let raw = format!(
+            "{}{}{}[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!a:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n",
+            puppets_block(&["Bot a"]),
+            server_block("nether"),
+            management_block(Some("rogue"), &["@dark:nether.im"]),
+        );
+        let err = loaded(&raw).validate().unwrap_err();
+        assert!(
+            err.to_string().contains("unknown server profile 'rogue'"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn management_store_is_reserved_against_bridges() {
+        // A bridge explicitly claiming the management store_path is a hard error
+        // (same duplicate-store rule as bridge-vs-bridge).
+        let raw = format!(
+            "{}{}{}[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!a:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n[bridge.matrix]\nstore_path = \"./nether-store/management\"\n",
+            puppets_block(&["Bot a"]),
+            server_block("nether"),
+            management_block(None, &["@dark:nether.im"]),
+        );
+        let err = loaded(&raw).validate().unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate matrix store_path"),
+            "unexpected: {err}"
+        );
     }
 }

@@ -51,6 +51,10 @@ strip = true
 tokio = { version = "1" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# Read-modify-write of tenants.toml (#4): toml_edit preserves comments and
+# operator hand-formatting where a serde round-trip would destroy them. Same
+# 0.22 line toml 0.8 already pulls in transitively.
+toml_edit = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

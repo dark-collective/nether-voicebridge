@@ -62,6 +62,28 @@ pub fn load_tenants(
     parse_tenants(&content, path, servers, data_dir)
 }
 
+/// The tenant names currently in the file, WITHOUT profile resolution — for
+/// display (the management bot's `list`) where the caller only needs to know
+/// which entries exist, not their resolved identities. Missing file = empty.
+pub fn list_tenant_names(path: &str) -> Result<Vec<String>, ConfigError> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(ConfigError::Io {
+                path: path.to_string(),
+                source,
+            });
+        }
+    };
+    let file: TenantsFile = toml::from_str(&content).map_err(ConfigError::Parse)?;
+    Ok(file
+        .bridges
+        .into_iter()
+        .filter_map(|b| b.name)
+        .collect())
+}
+
 /// Parse + resolve tenants from TOML content (separated from file IO for tests).
 fn parse_tenants(
     content: &str,

@@ -76,7 +76,10 @@ async fn main() -> Result<()> {
         &cfg.data_dir,
     )
     .context("loading tenants.toml")?;
-    if cfg.bridges.is_empty() && !tenants.is_empty() {
+    if cfg.bridges.is_empty() && (!tenants.is_empty() || cfg.management.is_some()) {
+        // Bridges may all come from tenants.toml — or, with the management bot
+        // configured (#4), from future `link` commands: an empty boot is a
+        // legitimate starting state for a hosted deployment.
         cfg.validate_allowing_no_bridges()
             .context("config validation failed")?;
     } else {
@@ -95,14 +98,23 @@ async fn main() -> Result<()> {
         .enumerate()
         .map(|(i, b)| b.name.clone().unwrap_or_else(|| format!("bridge-{i}")))
         .collect();
-    let static_keys = nvb_config::LiveKeys::from_bridges(&cfg.bridges);
+    let mut static_keys = nvb_config::LiveKeys::from_bridges(&cfg.bridges);
+    if let Some(m) = &cfg.management {
+        // The management bot's store/device are reserved like a static bridge's:
+        // no tenant may ever claim them.
+        static_keys.reserve_management(m);
+    }
 
     let nvb_config::Config {
         puppets,
         bridges,
         servers,
         data_dir,
+        management,
     } = cfg;
+
+    // The management bot itself wires up below once the supervisor exists.
+    let _ = &management;
 
     // The Discord puppet bots are a SHARED, process-wide pool: one set of gateway
     // clients started once (`pool.run`), dynamically allocated across every
@@ -118,7 +130,7 @@ async fn main() -> Result<()> {
     // bridge failing ends *that* bridge only — the rest keep running.
     let mut supervisor = Supervisor::new(
         pool,
-        pool_shutdown,
+        pool_shutdown.clone(),
         supervisor::TenantsCtx {
             servers,
             data_dir,
@@ -141,6 +153,7 @@ async fn main() -> Result<()> {
     supervisor
         .spawn_boot_tenants(tenants)
         .context("starting tenants from tenants.toml")?;
+
 
     // Drive everything. On SIGINT/SIGTERM the supervisor cancels every bridge
     // root and *awaits* (bounded by a timeout) that the bridge futures unwind —
@@ -198,6 +211,12 @@ fn check_tenants(cfg: &nvb_config::Config, path_override: Option<&str>) -> i32 {
         println!("static config: ERROR {e}");
         return 1;
     }
+    // Mirror the boot/reload gate: the management bot's store/device are
+    // reserved exactly like a static bridge's.
+    let mut live = nvb_config::LiveKeys::from_bridges(&cfg.bridges);
+    if let Some(m) = &cfg.management {
+        live.reserve_management(m);
+    }
     let tenants = match nvb_config::load_tenants(path, &cfg.servers, &cfg.data_dir) {
         Ok(t) => t,
         Err(e) => {
@@ -216,7 +235,6 @@ fn check_tenants(cfg: &nvb_config::Config, path_override: Option<&str>) -> i32 {
         .enumerate()
         .map(|(i, b)| b.name.clone().unwrap_or_else(|| format!("bridge-{i}")))
         .collect();
-    let mut live = nvb_config::LiveKeys::from_bridges(&cfg.bridges);
     let mut failed = false;
     for t in &tenants {
         // The loader guarantees a name.

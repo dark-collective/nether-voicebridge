@@ -1,0 +1,296 @@
+//! Programmatic edits to `tenants.toml` (#4).
+//!
+//! The management bot mutates the tenant set by rewriting the desired-state
+//! file and asking the supervisor to reconcile — the file stays the single
+//! source of truth (`crate::tenants`). Edits go through `toml_edit` so operator
+//! comments and hand-formatting survive a bot edit, and every write is atomic
+//! (tmp + rename) so a crash mid-write can never leave a half file for the
+//! next reload to reject.
+//!
+//! Each mutation returns the file's PRIOR content so the caller can roll the
+//! file back if the supervisor rejects the reconcile (all-or-nothing): without
+//! the rollback, a rejected edit would leave `tenants.toml` lying about the
+//! running set and poison every later SIGHUP.
+
+use std::path::Path;
+use toml_edit::{DocumentMut, Item, Table, value};
+
+use crate::ConfigError;
+
+/// The fields of one bot-created tenant entry. Deliberately minimal — the
+/// entry inherits everything else from its `[server.<name>]` profile, exactly
+/// like a hand-written one.
+#[derive(Debug, Clone)]
+pub struct NewTenant {
+    pub name: String,
+    pub server: String,
+    pub room_id: String,
+    pub guild_id: String,
+    pub channel_id: String,
+}
+
+/// Prior state of the tenants file, for rollback: `None` = the file did not
+/// exist.
+pub type PriorContent = Option<String>;
+
+/// Append a `[[bridge]]` entry for `t` to the tenants file (creating the file
+/// if absent). Fails without touching the file when an entry named `t.name`
+/// already exists. Returns the prior content for [`restore_tenants_file`].
+pub fn add_tenant_entry(path: &str, t: &NewTenant) -> Result<PriorContent, ConfigError> {
+    let prior = read_prior(path)?;
+    let mut doc = parse_doc(prior.as_deref())?;
+
+    if find_entry(&doc, &t.name).is_some() {
+        return Err(ConfigError::Validation(format!(
+            "tenants file already has a bridge named '{}'",
+            t.name
+        )));
+    }
+
+    let mut entry = Table::new();
+    entry["name"] = value(&t.name);
+    entry["server"] = value(&t.server);
+    entry["room_id"] = value(&t.room_id);
+    let mut discord = Table::new();
+    discord["guild_id"] = value(&t.guild_id);
+    discord["channel_id"] = value(&t.channel_id);
+    entry["discord"] = Item::Table(discord);
+
+    // `[[bridge]]` array-of-tables; created on first use.
+    let bridges = doc
+        .entry("bridge")
+        .or_insert(Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+    let Some(arr) = bridges.as_array_of_tables_mut() else {
+        return Err(ConfigError::Validation(
+            "tenants file has a non-array `bridge` key — fix it by hand".to_string(),
+        ));
+    };
+    arr.push(entry);
+
+    write_atomic(path, &doc.to_string())?;
+    Ok(prior)
+}
+
+/// Remove the `[[bridge]]` entry named `name`. Fails without touching the file
+/// when no such entry exists. Returns the prior content for
+/// [`restore_tenants_file`].
+pub fn remove_tenant_entry(path: &str, name: &str) -> Result<PriorContent, ConfigError> {
+    let prior = read_prior(path)?;
+    let mut doc = parse_doc(prior.as_deref())?;
+
+    let Some(idx) = find_entry(&doc, name) else {
+        return Err(ConfigError::Validation(format!(
+            "tenants file has no bridge named '{name}'"
+        )));
+    };
+    // find_entry only returns Some when `bridge` is an array-of-tables.
+    doc["bridge"].as_array_of_tables_mut().unwrap().remove(idx);
+
+    write_atomic(path, &doc.to_string())?;
+    Ok(prior)
+}
+
+/// Roll the tenants file back to `prior` (the return value of a mutation):
+/// rewrite the old content, or delete the file if it did not exist before.
+pub fn restore_tenants_file(path: &str, prior: PriorContent) -> Result<(), ConfigError> {
+    match prior {
+        Some(content) => write_atomic(path, &content),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(ConfigError::Io {
+                path: path.to_string(),
+                source,
+            }),
+        },
+    }
+}
+
+fn read_prior(path: &str) -> Result<PriorContent, ConfigError> {
+    match std::fs::read_to_string(path) {
+        Ok(c) => Ok(Some(c)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ConfigError::Io {
+            path: path.to_string(),
+            source,
+        }),
+    }
+}
+
+fn parse_doc(content: Option<&str>) -> Result<DocumentMut, ConfigError> {
+    content
+        .unwrap_or_default()
+        .parse::<DocumentMut>()
+        .map_err(|e| ConfigError::Validation(format!("tenants file is not valid TOML: {e}")))
+}
+
+/// Index of the `[[bridge]]` entry whose `name` equals `name`, if any.
+fn find_entry(doc: &DocumentMut, name: &str) -> Option<usize> {
+    doc.get("bridge")?
+        .as_array_of_tables()?
+        .iter()
+        .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+}
+
+/// Write `content` to `path` atomically: tmp file in the same directory, then
+/// rename over the target. Creates the parent directory if missing (first-ever
+/// tenant on a fresh data_dir).
+fn write_atomic(path: &str, content: &str) -> Result<(), ConfigError> {
+    let io_err = |source: std::io::Error| ConfigError::Io {
+        path: path.to_string(),
+        source,
+    };
+    let target = Path::new(path);
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(io_err)?;
+        }
+    }
+    let tmp = target.with_extension("toml.tmp");
+    std::fs::write(&tmp, content).map_err(io_err)?;
+    std::fs::rename(&tmp, target).map_err(io_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TmpDir(std::path::PathBuf);
+    impl TmpDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "nvb-tenants-edit-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn file(&self) -> String {
+            self.0.join("tenants.toml").to_string_lossy().into_owned()
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tenant(name: &str) -> NewTenant {
+        NewTenant {
+            name: name.to_string(),
+            server: "nether".to_string(),
+            room_id: format!("!{name}:nether.im"),
+            guild_id: "111".to_string(),
+            channel_id: "222".to_string(),
+        }
+    }
+
+    #[test]
+    fn add_creates_file_and_loads_back() {
+        let dir = TmpDir::new();
+        let path = dir.file();
+        let prior = add_tenant_entry(&path, &tenant("Guest Voice")).unwrap();
+        assert!(prior.is_none(), "file should not have existed");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        // Round-trips through the real loader shape (name/server/room_id + discord).
+        let parsed: crate::TenantsFile = toml::from_str(&content).unwrap();
+        assert_eq!(parsed.bridges.len(), 1);
+        assert_eq!(parsed.bridges[0].name.as_deref(), Some("Guest Voice"));
+        assert_eq!(parsed.bridges[0].server.as_deref(), Some("nether"));
+        assert_eq!(parsed.bridges[0].room_id, "!Guest Voice:nether.im");
+        assert_eq!(parsed.bridges[0].discord.guild_id, "111");
+    }
+
+    #[test]
+    fn add_preserves_comments_and_appends() {
+        let dir = TmpDir::new();
+        let path = dir.file();
+        let hand_written = "# operator notes survive bot edits\n\n[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!a:x\"\n\n[bridge.discord]\nguild_id = \"1\"\nchannel_id = \"2\"\n";
+        std::fs::write(&path, hand_written).unwrap();
+
+        let prior = add_tenant_entry(&path, &tenant("b")).unwrap();
+        assert_eq!(prior.as_deref(), Some(hand_written));
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("# operator notes survive bot edits"));
+        let parsed: crate::TenantsFile = toml::from_str(&content).unwrap();
+        assert_eq!(parsed.bridges.len(), 2);
+        assert_eq!(parsed.bridges[1].name.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn add_rejects_duplicate_name_without_touching_file() {
+        let dir = TmpDir::new();
+        let path = dir.file();
+        add_tenant_entry(&path, &tenant("a")).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let err = add_tenant_entry(&path, &tenant("a")).unwrap_err();
+        assert!(err.to_string().contains("already has a bridge named 'a'"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn remove_deletes_only_the_named_entry() {
+        let dir = TmpDir::new();
+        let path = dir.file();
+        add_tenant_entry(&path, &tenant("a")).unwrap();
+        add_tenant_entry(&path, &tenant("b")).unwrap();
+        remove_tenant_entry(&path, "a").unwrap();
+        let parsed: crate::TenantsFile =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.bridges.len(), 1);
+        assert_eq!(parsed.bridges[0].name.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn remove_unknown_name_errors_without_touching_file() {
+        let dir = TmpDir::new();
+        let path = dir.file();
+        add_tenant_entry(&path, &tenant("a")).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let err = remove_tenant_entry(&path, "ghost").unwrap_err();
+        assert!(err.to_string().contains("no bridge named 'ghost'"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn restore_rewrites_prior_content() {
+        let dir = TmpDir::new();
+        let path = dir.file();
+        add_tenant_entry(&path, &tenant("a")).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let prior = add_tenant_entry(&path, &tenant("b")).unwrap();
+        restore_tenants_file(&path, prior).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn restore_none_deletes_the_created_file() {
+        let dir = TmpDir::new();
+        let path = dir.file();
+        let prior = add_tenant_entry(&path, &tenant("a")).unwrap();
+        restore_tenants_file(&path, prior).unwrap();
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn bot_written_file_passes_the_real_loader() {
+        // End-to-end shape check: an entry written here resolves through
+        // load_tenants with a profile, like any hand-written tenant.
+        let dir = TmpDir::new();
+        let path = dir.file();
+        add_tenant_entry(&path, &tenant("Guest Voice")).unwrap();
+
+        let profile: crate::ServerProfile = toml::from_str(
+            "homeserver_url = \"https://nether.im\"\nsender_localpart = \"voicebridge\"\nappservice_id = \"voicebridge\"\nappservice_token = \"tok\"\n",
+        )
+        .unwrap();
+        let servers = std::collections::HashMap::from([("nether".to_string(), profile)]);
+        let got = crate::load_tenants(&path, &servers, "/data").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].matrix.store_path, "/data/guest-voice");
+        assert_eq!(got[0].matrix.bot_user_id, "@voicebridge_bot:nether.im");
+    }
+}
