@@ -449,7 +449,7 @@ pub fn resolve_bridge_store_path(b: &mut BridgeConfig, data_dir: &str, leaf: &st
 /// validate a further bridge against them without re-validating the whole set.
 /// Hard keys mirror `Config::validate`'s cross-bridge errors; soft keys mirror its
 /// warnings.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct LiveKeys {
     /// Bridge names (labels) — the supervisor keys running bridges by label, so a
     /// duplicate would collide in its registry and in the puppet pool's channel map.
@@ -653,6 +653,7 @@ impl Config {
     /// server domain resolution order:
     ///   1. Explicit `matrix.matrix_domain` (or inherited from `[server.<name>]`) — use as-is.
     ///   2. Extract host from `matrix.homeserver_url` (the original behaviour).
+    ///
     /// The explicit field is needed when `homeserver_url` is an internal proxy address
     /// (e.g. `http://matrix-traefik:8008` in Docker) whose hostname is not the public
     /// Matrix server name.
@@ -863,7 +864,14 @@ impl Config {
                 "config must define at least one [[bridge]]".to_string(),
             ));
         }
+        self.validate_allowing_no_bridges()
+    }
 
+    /// [`validate`](Self::validate) minus the ≥1-`[[bridge]]` requirement — for a
+    /// hosting deployment whose bridges all come from `tenants.toml` (#45). The
+    /// caller is responsible for requiring at least one bridge across the merged
+    /// static + tenant set.
+    pub fn validate_allowing_no_bridges(&self) -> Result<(), ConfigError> {
         // Hard: the shared pool must have at least one bot — every active
         // channel needs an anchor, so a pool of zero can bridge nothing.
         if self.puppets.tokens.is_empty() {

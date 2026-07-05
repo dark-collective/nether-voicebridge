@@ -72,12 +72,42 @@ async fn main() -> Result<()> {
             Err(e) => return Err(e).context("loading config from config.toml"),
         },
     };
-    cfg.validate().context("config validation failed")?;
+    // Boot-time tenants (#45): load BEFORE validation so a hosting deployment
+    // whose bridges all come from tenants.toml (zero static [[bridge]]s) can
+    // pass. An invalid tenants file at boot fails startup with the same rigor
+    // as config.toml — only the SIGHUP reload path is forgiving.
+    let tenants = nvb_config::load_tenants(
+        &nvb_config::tenants_path(&cfg.data_dir),
+        &cfg.servers,
+        &cfg.data_dir,
+    )
+    .context("loading tenants.toml")?;
+    if cfg.bridges.is_empty() && !tenants.is_empty() {
+        cfg.validate_allowing_no_bridges()
+            .context("config validation failed")?;
+    } else {
+        // Also the no-bridges-anywhere case: validate() then errors with the
+        // usual "must define at least one [[bridge]]".
+        cfg.validate().context("config validation failed")?;
+    }
     cfg.log_redacted_summary();
-    // `data_dir` was already consumed by `load` to resolve each bridge's
-    // `store_path`; only the pool and bridges are needed past this point.
+
+    // The static bridges' labels + uniqueness keys, captured before the configs
+    // move: tenants are validated against these (at boot and on every reload),
+    // and they stay reserved even if a static bridge later dies.
+    let static_labels: std::collections::HashSet<String> = cfg
+        .bridges
+        .iter()
+        .enumerate()
+        .map(|(i, b)| b.name.clone().unwrap_or_else(|| format!("bridge-{i}")))
+        .collect();
+    let static_keys = nvb_config::LiveKeys::from_bridges(&cfg.bridges);
+
     let nvb_config::Config {
-        puppets, bridges, ..
+        puppets,
+        bridges,
+        servers,
+        data_dir,
     } = cfg;
 
     // The Discord puppet bots are a SHARED, process-wide pool: one set of gateway
@@ -92,7 +122,16 @@ async fn main() -> Result<()> {
     // one independent Matrix/RTC pipeline per bridge, all `!Send`, all driven on
     // this task. Each bridge future swallows its own error (logging it), so one
     // bridge failing ends *that* bridge only — the rest keep running.
-    let mut supervisor = Supervisor::new(pool, pool_shutdown);
+    let mut supervisor = Supervisor::new(
+        pool,
+        pool_shutdown,
+        supervisor::TenantsCtx {
+            servers,
+            data_dir,
+            static_keys,
+            static_labels,
+        },
+    );
 
     for (idx, bridge) in bridges.into_iter().enumerate() {
         // Shared bridge label: drives the `bridge{name=…}` span, is the shared
@@ -102,15 +141,18 @@ async fn main() -> Result<()> {
             bridge.name.clone().unwrap_or_else(|| format!("bridge-{idx}")).as_str(),
         );
         supervisor
-            .spawn_bridge(label.clone(), bridge)
+            .spawn_bridge(label.clone(), bridge, supervisor::Origin::Static)
             .with_context(|| format!("starting bridge '{label}'"))?;
     }
+    supervisor
+        .spawn_boot_tenants(tenants)
+        .context("starting tenants from tenants.toml")?;
 
     // Drive everything. On SIGINT/SIGTERM the supervisor cancels every bridge
     // root and *awaits* (bounded by a timeout) that the bridge futures unwind —
     // each side leaves voice, resets nicknames, retracts ghost m.call.member,
     // and closes LiveKit before we return. WAV finalize happens per bridge as
-    // it completes.
+    // it completes; SIGHUP reconciles the tenant set against tenants.toml.
     supervisor.run().await;
 
     Ok(())
