@@ -717,6 +717,26 @@ impl SharedPool {
             .contains(&guild)
     }
 
+    /// Whether at least one puppet bot has learned (via `ready`/`guild_create`)
+    /// that it is a member of `guild_id`. Used by the management bot's `link`
+    /// preflight. Guild membership is only known after each bot's gateway
+    /// `ready`, so shortly after startup this can be a false negative — callers
+    /// should treat `false` as a warning, not a hard failure.
+    pub fn any_bot_in_guild(&self, guild_id: u64) -> bool {
+        // GuildId is a NonZeroU64 and `GuildId::new(0)` panics; 0 can reach us
+        // from user input (`is_numeric_id` accepts "0").
+        if guild_id == 0 {
+            return false;
+        }
+        let guild = GuildId::new(guild_id);
+        self.slots.iter().any(|s| {
+            s.guilds
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&guild)
+        })
+    }
+
     /// Get or create the route handle for `key`, re-pointing it at `mixer`.
     fn route_to(routes: &mut HashMap<String, Route>, key: &str, mixer: Arc<PlaybackMixer>) -> Route {
         match routes.get(key) {
@@ -3193,6 +3213,17 @@ mod tests {
         p.release("A", "a1");
         // The freed guild-1 bot can't serve B (guild 2); b2 stays overflow.
         assert!(p.test_is_overflow("B", "b2"), "b2 still overflow — bot wrong guild");
+    }
+
+    #[test]
+    fn any_bot_in_guild_reflects_learned_membership() {
+        let p = pool(2);
+        assert!(!p.any_bot_in_guild(7), "nothing learned yet");
+        p.slots[1].guilds.write().unwrap().insert(GuildId::new(7));
+        assert!(p.any_bot_in_guild(7), "one bot knowing the guild suffices");
+        assert!(!p.any_bot_in_guild(8), "unknown guild");
+        assert!(!p.any_bot_in_guild(0), "guild 0 is invalid input, not a panic");
+        assert!(!pool(0).any_bot_in_guild(7), "empty pool covers nothing");
     }
 
     #[test]

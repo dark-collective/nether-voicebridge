@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
+use tracing::Instrument;
 
 /// A LiveKit focus entry from the `.well-known/matrix/client` endpoint.
 #[derive(Debug, Clone)]
@@ -50,37 +51,43 @@ pub async fn discover_livekit_focus(
     room_id: &str,
 ) -> Result<LivekitFocusInfo> {
     let url = format!("{homeserver_url}/.well-known/matrix/client");
-    let _span = tracing::info_span!("rtc.well_known", %url).entered();
+    // `.instrument`, not `.entered()`: an EnteredSpan held across an await
+    // makes the future !Send, and the management bot calls this from a
+    // Send event handler.
+    let span = tracing::info_span!("rtc.well_known", %url);
+    async move {
+        let resp: WellKnownClient = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?
+            .error_for_status()
+            .with_context(|| format!("GET {url} returned error status"))?
+            .json()
+            .await
+            .with_context(|| format!("parsing well-known JSON from {url}"))?;
 
-    let resp: WellKnownClient = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?
-        .error_for_status()
-        .with_context(|| format!("GET {url} returned error status"))?
-        .json()
-        .await
-        .with_context(|| format!("parsing well-known JSON from {url}"))?;
+        let focus = resp
+            .rtc_foci
+            .into_iter()
+            .find_map(|f| match f {
+                RtcFocus::Livekit { livekit_alias, livekit_service_url } => {
+                    Some(LivekitFocusInfo {
+                        alias: livekit_alias.unwrap_or_else(|| room_id.to_owned()),
+                        service_url: livekit_service_url,
+                    })
+                }
+                RtcFocus::Unknown => None,
+            })
+            .ok_or_else(|| anyhow!("no livekit focus found in {url}"))?;
 
-    let focus = resp
-        .rtc_foci
-        .into_iter()
-        .find_map(|f| match f {
-            RtcFocus::Livekit { livekit_alias, livekit_service_url } => {
-                Some(LivekitFocusInfo {
-                    alias: livekit_alias.unwrap_or_else(|| room_id.to_owned()),
-                    service_url: livekit_service_url,
-                })
-            }
-            RtcFocus::Unknown => None,
-        })
-        .ok_or_else(|| anyhow!("no livekit focus found in {url}"))?;
-
-    tracing::info!(
-        alias = %focus.alias,
-        service_url = %focus.service_url,
-        "LiveKit focus discovered"
-    );
-    Ok(focus)
+        tracing::info!(
+            alias = %focus.alias,
+            service_url = %focus.service_url,
+            "LiveKit focus discovered"
+        );
+        Ok(focus)
+    }
+    .instrument(span)
+    .await
 }

@@ -109,6 +109,19 @@ pub struct ManagementConfig {
     pub appservice_token: String,
 }
 
+impl ManagementConfig {
+    /// Base URL to use for `.well-known/matrix/client` discovery — same
+    /// semantics as [`MatrixConfig::well_known_base_url`]: `matrix_domain` (the
+    /// public address that actually serves `.well-known`) wins over a possibly
+    /// internal `homeserver_url`.
+    pub fn well_known_base_url(&self) -> String {
+        match &self.matrix_domain {
+            Some(domain) => format!("https://{domain}"),
+            None => self.homeserver_url.trim_end_matches('/').to_owned(),
+        }
+    }
+}
+
 /// The shared Discord puppet bot pool (process-wide, not per-bridge).
 #[derive(Debug, Deserialize, Default)]
 pub struct PuppetsConfig {

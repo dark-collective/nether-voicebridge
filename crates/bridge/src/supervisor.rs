@@ -355,6 +355,9 @@ impl Supervisor {
                 out.sort_by(|a, b| a.label.cmp(&b.label));
                 let _ = reply.send(out);
             }
+            ControlMsg::GuildCoverage { guild_id, reply } => {
+                let _ = reply.send(self.pool.any_bot_in_guild(guild_id));
+            }
         }
     }
 

@@ -26,6 +26,13 @@ pub enum ControlMsg {
     Status {
         reply: oneshot::Sender<Vec<BridgeStatus>>,
     },
+    /// Is `guild_id` known (via gateway `ready`/`guild_create`) to at least one
+    /// puppet bot? `false` may mean "not invited" OR "bots still connecting" —
+    /// the `link` preflight treats it as a warning, never a rejection.
+    GuildCoverage {
+        guild_id: u64,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 /// What an accepted reconcile did. `failed` lists entries whose plan was
@@ -96,6 +103,14 @@ struct BotCtx {
     server_names: Vec<String>,
     homeserver_url: String,
     appservice_token: String,
+    /// Shared HTTP client for the raw `link` preflight probes (power-level GET,
+    /// well-known discovery). The join probe builds its own inside
+    /// `appservice_join_room`.
+    http: reqwest::Client,
+    /// Base URL for `.well-known/matrix/client` discovery — `matrix_domain`
+    /// semantics, NOT necessarily `homeserver_url` (which may be an internal
+    /// proxy address in Docker deployments).
+    well_known_base: String,
     /// Serializes tenants.toml mutations: the link/unlink flow is a
     /// read-modify-write of the file plus a reconcile round-trip, and two
     /// concurrent commands interleaving those steps could drop an edit or roll
@@ -188,6 +203,11 @@ pub async fn run(
         server_names,
         homeserver_url: cfg.homeserver_url.clone(),
         appservice_token: cfg.appservice_token.clone(),
+        http: reqwest::Client::builder()
+            .use_rustls_tls()
+            .build()
+            .context("building management-bot http client")?,
+        well_known_base: cfg.well_known_base_url(),
         mutate_lock: tokio::sync::Mutex::new(()),
     });
 
@@ -482,6 +502,203 @@ async fn request_reconcile(ctx: &BotCtx) -> Option<Result<ReconcileSummary, Stri
     tokio::time::timeout(CONTROL_TIMEOUT, rx).await.ok()?.ok()
 }
 
+/// Ask the supervisor whether any puppet bot is a member of `guild_id`.
+/// `None` = no answer (channel down / timeout — caller reports "could not
+/// verify"); the answer itself is computed synchronously from pool memory.
+async fn query_guild_coverage(ctx: &BotCtx, guild_id: u64) -> Option<bool> {
+    let (tx, rx) = oneshot::channel();
+    ctx.control
+        .send(ControlMsg::GuildCoverage { guild_id, reply: tx })
+        .ok()?;
+    tokio::time::timeout(CONTROL_TIMEOUT, rx).await.ok()?.ok()
+}
+
+// ---- link preflight (#47 slice 1) ----
+
+/// Verdict of a room's `m.room.power_levels` for the bridge's ghost users:
+/// can a freshly-joined ghost post `org.matrix.msc3401.call.member`?
+#[derive(Debug, PartialEq, Eq)]
+struct CallPowerCheck {
+    /// Effective power level required to post the call-member state event.
+    required: i64,
+    /// Power level a freshly-joined appservice ghost gets. Ghosts are minted
+    /// dynamically, so they are never in the `users` map — `users_default`
+    /// is what they will have.
+    ghost_pl: i64,
+}
+
+impl CallPowerCheck {
+    fn ok(&self) -> bool {
+        self.ghost_pl >= self.required
+    }
+}
+
+/// Pure evaluation of a room's power levels (unit-tested below). `content` is
+/// the raw `m.room.power_levels` event content; `None` means the event is
+/// absent (GET 404). Per spec an absent event implies `state_default = 0`
+/// (would pass), but such rooms are practically nonexistent and an absent
+/// event here more likely means something unexpected — fail safe by treating
+/// it as the spec default-with-event value of 50.
+fn evaluate_call_member_power(content: Option<&serde_json::Value>) -> CallPowerCheck {
+    let Some(c) = content else {
+        return CallPowerCheck { required: 50, ghost_pl: 0 };
+    };
+    let required = c
+        .get("events")
+        .and_then(|e| e.get(CALL_MEMBER_EVENT))
+        .and_then(pl_int)
+        .or_else(|| c.get("state_default").and_then(pl_int))
+        .unwrap_or(50);
+    let ghost_pl = c.get("users_default").and_then(pl_int).unwrap_or(0);
+    CallPowerCheck { required, ghost_pl }
+}
+
+const CALL_MEMBER_EVENT: &str = "org.matrix.msc3401.call.member";
+
+/// Power-level values are canonically integers, but legacy rooms (and some
+/// servers) carry them as numeric strings — accept both.
+fn pl_int(v: &serde_json::Value) -> Option<i64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Warnings from probes that can have benign false negatives (currently only
+/// guild coverage — bots learn their guilds at gateway `ready`, so early after
+/// startup a legitimately-invited guild may not be known yet).
+struct ProbeReport {
+    warnings: Vec<String>,
+}
+
+/// Run every room/guild prerequisite probe BEFORE tenants.toml is touched.
+/// `Err` carries the complete user-facing reply text — probe failures are
+/// operator errors, not bugs, so they go to the DM rather than the log.
+///
+/// Side effect: the join probe (deliberately idempotent with the later bridge
+/// spawn) leaves the bot joined to the room even when a later probe fails.
+/// That is harmless — a retried `link` reuses the membership, and the bridge
+/// needs it anyway. (`unlink` never leaves rooms either; out of scope here.)
+async fn probe_room_prereqs(
+    ctx: &BotCtx,
+    room_id: &str,
+    guild_id: &str,
+) -> Result<ProbeReport, String> {
+    // 1. Join (hard): covers restricted/invite-only rooms and typo'd room ids.
+    match tokio::time::timeout(
+        Duration::from_secs(15),
+        crate::matrix::appservice_join_room(
+            &ctx.homeserver_url,
+            &ctx.appservice_token,
+            room_id,
+            ctx.own_user.as_str(),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return Err(format!(
+                "❌ The bridge bot could not join {room_id}: {e}\n\
+                 If the room is invite-only or restricted, invite {} to it first, then run `link` again.\n\
+                 Nothing was written.",
+                ctx.own_user
+            ));
+        }
+        Err(_) => {
+            return Err(format!(
+                "❌ Joining {room_id} timed out after 15 s — is the homeserver reachable?\n\
+                 Nothing was written."
+            ));
+        }
+    }
+
+    // 2. Power levels (hard): a room that blocks ghosts from posting
+    // `org.matrix.msc3401.call.member` silently breaks the Discord→Matrix
+    // direction, so refuse to link it. Must run after the join (a non-member
+    // GET 403s).
+    let pl_content = tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::matrix::get_room_state(
+            &ctx.http,
+            &ctx.homeserver_url,
+            &ctx.appservice_token,
+            room_id,
+            "m.room.power_levels",
+            ctx.own_user.as_str(),
+        ),
+    )
+    .await
+    .map_err(|_| {
+        "❌ Reading the room's power levels timed out after 10 s.\nNothing was written."
+            .to_string()
+    })?
+    .map_err(|e| {
+        format!(
+            "❌ Could not read the room's power levels: {e}\nNothing was written."
+        )
+    })?;
+    let check = evaluate_call_member_power(pl_content.as_ref());
+    if !check.ok() {
+        return Err(format!(
+            "❌ The room's power levels block the bridge: posting `{CALL_MEMBER_EVENT}` needs power level {}, but the bridge's ghost users join at level {} — Matrix would never see the Discord side of the call.\n\
+             Fix: start an Element Call in the room once (that sets the level), or via /devtools set `events[\"{CALL_MEMBER_EVENT}\"] = 0` in `m.room.power_levels`. Element's \"Roles & Permissions\" UI shows \"Default\" either way, so check the raw event.\n\
+             Nothing was written.",
+            check.required, check.ghost_pl
+        ));
+    }
+
+    // 3. MatrixRTC focus (hard): a `link`-created tenant always uses the
+    // default LiveKit config, so this discovery is exactly what the spawned
+    // bridge will do.
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::rtc::well_known::discover_livekit_focus(&ctx.http, &ctx.well_known_base, room_id),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            return Err(format!(
+                "❌ MatrixRTC does not appear to be set up on this homeserver: {e}\n\
+                 `{}/.well-known/matrix/client` must publish an `org.matrix.msc4143.rtc_foci` LiveKit entry (lk-jwt-service + LiveKit). Without it no call can be bridged.\n\
+                 Nothing was written.",
+                ctx.well_known_base
+            ));
+        }
+        Err(_) => {
+            return Err(format!(
+                "❌ MatrixRTC discovery timed out after 10 s (`{}/.well-known/matrix/client`).\n\
+                 Nothing was written.",
+                ctx.well_known_base
+            ));
+        }
+    }
+
+    // 4. Discord guild coverage (WARN only): guilds are learned per-bot at
+    // gateway `ready`, so a false negative is expected shortly after startup.
+    let mut warnings = Vec::new();
+    match guild_id.parse::<u64>() {
+        Ok(gid) => match query_guild_coverage(ctx, gid).await {
+            Some(true) => {}
+            Some(false) => warnings.push(format!(
+                "⚠️ No puppet bot reports membership of guild {guild_id} yet — Matrix speakers will not be voiced on Discord until the puppet bots are invited to that guild. (If the process just started, the bots may still be connecting.)"
+            )),
+            None => warnings.push(
+                "⚠️ Could not verify puppet-bot guild membership (no answer from the supervisor)."
+                    .to_string(),
+            ),
+        },
+        // Past is_numeric_id this only means a >u64 digit string.
+        Err(_) => warnings.push(format!(
+            "⚠️ Could not verify puppet-bot guild membership ('{guild_id}' is not a valid guild id)."
+        )),
+    }
+
+    Ok(ProbeReport { warnings })
+}
+
 async fn handle_list(ctx: &BotCtx, room: &Room) {
     let Some(running) = query_status(ctx).await else {
         reply(room, "The supervisor did not respond — check the bridge logs.").await;
@@ -560,6 +777,18 @@ async fn handle_link(
         }
     };
 
+    // Preflight probes (#47): verify the room/guild prerequisites BEFORE
+    // touching tenants.toml — a failed probe replies and writes nothing.
+    // Runs outside the mutate lock (slow network I/O; a duplicate-name race
+    // is still caught by add_tenant_entry's own rejection).
+    let report = match probe_room_prereqs(ctx, &room_id, &guild_id).await {
+        Ok(r) => r,
+        Err(msg) => {
+            reply(room, &msg).await;
+            return;
+        }
+    };
+
     let tenant = NewTenant {
         name: name.clone(),
         server,
@@ -584,12 +813,19 @@ async fn handle_link(
                 ))
                 .await;
             } else if summary.added.iter().any(|l| l == &name) {
+                let guild_line = if report.warnings.is_empty() {
+                    format!("✓ puppet bots present in guild {guild_id}")
+                } else {
+                    report.warnings.join("\n")
+                };
                 reply(room, &format!(
                     "✅ Bridge '{name}' is up: {room_id} ↔ guild {guild_id} channel {channel_id}.\n\
-                     Checklist if no audio flows:\n\
-                     • the Matrix room must allow power level 0 for `org.matrix.msc3401.call.member` (starting a proper Element Call in the room once sets this)\n\
-                     • a restricted/invite-only room needs the bridge bot invited\n\
-                     • every puppet bot must be invited to the Discord guild with Connect, Speak, Use Voice Activity, Change Nickname"
+                     Verified before linking:\n\
+                     ✓ bridge bot joined the room\n\
+                     ✓ call power levels allow the bridge's ghosts\n\
+                     ✓ MatrixRTC focus discovered\n\
+                     {guild_line}\n\
+                     Not verifiable here: the puppet bots need Connect, Speak, Use Voice Activity and Change Nickname on the voice channel."
                 ))
                 .await;
             } else {
@@ -716,5 +952,66 @@ mod tests {
         assert!(!is_numeric_id(""));
         assert!(!is_numeric_id("12a4"));
         assert!(!is_numeric_id("#general"));
+    }
+
+    fn pl(json: serde_json::Value) -> CallPowerCheck {
+        evaluate_call_member_power(Some(&json))
+    }
+
+    #[test]
+    fn call_power_events_override() {
+        // The properly-configured Element Call room.
+        let c = pl(serde_json::json!({
+            "events": { "org.matrix.msc3401.call.member": 0 },
+            "state_default": 50,
+        }));
+        assert_eq!(c, CallPowerCheck { required: 0, ghost_pl: 0 });
+        assert!(c.ok());
+
+        // An explicit blocking override.
+        assert!(!pl(serde_json::json!({
+            "events": { "org.matrix.msc3401.call.member": 50 },
+            "state_default": 0,
+        }))
+        .ok());
+    }
+
+    #[test]
+    fn call_power_state_default_fallback() {
+        assert!(pl(serde_json::json!({ "state_default": 0 })).ok());
+        // No override, no state_default → spec default 50 (the verified
+        // 2026-06-16 silent breakage: a room left at default state PL).
+        let c = pl(serde_json::json!({ "users_default": 0 }));
+        assert_eq!(c, CallPowerCheck { required: 50, ghost_pl: 0 });
+        assert!(!c.ok());
+    }
+
+    #[test]
+    fn call_power_users_default_counts() {
+        // Ghosts join at users_default; a room that raises it alongside
+        // state_default still works.
+        assert!(pl(serde_json::json!({
+            "state_default": 50,
+            "users_default": 50,
+        }))
+        .ok());
+    }
+
+    #[test]
+    fn call_power_accepts_string_encoded_levels() {
+        // Legacy rooms carry power levels as numeric strings.
+        assert!(pl(serde_json::json!({
+            "events": { "org.matrix.msc3401.call.member": "0" },
+            "state_default": "50",
+        }))
+        .ok());
+        assert!(!pl(serde_json::json!({ "state_default": "50" })).ok());
+    }
+
+    #[test]
+    fn call_power_absent_event_fails_safe() {
+        let c = evaluate_call_member_power(None);
+        assert_eq!(c, CallPowerCheck { required: 50, ghost_pl: 0 });
+        assert!(!c.ok());
     }
 }

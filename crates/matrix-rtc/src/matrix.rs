@@ -809,6 +809,46 @@ pub(crate) async fn appservice_join_room(
     Ok(())
 }
 
+/// GET a room state event (empty state key) via the CS API, authenticated with
+/// the appservice `as_token` and masqueraded as `user_id` (must be
+/// appservice-controlled and joined to the room). `Ok(Some(content))` on 200,
+/// `Ok(None)` on 404 (event absent), `Err` otherwise (auth, not in room,
+/// network).
+pub(crate) async fn get_room_state(
+    http: &reqwest::Client,
+    homeserver_url: &str,
+    appservice_token: &str,
+    room_id: &str,
+    event_type: &str,
+    user_id: &str,
+) -> Result<Option<serde_json::Value>> {
+    // Trailing "" = the empty state key, mirroring the ghost PUT-state path.
+    let url = crate::rtc::ghost::cs_url(
+        homeserver_url,
+        &["rooms", room_id, "state", event_type, ""],
+        Some(user_id),
+    )?;
+    let resp = http
+        .get(url)
+        .bearer_auth(appservice_token)
+        .send()
+        .await
+        .with_context(|| format!("GET room state {event_type}"))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("{status}: {body}"));
+    }
+    let content = resp
+        .json()
+        .await
+        .with_context(|| format!("parsing {event_type} state content"))?;
+    Ok(Some(content))
+}
+
 /// Run the Matrix sync loop (classic `/v3/sync` via `client.sync`). Must be called
 /// with a client produced by `build_client`. Drives the `SyncCallMemberEvent`
 /// handler and sends call-active signals through `call_active_tx` when the first

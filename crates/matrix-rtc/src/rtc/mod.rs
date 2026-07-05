@@ -25,7 +25,8 @@ mod membership;
 mod openid;
 mod publish;
 mod session;
-mod well_known;
+// `pub(crate)`: the management bot's link preflight probes RTC-foci discovery.
+pub(crate) mod well_known;
 
 // Phase 4 tone diagnostic — kept on disk (and compiling) but not used in the
 // live path. Re-wire in `publish` if a standalone tone test is ever needed.
