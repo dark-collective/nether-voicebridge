@@ -3,7 +3,22 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0-alpha.5] - 2026-07-05
+
+### Fixed
+- **"Robotic"/distorted Discord speakers heard through the bridge (#36) — root-caused
+  and fixed.** songbird 0.6.0's DAVE receive path hands every decrypted voice packet
+  to the Opus decoder with the DAVE supplemental section (truncated AES128-GCM tag,
+  ULEB128 nonce, size byte, `0xFAFA` marker — typically 12–16 trailing non-audio
+  bytes) still appended. Opus never errors on the trailing garbage, but CELT/
+  hybrid-mode frames read bits from the packet end, so affected frames decode into
+  metallic warble — transiently for desktop speakers (as their encoder switches
+  modes) and near-constantly for one PS5 sender, while Discord's own clients heard
+  the same speakers clean. Fixed by vendoring songbird 0.6.0 (`vendor/songbird`,
+  wired via `[patch.crates-io]`) with the stored packet carrying its receive-time
+  corrected payload tail so the decode slice excludes the trailer. Confirmed live:
+  the permanently-affected PS5 speaker was immediately clean. Being reported
+  upstream. Also bumps davey 0.1.3 → 0.1.4 (libdave-parity receive hardening).
 
 ### Changed
 - **Per-guild puppet allocation & multiplexing: one guild's calls no longer starve
@@ -24,6 +39,11 @@ adheres to [Semantic Versioning](https://semver.org/).
 - `multiguild_spike` example (`cargo run -p nvb-discord --example multiguild_spike`):
   live GO/NO-GO probe that one bot can hold two concurrent DAVE voice sessions —
   per-guild capture WAVs, distinct playback tones, soak logging.
+
+### Verified
+- Ghost Olm session rotation (#52, shipped in alpha.4) is now fully live-verified:
+  membership- and max-age-triggered rotations fire on schedule, are non-disruptive
+  mid-call, re-deliver keys immediately, and hold file descriptors flat.
 
 ## [0.3.0-alpha.4] - 2026-07-04
 
