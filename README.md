@@ -14,7 +14,21 @@ channel↔room pairs at once.
 > **not yet had a human code review**. It works in day-to-day use on the author's
 > homeserver, but expect rough edges, breaking changes, and bugs. Run it at your
 > own risk, and please report what breaks. Come say hi / get help in the Matrix
-> room: [`#nether-voicebridge:nether.im`](https://matrix.to/#/%23nether-voicebridge:nether.im).
+> room [`#nether-voicebridge:nether.im`](https://matrix.to/#/%23nether-voicebridge:nether.im)
+> or on the [Discord server](https://discord.gg/BQYxEdu7s2).
+
+## Community
+
+Development happens in the open on both platforms — fittingly, kept in sync by a
+bridge (the [mautrix-discord](https://github.com/mautrix/discord) text bridge; this
+project handles the voice side). The Matrix development-space rooms are bridged to
+the matching channels on the [Discord server](https://discord.gg/BQYxEdu7s2):
+
+- [`#nether-voicebridge-devel:nether.im`](https://matrix.to/#/%23nether-voicebridge-devel:nether.im)
+  ↔ `#voice-bridge-development` — development discussion
+- the *Git Update Spam* room ↔ `#git-update-spam` — commit / CI / release feed
+
+Same conversation on both sides; join from whichever platform you prefer.
 
 ## Screenshots
 
@@ -108,7 +122,8 @@ before picking the next big thing.
 
 The live roadmap board is at
 [the project's Projects tab](https://nether.codes/dark/nether-voicebridge/projects).
-If any of this matters to you, say so in the community room or on the issue tracker
+If any of this matters to you, say so in the community room, on
+[Discord](https://discord.gg/BQYxEdu7s2), or on the issue tracker
 (below) — interest is what moves an idea up the list.
 
 ## How it works
