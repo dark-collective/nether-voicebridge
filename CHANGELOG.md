@@ -3,7 +3,7 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0-alpha.7] - 2026-07-05
 
 ### Added
 - **Runtime bridge provisioning (#45).** Bridges can now be added, removed, and
