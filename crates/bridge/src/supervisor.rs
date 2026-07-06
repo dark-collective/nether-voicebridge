@@ -18,6 +18,8 @@ use anyhow::{Context, Result};
 use futures_util::future::{FutureExt, LocalBoxFuture};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal::unix::{Signal, SignalKind, signal};
@@ -34,6 +36,50 @@ use nvb_matrix_rtc::mgmt::{BridgeStatus, ControlMsg, ControlTx, ReconcileSummary
 /// memberships, close LiveKit) before its future is force-dropped. The
 /// per-bridge version of the process-exit drain budget.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Best-effort human-readable text from a caught panic payload (the common
+/// `&str` / `String` cases; anything else is opaque).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "<non-string panic payload>"
+    }
+}
+
+/// Contain a panic in one bridge future so it can't unwind the shared supervisor
+/// task — every bridge future *and* the puppet pool are polled on this one task
+/// (they're `!Send`), so an uncaught panic in any of them would take down every
+/// other tenant plus the pool. On panic we log and resolve to the bridge's label,
+/// exactly as a normal exit does, so `on_bridge_complete` tears that one tenant
+/// down (`unregister_channel`, WAV finalize) and its neighbours keep running.
+///
+/// `AssertUnwindSafe` is required because the bridge future closes over
+/// `!UnwindSafe` state (Arc<Mutex<…>>, routers); it is sound here because we drop
+/// the future on panic rather than resuming it, and the pool's std mutexes already
+/// recover from poisoning via `PoisonError::into_inner`.
+///
+/// NOTE: this relies on the default `panic = "unwind"` strategy — `Cargo.toml` has
+/// no `panic = "abort"`. Under `abort` the process dies before `catch_unwind` runs
+/// and this boundary silently becomes a no-op.
+async fn guard_bridge_panic<F>(label: Arc<str>, fut: F) -> Arc<str>
+where
+    F: Future<Output = Arc<str>>,
+{
+    match AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(l) => l,
+        Err(payload) => {
+            tracing::error!(
+                bridge = %label,
+                panic = %panic_message(payload.as_ref()),
+                "bridge task PANICKED — contained; this tenant is torn down, others unaffected"
+            );
+            label
+        }
+    }
+}
 
 /// Where a bridge came from — static `config.toml` bridges are never touched by
 /// the tenants reconcile; `tenants.toml` bridges are owned by it.
@@ -211,7 +257,12 @@ impl Supervisor {
             fut_label
         }
         .instrument(span);
-        self.bridges.push(fut.boxed_local());
+        // Wrap in a panic boundary so a panic in this one bridge is contained to
+        // this bridge instead of unwinding the shared supervisor task (which drives
+        // every tenant + the pool). A caught panic resolves to the label, so the
+        // normal `on_bridge_complete` teardown runs.
+        self.bridges
+            .push(guard_bridge_panic(label.clone(), fut).boxed_local());
         Ok(())
     }
 
@@ -695,5 +746,47 @@ mod tests {
         let a = tenant("a", "!a:x");
         let b = tenant("b", "!b:x");
         validate_desired(&[a, b], &ctx).expect("disjoint tenants accepted");
+    }
+
+    /// A bridge future that panics mid-poll. Explicit `Arc<str>` return type so the
+    /// `!` from `panic!` coerces cleanly (no unreachable-tail lint).
+    async fn panicking_bridge() -> Arc<str> {
+        panic!("simulated bridge panic")
+    }
+
+    #[tokio::test]
+    async fn guard_passes_through_normal_completion() {
+        let label: Arc<str> = Arc::from("ok-bridge");
+        let out = guard_bridge_panic(label.clone(), async move { label }).await;
+        assert_eq!(&*out, "ok-bridge");
+    }
+
+    #[tokio::test]
+    async fn guard_contains_panic_and_returns_label() {
+        // The inner future panics; the guard must catch it (this test must NOT
+        // unwind) and resolve to the label so on_bridge_complete can tear it down.
+        let label: Arc<str> = Arc::from("boom-bridge");
+        let out = guard_bridge_panic(label.clone(), panicking_bridge()).await;
+        assert_eq!(&*out, "boom-bridge");
+    }
+
+    #[tokio::test]
+    async fn guard_lets_the_driving_loop_survive_a_panicking_bridge() {
+        // Mirror run()'s FuturesUnordered<LocalBoxFuture<Arc<str>>>: a panicking
+        // bridge and a healthy one both drain, and draining the panicker does not
+        // abort the set.
+        let mut set: FuturesUnordered<LocalBoxFuture<'static, Arc<str>>> =
+            FuturesUnordered::new();
+        let bad: Arc<str> = Arc::from("bad");
+        let good: Arc<str> = Arc::from("good");
+        set.push(guard_bridge_panic(bad.clone(), panicking_bridge()).boxed_local());
+        set.push(guard_bridge_panic(good.clone(), async move { good }).boxed_local());
+
+        let mut done: Vec<String> = Vec::new();
+        while let Some(label) = set.next().await {
+            done.push(label.to_string());
+        }
+        done.sort();
+        assert_eq!(done, vec!["bad".to_string(), "good".to_string()]);
     }
 }
