@@ -299,6 +299,11 @@ struct GhostConfig {
     /// changes + max-age. Mirrors `matrix.rotate_ghost_sessions` (default on);
     /// only effective on the Olm transport.
     rotate_ghost_sessions: bool,
+    /// Admission cap on concurrent ghosts for this bridge (`[limits]
+    /// max_ghosts_per_bridge`, #47). At the cap a NEW speaker is not bridged
+    /// (WARN + null sink); a slot frees when a ghost is released. `None` ⇒
+    /// unlimited. Bounds the super-linear Olm key-distribution cost per room.
+    max_ghosts: Option<usize>,
 }
 
 impl GhostPool {
@@ -309,6 +314,7 @@ impl GhostPool {
         matrix_cfg: &MatrixConfig,
         livekit_cfg: &LiveKitConfig,
         capture_wav: bool,
+        max_ghosts: Option<usize>,
     ) -> Result<Arc<Self>> {
         let bot_user: OwnedUserId = matrix_cfg
             .bot_user_id
@@ -347,6 +353,7 @@ impl GhostPool {
                 ghost_localpart_prefix: ghost_localpart_prefix(matrix_cfg.sender_localpart.as_deref()),
                 prune_stale_devices: matrix_cfg.prune_stale_devices.unwrap_or(true),
                 rotate_ghost_sessions: matrix_cfg.rotate_ghost_sessions.unwrap_or(true),
+                max_ghosts,
             },
         }))
     }
@@ -586,12 +593,39 @@ impl GhostPool {
     }
 }
 
+/// The sink a speaker gets when the bridge is at its ghost cap (`[limits]
+/// max_ghosts_per_bridge`, #47): frames are silently discarded and no ghost
+/// exists. Never registered in `sinks`, so a later re-`assign` (speaker
+/// re-join) re-checks the cap and can promote to a real ghost once a slot
+/// frees.
+struct NullCaptureSink;
+
+impl CaptureSink for NullCaptureSink {
+    fn push(&self, _mono: &[i16]) {}
+}
+
 impl CaptureRouter for GhostPool {
     fn assign(&self, key: &str, display_name: &str, avatar_url: Option<&str>) -> Arc<dyn CaptureSink> {
         let mut sinks = self.sinks.lock().unwrap_or_else(PoisonError::into_inner);
         // Idempotent: a re-join for the same Discord user reuses its sink/ghost.
         if let Some(sink) = sinks.get(key) {
             return sink.clone();
+        }
+        // Admission cap (#47): at the cap a NEW speaker is simply not bridged —
+        // one WARN per assign attempt (assign is called once per speaker
+        // appearance, so this doesn't spam), existing ghosts unaffected, FCFS
+        // like puppet overflow. `sinks` holds only real ghosts, so a release
+        // frees the slot for the next assign.
+        if let Some(max) = self.cfg.max_ghosts {
+            if sinks.len() >= max {
+                tracing::warn!(
+                    key,
+                    display_name,
+                    max_ghosts = max,
+                    "ghost cap reached — speaker NOT bridged to Matrix until a slot frees"
+                );
+                return Arc::new(NullCaptureSink);
+            }
         }
         let (frame_tx, frame_rx) = mpsc::channel::<Vec<i16>>(FRAME_CHANNEL_DEPTH);
         let sink = Arc::new(GhostSink {
@@ -1944,6 +1978,50 @@ fn build_membership(device_id: &OwnedDeviceId, focus: &LivekitFocusInfo) -> Call
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_pool(max_ghosts: Option<usize>) -> Arc<GhostPool> {
+        let matrix_cfg = MatrixConfig {
+            homeserver_url: "https://nether.im".into(),
+            room_id: "!r:nether.im".into(),
+            bot_user_id: "@bridge:nether.im".into(),
+            ..MatrixConfig::default()
+        };
+        GhostPool::new(&matrix_cfg, &LiveKitConfig::default(), false, max_ghosts)
+            .expect("test pool")
+    }
+
+    fn sink_count(pool: &GhostPool) -> usize {
+        pool.sinks.lock().unwrap_or_else(PoisonError::into_inner).len()
+    }
+
+    #[test]
+    fn assign_enforces_ghost_cap() {
+        let pool = test_pool(Some(2));
+        // Two speakers fit.
+        let _a = pool.assign("a", "Alice", None);
+        let _b = pool.assign("b", "Bob", None);
+        assert_eq!(sink_count(&pool), 2);
+        // A third is capped: null sink, no ghost registered.
+        let _c = pool.assign("c", "Carol", None);
+        assert_eq!(sink_count(&pool), 2);
+        // Idempotent re-assign of an EXISTING speaker is never capped.
+        let _a2 = pool.assign("a", "Alice", None);
+        assert_eq!(sink_count(&pool), 2);
+        // A release frees the slot; the previously-capped speaker now fits.
+        pool.release("a");
+        assert_eq!(sink_count(&pool), 1);
+        let _c2 = pool.assign("c", "Carol", None);
+        assert_eq!(sink_count(&pool), 2);
+    }
+
+    #[test]
+    fn assign_without_cap_is_unlimited() {
+        let pool = test_pool(None);
+        for i in 0..50 {
+            let _ = pool.assign(&format!("u{i}"), "U", None);
+        }
+        assert_eq!(sink_count(&pool), 50);
+    }
 
     #[test]
     fn ghost_identity_detection() {

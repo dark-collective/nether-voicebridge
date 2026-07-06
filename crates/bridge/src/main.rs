@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
         servers,
         data_dir,
         management,
+        limits,
     } = cfg;
 
     // Captured before `servers`/`data_dir` move into the supervisor's ctx: the
@@ -142,6 +143,7 @@ async fn main() -> Result<()> {
             data_dir,
             static_keys,
             static_labels,
+            limits,
         },
     );
 
@@ -169,8 +171,15 @@ async fn main() -> Result<()> {
         let control = supervisor.control_handle();
         let shutdown = pool_shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                nvb_matrix_rtc::mgmt::run(mgmt_cfg, server_names, data_dir, control, shutdown).await
+            if let Err(e) = nvb_matrix_rtc::mgmt::run(
+                mgmt_cfg,
+                server_names,
+                data_dir,
+                limits.mgmt_cooldown_secs,
+                control,
+                shutdown,
+            )
+            .await
             {
                 tracing::error!(error = %e, "management bot exited with error");
             }
@@ -250,6 +259,16 @@ fn check_tenants(cfg: &nvb_config::Config, path_override: Option<&str>) -> i32 {
     if tenants.is_empty() {
         println!("{path}: no tenants (missing or empty file) — nothing to check");
         return 0;
+    }
+    // Admission budget (#47): mirror the boot/reload gate's max_tenants check.
+    if let Some(max) = cfg.limits.max_tenants {
+        if tenants.len() > max {
+            println!(
+                "{path}: ERROR {} tenants but [limits] max_tenants = {max}",
+                tenants.len()
+            );
+            return 1;
+        }
     }
 
     let static_labels: std::collections::HashSet<String> = cfg

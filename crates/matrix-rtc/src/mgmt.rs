@@ -79,9 +79,9 @@ use matrix_sdk::{
         },
     },
 };
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use nvb_config::{ManagementConfig, NewTenant};
@@ -116,6 +116,46 @@ struct BotCtx {
     /// concurrent commands interleaving those steps could drop an edit or roll
     /// back the wrong prior content.
     mutate_lock: tokio::sync::Mutex<()>,
+    /// Per-operator cooldown between state-changing commands (`[limits]
+    /// mgmt_cooldown_secs`, #47). `None` ⇒ unlimited.
+    cooldown: Option<Duration>,
+    /// Last state-change attempt per operator MXID, for the cooldown gate.
+    mutate_stamps: StdMutex<HashMap<String, Instant>>,
+}
+
+impl BotCtx {
+    /// The `link`/`unlink` rate gate (#47): `Some(remaining_secs)` ⇒ `sender`
+    /// is still cooling down (nothing stamped); `None` ⇒ allowed, and this
+    /// attempt is stamped. Stamped on *attempts* that reach a state change
+    /// (past the cheap shape checks), successful or not — the budget guards
+    /// spawn/teardown work, not outcomes.
+    fn mutate_cooldown(&self, sender: &str) -> Option<u64> {
+        let cooldown = self.cooldown?;
+        let mut stamps = self
+            .mutate_stamps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        cooldown_check(&mut stamps, sender, Instant::now(), cooldown)
+    }
+}
+
+/// Pure core of the cooldown gate, split out for unit testing: returns the
+/// whole seconds remaining (≥ 1) when `sender`'s last stamp is younger than
+/// `cooldown`, else stamps `now` and clears them to proceed.
+fn cooldown_check(
+    stamps: &mut HashMap<String, Instant>,
+    sender: &str,
+    now: Instant,
+    cooldown: Duration,
+) -> Option<u64> {
+    if let Some(last) = stamps.get(sender) {
+        let elapsed = now.saturating_duration_since(*last);
+        if elapsed < cooldown {
+            return Some((cooldown - elapsed).as_secs().max(1));
+        }
+    }
+    stamps.insert(sender.to_owned(), now);
+    None
 }
 
 /// Run the management bot to completion (cancelled by `shutdown`).
@@ -128,6 +168,7 @@ pub async fn run(
     cfg: ManagementConfig,
     server_names: Vec<String>,
     data_dir: String,
+    mgmt_cooldown_secs: Option<u64>,
     control: ControlTx,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -209,6 +250,8 @@ pub async fn run(
             .context("building management-bot http client")?,
         well_known_base: cfg.well_known_base_url(),
         mutate_lock: tokio::sync::Mutex::new(()),
+        cooldown: mgmt_cooldown_secs.map(Duration::from_secs),
+        mutate_stamps: StdMutex::new(HashMap::new()),
     });
 
     // Invites that arrived while the bot was offline (consumed by the initial
@@ -245,7 +288,7 @@ pub async fn run(
                 return;
             }
             match parse_command(&text.body) {
-                Parsed::Cmd(cmd) => handle_command(&ctx, &room, cmd).await,
+                Parsed::Cmd(cmd) => handle_command(&ctx, &room, ev.sender.as_str(), cmd).await,
                 Parsed::Usage(usage) => reply(&room, &usage).await,
                 // Unrecognized chatter: help out in a DM, stay silent in a
                 // multi-user room (the bot may share a room with real traffic).
@@ -470,18 +513,18 @@ fn tokenize(s: &str) -> Option<Vec<String>> {
 
 // ---- command execution ----
 
-async fn handle_command(ctx: &BotCtx, room: &Room, cmd: Command) {
+async fn handle_command(ctx: &BotCtx, room: &Room, sender: &str, cmd: Command) {
     match cmd {
         Command::Help => reply(room, HELP_TEXT).await,
         Command::List => handle_list(ctx, room).await,
-        Command::Unlink { name } => handle_unlink(ctx, room, &name).await,
+        Command::Unlink { name } => handle_unlink(ctx, room, sender, &name).await,
         Command::Link {
             name,
             room_id,
             guild_id,
             channel_id,
             server,
-        } => handle_link(ctx, room, name, room_id, guild_id, channel_id, server).await,
+        } => handle_link(ctx, room, sender, name, room_id, guild_id, channel_id, server).await,
     }
 }
 
@@ -734,9 +777,11 @@ async fn handle_list(ctx: &BotCtx, room: &Room) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_link(
     ctx: &BotCtx,
     room: &Room,
+    sender: &str,
     name: String,
     room_id: String,
     guild_id: String,
@@ -776,6 +821,13 @@ async fn handle_link(
             return;
         }
     };
+
+    // Rate gate (#47): past the cheap shape checks (a typo doesn't burn the
+    // budget), before the expensive probes and the state change they precede.
+    if let Some(remaining) = ctx.mutate_cooldown(sender) {
+        reply(room, &format!("⏳ Rate limited — try again in {remaining}s.")).await;
+        return;
+    }
 
     // Preflight probes (#47): verify the room/guild prerequisites BEFORE
     // touching tenants.toml — a failed probe replies and writes nothing.
@@ -849,7 +901,13 @@ async fn handle_link(
     }
 }
 
-async fn handle_unlink(ctx: &BotCtx, room: &Room, name: &str) {
+async fn handle_unlink(ctx: &BotCtx, room: &Room, sender: &str, name: &str) {
+    // Rate gate (#47) — same budget as `link` (they share the stamp map, so an
+    // operator can't alternate the two to thrash spawn/teardown).
+    if let Some(remaining) = ctx.mutate_cooldown(sender) {
+        reply(room, &format!("⏳ Rate limited — try again in {remaining}s.")).await;
+        return;
+    }
     let _guard = ctx.mutate_lock.lock().await;
     let prior = match nvb_config::remove_tenant_entry(&ctx.tenants_path, name) {
         Ok(p) => p,
@@ -889,6 +947,35 @@ fn is_numeric_id(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cooldown_gates_within_window_and_stamps_attempts() {
+        let mut stamps = HashMap::new();
+        let cd = Duration::from_secs(30);
+        let t0 = Instant::now();
+
+        // First attempt: allowed and stamped.
+        assert_eq!(cooldown_check(&mut stamps, "@op:x", t0, cd), None);
+        // Immediately again: gated, full window remaining (rounded ≥ 1).
+        assert_eq!(cooldown_check(&mut stamps, "@op:x", t0, cd), Some(30));
+        // Mid-window: remaining counts down…
+        assert_eq!(
+            cooldown_check(&mut stamps, "@op:x", t0 + Duration::from_secs(29), cd),
+            Some(1)
+        );
+        // …and sub-second remainders report 1, never a confusing "0s".
+        assert_eq!(
+            cooldown_check(&mut stamps, "@op:x", t0 + Duration::from_millis(29_500), cd),
+            Some(1)
+        );
+        // A gated attempt did NOT re-stamp: the window still expires at t0+30.
+        assert_eq!(
+            cooldown_check(&mut stamps, "@op:x", t0 + Duration::from_secs(30), cd),
+            None
+        );
+        // Cooldowns are PER operator — a different MXID is independent.
+        assert_eq!(cooldown_check(&mut stamps, "@other:x", t0, cd), None);
+    }
 
     #[test]
     fn tokenize_plain_and_quoted() {

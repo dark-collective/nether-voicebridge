@@ -67,6 +67,35 @@ pub struct Config {
     /// no management bot runs.
     #[serde(default)]
     pub management: Option<ManagementConfig>,
+    /// Admission-control limits (#47 hardening). TOML `[limits]` maps here;
+    /// every field is optional and an absent field means unlimited — the
+    /// pre-limits behavior. Absent section ⇒ all unlimited.
+    #[serde(default)]
+    pub limits: LimitsConfig,
+}
+
+/// The `[limits]` block: operator-wide admission budgets (#47). These are
+/// blunt denial-of-service guards for a hosted deployment, not fairness
+/// scheduling — each is a hard cap checked at its admission point.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct LimitsConfig {
+    /// Maximum number of tenant bridges admitted (boot, SIGHUP reload, and the
+    /// management bot's `link` all validate against it; the whole desired set
+    /// is rejected beyond it, matching the all-or-nothing reload contract).
+    /// Static `[[bridge]]` entries are operator-authored and do NOT count.
+    #[serde(default)]
+    pub max_tenants: Option<usize>,
+    /// Maximum concurrent ghosts (= bridged Discord speakers) per bridge. At
+    /// the cap a new speaker is simply not bridged to Matrix (WARN logged,
+    /// existing ghosts unaffected); a slot frees when a ghost is released.
+    /// Bounds the super-linear Olm key-distribution cost per room.
+    #[serde(default)]
+    pub max_ghosts_per_bridge: Option<usize>,
+    /// Per-operator (MXID) cooldown in seconds between state-changing
+    /// management-bot commands (`link` / `unlink`), so spawn/teardown can't be
+    /// thrashed. `list`/`help` are exempt.
+    #[serde(default)]
+    pub mgmt_cooldown_secs: Option<u64>,
 }
 
 /// The `[management]` block: a Matrix bot that lets allowlisted operators
@@ -942,8 +971,9 @@ impl Config {
             servers: std::collections::HashMap::new(),
             data_dir: default_data_dir(),
             // Env-var mode is the minimal single-bridge deployment; the
-            // management bot is a config-file feature.
+            // management bot and admission limits are config-file features.
             management: None,
+            limits: LimitsConfig::default(),
             bridges: vec![BridgeConfig {
                 name,
                 server: None,
@@ -1322,6 +1352,32 @@ media_e2ee = false
         assert_eq!(cfg.bridges[0].matrix.room_id, "!a:nether.im");
         assert_eq!(cfg.bridges[1].matrix.room_id, "!b:nether.im");
         cfg.validate().expect("should validate");
+    }
+
+    #[test]
+    fn limits_absent_means_unlimited_and_parses_when_present() {
+        // Absent [limits] section ⇒ every cap None (unlimited, pre-#47 behavior).
+        let raw = format!(
+            "{}{}",
+            puppets_block(&["Bot a"]),
+            bridge_block(Some("a"), "!a:nether.im", "./sa", "222"),
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse failed");
+        assert_eq!(cfg.limits.max_tenants, None);
+        assert_eq!(cfg.limits.max_ghosts_per_bridge, None);
+        assert_eq!(cfg.limits.mgmt_cooldown_secs, None);
+
+        // Present section with a subset of fields: set ones parse, rest stay None.
+        let raw = format!(
+            "[limits]\nmax_tenants = 25\nmgmt_cooldown_secs = 30\n{}{}",
+            puppets_block(&["Bot a"]),
+            bridge_block(Some("a"), "!a:nether.im", "./sa", "222"),
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse failed");
+        assert_eq!(cfg.limits.max_tenants, Some(25));
+        assert_eq!(cfg.limits.max_ghosts_per_bridge, None);
+        assert_eq!(cfg.limits.mgmt_cooldown_secs, Some(30));
+        cfg.validate().expect("limits never invalidate a config");
     }
 
     #[test]

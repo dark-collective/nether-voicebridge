@@ -74,6 +74,17 @@
 # # display_name = "Voice Bridge Manager"   # optional; sets the shared bot account's name
 # # device_id / store_path auto-derive ("management", <data_dir>/management)
 
+# ── Admission limits (optional) ──────────────────────────────────────────────
+# Hard caps for a hosted deployment (#47). Every field is optional; an absent
+# field (or the whole absent section) means unlimited — the default behavior.
+#
+# [limits]
+# max_tenants = 25              # tenant bridges admitted (static [[bridge]]s don't count);
+#                               # boot / SIGHUP / `link` reject a set beyond this
+# max_ghosts_per_bridge = 16    # concurrent bridged Discord speakers per bridge; at the cap
+#                               # a NEW speaker is not bridged (WARN) until a slot frees
+# mgmt_cooldown_secs = 30       # per-operator cooldown between `link`/`unlink` commands
+
 [puppets]
 # One entry per puppet bot — each is a SEPARATE Discord application with its own
 # bot token, created deliberately at discord.com/developers/applications. This is

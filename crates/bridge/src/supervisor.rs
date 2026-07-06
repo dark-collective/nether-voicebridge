@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use nvb_audio::routing::{CaptureRouter, PlaybackRouter};
-use nvb_config::{BridgeConfig, LiveKeys, ServerProfile, validate_bridge_against};
+use nvb_config::{BridgeConfig, LimitsConfig, LiveKeys, ServerProfile, validate_bridge_against};
 use nvb_discord::{CaptureSink, SharedPool};
 use nvb_matrix_rtc::GhostPool;
 use nvb_matrix_rtc::mgmt::{BridgeStatus, ControlMsg, ControlTx, ReconcileSummary};
@@ -102,6 +102,10 @@ pub struct TenantsCtx {
     /// Labels of the static bridges (`name` or the positional `bridge-{i}`) —
     /// the supervisor registry / puppet-pool channel key namespace.
     pub static_labels: HashSet<String>,
+    /// Admission budgets (`[limits]`, #47): `max_tenants` gates every tenant
+    /// admission path through [`validate_desired`]; `max_ghosts_per_bridge` is
+    /// threaded into each bridge's `GhostPool`.
+    pub limits: LimitsConfig,
 }
 
 /// Book-keeping for one live bridge, keyed by label in [`Supervisor::running`].
@@ -192,9 +196,13 @@ impl Supervisor {
         // appservice ghost per Discord speaker. Created once and shared: handed to
         // the shared pool as this channel's `CaptureRouter` (the anchor pushes
         // per-speaker audio into it), and to the Matrix side (`run`) to be driven.
-        let ghost_pool =
-            GhostPool::new(&bridge.matrix, &bridge.livekit, bridge.discord.capture_wav)
-                .context("building ghost pool")?;
+        let ghost_pool = GhostPool::new(
+            &bridge.matrix,
+            &bridge.livekit,
+            bridge.discord.capture_wav,
+            self.ctx.limits.max_ghosts_per_bridge,
+        )
+        .context("building ghost pool")?;
         let capture_router: Arc<dyn CaptureRouter> = ghost_pool.clone();
 
         // Register this bridge's channel with the shared pool → its PlaybackRouter.
@@ -575,6 +583,18 @@ async fn recv_control(
 /// Validate a desired tenant set against the static bridges and each other —
 /// the all-or-nothing gate of a reload. Pure over `ctx`.
 fn validate_desired(desired: &[BridgeConfig], ctx: &TenantsCtx) -> Result<(), String> {
+    // Admission budget (#47): the whole desired set is rejected beyond the cap,
+    // matching the all-or-nothing reload contract. Checked here so every
+    // admission path (boot, SIGHUP, mgmt link's reconcile, --check-tenants)
+    // shares one gate; the mgmt flow rolls tenants.toml back on rejection.
+    if let Some(max) = ctx.limits.max_tenants {
+        if desired.len() > max {
+            return Err(format!(
+                "tenant limit reached: {} tenants requested but [limits] max_tenants = {max}",
+                desired.len()
+            ));
+        }
+    }
     let mut live = ctx.static_keys.clone();
     for d in desired {
         // The loader guarantees a name; the label namespace is shared with the
@@ -717,6 +737,7 @@ mod tests {
             data_dir: "/data".into(),
             static_keys: LiveKeys::from_bridges([&stat]),
             static_labels: HashSet::from(["Main Voice".to_string()]),
+            limits: LimitsConfig::default(),
         };
         // Label collision with a static bridge.
         let t = tenant("Main Voice", "!t:x");
@@ -742,10 +763,33 @@ mod tests {
             data_dir: "/data".into(),
             static_keys: LiveKeys::default(),
             static_labels: HashSet::new(),
+            limits: LimitsConfig::default(),
         };
         let a = tenant("a", "!a:x");
         let b = tenant("b", "!b:x");
         validate_desired(&[a, b], &ctx).expect("disjoint tenants accepted");
+    }
+
+    #[test]
+    fn validate_desired_enforces_max_tenants() {
+        let mut ctx = TenantsCtx {
+            servers: HashMap::new(),
+            data_dir: "/data".into(),
+            static_keys: LiveKeys::default(),
+            static_labels: HashSet::new(),
+            limits: LimitsConfig { max_tenants: Some(2), ..Default::default() },
+        };
+        let a = tenant("a", "!a:x");
+        let b = tenant("b", "!b:x");
+        let c = tenant("c", "!c:x");
+        // At the cap: accepted.
+        validate_desired(&[a.clone(), b.clone()], &ctx).expect("at-cap set accepted");
+        // Beyond the cap: whole set rejected with the friendly limit message.
+        let err = validate_desired(&[a.clone(), b.clone(), c.clone()], &ctx).unwrap_err();
+        assert!(err.contains("max_tenants = 2"), "unexpected: {err}");
+        // No cap configured ⇒ unlimited (pre-limits behavior).
+        ctx.limits.max_tenants = None;
+        validate_desired(&[a, b, c], &ctx).expect("uncapped set accepted");
     }
 
     /// A bridge future that panics mid-poll. Explicit `Arc<str>` return type so the
