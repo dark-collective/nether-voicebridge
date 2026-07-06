@@ -3,6 +3,50 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.10] - 2026-07-06
+
+### Added
+- **Two-sided link auth (#47).** Two optional `[management]` knobs (both default
+  off) make a `link` require consent from both sides of the bridge.
+  `require_room_authority = true`: the sender must be a joined member of the
+  target Matrix room with power level ≥ its `state_default` (a room moderator),
+  not just an allowlisted operator. `require_discord_approval = true`: a link
+  that passes every probe is held pending — nothing written — under a one-time
+  code until someone with the Manage Server permission in the target guild runs
+  `/bridge approve code:<code>` (a slash command registered by the puppet bot at
+  `approval_bot_index`, default 0; that bot's application must be invited with
+  the `applications.commands` OAuth scope — join scopes with `%20`, not `+`).
+  Pending links expire after `approval_timeout_secs` (default 600), the ban
+  list is re-checked at approval time, and both sides are notified of the
+  outcome. The audit log gains `link_pending`/`approve_rejected`, and `link_ok`
+  records who approved.
+- **Admission budgets: the `[limits]` block (#47).** Optional hard caps for a
+  hosted deployment — `max_tenants` (boot, SIGHUP reload, and `link` all
+  validate against it; the whole set is rejected beyond it),
+  `max_ghosts_per_bridge` (at the cap a new Discord speaker is not bridged
+  until a slot frees), and `mgmt_cooldown_secs` (per-operator cooldown between
+  state-changing management commands). Absent fields mean unlimited — the
+  previous behavior.
+- **Abuse controls (#47).** Tenants now record their `owner` (the MXID that
+  linked them) and creation time. New management commands `ban <owner|guild|room>
+  <value>` / `unban` / `bans` maintain deny-lists in `<data_dir>/banlist.toml`;
+  a ban also unlinks every matching running tenant through the same declarative
+  reconcile path everything else uses. `link` refuses banned owners/guilds/rooms
+  and fails closed if the ban list is unreadable. Every state-changing command
+  is recorded in an append-only `<data_dir>/audit.jsonl`.
+
+### Fixed
+- **One tenant's panic can no longer take down the whole process (#47).** Each
+  bridge future is wrapped in a panic boundary at the supervisor, so a panicking
+  bridge tears down like a normal exit — its neighbours and the puppet pool keep
+  running.
+
+### Internal
+- Discord ToS posture documented for a hosted instance
+  (`docs/nether-voicebridge-discord-tos.md`, #47/#61).
+- Testing framework (#38): committed design doc, a per-PR hermetic test+clippy
+  CI job, and the Tier-1 audio-integrity oracle with deterministic probes.
+
 ## [0.3.0-alpha.9] - 2026-07-05
 
 ### Added
