@@ -27,6 +27,11 @@ pub struct NewTenant {
     pub room_id: String,
     pub guild_id: String,
     pub channel_id: String,
+    /// Owner record (#47): the MXID that issued `link`. Written as `owner` on
+    /// the entry so `ban owner` can match it later.
+    pub owner: Option<String>,
+    /// Creation time, unix epoch seconds. Written as `created` on the entry.
+    pub created: Option<i64>,
 }
 
 /// Prior state of the tenants file, for rollback: `None` = the file did not
@@ -51,6 +56,12 @@ pub fn add_tenant_entry(path: &str, t: &NewTenant) -> Result<PriorContent, Confi
     entry["name"] = value(&t.name);
     entry["server"] = value(&t.server);
     entry["room_id"] = value(&t.room_id);
+    if let Some(owner) = &t.owner {
+        entry["owner"] = value(owner);
+    }
+    if let Some(created) = t.created {
+        entry["created"] = value(created);
+    }
     let mut discord = Table::new();
     discord["guild_id"] = value(&t.guild_id);
     discord["channel_id"] = value(&t.channel_id);
@@ -88,6 +99,49 @@ pub fn remove_tenant_entry(path: &str, name: &str) -> Result<PriorContent, Confi
 
     write_atomic(path, &doc.to_string())?;
     Ok(prior)
+}
+
+/// Remove every `[[bridge]]` entry matching `pred` (#47 ban teardown: ban a
+/// guild/room/owner and every tenant it matches is removed in one atomic
+/// write, then reconciled away). `pred` sees each entry's `(owner, guild_id,
+/// room_id)`, any of which may be absent on hand-written entries. Returns the
+/// removed entry names (possibly empty — an empty match is not an error) and
+/// the prior content for [`restore_tenants_file`]. The file is not rewritten
+/// when nothing matches.
+pub fn remove_tenant_entries_matching(
+    path: &str,
+    pred: impl Fn(Option<&str>, Option<&str>, Option<&str>) -> bool,
+) -> Result<(Vec<String>, PriorContent), ConfigError> {
+    let prior = read_prior(path)?;
+    let mut doc = parse_doc(prior.as_deref())?;
+
+    let mut removed = Vec::new();
+    if let Some(arr) = doc.get_mut("bridge").and_then(|b| b.as_array_of_tables_mut()) {
+        let mut idx = 0;
+        while idx < arr.len() {
+            let t = arr.get(idx).expect("idx < len");
+            let owner = t.get("owner").and_then(|v| v.as_str());
+            let guild = t
+                .get("discord")
+                .and_then(|d| d.as_table_like())
+                .and_then(|d| d.get("guild_id"))
+                .and_then(|v| v.as_str());
+            let room = t.get("room_id").and_then(|v| v.as_str());
+            if pred(owner, guild, room) {
+                removed.push(
+                    t.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>").to_string(),
+                );
+                arr.remove(idx);
+            } else {
+                idx += 1;
+            }
+        }
+    }
+
+    if !removed.is_empty() {
+        write_atomic(path, &doc.to_string())?;
+    }
+    Ok((removed, prior))
 }
 
 /// Roll the tenants file back to `prior` (the return value of a mutation):
@@ -134,8 +188,9 @@ fn find_entry(doc: &DocumentMut, name: &str) -> Option<usize> {
 
 /// Write `content` to `path` atomically: tmp file in the same directory, then
 /// rename over the target. Creates the parent directory if missing (first-ever
-/// tenant on a fresh data_dir).
-fn write_atomic(path: &str, content: &str) -> Result<(), ConfigError> {
+/// tenant on a fresh data_dir). Shared with the ban list (#47), which has the
+/// same crash-mid-write concern.
+pub(crate) fn write_atomic(path: &str, content: &str) -> Result<(), ConfigError> {
     let io_err = |source: std::io::Error| ConfigError::Io {
         path: path.to_string(),
         source,
@@ -183,6 +238,8 @@ mod tests {
             room_id: format!("!{name}:nether.im"),
             guild_id: "111".to_string(),
             channel_id: "222".to_string(),
+            owner: None,
+            created: None,
         }
     }
 
@@ -273,6 +330,64 @@ mod tests {
         let prior = add_tenant_entry(&path, &tenant("a")).unwrap();
         restore_tenants_file(&path, prior).unwrap();
         assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn owner_record_round_trips() {
+        let dir = TmpDir::new();
+        let path = dir.file();
+        let mut t = tenant("owned");
+        t.owner = Some("@dark:nether.im".to_string());
+        t.created = Some(1_780_000_000);
+        add_tenant_entry(&path, &t).unwrap();
+
+        let parsed: crate::TenantsFile =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.bridges[0].owner.as_deref(), Some("@dark:nether.im"));
+        assert_eq!(parsed.bridges[0].created, Some(1_780_000_000));
+        // Hand-written entries (no owner) still parse with None.
+        add_tenant_entry(&path, &tenant("plain")).unwrap();
+        let parsed: crate::TenantsFile =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.bridges[1].owner, None);
+    }
+
+    #[test]
+    fn remove_matching_by_owner_guild_and_room() {
+        let dir = TmpDir::new();
+        let path = dir.file();
+        let mut a = tenant("a");
+        a.owner = Some("@evil:x".to_string());
+        let mut b = tenant("b");
+        b.owner = Some("@fine:x".to_string());
+        b.guild_id = "999".to_string();
+        let c = tenant("c"); // no owner (hand-written shape)
+        add_tenant_entry(&path, &a).unwrap();
+        add_tenant_entry(&path, &b).unwrap();
+        add_tenant_entry(&path, &c).unwrap();
+
+        // Owner match removes only a; entries without an owner never match.
+        let (removed, _prior) =
+            remove_tenant_entries_matching(&path, |o, _, _| o == Some("@evil:x")).unwrap();
+        assert_eq!(removed, vec!["a".to_string()]);
+
+        // Guild match removes b; c (guild 111) stays.
+        let (removed, _prior) =
+            remove_tenant_entries_matching(&path, |_, g, _| g == Some("999")).unwrap();
+        assert_eq!(removed, vec!["b".to_string()]);
+
+        // No match: file untouched, empty result, prior still returned.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (removed, prior) =
+            remove_tenant_entries_matching(&path, |_, _, r| r == Some("!nope:x")).unwrap();
+        assert!(removed.is_empty());
+        assert_eq!(prior.as_deref(), Some(before.as_str()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // Room match removes the rest.
+        let (removed, _prior) =
+            remove_tenant_entries_matching(&path, |_, _, r| r == Some("!c:nether.im")).unwrap();
+        assert_eq!(removed, vec!["c".to_string()]);
     }
 
     #[test]

@@ -3,11 +3,14 @@
 use serde::Deserialize;
 use thiserror::Error;
 
+mod banlist;
 mod tenants;
 mod tenants_edit;
+pub use banlist::{BanKind, BanList, add_ban, banlist_path, load_banlist, remove_ban};
 pub use tenants::{TenantsFile, list_tenant_names, load_tenants, tenants_path};
 pub use tenants_edit::{
-    NewTenant, PriorContent, add_tenant_entry, remove_tenant_entry, restore_tenants_file,
+    NewTenant, PriorContent, add_tenant_entry, remove_tenant_entries_matching,
+    remove_tenant_entry, restore_tenants_file,
 };
 
 #[derive(Debug, Error)]
@@ -228,6 +231,17 @@ pub struct BridgeConfig {
     pub matrix: MatrixConfig,
     #[serde(default)]
     pub livekit: LiveKitConfig,
+    /// Owner record (#47 abuse controls): the MXID that created this entry via
+    /// the management bot's `link`. Absent on hand-written entries. Only
+    /// matched by `ban owner` — it never affects bridge behavior. NOTE it
+    /// participates in the reconcile fingerprint like any field, so hand-editing
+    /// it bounces the bridge (harmless, but know why).
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// When the entry was created via `link`, unix epoch seconds (display with
+    /// `date -d @<n>`). Absent on hand-written entries.
+    #[serde(default)]
+    pub created: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1004,6 +1018,9 @@ impl Config {
                     media_e2ee,
                     key_transport,
                 },
+                // Env-var mode is operator-authored: no owner record.
+                owner: None,
+                created: None,
             }],
         };
         cfg.resolve_bot_user_ids();

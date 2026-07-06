@@ -408,6 +408,7 @@ impl Supervisor {
                             room_id: cfg.matrix.room_id.clone(),
                             guild_id: cfg.discord.guild_id.clone(),
                             channel_id: cfg.discord.channel_id.clone(),
+                            owner: cfg.owner.clone(),
                         }
                     })
                     .collect();
@@ -677,6 +678,8 @@ mod tests {
                 ..MatrixConfig::default()
             },
             livekit: LiveKitConfig::default(),
+            owner: None,
+            created: None,
         }
     }
 

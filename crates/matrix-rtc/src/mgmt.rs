@@ -57,6 +57,8 @@ pub struct BridgeStatus {
     pub room_id: String,
     pub guild_id: String,
     pub channel_id: String,
+    /// Owner record (#47): the MXID that `link`ed this tenant, when known.
+    pub owner: Option<String>,
 }
 
 /// Convenience alias for the supervisor-facing sender handle.
@@ -84,7 +86,7 @@ use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use nvb_config::{ManagementConfig, NewTenant};
+use nvb_config::{BanKind, ManagementConfig, NewTenant};
 
 /// How long a command handler waits for the supervisor to answer a control
 /// request. The reconcile itself is synchronous bookkeeping (teardown happens
@@ -121,6 +123,12 @@ struct BotCtx {
     cooldown: Option<Duration>,
     /// Last state-change attempt per operator MXID, for the cooldown gate.
     mutate_stamps: StdMutex<HashMap<String, Instant>>,
+    /// `<data_dir>/banlist.toml` (#47 abuse controls) — deny-lists enforced by
+    /// `link` and edited by `ban`/`unban`.
+    banlist_path: String,
+    /// `<data_dir>/audit.jsonl` (#47) — append-only record of every
+    /// state-changing command and its outcome.
+    audit_path: String,
 }
 
 impl BotCtx {
@@ -136,6 +144,28 @@ impl BotCtx {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         cooldown_check(&mut stamps, sender, Instant::now(), cooldown)
+    }
+}
+
+/// Append one audit event (#47): `{"ts":<epoch secs>,"actor":…,"event":…,…}`
+/// per line to `<data_dir>/audit.jsonl`. Best-effort — a failed write WARNs
+/// and never blocks the command (the audit trail is forensic, not a gate).
+fn audit(ctx: &BotCtx, actor: &str, event: &str, detail: serde_json::Value) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = serde_json::json!({ "ts": ts, "actor": actor, "event": event, "detail": detail });
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&ctx.audit_path)?;
+        writeln!(f, "{line}")
+    };
+    if let Err(e) = write() {
+        tracing::warn!(error = %e, path = %ctx.audit_path, "audit log write failed");
     }
 }
 
@@ -252,6 +282,8 @@ pub async fn run(
         mutate_lock: tokio::sync::Mutex::new(()),
         cooldown: mgmt_cooldown_secs.map(Duration::from_secs),
         mutate_stamps: StdMutex::new(HashMap::new()),
+        banlist_path: nvb_config::banlist_path(&data_dir),
+        audit_path: format!("{}/audit.jsonl", data_dir.trim_end_matches('/')),
     });
 
     // Invites that arrived while the bot was offline (consumed by the initial
@@ -429,6 +461,15 @@ enum Command {
     Unlink {
         name: String,
     },
+    Ban {
+        kind: String,
+        value: String,
+    },
+    Unban {
+        kind: String,
+        value: String,
+    },
+    Bans,
 }
 
 #[derive(Debug, PartialEq)]
@@ -442,8 +483,11 @@ enum Parsed {
 
 const LINK_USAGE: &str = "Usage: `link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server]`\nQuote names containing spaces: `link \"Guest Voice\" !abc:example.org 123456 789012`";
 const UNLINK_USAGE: &str = "Usage: `unlink <name>`";
+const BAN_USAGE: &str =
+    "Usage: `ban <owner|guild|room> <value>` — e.g. `ban owner @evil:example.org`, `ban guild 123456`, `ban room !abc:example.org`. Banning also unlinks every matching tenant.";
+const UNBAN_USAGE: &str = "Usage: `unban <owner|guild|room> <value>`";
 
-const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridges (static + tenants) and whether they are running\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server] — bridge a Discord voice channel to a Matrix room\n  unlink <name> — remove a bridge created with link\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridges (static + tenants) and whether they are running\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server] — bridge a Discord voice channel to a Matrix room\n  unlink <name> — remove a bridge created with link\n  ban <owner|guild|room> <value> — deny-list an owner MXID / Discord guild / Matrix room AND unlink every matching tenant\n  unban <owner|guild|room> <value> — remove a ban\n  bans — show the deny-lists\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
 
 /// Parse one message body. The verb is case-insensitive; arguments support
 /// double-quoting for names with spaces.
@@ -472,6 +516,20 @@ fn parse_command(body: &str) -> Parsed {
         "unlink" => match args {
             [name] => Parsed::Cmd(Command::Unlink { name: name.clone() }),
             _ => Parsed::Usage(UNLINK_USAGE.to_string()),
+        },
+        "ban" => match args {
+            [kind, value] => Parsed::Cmd(Command::Ban { kind: kind.clone(), value: value.clone() }),
+            _ => Parsed::Usage(BAN_USAGE.to_string()),
+        },
+        "unban" => match args {
+            [kind, value] => {
+                Parsed::Cmd(Command::Unban { kind: kind.clone(), value: value.clone() })
+            }
+            _ => Parsed::Usage(UNBAN_USAGE.to_string()),
+        },
+        "bans" => match args {
+            [] => Parsed::Cmd(Command::Bans),
+            _ => Parsed::Usage("Usage: `bans`".to_string()),
         },
         _ => Parsed::Unknown,
     }
@@ -525,6 +583,9 @@ async fn handle_command(ctx: &BotCtx, room: &Room, sender: &str, cmd: Command) {
             channel_id,
             server,
         } => handle_link(ctx, room, sender, name, room_id, guild_id, channel_id, server).await,
+        Command::Ban { kind, value } => handle_ban(ctx, room, sender, &kind, &value).await,
+        Command::Unban { kind, value } => handle_unban(ctx, room, sender, &kind, &value).await,
+        Command::Bans => handle_bans(ctx, room).await,
     }
 }
 
@@ -749,8 +810,9 @@ async fn handle_list(ctx: &BotCtx, room: &Room) {
     };
     let mut lines: Vec<String> = Vec::new();
     for b in &running {
+        let owner = b.owner.as_deref().map(|o| format!(", owner {o}")).unwrap_or_default();
         lines.push(format!(
-            "• {} — {}, room {}, guild {} channel {} [running]",
+            "• {} — {}, room {}, guild {} channel {}{owner} [running]",
             b.label,
             if b.is_tenant { "tenant" } else { "static" },
             b.room_id,
@@ -822,6 +884,36 @@ async fn handle_link(
         }
     };
 
+    // Ban enforcement (#47): before anything is spent on this request. A ban
+    // list that exists but cannot be read fails CLOSED — silently ignoring the
+    // deny-lists would un-ban everyone on a corrupt file.
+    match nvb_config::load_banlist(&ctx.banlist_path) {
+        Ok(bans) => {
+            let hit = if bans.contains(BanKind::Owner, sender) {
+                Some(("owner", sender.to_string()))
+            } else if bans.contains(BanKind::Guild, &guild_id) {
+                Some(("guild", guild_id.clone()))
+            } else if bans.contains(BanKind::Room, &room_id) {
+                Some(("room", room_id.clone()))
+            } else {
+                None
+            };
+            if let Some((kind, value)) = hit {
+                audit(ctx, sender, "link_rejected", serde_json::json!({
+                    "name": name, "reason": "banned", "kind": kind, "value": value,
+                }));
+                reply(room, &format!("🚫 Rejected: {kind} `{value}` is banned.")).await;
+                return;
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "ban list unreadable — refusing link (fail-closed)");
+            reply(room, "The ban list is unreadable — link refused until an operator fixes it.")
+                .await;
+            return;
+        }
+    }
+
     // Rate gate (#47): past the cheap shape checks (a typo doesn't burn the
     // budget), before the expensive probes and the state change they precede.
     if let Some(remaining) = ctx.mutate_cooldown(sender) {
@@ -847,6 +939,15 @@ async fn handle_link(
         room_id: room_id.clone(),
         guild_id: guild_id.clone(),
         channel_id: channel_id.clone(),
+        // Owner record (#47): who created this tenant, for `ban owner` and the
+        // audit trail. Epoch seconds; display with `date -d @<n>`.
+        owner: Some(sender.to_owned()),
+        created: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        ),
     };
     let _guard = ctx.mutate_lock.lock().await;
     let prior = match nvb_config::add_tenant_entry(&ctx.tenants_path, &tenant) {
@@ -860,11 +961,18 @@ async fn handle_link(
     match request_reconcile(ctx).await {
         Some(Ok(summary)) => {
             if let Some((_, err)) = summary.failed.iter().find(|(l, _)| l == &name) {
+                audit(ctx, sender, "link_failed_spawn", serde_json::json!({
+                    "name": name, "error": err,
+                }));
                 reply(room, &format!(
                     "The entry was accepted but the bridge FAILED to start: {err}\nIt stays in tenants.toml — fix the cause and `unlink`/`link` again (or reload)."
                 ))
                 .await;
             } else if summary.added.iter().any(|l| l == &name) {
+                audit(ctx, sender, "link_ok", serde_json::json!({
+                    "name": name, "room_id": room_id, "guild_id": guild_id,
+                    "channel_id": channel_id,
+                }));
                 let guild_line = if report.warnings.is_empty() {
                     format!("✓ puppet bots present in guild {guild_id}")
                 } else {
@@ -893,9 +1001,13 @@ async fn handle_link(
             if let Err(e) = nvb_config::restore_tenants_file(&ctx.tenants_path, prior) {
                 tracing::error!(error = %e, "rollback of tenants.toml failed after rejected reconcile");
             }
+            audit(ctx, sender, "link_rejected", serde_json::json!({
+                "name": name, "reason": rejection,
+            }));
             reply(room, &format!("❌ Rejected: {rejection}\ntenants.toml was rolled back.")).await;
         }
         None => {
+            audit(ctx, sender, "link_unconfirmed", serde_json::json!({ "name": name }));
             reply(room, "The supervisor did not respond — the entry was written to tenants.toml but may not be running. Check the bridge logs.").await;
         }
     }
@@ -918,6 +1030,9 @@ async fn handle_unlink(ctx: &BotCtx, room: &Room, sender: &str, name: &str) {
     };
     match request_reconcile(ctx).await {
         Some(Ok(summary)) => {
+            audit(ctx, sender, "unlink_ok", serde_json::json!({
+                "name": name, "was_running": summary.removed.iter().any(|l| l == name),
+            }));
             if summary.removed.iter().any(|l| l == name) {
                 reply(room, &format!("🛑 Bridge '{name}' is stopping (teardown takes a few seconds).")).await;
             } else {
@@ -931,11 +1046,175 @@ async fn handle_unlink(ctx: &BotCtx, room: &Room, sender: &str, name: &str) {
             if let Err(e) = nvb_config::restore_tenants_file(&ctx.tenants_path, prior) {
                 tracing::error!(error = %e, "rollback of tenants.toml failed after rejected reconcile");
             }
+            audit(ctx, sender, "unlink_rejected", serde_json::json!({
+                "name": name, "reason": rejection,
+            }));
             reply(room, &format!("❌ Rejected: {rejection}\ntenants.toml was rolled back.")).await;
         }
         None => {
+            audit(ctx, sender, "unlink_unconfirmed", serde_json::json!({ "name": name }));
             reply(room, "The supervisor did not respond — the entry was removed from tenants.toml but the bridge may still be running. Check the bridge logs.").await;
         }
+    }
+}
+
+/// The `ban` command (#47): record the ban, then tear down every matching
+/// tenant through the same declarative path everything else uses (remove the
+/// entries from tenants.toml + reconcile) — no separate kill mechanism to
+/// drift. Static bridges are operator-authored and out of scope.
+async fn handle_ban(ctx: &BotCtx, room: &Room, sender: &str, kind_str: &str, value: &str) {
+    let Some(kind) = BanKind::parse(kind_str) else {
+        reply(room, BAN_USAGE).await;
+        return;
+    };
+    if !ban_value_shape_ok(kind, value) {
+        reply(room, &format!("'{value}' does not look like a {} — {}", kind.as_str(), BAN_USAGE))
+            .await;
+        return;
+    }
+    if let Some(remaining) = ctx.mutate_cooldown(sender) {
+        reply(room, &format!("⏳ Rate limited — try again in {remaining}s.")).await;
+        return;
+    }
+    let _guard = ctx.mutate_lock.lock().await;
+
+    match nvb_config::add_ban(&ctx.banlist_path, kind, value) {
+        Ok(true) => {}
+        Ok(false) => {
+            reply(room, &format!("{} `{value}` is already banned.", kind.as_str())).await;
+            return;
+        }
+        Err(e) => {
+            reply(room, &format!("Cannot write the ban list: {e}")).await;
+            return;
+        }
+    }
+
+    // Teardown sweep: unlink every tenant the new ban matches.
+    let (removed, prior) = match nvb_config::remove_tenant_entries_matching(
+        &ctx.tenants_path,
+        |owner, guild, room_id| match kind {
+            BanKind::Owner => owner == Some(value),
+            BanKind::Guild => guild == Some(value),
+            BanKind::Room => room_id == Some(value),
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            audit(ctx, sender, "ban", serde_json::json!({
+                "kind": kind.as_str(), "value": value, "teardown_error": e.to_string(),
+            }));
+            reply(room, &format!(
+                "🔨 Banned {} `{value}`, but scanning tenants.toml failed: {e}\nMatching tenants may still be running — check the file by hand.",
+                kind.as_str()
+            ))
+            .await;
+            return;
+        }
+    };
+
+    if removed.is_empty() {
+        audit(ctx, sender, "ban", serde_json::json!({
+            "kind": kind.as_str(), "value": value, "removed": [],
+        }));
+        reply(room, &format!(
+            "🔨 Banned {} `{value}`. No running tenants matched; future `link`s are refused.",
+            kind.as_str()
+        ))
+        .await;
+        return;
+    }
+
+    match request_reconcile(ctx).await {
+        Some(Ok(_)) => {
+            audit(ctx, sender, "ban", serde_json::json!({
+                "kind": kind.as_str(), "value": value, "removed": removed,
+            }));
+            reply(room, &format!(
+                "🔨 Banned {} `{value}` and unlinked {} tenant(s): {}.",
+                kind.as_str(),
+                removed.len(),
+                removed.join(", ")
+            ))
+            .await;
+        }
+        Some(Err(rejection)) => {
+            // Keep the ban, restore the entries: a rejected reconcile must not
+            // leave the file lying about the running set. The ban still blocks
+            // future links; the teardown can be retried.
+            if let Err(e) = nvb_config::restore_tenants_file(&ctx.tenants_path, prior) {
+                tracing::error!(error = %e, "rollback of tenants.toml failed after rejected reconcile");
+            }
+            audit(ctx, sender, "ban", serde_json::json!({
+                "kind": kind.as_str(), "value": value, "teardown_rejected": rejection,
+            }));
+            reply(room, &format!(
+                "🔨 Banned {} `{value}`, but the teardown reconcile was rejected: {rejection}\ntenants.toml was rolled back — matching tenants are still running.",
+                kind.as_str()
+            ))
+            .await;
+        }
+        None => {
+            audit(ctx, sender, "ban", serde_json::json!({
+                "kind": kind.as_str(), "value": value, "removed": removed,
+                "reconcile": "no answer",
+            }));
+            reply(room, "The ban was recorded and the entries removed, but the supervisor did not respond — matching bridges may still be running. Check the bridge logs.").await;
+        }
+    }
+}
+
+async fn handle_unban(ctx: &BotCtx, room: &Room, sender: &str, kind_str: &str, value: &str) {
+    let Some(kind) = BanKind::parse(kind_str) else {
+        reply(room, UNBAN_USAGE).await;
+        return;
+    };
+    if let Some(remaining) = ctx.mutate_cooldown(sender) {
+        reply(room, &format!("⏳ Rate limited — try again in {remaining}s.")).await;
+        return;
+    }
+    let _guard = ctx.mutate_lock.lock().await;
+    match nvb_config::remove_ban(&ctx.banlist_path, kind, value) {
+        Ok(true) => {
+            audit(ctx, sender, "unban", serde_json::json!({
+                "kind": kind.as_str(), "value": value,
+            }));
+            reply(room, &format!("✅ Unbanned {} `{value}`.", kind.as_str())).await;
+        }
+        Ok(false) => {
+            reply(room, &format!("{} `{value}` was not banned.", kind.as_str())).await;
+        }
+        Err(e) => {
+            reply(room, &format!("Cannot write the ban list: {e}")).await;
+        }
+    }
+}
+
+async fn handle_bans(ctx: &BotCtx, room: &Room) {
+    match nvb_config::load_banlist(&ctx.banlist_path) {
+        Ok(bans) if bans.is_empty() => reply(room, "No bans.").await,
+        Ok(bans) => {
+            let mut lines = Vec::new();
+            for (label, list) in
+                [("owners", &bans.owners), ("guilds", &bans.guilds), ("rooms", &bans.rooms)]
+            {
+                if !list.is_empty() {
+                    lines.push(format!("• {label}: {}", list.join(", ")));
+                }
+            }
+            reply(room, &lines.join("\n")).await;
+        }
+        Err(e) => reply(room, &format!("Cannot read the ban list: {e}")).await,
+    }
+}
+
+/// Cheap shape check for a ban value, mirroring `link`'s checks: catches a
+/// swapped kind/value before it lands in the deny-list.
+fn ban_value_shape_ok(kind: BanKind, value: &str) -> bool {
+    match kind {
+        BanKind::Owner => value.starts_with('@') && value.contains(':'),
+        BanKind::Guild => is_numeric_id(value),
+        BanKind::Room => value.starts_with('!') && value.contains(':'),
     }
 }
 
@@ -975,6 +1254,33 @@ mod tests {
         );
         // Cooldowns are PER operator — a different MXID is independent.
         assert_eq!(cooldown_check(&mut stamps, "@other:x", t0, cd), None);
+    }
+
+    #[test]
+    fn parses_ban_unban_and_bans() {
+        assert_eq!(
+            parse_command("ban owner @evil:x"),
+            Parsed::Cmd(Command::Ban { kind: "owner".into(), value: "@evil:x".into() })
+        );
+        assert_eq!(
+            parse_command("UNBAN guild 123"),
+            Parsed::Cmd(Command::Unban { kind: "guild".into(), value: "123".into() })
+        );
+        assert_eq!(parse_command("bans"), Parsed::Cmd(Command::Bans));
+        // Wrong arity → usage, not Unknown (these are our verbs).
+        assert!(matches!(parse_command("ban owner"), Parsed::Usage(_)));
+        assert!(matches!(parse_command("ban a b c"), Parsed::Usage(_)));
+        assert!(matches!(parse_command("bans now"), Parsed::Usage(_)));
+    }
+
+    #[test]
+    fn ban_value_shapes() {
+        assert!(ban_value_shape_ok(BanKind::Owner, "@evil:example.org"));
+        assert!(!ban_value_shape_ok(BanKind::Owner, "evil"));
+        assert!(ban_value_shape_ok(BanKind::Guild, "123456"));
+        assert!(!ban_value_shape_ok(BanKind::Guild, "@evil:x"));
+        assert!(ban_value_shape_ok(BanKind::Room, "!abc:example.org"));
+        assert!(!ban_value_shape_ok(BanKind::Room, "#alias:example.org"));
     }
 
     #[test]
