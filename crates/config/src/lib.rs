@@ -206,6 +206,13 @@ pub struct PuppetsConfig {
     /// to disable. Prefix + name is truncated to Discord's 32-char nickname cap.
     #[serde(default = "default_nickname_prefix")]
     pub nickname_prefix: String,
+    /// WHOLE nickname (no prefix applied) a capture-only anchor wears while it
+    /// idles in a voice channel during the post-call grace window (#59), so
+    /// Discord users can tell "the bridge is idling here briefly" from an
+    /// actual bridged participant. Default `"[Matrix: Standby]"`; truncated to
+    /// the 32-char cap.
+    #[serde(default = "default_standby_nickname")]
+    pub standby_nickname: String,
 }
 
 /// A reusable homeserver + appservice identity, referenced by bridges via
@@ -300,6 +307,10 @@ pub struct DiscordConfig {
 
 fn default_nickname_prefix() -> String {
     "[Matrix] ".to_string()
+}
+
+fn default_standby_nickname() -> String {
+    "[Matrix: Standby]".to_string()
 }
 
 fn default_approval_timeout_secs() -> u64 {
@@ -1023,6 +1034,7 @@ impl Config {
                     .filter(|s| !s.is_empty())
                     .collect(),
                 nickname_prefix,
+                standby_nickname: default_standby_nickname(),
             },
             servers: std::collections::HashMap::new(),
             data_dir: default_data_dir(),

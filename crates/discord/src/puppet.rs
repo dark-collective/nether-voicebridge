@@ -95,6 +95,7 @@ const VOICE_HEALTH_SWEEP: Duration = Duration::from_secs(15);
 /// once the call is genuinely empty of Matrix users.
 const ANCHOR_IDLE_GRACE: Duration = Duration::from_secs(90);
 
+
 /// Speaking-gate poll cadence. One Discord tick; well under the mixer's 150 ms
 /// jitter prime, so resuming a paused track on speech onset adds at most one tick
 /// of latency and never clips the first phoneme.
@@ -181,6 +182,11 @@ enum PuppetCommand {
     /// Set this bot's nickname in `guild` (relabel the overflow host). Prefix
     /// applied here.
     SetNickname { guild: GuildId, name: String },
+    /// Wear the standby label (`[puppets] standby_nickname`, a WHOLE nickname —
+    /// no prefix) while idling as a capture-only anchor in `guild` during the
+    /// [`ANCHOR_IDLE_GRACE`] window, so Discord users can tell "the bridge is
+    /// idling here briefly" from a bridged participant (#59 UX).
+    SetStandbyNickname { guild: GuildId },
     /// Reset the nickname, leave voice, drop the SSRC exclusion — for this bot's
     /// engagement in `guild` only.
     Release { guild: GuildId },
@@ -192,9 +198,16 @@ enum PuppetCommand {
     /// generation that registered the handler, so a disconnect from a connection
     /// we have already replaced is ignored. The loop rejoins that guild's channel.
     DriverDropped { guild: GuildId, epoch: u64 },
-    /// Reconcile probe (from the periodic sweep): if the bot is genuinely out of
-    /// voice in `guild` while the allocator still believes it active there,
-    /// rejoin it. Catches a silent death that emitted no `DriverDisconnect`.
+    /// Reconcile probe: if the bot is out of voice in `guild` — or connected to
+    /// a channel OTHER than its assigned one (#62: a moderator force-move keeps
+    /// the connection alive, so no `DriverDisconnect` fires) — while the
+    /// allocator still believes it active there, rejoin the assigned channel.
+    /// Sent by the periodic sweep and (delayed a beat, so songbird's view has
+    /// settled) by the gateway voice-state handler when it sees one of our OWN
+    /// bots change channel. Deliberately carries NO channel snapshot: each
+    /// probe re-evaluates songbird's CURRENT state, so a probe queued behind
+    /// an in-flight recovery is a harmless no-op instead of replaying a stale
+    /// displacement.
     VerifyConnected { guild: GuildId },
 }
 
@@ -207,6 +220,7 @@ impl PuppetCommand {
             Self::BecomeAnchor { .. } => "BecomeAnchor",
             Self::SetMuted { .. } => "SetMuted",
             Self::SetNickname { .. } => "SetNickname",
+            Self::SetStandbyNickname { .. } => "SetStandbyNickname",
             Self::Release { .. } => "Release",
             Self::ReleaseAndAck { .. } => "ReleaseAndAck",
             Self::DriverDropped { .. } => "DriverDropped",
@@ -393,10 +407,16 @@ struct LinkApprovalCfg {
 pub struct SharedPool {
     /// Prefix for puppet nicknames (e.g. `"[Matrix] "`; empty disables).
     nickname_prefix: Arc<str>,
+    /// Whole nickname a capture-only anchor wears during its idle grace (#59).
+    standby_nickname: Arc<str>,
     slots: Vec<PuppetSlot>,
     /// All puppet bot user ids — never minted as ghosts (global; a bot is a bot
     /// in every channel).
     bot_ids: BotIdSet,
+    /// Bot user id → slot index (#62): lets the gateway voice-state handler
+    /// route an event about one of our OWN bots to that bot's command loop.
+    /// Seeded from the tokens at build, confirmed at each `ready`.
+    bot_index_by_id: RwLock<HashMap<u64, usize>>,
     alloc: StdMutex<AllocState>,
     /// `/bridge approve` wiring (#47) — `None` unless two-sided link auth is on.
     link_approval: std::sync::OnceLock<LinkApprovalCfg>,
@@ -431,10 +451,12 @@ impl SharedPool {
         // ghosted by another bot's startup seeding before its own `ready` registers
         // it — an echo (constraint #5). Best-effort; `ready` re-confirms each id.
         let mut bot_ids = HashSet::new();
-        for tok in &cfg.tokens {
+        let mut bot_index_by_id = HashMap::new();
+        for (idx, tok) in cfg.tokens.iter().enumerate() {
             match decode_bot_user_id(tok) {
                 Some(id) => {
                     bot_ids.insert(id);
+                    bot_index_by_id.insert(id, idx);
                 }
                 None => tracing::warn!("could not decode a puppet bot user id from its token — relying on `ready` (a brief startup echo window is possible)"),
             }
@@ -442,8 +464,10 @@ impl SharedPool {
 
         Arc::new(Self {
             nickname_prefix: Arc::from(cfg.nickname_prefix.as_str()),
+            standby_nickname: Arc::from(cfg.standby_nickname.as_str()),
             slots,
             bot_ids: Arc::new(RwLock::new(bot_ids)),
+            bot_index_by_id: RwLock::new(bot_index_by_id),
             alloc: StdMutex::new(AllocState {
                 channels: HashMap::new(),
                 next_seq: 0,
@@ -677,6 +701,15 @@ impl SharedPool {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .contains(&user_id)
+    }
+
+    /// Slot index of one of our OWN puppet bots, by Discord user id (#62).
+    fn bot_index_of(&self, user_id: u64) -> Option<usize> {
+        self.bot_index_by_id
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&user_id)
+            .copied()
     }
 
     /// Retract any ghost wrongly minted for one of our OWN puppet bots. A puppet is
@@ -1682,7 +1715,7 @@ impl SharedPool {
                                 sess.mixer.clear();
                                 sess.name = None;
                             }
-                            self.send_cmd(idx, PuppetCommand::SetNickname { guild, name: String::new() });
+                            self.send_cmd(idx, PuppetCommand::SetStandbyNickname { guild });
                             self.send_cmd(idx, PuppetCommand::SetMuted { guild, muted: false });
                             tracing::info!(bridge, key, idx, "last puppet released but Discord speakers remain — keeping capture-only anchor (grace before release)");
                             self.schedule_anchor_idle_release(guard, bridge);
@@ -1731,10 +1764,16 @@ impl SharedPool {
         }
     }
 
-    fn release_all(&self, bridge: &str) {
+    fn release_all(self: &Arc<Self>, bridge: &str) {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
         let guard = &mut *guard;
-        self.release_all_locked(guard, bridge);
+        // Call-end teardown (#59): KEEP a capture-only anchor when Discord
+        // speakers remain, mirroring the single-participant `release` path.
+        // This seam used to clobber the keep decision `release` had made ~0.5s
+        // earlier, leaving the bridge dormant with humans still in the channel.
+        // Process/tenant drains go through `unregister_channel` instead, which
+        // drains unconditionally.
+        self.release_all_locked(guard, bridge, true);
         // The bots just freed can activate channels waiting for an anchor.
         self.rebalance(guard);
     }
@@ -1745,13 +1784,43 @@ impl SharedPool {
     /// a bot serving another channel in the same guild holds a different entry and
     /// is untouched (#46). Idempotent: a second pass finds nothing to drain.
     /// Caller rebalances.
-    fn release_all_locked(&self, guard: &mut AllocState, bridge: &str) {
+    ///
+    /// `keep_capture_anchor` (#59): on a call-end (`release_all`) a channel whose
+    /// Discord speakers are still present keeps its anchor as capture-only under
+    /// the [`ANCHOR_IDLE_GRACE`] timer — a Matrix user returning within the grace
+    /// (e.g. after an Element Call membership flap) reuses the live session with
+    /// no join latency and no SSRC-map reset. `false` (`unregister_channel`)
+    /// drains unconditionally: teardown must return the connection count to
+    /// baseline.
+    fn release_all_locked(
+        self: &Arc<Self>,
+        guard: &mut AllocState,
+        bridge: &str,
+        keep_capture_anchor: bool,
+    ) {
         let Some(ch) = guard.channels.get_mut(bridge) else { return };
         let guild = ch.guild_id;
         let anchor = ch.anchor.load(Ordering::Relaxed);
+        let speakers_present = !ch
+            .user_sinks
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty();
+        let keep_anchor = keep_capture_anchor && anchor != NO_ANCHOR && speakers_present;
         let mut anchor_freed = false;
         for (_key, assign) in ch.assignments.drain() {
             if let Assign::Puppet { idx, .. } = assign {
+                if keep_anchor && idx == anchor {
+                    // Demote to capture-only instead of releasing: drop the
+                    // playback identity, keep the session + anchor election.
+                    if let Some(sess) = guard.sessions.get_mut(&(idx, guild)) {
+                        sess.mixer.clear();
+                        sess.name = None;
+                    }
+                    self.send_cmd(idx, PuppetCommand::SetStandbyNickname { guild });
+                    self.send_cmd(idx, PuppetCommand::SetMuted { guild, muted: false });
+                    continue;
+                }
                 guard.sessions.remove(&(idx, guild));
                 self.send_cmd(idx, PuppetCommand::Release { guild });
                 if idx == anchor {
@@ -1761,14 +1830,24 @@ impl SharedPool {
         }
         // A capture-only-held anchor has no Assign::Puppet of its own, so the
         // drain above won't free it — release it explicitly so teardown returns
-        // to baseline (Phase 9 guarantee).
-        if anchor != NO_ANCHOR && !anchor_freed {
+        // to baseline (Phase 9 guarantee), unless it is being deliberately kept.
+        if anchor != NO_ANCHOR && !anchor_freed && !keep_anchor {
             guard.sessions.remove(&(anchor, guild));
             self.send_cmd(anchor, PuppetCommand::Release { guild });
         }
         ch.routes.clear();
-        ch.anchor.store(NO_ANCHOR, Ordering::Relaxed);
         ch.overflow_mixer.clear();
+        if !keep_anchor {
+            ch.anchor.store(NO_ANCHOR, Ordering::Relaxed);
+        }
+        if keep_anchor {
+            tracing::info!(
+                bridge,
+                idx = anchor,
+                "call ended but Discord speakers remain — keeping capture-only anchor (grace before release)"
+            );
+            self.schedule_anchor_idle_release(guard, bridge);
+        }
     }
 
     /// Runtime counterpart to [`register_channel`](Self::register_channel) (#45):
@@ -1780,10 +1859,12 @@ impl SharedPool {
     /// held by in-flight bot commands keep their `Arc`s alive until they finish.
     /// Per-(bot, guild) `health` entries are intentionally kept: they describe the
     /// guild's voice server, not this channel, and prune on their own schedule.
-    pub fn unregister_channel(&self, bridge: &str) {
+    pub fn unregister_channel(self: &Arc<Self>, bridge: &str) {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
         let guard = &mut *guard;
-        self.release_all_locked(guard, bridge);
+        // Full drain (#59): never keep a capture-only anchor here — the channel
+        // is going away and teardown must return connections to baseline.
+        self.release_all_locked(guard, bridge, false);
         let Some(mut ch) = guard.channels.remove(bridge) else { return };
         if let Some(token) = ch.anchor_idle_release.take() {
             token.cancel();
@@ -1997,6 +2078,13 @@ impl EventHandler for PuppetHandler {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(ready.user.id.get());
+        // ...and its id→slot mapping, for routing our own voice-state events
+        // (#62) — authoritative confirmation of the build-time token decode.
+        self.pool
+            .bot_index_by_id
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(ready.user.id.get(), self.idx);
         // Self-heal: if a startup race ghosted this bot before its id was known
         // (e.g. it was lingering in voice from a previous crash), retract it now.
         self.pool.retract_self_ghost(ready.user.id.get());
@@ -2052,7 +2140,30 @@ impl EventHandler for PuppetHandler {
         let user_id = new.user_id.get();
         // Our own puppet/anchor bots are never ghosts and never count as presence
         // (echo-exclusion, constraint #5). `ensure_ghost` double-checks bot_ids.
+        // But a voice-state change for one of OUR bots can be a moderator
+        // force-move (#62): the connection survives, so no `DriverDisconnect`
+        // fires and the health sweep sees a connected (but misplaced) bot. Let
+        // the bot's own command loop verify it is still in its assigned channel
+        // — each bot forwards only its OWN event (every pool gateway sees every
+        // update; one probe is enough), and the loop's recovery latch +
+        // assigned-channel comparison make the probe idempotent.
         if self.pool.is_bridge_bot(user_id) {
+            if self.pool.bot_index_of(user_id) == Some(self.idx) {
+                // Delay the probe a beat: an instant rejoin races songbird's
+                // own processing of the very move that fired this event (the
+                // join request comes back "cancelled/dropped" — live-observed),
+                // which needlessly quarantines the bot and fails over. After
+                // the pause songbird's view has settled, so the loop's
+                // `voice_displaced` check sees the mismatch and the SAME bot
+                // rejoins cleanly; quarantine+failover stays as the backstop
+                // if the rejoin still fails.
+                let pool = self.pool.clone();
+                let idx = self.idx;
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    pool.send_cmd(idx, PuppetCommand::VerifyConnected { guild: guild_id });
+                });
+            }
             return;
         }
         // Reconcile this user across every bridged channel in the guild: present in
@@ -2553,6 +2664,18 @@ async fn puppet_command_loop(
                     }
                 }
             }
+            PuppetCommand::SetStandbyNickname { guild } => {
+                if active.contains_key(&guild) {
+                    // The label is configured whole — no prefix; reuse
+                    // build_nickname only for its safe char truncation.
+                    let nick = build_nickname("", &pool.standby_nickname);
+                    if let Err(e) = guild.edit_nickname(&ctx.http, Some(nick.as_str())).await {
+                        tracing::warn!(idx, error = %e, "failed to set standby nickname");
+                    } else {
+                        tracing::info!(idx, nick = %nick, "puppet relabeled (standby)");
+                    }
+                }
+            }
             PuppetCommand::Release { guild } => {
                 if let Some(mut conn) = active.remove(&guild) {
                     conn.cancel_gates();
@@ -2580,12 +2703,17 @@ async fn puppet_command_loop(
                     }
                     PuppetCommand::VerifyConnected { guild } => {
                         let proceed = pool.should_recover_disconnect(idx, *guild)
-                            && if active.contains_key(guild) {
-                                let gone = voice_channel_gone(&ctx, *guild).await;
-                                if !gone {
+                            && if let Some(assigned) =
+                                active.get(guild).map(|c| c.chan.channel_id)
+                            {
+                                // Displaced = out of voice entirely (silent
+                                // death) OR in the wrong channel (#62 force-
+                                // move), per songbird's CURRENT view.
+                                let displaced = voice_displaced(&ctx, *guild, assigned).await;
+                                if !displaced {
                                     pool.finish_recovery(idx, *guild);
                                 }
-                                gone
+                                displaced
                             } else {
                                 pool.finish_recovery(idx, *guild);
                                 false
@@ -2897,7 +3025,21 @@ async fn rejoin_puppet(
     // Drop the dead Call so the rejoin starts clean (mirrors puppet_join's reset
     // on a failed join).
     if let Some(manager) = songbird::get(ctx).await {
+        // A LIVE connection (the #62 force-move case) needs a real gateway
+        // leave here, and its confirmation echo cancels a join issued right
+        // after (live-observed: "request was cancelled/dropped" → needless
+        // quarantine + failover to another bot). Let the leave settle before
+        // rejoining. A dead connection (the classic disconnect recovery) has
+        // no echo pending — remove locally and rejoin at full speed, as
+        // proven by #46.
+        let was_live = match manager.get(chan.guild_id) {
+            Some(call) => call.lock().await.current_channel().is_some(),
+            None => false,
+        };
         let _ = manager.remove(chan.guild_id).await;
+        if was_live {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
     }
     // Drop the dead connection's SSRC from echo-exclusion; the fresh join
     // re-registers a new one via DriverConnect (mirrors puppet_leave's cleanup,
@@ -2943,15 +3085,22 @@ async fn rejoin_puppet(
 /// reconnect — so this never false-fires on a benign blip (unlike
 /// `current_connection()`). Returns `true` (treat as gone) if songbird/the Call is
 /// missing entirely.
-async fn voice_channel_gone(ctx: &Context, guild_id: GuildId) -> bool {
+async fn voice_displaced(ctx: &Context, guild_id: GuildId, assigned: ChannelId) -> bool {
     let Some(manager) = songbird::get(ctx).await else {
         return true;
     };
     match manager.get(guild_id) {
-        Some(call) => call.lock().await.current_channel().is_none(),
+        Some(call) => match call.lock().await.current_channel() {
+            // In voice, but is it the ASSIGNED channel? (#62: after a force-
+            // move the connection is alive, so "connected" alone is not
+            // "healthy".)
+            Some(current) => current.0.get() != assigned.get(),
+            None => true,
+        },
         None => true,
     }
 }
+
 
 /// Songbird handler that records a puppet's own SSRC into its channel's
 /// echo-exclusion set as soon as its voice driver connects.
@@ -3109,6 +3258,7 @@ mod tests {
         let cfg = PuppetsConfig {
             tokens: (0..n).map(|i| format!("Bot {i}")).collect(),
             nickname_prefix: "[Matrix] ".to_string(),
+            standby_nickname: "[Matrix: Standby]".to_string(),
         };
         SharedPool::new(&cfg)
     }
@@ -3716,6 +3866,82 @@ mod tests {
         p.assign("A", "dave", "Dave");
         assert_eq!(p.test_slot_of("A", "dave"), Some(anchor), "dave reused the anchor bot");
         assert_eq!(p.test_free_count(), 1, "the spare bot stayed free (no fresh allocation)");
+    }
+
+    /// Mark a Discord speaker present in channel `label` (in production this
+    /// comes from the anchor's capture wiring).
+    fn mark_speaker(p: &Arc<SharedPool>, label: &str, user: u64) {
+        let guard = p.alloc.lock().unwrap();
+        let ch = guard.channels.get(label).unwrap();
+        ch.user_sinks.write().unwrap().insert(user, Arc::new(NoopCaptureSink));
+    }
+
+    #[tokio::test]
+    async fn call_end_release_all_keeps_capture_only_anchor() {
+        // #59: the prod sequence — the per-member release keeps a capture-only
+        // anchor (Discord speakers remain), then the call-end `release_all`
+        // fires ~0.5s later. It used to free the kept anchor unconditionally,
+        // leaving the bridge dormant with humans still in the channel.
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        let anchor = p.test_anchor("A").unwrap();
+        mark_speaker(&p, "A", 999);
+        p.release("A", "alice"); // keep decision (grace armed)
+        assert_eq!(p.test_anchor("A"), Some(anchor));
+        p.release_all("A"); // the call-end sweep must respect it
+        assert_eq!(
+            p.test_anchor("A"),
+            Some(anchor),
+            "call-end keeps the capture-only anchor while Discord speakers remain"
+        );
+        // A Matrix user returning within the grace reuses the live anchor.
+        p.assign("A", "dave", "Dave");
+        assert_eq!(p.test_slot_of("A", "dave"), Some(anchor), "returning user reused the anchor");
+        assert_eq!(p.test_free_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn call_end_release_all_demotes_active_anchor_frees_the_rest() {
+        // #59: a call-end that still holds live assignments — the anchor (with
+        // speakers present) is demoted to capture-only, every other puppet is
+        // freed, routes/overflow are cleared.
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        p.assign("A", "bob", "Bob");
+        let anchor = p.test_anchor("A").unwrap();
+        mark_speaker(&p, "A", 999);
+        p.release_all("A");
+        assert_eq!(p.test_anchor("A"), Some(anchor), "anchor demoted, not freed");
+        assert!(p.test_slot_of("A", "alice").is_none());
+        assert!(p.test_slot_of("A", "bob").is_none());
+        assert_eq!(p.test_free_count(), 1, "the non-anchor bot returned to the pool");
+    }
+
+    #[test]
+    fn bot_identity_map_routes_ids_to_slots() {
+        // #62: the id→slot map lets the gateway handler route a bot's own
+        // voice-state event to that bot's command loop. Test tokens don't
+        // decode, so seed via the `ready`-path insert.
+        let p = pool(2);
+        p.bot_index_by_id.write().unwrap().insert(111, 0);
+        p.bot_index_by_id.write().unwrap().insert(222, 1);
+        assert_eq!(p.bot_index_of(111), Some(0));
+        assert_eq!(p.bot_index_of(222), Some(1));
+        assert_eq!(p.bot_index_of(333), None);
+    }
+
+    #[test]
+    fn call_end_release_all_drains_fully_without_speakers() {
+        // #59 boundary: with no Discord speakers there is nothing to capture —
+        // the call-end sweep drains to baseline exactly as before.
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        p.release_all("A");
+        assert!(p.test_anchor("A").is_none(), "no speakers → anchor freed");
+        assert_eq!(p.test_free_count(), 2);
     }
 
     #[test]

@@ -127,6 +127,10 @@ tokens = [
 # Discord users can tell which voices are bridged Matrix participants. Set to
 # "" to disable. Prefix + name is truncated to Discord's 32-char nickname cap.
 nickname_prefix = "[Matrix] "
+# Optional (default "[Matrix: Standby]"). WHOLE nickname (prefix NOT applied) a
+# bot wears while idling in a channel during the brief post-call grace window,
+# so it doesn't look like a participant named after the bare prefix.
+# standby_nickname = "[Matrix: Standby]"
 
 [[bridge]]
 # Optional label, used in logs/spans (the `bridge{name=...}` span prefix).
