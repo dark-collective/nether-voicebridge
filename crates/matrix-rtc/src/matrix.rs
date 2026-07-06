@@ -809,23 +809,23 @@ pub(crate) async fn appservice_join_room(
     Ok(())
 }
 
-/// GET a room state event (empty state key) via the CS API, authenticated with
-/// the appservice `as_token` and masqueraded as `user_id` (must be
-/// appservice-controlled and joined to the room). `Ok(Some(content))` on 200,
-/// `Ok(None)` on 404 (event absent), `Err` otherwise (auth, not in room,
-/// network).
+/// GET a room state event via the CS API, authenticated with the appservice
+/// `as_token` and masqueraded as `user_id` (must be appservice-controlled and
+/// joined to the room). `state_key` is `""` for keyless events.
+/// `Ok(Some(content))` on 200, `Ok(None)` on 404 (event absent), `Err`
+/// otherwise (auth, not in room, network).
 pub(crate) async fn get_room_state(
     http: &reqwest::Client,
     homeserver_url: &str,
     appservice_token: &str,
     room_id: &str,
     event_type: &str,
+    state_key: &str,
     user_id: &str,
 ) -> Result<Option<serde_json::Value>> {
-    // Trailing "" = the empty state key, mirroring the ghost PUT-state path.
     let url = crate::rtc::ghost::cs_url(
         homeserver_url,
-        &["rooms", room_id, "state", event_type, ""],
+        &["rooms", room_id, "state", event_type, state_key],
         Some(user_id),
     )?;
     let resp = http

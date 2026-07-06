@@ -128,6 +128,30 @@ pub struct ManagementConfig {
     /// when omitted.
     #[serde(default)]
     pub store_path: String,
+    /// Two-sided link authority, Matrix side (#47): when `true`, a `link`
+    /// sender must be a joined member of the target room with power level ≥
+    /// the room's `state_default` (i.e. they could configure the room
+    /// themselves) — not just an allowlisted operator. Default `false`, the
+    /// pre-#47 operator model.
+    #[serde(default)]
+    pub require_room_authority: bool,
+    /// Two-sided link authority, Discord side (#47): when `true`, a `link`
+    /// that passes every probe is held PENDING (nothing written) until someone
+    /// with Manage Server permission in the target guild runs
+    /// `/bridge approve code:<code>` on the designated puppet bot. Default
+    /// `false`.
+    #[serde(default)]
+    pub require_discord_approval: bool,
+    /// How long a pending (unapproved) link stays claimable, in seconds.
+    /// Default 600 (10 minutes).
+    #[serde(default = "default_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+    /// Index into `[puppets] tokens` of the bot that registers and serves the
+    /// `/bridge approve` command. Default 0 (the first pool bot). That bot's
+    /// application must be (re-)invited with the `applications.commands` OAuth
+    /// scope or the command will not appear in guilds.
+    #[serde(default)]
+    pub approval_bot_index: usize,
     // --- resolved from the referenced [server.<name>] profile ---
     #[serde(default)]
     pub homeserver_url: String,
@@ -262,6 +286,10 @@ pub struct DiscordConfig {
 
 fn default_nickname_prefix() -> String {
     "[Matrix] ".to_string()
+}
+
+fn default_approval_timeout_secs() -> u64 {
+    600
 }
 
 fn default_data_dir() -> String {
@@ -1150,6 +1178,24 @@ impl Config {
                 "[management]: missing required field(s) after profile merge: {}",
                 missing.join(", ")
             )));
+        }
+        if m.require_discord_approval {
+            if m.approval_bot_index >= self.puppets.tokens.len() {
+                return Err(ConfigError::Validation(format!(
+                    "[management]: approval_bot_index {} is out of range — \
+                     [puppets] defines {} token(s)",
+                    m.approval_bot_index,
+                    self.puppets.tokens.len()
+                )));
+            }
+            if m.approval_timeout_secs == 0 {
+                return Err(ConfigError::Validation(
+                    "[management]: approval_timeout_secs must be ≥ 1 — a zero \
+                     TTL would expire every pending link before it could be \
+                     approved"
+                        .to_string(),
+                ));
+            }
         }
         Ok(())
     }

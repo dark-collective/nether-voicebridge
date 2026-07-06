@@ -73,6 +73,19 @@
 # allow = ["@you:nether.im"]     # operator MXIDs (commands + invite auto-join)
 # # display_name = "Voice Bridge Manager"   # optional; sets the shared bot account's name
 # # device_id / store_path auto-derive ("management", <data_dir>/management)
+#
+# # Two-sided link auth (#47) — both optional, both default false:
+# # require_room_authority = true    # `link` sender must be a joined member of the target
+# #                                  # room with power level ≥ its state_default (i.e. a
+# #                                  # room moderator), not just an allowlisted operator
+# # require_discord_approval = true  # `link` is held PENDING (nothing written) until someone
+# #                                  # with Manage Server in the target guild runs
+# #                                  # `/bridge approve code:<code>`; the command is
+# #                                  # registered by the puppet bot at approval_bot_index
+# #                                  # (default 0), whose application must be invited with
+# #                                  # the `applications.commands` OAuth scope
+# # approval_timeout_secs = 600      # pending-link TTL
+# # approval_bot_index = 0           # which [puppets] token serves /bridge approve
 
 # ── Admission limits (optional) ──────────────────────────────────────────────
 # Hard caps for a hosted deployment (#47). Every field is optional; an absent

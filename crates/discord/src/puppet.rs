@@ -42,6 +42,14 @@ use std::sync::{Arc, Mutex as StdMutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use serenity::builder::{
+    CreateCommand, CreateCommandOption, CreateInteractionResponse,
+    CreateInteractionResponseMessage, EditInteractionResponse,
+};
+use serenity::model::application::{
+    Command as ApplicationCommand, CommandData, CommandDataOptionValue, CommandInteraction,
+    CommandOptionType, Interaction, InteractionContext,
+};
 use serenity::{async_trait, model::prelude::*, prelude::*};
 use songbird::{
     driver::{DecodeConfig, DecodeMode},
@@ -354,6 +362,32 @@ struct AllocState {
     health: HashMap<(usize, GuildId), SessionHealth>,
 }
 
+/// A Discord-side `/bridge approve` invocation (#47 two-sided link auth),
+/// forwarded to whoever holds the pending-link table (the Matrix management
+/// bot, via an adapter in the binary). The invoker's Manage Server permission
+/// has already been verified against the interaction payload; `reply` carries
+/// the human-readable outcome back for the interaction follow-up.
+pub struct LinkApproval {
+    /// The code the invoker typed (as-is; matching is the receiver's job).
+    pub code: String,
+    /// Guild the command was invoked in — the pending link's guild must match.
+    pub guild_id: u64,
+    /// Display handle of the approving Discord user, for the audit trail and
+    /// the Matrix-side notification (`name (id)`).
+    pub invoker: String,
+}
+
+/// Approval-command wiring (#47), set once before [`SharedPool::run`] when the
+/// management bot requires Discord-side approval. Only `bot_index` registers
+/// and serves the `/bridge` command (slash commands are per-application, and
+/// N pool bots each registering one would show N duplicates).
+struct LinkApprovalCfg {
+    bot_index: usize,
+    tx: mpsc::UnboundedSender<(LinkApproval, oneshot::Sender<String>)>,
+    /// `ready` fires again on every gateway reconnect; register the command once.
+    registered: AtomicBool,
+}
+
 /// The shared puppet pool. Built once per process; every bridge's Discord side is
 /// a [`ChannelView`] into it.
 pub struct SharedPool {
@@ -364,6 +398,8 @@ pub struct SharedPool {
     /// in every channel).
     bot_ids: BotIdSet,
     alloc: StdMutex<AllocState>,
+    /// `/bridge approve` wiring (#47) — `None` unless two-sided link auth is on.
+    link_approval: std::sync::OnceLock<LinkApprovalCfg>,
 }
 
 impl SharedPool {
@@ -414,7 +450,26 @@ impl SharedPool {
                 sessions: HashMap::new(),
                 health: HashMap::new(),
             }),
+            link_approval: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Turn on the `/bridge approve` command (#47 two-sided link auth): bot
+    /// `bot_index` registers the global slash command at `ready` and forwards
+    /// each valid invocation (with a oneshot for the outcome text) over `tx`.
+    /// Call before [`run`](Self::run); a second call is a no-op.
+    pub fn enable_link_approval(
+        &self,
+        bot_index: usize,
+        tx: mpsc::UnboundedSender<(LinkApproval, oneshot::Sender<String>)>,
+    ) {
+        if self
+            .link_approval
+            .set(LinkApprovalCfg { bot_index, tx, registered: AtomicBool::new(false) })
+            .is_err()
+        {
+            tracing::warn!("enable_link_approval called twice — keeping the first wiring");
+        }
     }
 
     /// Register a bridge's channel and return its [`PlaybackRouter`] view. Parses
@@ -1952,6 +2007,24 @@ impl EventHandler for PuppetHandler {
             self.pool.note_bot_guild(self.idx, ug.id);
         }
 
+        // #47 two-sided link auth: the designated bot registers the global
+        // `/bridge approve` command. Once per process — `ready` refires on
+        // reconnect and registration is an upsert HTTP call we needn't repeat.
+        if let Some(cfg) = self.pool.link_approval.get() {
+            if cfg.bot_index == self.idx && !cfg.registered.swap(true, Ordering::SeqCst) {
+                match register_bridge_command(&ctx).await {
+                    Ok(()) => {
+                        tracing::info!(idx = self.idx, "registered the /bridge approve command")
+                    }
+                    Err(e) => {
+                        // Cleared so the next reconnect retries.
+                        cfg.registered.store(false, Ordering::SeqCst);
+                        tracing::error!(idx = self.idx, error = %e, "failed to register the /bridge command");
+                    }
+                }
+            }
+        }
+
         // `ready` can fire again on reconnect; only the first run takes the rx.
         let slot = &self.pool.slots[self.idx];
         let Some(rx) = slot.cmd_rx.lock().unwrap_or_else(PoisonError::into_inner).take() else {
@@ -2052,6 +2125,151 @@ impl EventHandler for PuppetHandler {
         _full: Option<serenity::model::guild::Guild>,
     ) {
         self.pool.forget_bot_guild(self.idx, incomplete.id);
+    }
+
+    /// `/bridge approve <code>` (#47 two-sided link auth). Only the designated
+    /// bot's application registered the command, so only its gateway receives
+    /// these. The Manage Server gate is checked here from `member.permissions`
+    /// (computed server-side by Discord for interactions); the code↔guild match
+    /// happens at the pending-link table on the Matrix side.
+    #[tracing::instrument(parent = None, name = "puppet", skip_all, fields(idx = self.idx))]
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        let Some(cfg) = self.pool.link_approval.get() else { return };
+        if cfg.bot_index != self.idx {
+            return;
+        }
+        let Interaction::Command(cmd) = interaction else { return };
+        if cmd.data.name != "bridge" {
+            return;
+        }
+        let Some(guild_id) = cmd.guild_id else {
+            respond_ephemeral(&ctx, &cmd, "This command only works inside a Discord server.")
+                .await;
+            return;
+        };
+        // `default_member_permissions` already hides the command from
+        // non-managers, but server admins can re-expose it in Integration
+        // settings — enforce the gate server-side too.
+        let perms = cmd.member.as_ref().and_then(|m| m.permissions);
+        if !perms.is_some_and(|p| p.manage_guild() || p.administrator()) {
+            respond_ephemeral(
+                &ctx,
+                &cmd,
+                "You need the **Manage Server** permission to approve a bridge link.",
+            )
+            .await;
+            return;
+        }
+        let Some(code) = extract_approve_code(&cmd.data) else {
+            respond_ephemeral(&ctx, &cmd, "Usage: `/bridge approve code:<code>`").await;
+            return;
+        };
+
+        // Defer (ephemeral): the approval commits a tenant (file write +
+        // reconcile round-trip), which can exceed the 3 s initial-response
+        // window.
+        if let Err(e) = cmd
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::Defer(
+                    CreateInteractionResponseMessage::new().ephemeral(true),
+                ),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "failed to defer /bridge approve");
+            return;
+        }
+
+        let (otx, orx) = oneshot::channel();
+        let approval = LinkApproval {
+            code,
+            guild_id: guild_id.get(),
+            invoker: format!("{} ({})", cmd.user.name, cmd.user.id.get()),
+        };
+        let outcome = if cfg.tx.send((approval, otx)).is_err() {
+            "The bridge's management service is not running — try again later.".to_string()
+        } else {
+            match tokio::time::timeout(Duration::from_secs(60), orx).await {
+                Ok(Ok(text)) => text,
+                _ => "No answer from the bridge's management service — ask the operator to check the logs.".to_string(),
+            }
+        };
+        if let Err(e) = cmd
+            .edit_response(&ctx.http, EditInteractionResponse::new().content(outcome))
+            .await
+        {
+            tracing::warn!(error = %e, "failed to send the /bridge approve outcome");
+        }
+    }
+}
+
+/// Register the global `/bridge approve <code>` application command (#47).
+/// `default_member_permissions(MANAGE_GUILD)` makes Discord hide it from
+/// regular members by default; guild-only. Registration is an upsert, so a
+/// changed definition converges on restart.
+async fn register_bridge_command(ctx: &Context) -> Result<()> {
+    ApplicationCommand::create_global_command(
+        &ctx.http,
+        CreateCommand::new("bridge")
+            .description("Nether voice bridge")
+            .default_member_permissions(Permissions::MANAGE_GUILD)
+            .contexts(vec![InteractionContext::Guild])
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "approve",
+                    "Approve a pending Matrix-Discord voice bridge link",
+                )
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "code",
+                        "The approval code from the Matrix management bot",
+                    )
+                    .required(true),
+                ),
+            ),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| anyhow!("registering the /bridge command: {e}"))
+}
+
+/// Pull the `code` argument out of a `/bridge approve` invocation.
+fn extract_approve_code(data: &CommandData) -> Option<String> {
+    for opt in &data.options {
+        if opt.name != "approve" {
+            continue;
+        }
+        if let CommandDataOptionValue::SubCommand(subs) = &opt.value {
+            for sub in subs {
+                if sub.name == "code" {
+                    if let CommandDataOptionValue::String(v) = &sub.value {
+                        let v = v.trim();
+                        if !v.is_empty() {
+                            return Some(v.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Immediate ephemeral reply to a slash-command interaction (best-effort).
+async fn respond_ephemeral(ctx: &Context, cmd: &CommandInteraction, text: &str) {
+    if let Err(e) = cmd
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new().content(text).ephemeral(true),
+            ),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "failed to reply to a /bridge interaction");
     }
 }
 

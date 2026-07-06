@@ -314,6 +314,28 @@ writing anything, replying with a specific fix if a prerequisite is missing
 as they connect). Note the bot must also be able to *speak* in the room you DM
 it from: in a room whose power levels block PL-0 message sends it stays mute.
 
+### Two-sided link auth
+
+By default an allowlisted operator may `link` any joinable room to any channel
+the puppet bots can reach. For a hosted/multi-tenant deployment, two optional
+`[management]` knobs make a link require consent from **both** sides:
+
+- `require_room_authority = true` — the person running `link` must be a joined
+  member of the target Matrix room with power level ≥ the room's
+  `state_default` (i.e. a room moderator), not just an allowlisted operator.
+- `require_discord_approval = true` — a `link` that passes every probe is held
+  **pending** (nothing written) and answered with a one-time code. Someone with
+  the **Manage Server** permission in the target Discord guild must run
+  `/bridge approve code:<code>` within `approval_timeout_secs` (default 600 s);
+  only then is the bridge created, and both sides are notified. The slash
+  command is registered by the puppet bot at `approval_bot_index` (default 0,
+  the first `[puppets]` token) — (re-)invite that bot's application with the
+  `applications.commands` OAuth scope (in addition to `bot`) or the command
+  will not appear. Separate the scopes with `%20`, not `+`
+  (`&scope=bot%20applications.commands` — the `+` form can silently drop the
+  second scope). Discord hides the command from members without Manage
+  Server, and the bridge re-checks the invoker's permission server-side.
+
 ## Community & contributing
 
 - **Development & support space:**

@@ -17,7 +17,7 @@ pub mod capture;
 pub use capture::CaptureSink;
 
 pub mod puppet;
-pub use puppet::{ChannelView, SharedExclude, SharedPool};
+pub use puppet::{ChannelView, LinkApproval, SharedExclude, SharedPool};
 
 // The Matrix-side ghost sink trait (one per Discord speaker). Aliased so it
 // doesn't clash with this crate's WAV-writing `capture::CaptureSink`.

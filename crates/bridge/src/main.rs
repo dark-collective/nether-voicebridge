@@ -131,6 +131,31 @@ async fn main() -> Result<()> {
     // The pool's own shutdown root: Ctrl-C cancels it to drain every puppet.
     let pool_shutdown = CancellationToken::new();
 
+    // Two-sided link auth (#47): when the management bot requires Discord-side
+    // approval, wire the pool's `/bridge approve` command to the bot. The two
+    // crates don't know each other, so an adapter task converts the pool's
+    // `LinkApproval` into the bot's `DiscordApproval` (the reply oneshot passes
+    // through untouched).
+    let mut mgmt_approval_rx = None;
+    if let Some((m, _, _)) = &mgmt_inputs {
+        if m.require_discord_approval {
+            let (pool_tx, mut pool_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (mgmt_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            pool.enable_link_approval(m.approval_bot_index, pool_tx);
+            tokio::spawn(async move {
+                while let Some((a, reply)) = pool_rx.recv().await {
+                    let _ = mgmt_tx.send(nvb_matrix_rtc::mgmt::DiscordApproval {
+                        code: a.code,
+                        guild_id: a.guild_id,
+                        invoker: a.invoker,
+                        reply,
+                    });
+                }
+            });
+            mgmt_approval_rx = Some(rx);
+        }
+    }
+
     // The supervisor owns every running bridge (and drives the pool's future):
     // one independent Matrix/RTC pipeline per bridge, all `!Send`, all driven on
     // this task. Each bridge future swallows its own error (logging it), so one
@@ -177,6 +202,7 @@ async fn main() -> Result<()> {
                 data_dir,
                 limits.mgmt_cooldown_secs,
                 control,
+                mgmt_approval_rx,
                 shutdown,
             )
             .await

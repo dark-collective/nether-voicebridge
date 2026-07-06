@@ -64,6 +64,23 @@ pub struct BridgeStatus {
 /// Convenience alias for the supervisor-facing sender handle.
 pub type ControlTx = mpsc::UnboundedSender<ControlMsg>;
 
+/// A Discord-side `/bridge approve <code>` invocation (#47 two-sided link
+/// auth), delivered from the puppet pool via an adapter task in the binary
+/// (the discord and matrix-rtc crates don't know each other; the binary
+/// bridges their two mirror types). The invoker's Manage Server permission was
+/// already verified against the interaction payload on the Discord side.
+pub struct DiscordApproval {
+    /// The code as typed (normalization is our job).
+    pub code: String,
+    /// Guild the command was invoked in — must match the pending link's guild.
+    pub guild_id: u64,
+    /// Approving Discord user, `name (id)`, for the audit trail and the
+    /// Matrix-side notification.
+    pub invoker: String,
+    /// Outcome text for the ephemeral interaction follow-up.
+    pub reply: oneshot::Sender<String>,
+}
+
 use anyhow::{Context, Result};
 use matrix_sdk::{
     Client, Room, RoomState, SessionMeta,
@@ -129,6 +146,112 @@ struct BotCtx {
     /// `<data_dir>/audit.jsonl` (#47) — append-only record of every
     /// state-changing command and its outcome.
     audit_path: String,
+    /// Two-sided link auth, Matrix side (#47): require the `link` sender to be
+    /// a joined member of the target room with PL ≥ its `state_default`.
+    require_room_authority: bool,
+    /// Two-sided link auth, Discord side (#47): `Some(ttl)` when a `link` is
+    /// held pending until `/bridge approve <code>`; `None` = commit directly.
+    approval_ttl: Option<Duration>,
+    /// Pending (probed, unapproved) links, keyed by approval code. Pruned
+    /// lazily on insert/lookup; capped at [`PENDING_LINK_CAP`].
+    pending: StdMutex<HashMap<String, PendingLink>>,
+}
+
+/// A `link` that passed every probe and now awaits its Discord-side approval.
+struct PendingLink {
+    tenant: NewTenant,
+    /// The MXID that requested the link (also `tenant.owner`).
+    requester: String,
+    /// Room the `link` command was issued in — outcome notification target.
+    origin_room: matrix_sdk::ruma::OwnedRoomId,
+    /// Probe warnings, carried into the eventual success reply.
+    warnings: Vec<String>,
+    created: Instant,
+}
+
+/// Cap on simultaneously pending links: bounds memory against a `link` spammer
+/// (each entry is tiny, so this is generous) while leaving room for honest
+/// concurrent onboarding.
+const PENDING_LINK_CAP: usize = 16;
+
+/// Code alphabet: uppercase alphanumerics minus the ambiguous 0/O/1/I — codes
+/// are relayed human-to-human across two chat systems.
+const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const CODE_LEN: usize = 6;
+
+/// Mint an approval code, `NVB-XXXXXX`. 32^6 ≈ 10^9 states against a cap of
+/// 16 live entries and a Discord-side actor limited to guessing through slash
+/// commands — collision and brute force are both out of reach.
+fn mint_approval_code() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let body: String = (0..CODE_LEN)
+        .map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char)
+        .collect();
+    format!("NVB-{body}")
+}
+
+/// Normalize a user-typed approval code: trim, uppercase, allow the `NVB-`
+/// prefix to be omitted.
+fn normalize_code(input: &str) -> String {
+    let up = input.trim().to_ascii_uppercase();
+    if up.starts_with("NVB-") { up } else { format!("NVB-{up}") }
+}
+
+fn prune_expired_pending(map: &mut HashMap<String, PendingLink>, now: Instant, ttl: Duration) {
+    map.retain(|_, p| now.saturating_duration_since(p.created) < ttl);
+}
+
+/// Insert a pending link under a fresh code, enforcing the cap. Returns the
+/// code, or a user-facing refusal when the table is full.
+fn insert_pending(
+    map: &mut HashMap<String, PendingLink>,
+    pending: PendingLink,
+    now: Instant,
+    ttl: Duration,
+) -> Result<String, String> {
+    prune_expired_pending(map, now, ttl);
+    if map.len() >= PENDING_LINK_CAP {
+        return Err(format!(
+            "There are already {PENDING_LINK_CAP} links awaiting Discord approval — try again \
+             once one is approved or expires."
+        ));
+    }
+    loop {
+        let code = mint_approval_code();
+        if !map.contains_key(&code) {
+            map.insert(code.clone(), pending);
+            return Ok(code);
+        }
+    }
+}
+
+/// Claim a pending link by (normalized) code + guild. A guild mismatch leaves
+/// the entry in place (a typo from the wrong server must not burn the code).
+fn take_pending(
+    map: &mut HashMap<String, PendingLink>,
+    code: &str,
+    guild_id: u64,
+    now: Instant,
+    ttl: Duration,
+) -> Result<PendingLink, String> {
+    prune_expired_pending(map, now, ttl);
+    let Some(p) = map.remove(code) else {
+        return Err(format!(
+            "Unknown or expired code `{code}` — codes expire after {} minutes; run `link` on \
+             the Matrix side again for a fresh one.",
+            ttl.as_secs().div_ceil(60)
+        ));
+    };
+    if p.tenant.guild_id != guild_id.to_string() {
+        // Put it back: a typo from the wrong server must not burn the code.
+        map.insert(code.to_owned(), p);
+        return Err(format!(
+            "Code `{code}` belongs to a link for a different Discord server — run the command \
+             in the server the link targets."
+        ));
+    }
+    Ok(p)
 }
 
 impl BotCtx {
@@ -200,6 +323,7 @@ pub async fn run(
     data_dir: String,
     mgmt_cooldown_secs: Option<u64>,
     control: ControlTx,
+    approval_rx: Option<mpsc::UnboundedReceiver<DiscordApproval>>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     // Pair the device identity with the crypto store (#30) — same rule as the
@@ -284,7 +408,32 @@ pub async fn run(
         mutate_stamps: StdMutex::new(HashMap::new()),
         banlist_path: nvb_config::banlist_path(&data_dir),
         audit_path: format!("{}/audit.jsonl", data_dir.trim_end_matches('/')),
+        require_room_authority: cfg.require_room_authority,
+        approval_ttl: cfg
+            .require_discord_approval
+            .then(|| Duration::from_secs(cfg.approval_timeout_secs)),
+        pending: StdMutex::new(HashMap::new()),
     });
+
+    // Discord-side approvals (#47 two-sided link auth): consume `/bridge
+    // approve` invocations forwarded by the puppet pool. Separate task so a
+    // slow commit (reconcile round-trip) never stalls the sync loop.
+    if let Some(mut rx) = approval_rx {
+        let ctx = ctx.clone();
+        let client = client.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    msg = rx.recv() => match msg {
+                        Some(approval) => handle_discord_approval(&ctx, &client, approval).await,
+                        None => break,
+                    }
+                }
+            }
+        });
+    }
 
     // Invites that arrived while the bot was offline (consumed by the initial
     // sync above, so the live handler never sees them).
@@ -659,6 +808,52 @@ fn evaluate_call_member_power(content: Option<&serde_json::Value>) -> CallPowerC
 
 const CALL_MEMBER_EVENT: &str = "org.matrix.msc3401.call.member";
 
+/// Verdict of the Matrix-side link-authority check (#47): may `sender` bridge
+/// this room? The bar is "could configure the room themselves": joined, with
+/// power level ≥ the room's `state_default`.
+#[derive(Debug, PartialEq, Eq)]
+struct SenderAuthority {
+    joined: bool,
+    sender_pl: i64,
+    required: i64,
+}
+
+impl SenderAuthority {
+    fn ok(&self) -> bool {
+        self.joined && self.sender_pl >= self.required
+    }
+}
+
+/// Pure evaluation of a sender's authority over a room (unit-tested below).
+/// `pl_content` is the raw `m.room.power_levels` content (`None` = absent →
+/// fail-safe required=50, same posture as the call-member check);
+/// `member_content` is the sender's `m.room.member` content (`None` = no
+/// membership event → not joined).
+fn evaluate_sender_authority(
+    pl_content: Option<&serde_json::Value>,
+    member_content: Option<&serde_json::Value>,
+    sender: &str,
+) -> SenderAuthority {
+    let joined = member_content
+        .and_then(|m| m.get("membership"))
+        .and_then(|v| v.as_str())
+        == Some("join");
+    let (sender_pl, required) = match pl_content {
+        Some(c) => {
+            let users_default = c.get("users_default").and_then(pl_int).unwrap_or(0);
+            let sender_pl = c
+                .get("users")
+                .and_then(|u| u.get(sender))
+                .and_then(pl_int)
+                .unwrap_or(users_default);
+            let required = c.get("state_default").and_then(pl_int).unwrap_or(50);
+            (sender_pl, required)
+        }
+        None => (0, 50),
+    };
+    SenderAuthority { joined, sender_pl, required }
+}
+
 /// Power-level values are canonically integers, but legacy rooms (and some
 /// servers) carry them as numeric strings — accept both.
 fn pl_int(v: &serde_json::Value) -> Option<i64> {
@@ -684,10 +879,15 @@ struct ProbeReport {
 /// spawn) leaves the bot joined to the room even when a later probe fails.
 /// That is harmless — a retried `link` reuses the membership, and the bridge
 /// needs it anyway. (`unlink` never leaves rooms either; out of scope here.)
+/// `authority_sender`: when set (two-sided link auth, #47), the probe also
+/// verifies that this MXID is a joined member of the room with power level ≥
+/// the room's `state_default` — an operator allowlist entry alone no longer
+/// authorizes bridging an arbitrary room.
 async fn probe_room_prereqs(
     ctx: &BotCtx,
     room_id: &str,
     guild_id: &str,
+    authority_sender: Option<&str>,
 ) -> Result<ProbeReport, String> {
     // 1. Join (hard): covers restricted/invite-only rooms and typo'd room ids.
     match tokio::time::timeout(
@@ -730,6 +930,7 @@ async fn probe_room_prereqs(
             &ctx.appservice_token,
             room_id,
             "m.room.power_levels",
+            "",
             ctx.own_user.as_str(),
         ),
     )
@@ -751,6 +952,53 @@ async fn probe_room_prereqs(
              Nothing was written.",
             check.required, check.ghost_pl
         ));
+    }
+
+    // 2b. Matrix-side link authority (#47, only with `require_room_authority`):
+    // the sender must hold moderator power in the room they are bridging.
+    // Reuses the power-levels content just fetched; only the sender's own
+    // membership event is an extra GET.
+    if let Some(sender) = authority_sender {
+        let member_content = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::matrix::get_room_state(
+                &ctx.http,
+                &ctx.homeserver_url,
+                &ctx.appservice_token,
+                room_id,
+                "m.room.member",
+                sender,
+                ctx.own_user.as_str(),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            "❌ Reading your room membership timed out after 10 s.\nNothing was written."
+                .to_string()
+        })?
+        .map_err(|e| {
+            format!("❌ Could not read your room membership: {e}\nNothing was written.")
+        })?;
+        let authority =
+            evaluate_sender_authority(pl_content.as_ref(), member_content.as_ref(), sender);
+        if !authority.ok() {
+            let reason = if !authority.joined {
+                "you are not a joined member of it".to_string()
+            } else {
+                format!(
+                    "your power level there is {} but linking needs ≥ {} (the room's \
+                     `state_default`)",
+                    authority.sender_pl, authority.required
+                )
+            };
+            return Err(format!(
+                "❌ Two-sided link auth is on: only someone with moderator power in {room_id} \
+                 may bridge it, and {reason}.\n\
+                 Join the room and have an admin raise your power level, or ask a room \
+                 moderator to run `link`.\n\
+                 Nothing was written."
+            ));
+        }
     }
 
     // 3. MatrixRTC focus (hard): a `link`-created tenant always uses the
@@ -924,8 +1172,11 @@ async fn handle_link(
     // Preflight probes (#47): verify the room/guild prerequisites BEFORE
     // touching tenants.toml — a failed probe replies and writes nothing.
     // Runs outside the mutate lock (slow network I/O; a duplicate-name race
-    // is still caught by add_tenant_entry's own rejection).
-    let report = match probe_room_prereqs(ctx, &room_id, &guild_id).await {
+    // is still caught by add_tenant_entry's own rejection). With
+    // `require_room_authority` the probe also checks the SENDER's power in
+    // the room (two-sided link auth, Matrix side).
+    let authority_sender = ctx.require_room_authority.then_some(sender);
+    let report = match probe_room_prereqs(ctx, &room_id, &guild_id, authority_sender).await {
         Ok(r) => r,
         Err(msg) => {
             reply(room, &msg).await;
@@ -949,36 +1200,88 @@ async fn handle_link(
                 .unwrap_or(0),
         ),
     };
+
+    // Two-sided link auth, Discord side (#47): hold the fully-probed link
+    // pending until someone with Manage Server in the target guild claims the
+    // code via `/bridge approve` — nothing is written until then.
+    if let Some(ttl) = ctx.approval_ttl {
+        let pending = PendingLink {
+            tenant,
+            requester: sender.to_owned(),
+            origin_room: room.room_id().to_owned(),
+            warnings: report.warnings,
+            created: Instant::now(),
+        };
+        let minted = {
+            let mut map = ctx.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            insert_pending(&mut map, pending, Instant::now(), ttl)
+        };
+        match minted {
+            Ok(code) => {
+                audit(ctx, sender, "link_pending", serde_json::json!({
+                    "name": name, "room_id": room_id, "guild_id": guild_id,
+                    "channel_id": channel_id, "code": code,
+                }));
+                reply(room, &format!(
+                    "⏳ All room checks passed — Discord-side approval required.\n\
+                     Have someone with **Manage Server** permission in Discord guild {guild_id} run:\n\
+                     `/bridge approve code:{code}`\n\
+                     The code expires in {} minutes; nothing is written until it is approved.",
+                    ttl.as_secs().div_ceil(60)
+                ))
+                .await;
+            }
+            Err(msg) => reply(room, &msg).await,
+        }
+        return;
+    }
+
+    let outcome = commit_link(ctx, tenant, &report.warnings, sender, None).await;
+    reply(room, &outcome).await;
+}
+
+/// Write `tenant` into tenants.toml and reconcile, returning the user-facing
+/// outcome text (shared by the direct `link` path and the Discord-approval
+/// path). `actor` is the requesting MXID (audit attribution); `approved_by`
+/// is the Discord approver when the commit came through `/bridge approve`.
+async fn commit_link(
+    ctx: &BotCtx,
+    tenant: NewTenant,
+    warnings: &[String],
+    actor: &str,
+    approved_by: Option<&str>,
+) -> String {
+    let name = tenant.name.clone();
+    let room_id = tenant.room_id.clone();
+    let guild_id = tenant.guild_id.clone();
+    let channel_id = tenant.channel_id.clone();
+
     let _guard = ctx.mutate_lock.lock().await;
     let prior = match nvb_config::add_tenant_entry(&ctx.tenants_path, &tenant) {
         Ok(p) => p,
-        Err(e) => {
-            reply(room, &format!("Cannot add '{name}': {e}")).await;
-            return;
-        }
+        Err(e) => return format!("Cannot add '{name}': {e}"),
     };
 
     match request_reconcile(ctx).await {
         Some(Ok(summary)) => {
             if let Some((_, err)) = summary.failed.iter().find(|(l, _)| l == &name) {
-                audit(ctx, sender, "link_failed_spawn", serde_json::json!({
+                audit(ctx, actor, "link_failed_spawn", serde_json::json!({
                     "name": name, "error": err,
                 }));
-                reply(room, &format!(
+                format!(
                     "The entry was accepted but the bridge FAILED to start: {err}\nIt stays in tenants.toml — fix the cause and `unlink`/`link` again (or reload)."
-                ))
-                .await;
+                )
             } else if summary.added.iter().any(|l| l == &name) {
-                audit(ctx, sender, "link_ok", serde_json::json!({
+                audit(ctx, actor, "link_ok", serde_json::json!({
                     "name": name, "room_id": room_id, "guild_id": guild_id,
-                    "channel_id": channel_id,
+                    "channel_id": channel_id, "approved_by": approved_by,
                 }));
-                let guild_line = if report.warnings.is_empty() {
+                let guild_line = if warnings.is_empty() {
                     format!("✓ puppet bots present in guild {guild_id}")
                 } else {
-                    report.warnings.join("\n")
+                    warnings.join("\n")
                 };
-                reply(room, &format!(
+                format!(
                     "✅ Bridge '{name}' is up: {room_id} ↔ guild {guild_id} channel {channel_id}.\n\
                      Verified before linking:\n\
                      ✓ bridge bot joined the room\n\
@@ -986,13 +1289,11 @@ async fn handle_link(
                      ✓ MatrixRTC focus discovered\n\
                      {guild_line}\n\
                      Not verifiable here: the puppet bots need Connect, Speak, Use Voice Activity and Change Nickname on the voice channel."
-                ))
-                .await;
+                )
             } else {
-                reply(room, &format!(
+                format!(
                     "Reconcile ran but '{name}' was not reported as added (unexpected) — check the bridge logs."
-                ))
-                .await;
+                )
             }
         }
         Some(Err(rejection)) => {
@@ -1001,16 +1302,98 @@ async fn handle_link(
             if let Err(e) = nvb_config::restore_tenants_file(&ctx.tenants_path, prior) {
                 tracing::error!(error = %e, "rollback of tenants.toml failed after rejected reconcile");
             }
-            audit(ctx, sender, "link_rejected", serde_json::json!({
+            audit(ctx, actor, "link_rejected", serde_json::json!({
                 "name": name, "reason": rejection,
             }));
-            reply(room, &format!("❌ Rejected: {rejection}\ntenants.toml was rolled back.")).await;
+            format!("❌ Rejected: {rejection}\ntenants.toml was rolled back.")
         }
         None => {
-            audit(ctx, sender, "link_unconfirmed", serde_json::json!({ "name": name }));
-            reply(room, "The supervisor did not respond — the entry was written to tenants.toml but may not be running. Check the bridge logs.").await;
+            audit(ctx, actor, "link_unconfirmed", serde_json::json!({ "name": name }));
+            "The supervisor did not respond — the entry was written to tenants.toml but may not be running. Check the bridge logs.".to_string()
         }
     }
+}
+
+/// Serve one Discord-side `/bridge approve` (#47): claim the pending link,
+/// re-check the deny-lists, commit, and notify both sides. The invoker's
+/// Manage Server permission was verified on the Discord side; here the code
+/// itself is the capability, scoped to the guild it was minted for.
+async fn handle_discord_approval(ctx: &BotCtx, client: &Client, approval: DiscordApproval) {
+    let Some(ttl) = ctx.approval_ttl else {
+        // Unreachable in practice: the channel is only wired when approval is
+        // configured. Answer anyway so the interaction never hangs.
+        let _ = approval
+            .reply
+            .send("Discord-side approval is not enabled on this instance.".to_string());
+        return;
+    };
+    let code = normalize_code(&approval.code);
+    let taken = {
+        let mut map = ctx.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        take_pending(&mut map, &code, approval.guild_id, Instant::now(), ttl)
+    };
+    let pending = match taken {
+        Ok(p) => p,
+        Err(msg) => {
+            // `msg` distinguishes unknown/expired from a guild mismatch — keep
+            // that in the audit trail, not just in the ephemeral reply.
+            audit(ctx, &approval.invoker, "approve_rejected", serde_json::json!({
+                "code": code, "guild_id": approval.guild_id.to_string(),
+                "reason": &msg,
+            }));
+            let _ = approval.reply.send(msg);
+            return;
+        }
+    };
+
+    // Ban re-check: a ban may have landed while the link sat pending; an
+    // approval must not resurrect it. Same fail-closed posture as `link`.
+    match nvb_config::load_banlist(&ctx.banlist_path) {
+        Ok(bans) => {
+            if bans.contains(BanKind::Owner, &pending.requester)
+                || bans.contains(BanKind::Guild, &pending.tenant.guild_id)
+                || bans.contains(BanKind::Room, &pending.tenant.room_id)
+            {
+                audit(ctx, &approval.invoker, "approve_rejected", serde_json::json!({
+                    "code": code, "reason": "banned",
+                }));
+                let _ = approval
+                    .reply
+                    .send("🚫 This link was banned while awaiting approval.".to_string());
+                return;
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "ban list unreadable — refusing approval (fail-closed)");
+            let _ = approval.reply.send(
+                "The ban list is unreadable — approval refused until an operator fixes it."
+                    .to_string(),
+            );
+            return;
+        }
+    }
+
+    tracing::info!(
+        code = %code,
+        invoker = %approval.invoker,
+        tenant = %pending.tenant.name,
+        "Discord-side link approval accepted"
+    );
+    let outcome = commit_link(
+        ctx,
+        pending.tenant,
+        &pending.warnings,
+        &pending.requester,
+        Some(&approval.invoker),
+    )
+    .await;
+
+    // Tell the Matrix requester in the room they linked from (best-effort —
+    // the Discord follow-up carries the same text either way).
+    if let Some(origin) = client.get_room(&pending.origin_room) {
+        reply(&origin, &format!("Discord approval by {}:\n{outcome}", approval.invoker)).await;
+    }
+    let _ = approval.reply.send(outcome);
 }
 
 async fn handle_unlink(ctx: &BotCtx, room: &Room, sender: &str, name: &str) {
@@ -1406,5 +1789,129 @@ mod tests {
         let c = evaluate_call_member_power(None);
         assert_eq!(c, CallPowerCheck { required: 50, ghost_pl: 0 });
         assert!(!c.ok());
+    }
+
+    // ---- two-sided link auth (#47) ----
+
+    fn joined() -> serde_json::Value {
+        serde_json::json!({ "membership": "join" })
+    }
+
+    #[test]
+    fn sender_authority_users_map_override() {
+        let pl = serde_json::json!({
+            "state_default": 50,
+            "users_default": 0,
+            "users": { "@mod:x": 50, "@admin:x": 100 },
+        });
+        assert!(evaluate_sender_authority(Some(&pl), Some(&joined()), "@mod:x").ok());
+        assert!(evaluate_sender_authority(Some(&pl), Some(&joined()), "@admin:x").ok());
+        // Not in the users map → users_default 0 < 50.
+        let plain = evaluate_sender_authority(Some(&pl), Some(&joined()), "@user:x");
+        assert_eq!(plain, SenderAuthority { joined: true, sender_pl: 0, required: 50 });
+        assert!(!plain.ok());
+    }
+
+    #[test]
+    fn sender_authority_requires_joined_membership() {
+        let pl = serde_json::json!({ "state_default": 0 });
+        // Power is sufficient (0 ≥ 0) but the sender must actually be joined.
+        assert!(!evaluate_sender_authority(Some(&pl), None, "@u:x").ok());
+        let invited = serde_json::json!({ "membership": "invite" });
+        assert!(!evaluate_sender_authority(Some(&pl), Some(&invited), "@u:x").ok());
+        assert!(evaluate_sender_authority(Some(&pl), Some(&joined()), "@u:x").ok());
+    }
+
+    #[test]
+    fn sender_authority_absent_pl_fails_safe() {
+        let a = evaluate_sender_authority(None, Some(&joined()), "@u:x");
+        assert_eq!(a, SenderAuthority { joined: true, sender_pl: 0, required: 50 });
+        assert!(!a.ok());
+    }
+
+    #[test]
+    fn sender_authority_accepts_string_encoded_levels() {
+        let pl = serde_json::json!({
+            "state_default": "50",
+            "users": { "@mod:x": "50" },
+        });
+        assert!(evaluate_sender_authority(Some(&pl), Some(&joined()), "@mod:x").ok());
+    }
+
+    #[test]
+    fn approval_code_shape_and_normalization() {
+        let code = mint_approval_code();
+        assert!(code.starts_with("NVB-"), "{code}");
+        assert_eq!(code.len(), 4 + CODE_LEN);
+        assert!(code[4..].bytes().all(|b| CODE_ALPHABET.contains(&b)), "{code}");
+
+        assert_eq!(normalize_code("nvb-abc234"), "NVB-ABC234");
+        assert_eq!(normalize_code("  ABC234 "), "NVB-ABC234");
+        assert_eq!(normalize_code("NVB-ABC234"), "NVB-ABC234");
+    }
+
+    fn test_pending(guild: &str, created: Instant) -> PendingLink {
+        PendingLink {
+            tenant: NewTenant {
+                name: "t".into(),
+                server: "s".into(),
+                room_id: "!r:x".into(),
+                guild_id: guild.into(),
+                channel_id: "2".into(),
+                owner: Some("@op:x".into()),
+                created: Some(0),
+            },
+            requester: "@op:x".into(),
+            origin_room: "!dm:x".try_into().unwrap(),
+            warnings: Vec::new(),
+            created,
+        }
+    }
+
+    #[test]
+    fn pending_take_matches_guild_and_burns_only_on_match() {
+        let ttl = Duration::from_secs(600);
+        let now = Instant::now();
+        let mut map = HashMap::new();
+        let code = insert_pending(&mut map, test_pending("111", now), now, ttl).unwrap();
+
+        // Wrong guild: refused AND the entry survives for the right server.
+        assert!(take_pending(&mut map, &code, 999, now, ttl).is_err());
+        assert_eq!(map.len(), 1);
+
+        // Right guild: claimed exactly once.
+        let p = take_pending(&mut map, &code, 111, now, ttl).unwrap();
+        assert_eq!(p.tenant.guild_id, "111");
+        assert!(take_pending(&mut map, &code, 111, now, ttl).is_err());
+    }
+
+    #[test]
+    fn pending_expires_after_ttl() {
+        let ttl = Duration::from_secs(600);
+        let t0 = Instant::now();
+        let mut map = HashMap::new();
+        let code = insert_pending(&mut map, test_pending("111", t0), t0, ttl).unwrap();
+        // One second before expiry: still claimable...
+        assert!(map.contains_key(&code));
+        prune_expired_pending(&mut map, t0 + Duration::from_secs(599), ttl);
+        assert!(map.contains_key(&code));
+        // ...at/after the TTL: gone.
+        assert!(take_pending(&mut map, &code, 111, t0 + Duration::from_secs(600), ttl).is_err());
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn pending_cap_refuses_but_expiry_frees() {
+        let ttl = Duration::from_secs(600);
+        let t0 = Instant::now();
+        let mut map = HashMap::new();
+        for _ in 0..PENDING_LINK_CAP {
+            insert_pending(&mut map, test_pending("111", t0), t0, ttl).unwrap();
+        }
+        assert!(insert_pending(&mut map, test_pending("111", t0), t0, ttl).is_err());
+        // Once the old ones age out, inserts are accepted again.
+        let later = t0 + Duration::from_secs(600);
+        assert!(insert_pending(&mut map, test_pending("111", later), later, ttl).is_ok());
+        assert_eq!(map.len(), 1);
     }
 }
