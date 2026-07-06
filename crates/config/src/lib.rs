@@ -10,7 +10,7 @@ pub use banlist::{BanKind, BanList, add_ban, banlist_path, load_banlist, remove_
 pub use tenants::{TenantsFile, list_tenant_names, load_tenants, tenants_path};
 pub use tenants_edit::{
     NewTenant, PriorContent, add_tenant_entry, remove_tenant_entries_matching,
-    remove_tenant_entry, restore_tenants_file,
+    remove_tenant_entry, restore_tenants_file, tenant_owners,
 };
 
 #[derive(Debug, Error)]
@@ -99,6 +99,11 @@ pub struct LimitsConfig {
     /// thrashed. `list`/`help` are exempt.
     #[serde(default)]
     pub mgmt_cooldown_secs: Option<u64>,
+    /// Maximum tenants a single non-operator owner (MXID) may have at once
+    /// (#43 open registration). Checked at `link` for non-allowlisted senders
+    /// only — operators are bounded by `max_tenants` alone. `None` ⇒ unlimited.
+    #[serde(default)]
+    pub max_tenants_per_owner: Option<usize>,
 }
 
 /// The `[management]` block: a Matrix bot that lets allowlisted operators
@@ -152,6 +157,15 @@ pub struct ManagementConfig {
     /// scope or the command will not appear in guilds.
     #[serde(default)]
     pub approval_bot_index: usize,
+    /// Open registration (#43): when `true`, Matrix users NOT on `allow` may
+    /// also DM the bot (direct rooms only) and use the self-serve command
+    /// subset — `link` (two-sided auth mandatory: `validate()` requires both
+    /// `require_*` knobs on), `unlink`/`list` scoped to tenants they own, and
+    /// `help`. Operator commands (`ban`/`unban`/`bans`, unscoped
+    /// unlink/list) stay allowlist-only. Default `false`: the bot ignores
+    /// non-allowlisted users entirely, the pre-#43 behavior.
+    #[serde(default)]
+    pub open_registration: bool,
     // --- resolved from the referenced [server.<name>] profile ---
     #[serde(default)]
     pub homeserver_url: String,
@@ -1196,6 +1210,15 @@ impl Config {
                         .to_string(),
                 ));
             }
+        }
+        if m.open_registration && !(m.require_room_authority && m.require_discord_approval) {
+            return Err(ConfigError::Validation(
+                "[management]: open_registration requires BOTH \
+                 require_room_authority and require_discord_approval — \
+                 without two-sided auth, any Matrix user could bridge rooms \
+                 and guilds they don't control"
+                    .to_string(),
+            ));
         }
         Ok(())
     }

@@ -86,6 +86,13 @@
 # #                                  # the `applications.commands` OAuth scope
 # # approval_timeout_secs = 600      # pending-link TTL
 # # approval_bot_index = 0           # which [puppets] token serves /bridge approve
+#
+# # Open registration (#43) — default false. When true, Matrix users NOT on
+# # `allow` may DM the bot (direct rooms only) and self-serve: `link` (with
+# # two-sided auth mandatory — validation requires both require_* knobs on),
+# # plus `unlink`/`list` scoped to bridges they created. ban/unban/bans stay
+# # operator-only. Pair with [limits] max_tenants_per_owner.
+# # open_registration = true
 
 # ── Admission limits (optional) ──────────────────────────────────────────────
 # Hard caps for a hosted deployment (#47). Every field is optional; an absent
@@ -97,6 +104,8 @@
 # max_ghosts_per_bridge = 16    # concurrent bridged Discord speakers per bridge; at the cap
 #                               # a NEW speaker is not bridged (WARN) until a slot frees
 # mgmt_cooldown_secs = 30       # per-operator cooldown between `link`/`unlink` commands
+# max_tenants_per_owner = 2     # bridges one self-serve user may own at once (#43;
+#                               # counts pending approvals too; operators exempt)
 
 [puppets]
 # One entry per puppet bot — each is a SEPARATE Discord application with its own

@@ -144,6 +144,25 @@ pub fn remove_tenant_entries_matching(
     Ok((removed, prior))
 }
 
+/// Owner records for every `[[bridge]]` entry, `(name, owner)` in file order.
+/// `owner` is `None` when the entry predates owner records or was hand-written
+/// without one. Read-only; a missing file is an empty list. Open registration
+/// (#43) keys `unlink`/`list` scoping and the per-owner cap off this.
+pub fn tenant_owners(path: &str) -> Result<Vec<(String, Option<String>)>, ConfigError> {
+    let prior = read_prior(path)?;
+    let doc = parse_doc(prior.as_deref())?;
+    let mut out = Vec::new();
+    if let Some(arr) = doc.get("bridge").and_then(|b| b.as_array_of_tables()) {
+        for t in arr {
+            let name =
+                t.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>").to_string();
+            let owner = t.get("owner").and_then(|v| v.as_str()).map(str::to_owned);
+            out.push((name, owner));
+        }
+    }
+    Ok(out)
+}
+
 /// Roll the tenants file back to `prior` (the return value of a mutation):
 /// rewrite the old content, or delete the file if it did not exist before.
 pub fn restore_tenants_file(path: &str, prior: PriorContent) -> Result<(), ConfigError> {
@@ -407,5 +426,29 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].matrix.store_path, "/data/guest-voice");
         assert_eq!(got[0].matrix.bot_user_id, "@voicebridge_bot:nether.im");
+    }
+
+    #[test]
+    fn tenant_owners_reads_records_and_tolerates_absences() {
+        let dir = TmpDir::new();
+        let path = dir.file();
+
+        // Missing file ⇒ empty list, not an error.
+        assert_eq!(tenant_owners(&path).unwrap(), vec![]);
+
+        let mut owned = tenant("mine");
+        owned.owner = Some("@me:nether.im".to_string());
+        add_tenant_entry(&path, &owned).unwrap();
+        // Hand-written / pre-owner-records entry: no owner field.
+        add_tenant_entry(&path, &tenant("legacy")).unwrap();
+
+        let got = tenant_owners(&path).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("mine".to_string(), Some("@me:nether.im".to_string())),
+                ("legacy".to_string(), None),
+            ]
+        );
     }
 }

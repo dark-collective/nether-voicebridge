@@ -336,6 +336,20 @@ the puppet bots can reach. For a hosted/multi-tenant deployment, two optional
   second scope). Discord hides the command from members without Manage
   Server, and the bridge re-checks the invoker's permission server-side.
 
+### Open registration
+
+With both two-sided knobs on, `open_registration = true` turns the management
+bot into a self-serve service: any Matrix user (not just the `allow` list) can
+DM the bot — direct invites only, so no one can pull it into arbitrary rooms —
+and use a scoped command set: `link` (room authority + Discord approval are
+mandatory), `unlink` and `list` limited to bridges they created, and `help`.
+Operator commands (`ban`/`unban`/`bans`, unscoped unlink/list) remain
+allowlist-only, deny-listed users are refused at the door, and
+`[limits] max_tenants_per_owner` caps how many bridges one user may own
+(pending approvals count). Config validation refuses `open_registration`
+without both `require_room_authority` and `require_discord_approval` — without
+those, any Matrix user could bridge rooms and guilds they don't control.
+
 ## Community & contributing
 
 - **Development & support space:**

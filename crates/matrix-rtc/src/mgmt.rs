@@ -155,6 +155,20 @@ struct BotCtx {
     /// Pending (probed, unapproved) links, keyed by approval code. Pruned
     /// lazily on insert/lookup; capped at [`PENDING_LINK_CAP`].
     pending: StdMutex<HashMap<String, PendingLink>>,
+    /// Open registration (#43): non-allowlisted users get the self-serve
+    /// command subset (DM-only). `false` ⇒ they are ignored entirely.
+    open_registration: bool,
+    /// `[limits] max_tenants_per_owner` — per-owner tenant cap, enforced at
+    /// `link` for non-operators only. `None` ⇒ unlimited.
+    max_tenants_per_owner: Option<usize>,
+}
+
+impl BotCtx {
+    /// Operators are the `allow` list; everyone else is a self-serve user
+    /// (when `open_registration` is on) or ignored (when off).
+    fn is_operator(&self, sender: &str) -> bool {
+        self.allow.contains(sender)
+    }
 }
 
 /// A `link` that passed every probe and now awaits its Discord-side approval.
@@ -321,7 +335,7 @@ pub async fn run(
     cfg: ManagementConfig,
     server_names: Vec<String>,
     data_dir: String,
-    mgmt_cooldown_secs: Option<u64>,
+    limits: nvb_config::LimitsConfig,
     control: ControlTx,
     approval_rx: Option<mpsc::UnboundedReceiver<DiscordApproval>>,
     shutdown: CancellationToken,
@@ -404,7 +418,7 @@ pub async fn run(
             .context("building management-bot http client")?,
         well_known_base: cfg.well_known_base_url(),
         mutate_lock: tokio::sync::Mutex::new(()),
-        cooldown: mgmt_cooldown_secs.map(Duration::from_secs),
+        cooldown: limits.mgmt_cooldown_secs.map(Duration::from_secs),
         mutate_stamps: StdMutex::new(HashMap::new()),
         banlist_path: nvb_config::banlist_path(&data_dir),
         audit_path: format!("{}/audit.jsonl", data_dir.trim_end_matches('/')),
@@ -413,6 +427,8 @@ pub async fn run(
             .require_discord_approval
             .then(|| Duration::from_secs(cfg.approval_timeout_secs)),
         pending: StdMutex::new(HashMap::new()),
+        open_registration: cfg.open_registration,
+        max_tenants_per_owner: limits.max_tenants_per_owner,
     });
 
     // Discord-side approvals (#47 two-sided link auth): consume `/bridge
@@ -438,8 +454,8 @@ pub async fn run(
     // Invites that arrived while the bot was offline (consumed by the initial
     // sync above, so the live handler never sees them).
     for room in client.invited_rooms() {
-        let sender = stripped_invite_sender(&room, &bot_user_id).await;
-        handle_invite(&ctx, sender.as_deref(), &room).await;
+        let invite = stripped_invite_details(&room, &bot_user_id).await;
+        handle_invite(&ctx, invite.as_ref(), &room).await;
     }
 
     client.add_event_handler_context(ctx.clone());
@@ -453,7 +469,11 @@ pub async fn run(
             {
                 return;
             }
-            handle_invite(&ctx, Some(ev.sender.as_str()), &room).await;
+            let invite = InviteDetails {
+                sender: ev.sender.to_string(),
+                is_direct: ev.content.is_direct.unwrap_or(false),
+            };
+            handle_invite(&ctx, Some(&invite), &room).await;
         },
     );
 
@@ -464,12 +484,39 @@ pub async fn run(
                 return;
             }
             let MessageType::Text(text) = &ev.content.msgtype else { return };
-            if !ctx.allow.contains(ev.sender.as_str()) {
+            let sender = ev.sender.as_str();
+            if !ctx.is_operator(sender) && !ctx.open_registration {
                 tracing::debug!(sender = %ev.sender, "ignoring message from non-allowlisted user");
                 return;
             }
             match parse_command(&text.body) {
-                Parsed::Cmd(cmd) => handle_command(&ctx, &room, ev.sender.as_str(), cmd).await,
+                Parsed::Cmd(cmd) => {
+                    // Self-serve tier (#43): non-operators get the scoped
+                    // subset; operator verbs answer with a refusal rather
+                    // than silence (the sender is a legitimate user here).
+                    if !ctx.is_operator(sender) && !allowed_for_self_serve(&cmd) {
+                        reply(&room, "That command is operator-only.").await;
+                        return;
+                    }
+                    // Deny-listed owners lose the self-serve tier entirely
+                    // (operators are never banned-gated; they run `unban`).
+                    if !ctx.is_operator(sender) {
+                        match nvb_config::load_banlist(&ctx.banlist_path) {
+                            Ok(bans) if bans.contains(BanKind::Owner, sender) => {
+                                reply(&room, "🚫 You are banned from using this bridge.").await;
+                                return;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                // Same fail-closed posture as `link`.
+                                tracing::error!(error = %e, "ban list unreadable — refusing self-serve command (fail-closed)");
+                                reply(&room, "The ban list is unreadable — commands are disabled until an operator fixes it.").await;
+                                return;
+                            }
+                        }
+                    }
+                    handle_command(&ctx, &room, sender, cmd).await
+                }
                 Parsed::Usage(usage) => reply(&room, &usage).await,
                 // Unrecognized chatter: help out in a DM, stay silent in a
                 // multi-user room (the bot may share a room with real traffic).
@@ -512,57 +559,94 @@ pub async fn run(
     }
 }
 
-/// The inviter of a pending invite, read from the stripped `m.room.member`
-/// state for our own user (the SDK does not carry an inviter field on the
-/// `Room`).
-async fn stripped_invite_sender(room: &Room, own: &UserId) -> Option<String> {
+/// What we know about a pending invite: who sent it and whether it is a
+/// direct (DM) invite — the latter gates self-serve auto-join (#43).
+struct InviteDetails {
+    sender: String,
+    is_direct: bool,
+}
+
+/// Details of a pending invite, read from the stripped `m.room.member` state
+/// for our own user (the SDK does not carry an inviter field on the `Room`).
+async fn stripped_invite_details(room: &Room, own: &UserId) -> Option<InviteDetails> {
     let raw = room
         .get_state_event_static_for_key::<RoomMemberEventContent, _>(own)
         .await
         .ok()??;
     match raw.deserialize().ok()? {
-        SyncOrStrippedState::Stripped(ev) => Some(ev.sender.to_string()),
+        SyncOrStrippedState::Stripped(ev) => Some(InviteDetails {
+            sender: ev.sender.to_string(),
+            is_direct: ev.content.is_direct.unwrap_or(false),
+        }),
         SyncOrStrippedState::Sync(_) => None,
     }
 }
 
-/// Accept (allowlisted inviter) or reject a room invite. Joins via the
-/// appservice-asserted `POST /join` — the client's own appservice-login token
-/// is guest-classified on some homeservers (Tuwunel) and would 403 on rooms
-/// without `guest_access` (see `matrix::appservice_join_room`).
-async fn handle_invite(ctx: &BotCtx, sender: Option<&str>, room: &Room) {
+/// Accept or reject a room invite. Operators may invite the bot anywhere;
+/// with `open_registration` (#43) anyone else may open a DM (direct invites
+/// only — a self-serve user can't pull the bot into arbitrary rooms, and a
+/// deny-listed owner can't open one at all). Joins via the appservice-asserted
+/// `POST /join` — the client's own appservice-login token is guest-classified
+/// on some homeservers (Tuwunel) and would 403 on rooms without `guest_access`
+/// (see `matrix::appservice_join_room`).
+async fn handle_invite(ctx: &BotCtx, invite: Option<&InviteDetails>, room: &Room) {
     let room_id = room.room_id().to_owned();
-    match sender {
-        Some(s) if ctx.allow.contains(s) => {
-            tracing::info!(room_id = %room_id, inviter = %s, "accepting invite from allowlisted operator");
-            match tokio::time::timeout(
-                Duration::from_secs(30),
-                crate::matrix::appservice_join_room(
-                    &ctx.homeserver_url,
-                    &ctx.appservice_token,
-                    room_id.as_str(),
-                    ctx.own_user.as_str(),
-                ),
-            )
-            .await
-            {
-                Ok(Ok(())) => greet_when_joined(room.clone()),
-                Ok(Err(e)) => {
-                    tracing::error!(room_id = %room_id, error = %e, "failed to join invited room")
+    let accept = match invite {
+        Some(i) if ctx.is_operator(&i.sender) => {
+            tracing::info!(room_id = %room_id, inviter = %i.sender, "accepting invite from allowlisted operator");
+            true
+        }
+        Some(i) if ctx.open_registration => {
+            let banned = match nvb_config::load_banlist(&ctx.banlist_path) {
+                Ok(bans) => bans.contains(BanKind::Owner, &i.sender),
+                // Fail closed, same posture as `link`.
+                Err(e) => {
+                    tracing::error!(error = %e, "ban list unreadable — rejecting self-serve invite (fail-closed)");
+                    true
                 }
-                Err(_) => tracing::error!(room_id = %room_id, "join timed out after 30 s"),
+            };
+            if banned {
+                tracing::warn!(room_id = %room_id, inviter = %i.sender, "rejecting invite from banned user");
+                false
+            } else if !i.is_direct {
+                tracing::info!(room_id = %room_id, inviter = %i.sender, "rejecting non-direct invite from self-serve user (DMs only)");
+                false
+            } else {
+                tracing::info!(room_id = %room_id, inviter = %i.sender, "accepting DM invite from self-serve user (open registration)");
+                true
             }
         }
         _ => {
             tracing::warn!(
                 room_id = %room_id,
-                inviter = sender.unwrap_or("<unknown>"),
+                inviter = invite.map(|i| i.sender.as_str()).unwrap_or("<unknown>"),
                 "rejecting invite from non-allowlisted user"
             );
-            if let Err(e) = room.leave().await {
-                tracing::warn!(room_id = %room_id, error = %e, "failed to reject invite");
-            }
+            false
         }
+    };
+    if !accept {
+        if let Err(e) = room.leave().await {
+            tracing::warn!(room_id = %room_id, error = %e, "failed to reject invite");
+        }
+        return;
+    }
+    match tokio::time::timeout(
+        Duration::from_secs(30),
+        crate::matrix::appservice_join_room(
+            &ctx.homeserver_url,
+            &ctx.appservice_token,
+            room_id.as_str(),
+            ctx.own_user.as_str(),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(())) => greet_when_joined(room.clone()),
+        Ok(Err(e)) => {
+            tracing::error!(room_id = %room_id, error = %e, "failed to join invited room")
+        }
+        Err(_) => tracing::error!(room_id = %room_id, "join timed out after 30 s"),
     }
 }
 
@@ -637,6 +721,20 @@ const BAN_USAGE: &str =
 const UNBAN_USAGE: &str = "Usage: `unban <owner|guild|room> <value>`";
 
 const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridges (static + tenants) and whether they are running\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server] — bridge a Discord voice channel to a Matrix room\n  unlink <name> — remove a bridge created with link\n  ban <owner|guild|room> <value> — deny-list an owner MXID / Discord guild / Matrix room AND unlink every matching tenant\n  unban <owner|guild|room> <value> — remove a ban\n  bans — show the deny-lists\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+
+/// Help for self-serve users (#43): only the verbs they may run, plus the
+/// consent flow they will hit.
+const SELF_SERVE_HELP_TEXT: &str = "Voice bridge commands:\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> — bridge a Discord voice channel to a Matrix room. You must be a moderator of the Matrix room, and someone with Manage Server on the Discord side must approve the link with the `/bridge approve` command and the code you'll receive.\n  unlink <name> — remove a bridge you created\n  list — your bridges\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+
+/// The self-serve command tier (#43): which verbs a non-operator may run when
+/// `open_registration` is on. Ownership scoping inside `list`/`unlink` narrows
+/// further; `ban`/`unban`/`bans` are operator-only.
+fn allowed_for_self_serve(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Help | Command::List | Command::Link { .. } | Command::Unlink { .. }
+    )
+}
 
 /// Parse one message body. The verb is case-insensitive; arguments support
 /// double-quoting for names with spaces.
@@ -722,8 +820,12 @@ fn tokenize(s: &str) -> Option<Vec<String>> {
 
 async fn handle_command(ctx: &BotCtx, room: &Room, sender: &str, cmd: Command) {
     match cmd {
-        Command::Help => reply(room, HELP_TEXT).await,
-        Command::List => handle_list(ctx, room).await,
+        Command::Help => {
+            let text =
+                if ctx.is_operator(sender) { HELP_TEXT } else { SELF_SERVE_HELP_TEXT };
+            reply(room, text).await
+        }
+        Command::List => handle_list(ctx, room, sender).await,
         Command::Unlink { name } => handle_unlink(ctx, room, sender, &name).await,
         Command::Link {
             name,
@@ -1051,13 +1153,20 @@ async fn probe_room_prereqs(
     Ok(ProbeReport { warnings })
 }
 
-async fn handle_list(ctx: &BotCtx, room: &Room) {
+async fn handle_list(ctx: &BotCtx, room: &Room, sender: &str) {
+    // Self-serve users (#43) see only tenants they own; operators see all.
+    let only_owned_by = (!ctx.is_operator(sender)).then_some(sender);
     let Some(running) = query_status(ctx).await else {
         reply(room, "The supervisor did not respond — check the bridge logs.").await;
         return;
     };
     let mut lines: Vec<String> = Vec::new();
     for b in &running {
+        if let Some(me) = only_owned_by {
+            if b.owner.as_deref() != Some(me) {
+                continue;
+            }
+        }
         let owner = b.owner.as_deref().map(|o| format!(", owner {o}")).unwrap_or_default();
         lines.push(format!(
             "• {} — {}, room {}, guild {} channel {}{owner} [running]",
@@ -1070,9 +1179,14 @@ async fn handle_list(ctx: &BotCtx, room: &Room) {
     }
     // Entries in tenants.toml that are NOT running (e.g. their spawn failed).
     let running_labels: HashSet<&str> = running.iter().map(|b| b.label.as_str()).collect();
-    match nvb_config::list_tenant_names(&ctx.tenants_path) {
-        Ok(names) => {
-            for name in names {
+    match nvb_config::tenant_owners(&ctx.tenants_path) {
+        Ok(entries) => {
+            for (name, owner) in entries {
+                if let Some(me) = only_owned_by {
+                    if owner.as_deref() != Some(me) {
+                        continue;
+                    }
+                }
                 if !running_labels.contains(name.as_str()) {
                     lines.push(format!("• {name} — tenant in tenants.toml but NOT running (check logs)"));
                 }
@@ -1081,7 +1195,12 @@ async fn handle_list(ctx: &BotCtx, room: &Room) {
         Err(e) => lines.push(format!("(could not read tenants.toml: {e})")),
     }
     if lines.is_empty() {
-        reply(room, "No bridges. Create one with `link` — send `help` for usage.").await;
+        let text = if only_owned_by.is_some() {
+            "You have no bridges. Create one with `link` — send `help` for usage."
+        } else {
+            "No bridges. Create one with `link` — send `help` for usage."
+        };
+        reply(room, text).await;
     } else {
         reply(room, &format!("Bridges:\n{}", lines.join("\n"))).await;
     }
@@ -1158,6 +1277,38 @@ async fn handle_link(
             tracing::error!(error = %e, "ban list unreadable — refusing link (fail-closed)");
             reply(room, "The ban list is unreadable — link refused until an operator fixes it.")
                 .await;
+            return;
+        }
+    }
+
+    // Per-owner tenant cap (#43): self-serve users only — operators are
+    // bounded by the global max_tenants alone. Pending links count too, or a
+    // user could park cap-dodging links awaiting approval.
+    if let (false, Some(cap)) = (ctx.is_operator(sender), ctx.max_tenants_per_owner) {
+        let existing = match nvb_config::tenant_owners(&ctx.tenants_path) {
+            Ok(entries) => entries
+                .iter()
+                .filter(|(_, o)| o.as_deref() == Some(sender))
+                .count(),
+            Err(e) => {
+                reply(room, &format!("Cannot read tenants.toml: {e}")).await;
+                return;
+            }
+        };
+        let pending = {
+            let map = ctx.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            map.values().filter(|p| p.requester == sender).count()
+        };
+        if existing + pending >= cap {
+            audit(ctx, sender, "link_rejected", serde_json::json!({
+                "name": name, "reason": "owner cap",
+                "existing": existing, "pending": pending, "cap": cap,
+            }));
+            reply(room, &format!(
+                "You already have {existing} bridge(s){} — the limit is {cap} per user. `unlink` one first.",
+                if pending > 0 { format!(" and {pending} awaiting approval") } else { String::new() }
+            ))
+            .await;
             return;
         }
     }
@@ -1404,6 +1555,30 @@ async fn handle_unlink(ctx: &BotCtx, room: &Room, sender: &str, name: &str) {
         return;
     }
     let _guard = ctx.mutate_lock.lock().await;
+    // Self-serve tier (#43): non-operators may only unlink tenants they own.
+    // Checked under the mutate lock so the owner can't change underneath us.
+    if !ctx.is_operator(sender) {
+        match nvb_config::tenant_owners(&ctx.tenants_path) {
+            Ok(entries) => match entries.iter().find(|(n, _)| n == name) {
+                Some((_, owner)) if owner.as_deref() == Some(sender) => {}
+                Some(_) => {
+                    reply(room, &format!(
+                        "You may only unlink bridges you created — '{name}' is not yours."
+                    ))
+                    .await;
+                    return;
+                }
+                None => {
+                    reply(room, &format!("Cannot remove '{name}': tenants file has no bridge named '{name}'")).await;
+                    return;
+                }
+            },
+            Err(e) => {
+                reply(room, &format!("Cannot read tenants.toml: {e}")).await;
+                return;
+            }
+        }
+    }
     let prior = match nvb_config::remove_tenant_entry(&ctx.tenants_path, name) {
         Ok(p) => p,
         Err(e) => {
@@ -1898,6 +2073,29 @@ mod tests {
         // ...at/after the TTL: gone.
         assert!(take_pending(&mut map, &code, 111, t0 + Duration::from_secs(600), ttl).is_err());
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn self_serve_tier_gates_operator_verbs() {
+        assert!(allowed_for_self_serve(&Command::Help));
+        assert!(allowed_for_self_serve(&Command::List));
+        assert!(allowed_for_self_serve(&Command::Link {
+            name: "n".into(),
+            room_id: "!r:x".into(),
+            guild_id: "1".into(),
+            channel_id: "2".into(),
+            server: None,
+        }));
+        assert!(allowed_for_self_serve(&Command::Unlink { name: "n".into() }));
+        assert!(!allowed_for_self_serve(&Command::Ban {
+            kind: "owner".into(),
+            value: "@x:y".into()
+        }));
+        assert!(!allowed_for_self_serve(&Command::Unban {
+            kind: "owner".into(),
+            value: "@x:y".into()
+        }));
+        assert!(!allowed_for_self_serve(&Command::Bans));
     }
 
     #[test]

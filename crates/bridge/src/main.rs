@@ -200,7 +200,7 @@ async fn main() -> Result<()> {
                 mgmt_cfg,
                 server_names,
                 data_dir,
-                limits.mgmt_cooldown_secs,
+                limits,
                 control,
                 mgmt_approval_rx,
                 shutdown,
