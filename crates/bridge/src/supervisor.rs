@@ -740,6 +740,61 @@ mod tests {
         assert!(plan.add.is_empty() && plan.remove.is_empty() && plan.replace.is_empty());
     }
 
+    /// Apply a reconcile plan to the registry the way `reconcile_tenants`'
+    /// bookkeeping does: removals drop, replacements re-key to the NEW config
+    /// (the pending-respawn effective view), additions insert.
+    fn apply_plan(run: &mut HashMap<String, BridgeConfig>, plan: ReconcilePlan) {
+        for l in plan.remove {
+            run.remove(&l);
+        }
+        for b in plan.replace.into_iter().chain(plan.add) {
+            run.insert(b.name.clone().unwrap(), b);
+        }
+    }
+
+    /// Tier-2 named scenario (#38 Phase C2): three consecutive reconciles —
+    /// add, replace, remove — with the registry carried forward, asserting the
+    /// CUMULATIVE state after each step and that a repeat of any file is a
+    /// no-op (the SIGHUP-twice case).
+    #[test]
+    fn scenario_reconcile_sequence_add_replace_remove() {
+        let a = tenant("a", "!a:x");
+        let b = tenant("b", "!b:x");
+        let mut run: HashMap<String, BridgeConfig> = HashMap::new();
+
+        // Reconcile 1: empty → {a, b}.
+        let plan = diff_tenants(&run, vec![a.clone(), b.clone()]);
+        assert_eq!(plan.add.len(), 2);
+        assert!(plan.remove.is_empty() && plan.replace.is_empty());
+        apply_plan(&mut run, plan);
+        assert_eq!(run.len(), 2);
+
+        // Reconcile 2: a changes (deep field) → replace a only, b untouched.
+        let mut a2 = a.clone();
+        a2.livekit.media_e2ee = Some(true);
+        let plan = diff_tenants(&run, vec![a2.clone(), b.clone()]);
+        assert!(plan.add.is_empty() && plan.remove.is_empty());
+        assert_eq!(plan.replace.len(), 1);
+        assert_eq!(plan.replace[0].name.as_deref(), Some("a"));
+        apply_plan(&mut run, plan);
+        assert_eq!(run.len(), 2);
+        assert_eq!(run["a"].livekit.media_e2ee, Some(true), "registry holds the NEW a");
+        assert_eq!(run["b"], b, "b never churned");
+
+        // A second SIGHUP with the same file: complete no-op (effective-
+        // fingerprint semantics — must not double-stop the replaced bridge).
+        let plan = diff_tenants(&run, vec![a2.clone(), b.clone()]);
+        assert!(plan.add.is_empty() && plan.remove.is_empty() && plan.replace.is_empty());
+
+        // Reconcile 3: a2 unlinked → only b remains.
+        let plan = diff_tenants(&run, vec![b.clone()]);
+        assert_eq!(plan.remove, vec!["a".to_string()]);
+        assert!(plan.add.is_empty() && plan.replace.is_empty());
+        apply_plan(&mut run, plan);
+        assert_eq!(run.len(), 1);
+        assert!(run.contains_key("b"));
+    }
+
     #[test]
     fn validate_desired_rejects_static_label_collision_and_key_dupes() {
         let stat = tenant("Main Voice", "!m:x");

@@ -3268,12 +3268,19 @@ mod tests {
 
     /// Build a pool of `n` bots with no channels registered yet.
     fn pool(n: usize) -> Arc<SharedPool> {
+        pool_with_timing(n, &TimingConfig::default())
+    }
+
+    /// Like [`pool`] but with an explicit timing profile — the paused-time
+    /// scenarios shrink the anchor-idle grace through the real `[timing]`
+    /// plumbing rather than reaching into pool internals.
+    fn pool_with_timing(n: usize, timing: &TimingConfig) -> Arc<SharedPool> {
         let cfg = PuppetsConfig {
             tokens: (0..n).map(|i| format!("Bot {i}")).collect(),
             nickname_prefix: "[Matrix] ".to_string(),
             standby_nickname: "[Matrix: Standby]".to_string(),
         };
-        SharedPool::new(&cfg, &TimingConfig::default())
+        SharedPool::new(&cfg, timing)
     }
 
     /// Register a channel `label` at guild/channel ids derived from `g`/`c`, and
@@ -4014,5 +4021,140 @@ mod tests {
             !ch.user_sinks.read().unwrap().contains_key(&4242),
             "ghost sink cleared"
         );
+    }
+
+    // --- Tier-2 named scenarios (#38 Phase C2): multi-step walks through the
+    // allocation lifecycle, composing the seams the single-step tests above
+    // verify in isolation. Each maps to an entry in the scenario catalogue
+    // (docs/nether-voicebridge-testing-design.md).
+
+    /// Catalogue: FCFS promotion order. Overflow speakers must be promoted in
+    /// strict arrival order as slots free up, across releases of dedicated
+    /// speakers AND of the anchor's own participant (which consolidates and
+    /// frees a second bot).
+    #[test]
+    fn scenario_overflow_fcfs_promotion_order() {
+        let p = pool(3);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "u1", "U1"); // anchor
+        p.assign("A", "u2", "U2");
+        p.assign("A", "u3", "U3"); // pool exhausted
+        p.assign("A", "o1", "O1"); // overflow, oldest
+        p.assign("A", "o2", "O2");
+        p.assign("A", "o3", "O3"); // overflow, newest
+        for o in ["o1", "o2", "o3"] {
+            assert!(p.test_is_overflow("A", o), "{o} starts in overflow");
+        }
+
+        // First freed slot goes to o1 — and exactly the freed slot.
+        let s2 = p.test_slot_of("A", "u2").unwrap();
+        p.release("A", "u2");
+        assert_eq!(p.test_slot_of("A", "o1"), Some(s2), "o1 promoted first (oldest)");
+        assert!(p.test_is_overflow("A", "o2") && p.test_is_overflow("A", "o3"));
+
+        // Second freed slot goes to o2, never o3.
+        p.release("A", "u3");
+        assert!(p.test_slot_of("A", "o2").is_some(), "o2 promoted second");
+        assert!(p.test_is_overflow("A", "o3"), "o3 still waiting");
+
+        // Releasing the anchor's own participant consolidates the oldest
+        // non-anchor speaker onto the anchor and frees that bot → o3 promoted.
+        p.release("A", "u1");
+        assert!(p.test_slot_of("A", "o3").is_some(), "o3 promoted by consolidation");
+        for o in ["o1", "o2", "o3"] {
+            assert!(!p.test_is_overflow("A", o), "{o} ends dedicated");
+        }
+        assert_eq!(p.test_free_count(), 0, "all three bots serving o1-o3");
+    }
+
+    /// Catalogue: #24 steal → release → re-promotion, run for TWO rounds. The
+    /// live "stranded overflow bot" bug was a one-shot fix; this guards that
+    /// the demote/re-promote bookkeeping is re-entrant under channel churn.
+    #[test]
+    fn scenario_steal_release_repromotion_two_rounds() {
+        let p = pool(3);
+        channel(&p, "A", 1, 10);
+        channel(&p, "B", 1, 20); // same guild: the only steal case since #46
+        p.assign("A", "a1", "A1");
+        p.assign("A", "a2", "A2");
+        p.assign("A", "a3", "A3"); // A holds all 3 bots
+        let anchor_a = p.test_anchor("A").unwrap();
+
+        for round in 1..=2 {
+            // B activates by stealing A's newest dedicated speaker.
+            p.assign("B", "b1", "B1");
+            assert!(p.test_anchor("B").is_some(), "round {round}: B anchored");
+            assert!(
+                p.test_is_overflow("A", "a3"),
+                "round {round}: a3 demoted to overflow by the steal"
+            );
+            assert_eq!(p.test_anchor("A"), Some(anchor_a), "round {round}: A anchor stable");
+            // B empties → freed bot must re-promote a3 (not strand it).
+            p.release("B", "b1");
+            assert!(
+                p.test_slot_of("A", "a3").is_some() && !p.test_is_overflow("A", "a3"),
+                "round {round}: a3 re-promoted after B freed the bot"
+            );
+            assert_eq!(p.test_free_count(), 0, "round {round}: all bots back on A");
+        }
+    }
+
+    /// Catalogue: anchor idle release. A capture-only anchor (Discord speakers
+    /// present, no Matrix participant) must actually leave voice once the
+    /// anchor-idle grace elapses — driven end-to-end through the `[timing]`
+    /// profile (#38 C1) under tokio paused time.
+    #[tokio::test(start_paused = true)]
+    async fn scenario_anchor_idle_release_after_grace() {
+        let timing = TimingConfig { anchor_idle_grace_ms: 5_000, ..TimingConfig::default() };
+        let p = pool_with_timing(2, &timing);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        let anchor = p.test_anchor("A").unwrap();
+        // A Discord speaker is present, so alice's release keeps a capture-only
+        // anchor and arms the idle grace.
+        {
+            let guard = p.alloc.lock().unwrap();
+            let ch = guard.channels.get("A").unwrap();
+            ch.user_sinks.write().unwrap().insert(999, Arc::new(NoopCaptureSink));
+        }
+        p.release("A", "alice");
+        assert_eq!(p.test_anchor("A"), Some(anchor), "capture-only anchor retained");
+
+        // Just short of the grace: still holding voice.
+        tokio::time::sleep(Duration::from_millis(4_900)).await;
+        assert_eq!(p.test_anchor("A"), Some(anchor), "still anchored before grace");
+
+        // Past the grace: the timer fires and the bot leaves.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(p.test_anchor("A"), None, "anchor released after idle grace");
+        assert_eq!(p.test_free_count(), 2, "connection count back to baseline");
+    }
+
+    /// Catalogue: anchor idle release must be CANCELLED by a Matrix participant
+    /// returning within the grace — and stay cancelled (no late release firing
+    /// after the original deadline passes).
+    #[tokio::test(start_paused = true)]
+    async fn scenario_anchor_idle_release_cancelled_by_returning_user() {
+        let timing = TimingConfig { anchor_idle_grace_ms: 5_000, ..TimingConfig::default() };
+        let p = pool_with_timing(2, &timing);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        let anchor = p.test_anchor("A").unwrap();
+        {
+            let guard = p.alloc.lock().unwrap();
+            let ch = guard.channels.get("A").unwrap();
+            ch.user_sinks.write().unwrap().insert(999, Arc::new(NoopCaptureSink));
+        }
+        p.release("A", "alice"); // grace armed
+
+        // A participant returns well within the grace and reuses the anchor.
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        p.assign("A", "dave", "Dave");
+        assert_eq!(p.test_slot_of("A", "dave"), Some(anchor), "dave reused the anchor");
+
+        // Long past the original deadline: the cancelled timer must not fire.
+        tokio::time::sleep(Duration::from_millis(10_000)).await;
+        assert_eq!(p.test_anchor("A"), Some(anchor), "no late idle release");
+        assert_eq!(p.test_slot_of("A", "dave"), Some(anchor), "dave undisturbed");
     }
 }

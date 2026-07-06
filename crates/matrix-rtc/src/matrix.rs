@@ -1460,4 +1460,42 @@ mod tests {
         assert!(reap.is_empty());
         assert!(since.is_empty(), "timer for a vanished membership is dropped");
     }
+
+    /// Tier-2 named scenario (#38 Phase C2): a user flapping absent→present→
+    /// absent must survive the reaper. Presence within the grace clears the
+    /// clock, and the SECOND absence starts a fresh one — only a full grace of
+    /// *continuous* absence reaps (the #54 class needs a genuine phantom, not
+    /// an EC heartbeat flap or a reconnecting client).
+    #[test]
+    fn scenario_flap_within_grace_survives_reaper() {
+        let key = "_@flappy:x_DEV_m.call";
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        let entries = [entry(key, "@flappy:x", false, false)];
+        let absent = live(&[]);
+        let present = live(&["@flappy:x"]);
+
+        // Absent: the clock starts; nothing reaped inside the grace.
+        assert!(classify_stale_memberships(&absent, &entries, &mut since, t0, GRACE).is_empty());
+        let mid = t0 + GRACE / 2;
+        assert!(classify_stale_memberships(&absent, &entries, &mut since, mid, GRACE).is_empty());
+
+        // Reappears within the grace → the clock is cleared.
+        assert!(classify_stale_memberships(&present, &entries, &mut since, mid, GRACE).is_empty());
+        assert!(since.is_empty(), "flap-back clears the phantom clock");
+
+        // Absent again: a FRESH clock — the earlier absence must not count.
+        let t1 = t0 + GRACE; // a full grace after first absence, but just re-absent
+        assert!(classify_stale_memberships(&absent, &entries, &mut since, t1, GRACE).is_empty());
+        let almost = t1 + GRACE - Duration::from_millis(1);
+        assert!(
+            classify_stale_memberships(&absent, &entries, &mut since, almost, GRACE).is_empty(),
+            "continuous absence not yet a full grace — kept"
+        );
+
+        // Only now has it been continuously absent for the full grace.
+        let reap = classify_stale_memberships(&absent, &entries, &mut since, t1 + GRACE, GRACE);
+        assert_eq!(reap, vec![key.to_string()]);
+        assert!(since.is_empty());
+    }
 }
