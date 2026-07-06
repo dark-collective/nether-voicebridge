@@ -13,6 +13,12 @@
 pub mod jitter;
 // Per-participant playback mixer for the Matrix → Discord direction (Phase 6).
 pub mod mixer;
+// Audio-integrity oracle: tolerance-based source-vs-captured comparison with
+// dropout/glitch detectors (#38 Tier 1; also the Tier-3 WavComparator).
+pub mod oracle;
+// Deterministic probe-signal synthesis — the oracle's golden inputs, seeded
+// so no WAV blobs live in git (#38).
+pub mod probe;
 // Cross-side playback routing: Matrix participants → Discord puppet outputs
 // (Phase 7 attribution). SDK-free contract between matrix-rtc and discord.
 pub mod routing;
