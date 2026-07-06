@@ -1,0 +1,73 @@
+name: CI
+
+# Hermetic per-PR gate (issue #38, Phase A): unit/integration tests + clippy.
+# Runs on every branch push and PR — unlike docker.yml, which is reserved for
+# releases. The live E2E harness (Phase D) gets its own nightly workflow and is
+# NEVER folded in here: external services make it inherently flaky, and a red
+# nightly is a triage ticket, not a merge block.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# One self-hosted runner, shared with release builds — a superseded push on the
+# same ref should yield its slot immediately.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Run directly on the runner's default act image (has node for the JS
+    # actions — a `container: rust:...` would lack it and break checkout/cache)
+    # and install the Rust toolchain ourselves, same pattern as docker.yml's
+    # packages job installing nfpm.
+    runs-on: docker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Mirror the Dockerfile's native build deps (livekit needs cmake/clang/
+      # bindgen + protobuf; opus is linked dynamically). livekit also downloads
+      # a prebuilt libwebrtc (~400-600 MB) into target/ on a cold build.
+      - name: Install native build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake clang libclang-dev libopus-dev \
+            pkg-config protobuf-compiler libssl-dev
+
+      # Cache keyed on the lockfile: toolchain + registry + git deps + the
+      # debug target dir (incl. the libwebrtc download). If target/ turns out
+      # to exceed the cache backend's limit, drop it from `path` and keep only
+      # ~/.cargo + ~/.rustup — slower compiles, but correct.
+      - name: Cache toolchain + cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ci-
+
+      # Stable toolchain via rustup (skipped when restored from cache). The
+      # release Dockerfile builds on rust:1-bookworm = the same stable channel.
+      - name: Install Rust toolchain
+        run: |
+          if ! [ -x "$HOME/.cargo/bin/cargo" ]; then
+            curl -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable --component clippy
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # --locked: the songbird/livekit pins are load-bearing (CLAUDE.md
+      # constraint 7); CI must never resolve a floated lockfile. The vendored
+      # [patch.crates-io] songbird is in-tree and needs nothing special.
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
