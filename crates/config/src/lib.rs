@@ -1,6 +1,7 @@
 #![allow(dead_code)] // secret fields are read in later phases
 
 use serde::Deserialize;
+use std::time::Duration;
 use thiserror::Error;
 
 mod banlist;
@@ -75,6 +76,17 @@ pub struct Config {
     /// pre-limits behavior. Absent section ⇒ all unlimited.
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// Raw `[timing]` overrides as written in the TOML (each key optional).
+    /// Resolved into `timing` at load time together with the `NVB_TIMING` env
+    /// preset; consumers read the resolved `timing`, never this.
+    #[serde(rename = "timing", default)]
+    timing_raw: TimingOverrides,
+    /// The resolved grace-timer profile (#38 Tier-2/3 testing): the `NVB_TIMING`
+    /// preset applied first, then any explicit `[timing]` keys on top. Defaults
+    /// are byte-identical to the historical hardcoded values — production
+    /// behavior is unchanged unless timing is deliberately configured.
+    #[serde(skip)]
+    pub timing: TimingConfig,
 }
 
 /// The `[limits]` block: operator-wide admission budgets (#47). These are
@@ -104,6 +116,166 @@ pub struct LimitsConfig {
     /// only — operators are bounded by `max_tenants` alone. `None` ⇒ unlimited.
     #[serde(default)]
     pub max_tenants_per_owner: Option<usize>,
+}
+
+/// The resolved grace-timer profile (#38). Every lifecycle timer the bridge
+/// runs on, in milliseconds. `Default` is **byte-identical to the historical
+/// hardcoded constants** — the only reason to touch these is the automated
+/// test harness (compressed graces make Tier-2/3 scenarios run in seconds
+/// instead of minutes). A non-default profile is loudly warned about at
+/// startup: it must never reach an unsuspecting production deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimingConfig {
+    /// Grace before a Matrix membership "leave" releases the puppet. Element
+    /// Call memberships spuriously flap active→inactive→active (~2-3 s gap,
+    /// ~every 90 s, MSC4140 expiry/heartbeat) — a reappear within the grace
+    /// cancels the release. Historical value 12 s.
+    pub leave_grace_ms: u64,
+    /// How long a non-ghost `m.call.member` must be continuously absent from
+    /// the LiveKit roster before the stale-membership reaper (#25) empties it.
+    /// Historical value 45 s.
+    pub reap_grace_ms: u64,
+    /// How often, while a call is active, the reaper sweeps for phantom
+    /// memberships. Historical value 20 s.
+    pub reap_interval_ms: u64,
+    /// How long a capture-only anchor (no Matrix participant of its own)
+    /// lingers in the Discord channel before it leaves — absorbs a Matrix
+    /// membership flap without churning the songbird/SSRC session.
+    /// Historical value 90 s.
+    pub anchor_idle_grace_ms: u64,
+    /// Base quarantine cooldown after a puppet's voice join times out; grows
+    /// `base * 2^n` per consecutive failure. Historical value 15 s.
+    pub quarantine_base_ms: u64,
+    /// Cap on the exponential quarantine backoff. Historical value 120 s.
+    pub quarantine_max_ms: u64,
+    /// How often the reconcile sweep probes each active puppet's voice
+    /// connection (backstop for a silent connection death). Historical
+    /// value 15 s.
+    pub voice_health_sweep_ms: u64,
+}
+
+impl Default for TimingConfig {
+    fn default() -> Self {
+        // The pre-#38 hardcoded constants, exactly.
+        Self {
+            leave_grace_ms: 12_000,
+            reap_grace_ms: 45_000,
+            reap_interval_ms: 20_000,
+            anchor_idle_grace_ms: 90_000,
+            quarantine_base_ms: 15_000,
+            quarantine_max_ms: 120_000,
+            voice_health_sweep_ms: 15_000,
+        }
+    }
+}
+
+impl TimingConfig {
+    /// The `NVB_TIMING=compressed` preset: every grace at 1-3 s so hermetic
+    /// and live test scenarios complete in seconds. Relative ordering of the
+    /// timers is preserved (sweep/interval ticks faster than the graces they
+    /// feed; quarantine still backs off toward its cap).
+    pub fn compressed() -> Self {
+        Self {
+            leave_grace_ms: 2_000,
+            reap_grace_ms: 3_000,
+            reap_interval_ms: 1_000,
+            anchor_idle_grace_ms: 3_000,
+            quarantine_base_ms: 1_000,
+            quarantine_max_ms: 3_000,
+            voice_health_sweep_ms: 1_000,
+        }
+    }
+
+    /// True when the profile is exactly the production default — the guard the
+    /// startup warn keys on.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn leave_grace(&self) -> Duration {
+        Duration::from_millis(self.leave_grace_ms)
+    }
+    pub fn reap_grace(&self) -> Duration {
+        Duration::from_millis(self.reap_grace_ms)
+    }
+    pub fn reap_interval(&self) -> Duration {
+        Duration::from_millis(self.reap_interval_ms)
+    }
+    pub fn anchor_idle_grace(&self) -> Duration {
+        Duration::from_millis(self.anchor_idle_grace_ms)
+    }
+    pub fn quarantine_base(&self) -> Duration {
+        Duration::from_millis(self.quarantine_base_ms)
+    }
+    pub fn quarantine_max(&self) -> Duration {
+        Duration::from_millis(self.quarantine_max_ms)
+    }
+    pub fn voice_health_sweep(&self) -> Duration {
+        Duration::from_millis(self.voice_health_sweep_ms)
+    }
+}
+
+/// The raw `[timing]` block: per-key overrides, each optional. Kept separate
+/// from [`TimingConfig`] so resolution can honor "preset first, explicit keys
+/// override" — after plain deserialization an explicitly-written default value
+/// would be indistinguishable from an absent key.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct TimingOverrides {
+    #[serde(default)]
+    pub leave_grace_ms: Option<u64>,
+    #[serde(default)]
+    pub reap_grace_ms: Option<u64>,
+    #[serde(default)]
+    pub reap_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub anchor_idle_grace_ms: Option<u64>,
+    #[serde(default)]
+    pub quarantine_base_ms: Option<u64>,
+    #[serde(default)]
+    pub quarantine_max_ms: Option<u64>,
+    #[serde(default)]
+    pub voice_health_sweep_ms: Option<u64>,
+}
+
+impl TimingOverrides {
+    /// Resolve the effective timing profile: start from the preset (`None` /
+    /// `"default"` ⇒ production defaults, `"compressed"` ⇒
+    /// [`TimingConfig::compressed`]), then apply each explicitly-set key on
+    /// top. Zero is rejected for every field — a zero-period `tokio` interval
+    /// panics, and a zero grace would make the debounces meaningless in a way
+    /// that only surfaces as racy runtime behavior.
+    pub fn resolve(&self, preset: Option<&str>) -> Result<TimingConfig, ConfigError> {
+        let mut t = match preset {
+            None | Some("") | Some("default") => TimingConfig::default(),
+            Some("compressed") => TimingConfig::compressed(),
+            Some(other) => {
+                return Err(ConfigError::InvalidEnv(format!(
+                    "NVB_TIMING='{other}' (expected 'default' or 'compressed')"
+                )));
+            }
+        };
+        macro_rules! apply {
+            ($field:ident) => {
+                if let Some(v) = self.$field {
+                    if v == 0 {
+                        return Err(ConfigError::Validation(format!(
+                            "[timing] {} must be > 0",
+                            stringify!($field)
+                        )));
+                    }
+                    t.$field = v;
+                }
+            };
+        }
+        apply!(leave_grace_ms);
+        apply!(reap_grace_ms);
+        apply!(reap_interval_ms);
+        apply!(anchor_idle_grace_ms);
+        apply!(quarantine_base_ms);
+        apply!(quarantine_max_ms);
+        apply!(voice_health_sweep_ms);
+        Ok(t)
+    }
 }
 
 /// The `[management]` block: a Matrix bot that lets allowlisted operators
@@ -827,6 +999,12 @@ pub fn validate_bridge_against(
     Ok(())
 }
 
+/// The `NVB_TIMING` env preset, normalized: unset or empty ⇒ `None` (default
+/// profile). Read at load time only, alongside `NVB_DATA_DIR`.
+fn timing_preset_from_env() -> Option<String> {
+    std::env::var("NVB_TIMING").ok().filter(|v| !v.is_empty())
+}
+
 impl Config {
     pub fn load(path: &str) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
@@ -852,6 +1030,9 @@ impl Config {
         if let Some(m) = cfg.management.as_mut() {
             resolve_management(m, &cfg.servers, &cfg.data_dir);
         }
+        // Timing profile: `NVB_TIMING` preset first, explicit `[timing]` keys
+        // override (#38). Defaults are byte-identical to the historical consts.
+        cfg.timing = cfg.timing_raw.resolve(timing_preset_from_env().as_deref())?;
         Ok(cfg)
     }
 
@@ -1042,6 +1223,10 @@ impl Config {
             // management bot and admission limits are config-file features.
             management: None,
             limits: LimitsConfig::default(),
+            timing_raw: TimingOverrides::default(),
+            // Env-var mode has no `[timing]` keys; the `NVB_TIMING` preset
+            // still applies (the harness reaches for it in both modes).
+            timing: TimingOverrides::default().resolve(timing_preset_from_env().as_deref())?,
             bridges: vec![BridgeConfig {
                 name,
                 server: None,
@@ -2203,6 +2388,73 @@ appservice_token = "hs_tok"
         let err = loaded(&raw).validate().unwrap_err();
         assert!(
             err.to_string().contains("duplicate matrix store_path"),
+            "unexpected: {err}"
+        );
+    }
+
+    // --- [timing] / NVB_TIMING resolution (#38 C1). Tests drive the pure
+    // `TimingOverrides::resolve` with an explicit preset argument instead of
+    // touching the process env (the env test at the bottom of this module is
+    // the suite's sole env reader/writer).
+
+    #[test]
+    fn timing_defaults_match_historical_consts() {
+        // The values the hardcoded constants had before #38 — byte-identical.
+        let t = TimingConfig::default();
+        assert_eq!(t.leave_grace_ms, 12_000);
+        assert_eq!(t.reap_grace_ms, 45_000);
+        assert_eq!(t.reap_interval_ms, 20_000);
+        assert_eq!(t.anchor_idle_grace_ms, 90_000);
+        assert_eq!(t.quarantine_base_ms, 15_000);
+        assert_eq!(t.quarantine_max_ms, 120_000);
+        assert_eq!(t.voice_health_sweep_ms, 15_000);
+        assert!(t.is_default());
+        assert!(!TimingConfig::compressed().is_default());
+    }
+
+    #[test]
+    fn timing_absent_section_resolves_to_default() {
+        let cfg: Config = toml::from_str("").expect("parse failed");
+        let t = cfg.timing_raw.resolve(None).expect("resolve failed");
+        assert!(t.is_default());
+        // "default"/empty preset spellings are equivalent to no preset.
+        assert!(cfg.timing_raw.resolve(Some("default")).unwrap().is_default());
+    }
+
+    #[test]
+    fn timing_toml_key_overrides_default() {
+        let cfg: Config =
+            toml::from_str("[timing]\nleave_grace_ms = 5000\n").expect("parse failed");
+        let t = cfg.timing_raw.resolve(None).expect("resolve failed");
+        assert_eq!(t.leave_grace_ms, 5_000);
+        assert_eq!(t.reap_grace_ms, 45_000); // untouched keys keep defaults
+        assert!(!t.is_default());
+        assert_eq!(t.leave_grace(), Duration::from_millis(5_000));
+    }
+
+    #[test]
+    fn timing_explicit_key_beats_compressed_preset() {
+        let cfg: Config =
+            toml::from_str("[timing]\nreap_grace_ms = 7000\n").expect("parse failed");
+        let t = cfg.timing_raw.resolve(Some("compressed")).expect("resolve failed");
+        // Preset first, explicit keys on top.
+        assert_eq!(t.reap_grace_ms, 7_000);
+        assert_eq!(t.leave_grace_ms, TimingConfig::compressed().leave_grace_ms);
+        assert_eq!(t.reap_interval_ms, TimingConfig::compressed().reap_interval_ms);
+    }
+
+    #[test]
+    fn timing_rejects_unknown_preset_and_zero_values() {
+        let empty = TimingOverrides::default();
+        let err = empty.resolve(Some("fast")).unwrap_err();
+        assert!(err.to_string().contains("NVB_TIMING"), "unexpected: {err}");
+
+        // Zero is rejected for every field: a zero-period tokio interval panics.
+        let cfg: Config =
+            toml::from_str("[timing]\nreap_interval_ms = 0\n").expect("parse failed");
+        let err = cfg.timing_raw.resolve(None).unwrap_err();
+        assert!(
+            err.to_string().contains("reap_interval_ms must be > 0"),
             "unexpected: {err}"
         );
     }

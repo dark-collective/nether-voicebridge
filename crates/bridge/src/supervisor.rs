@@ -27,7 +27,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use nvb_audio::routing::{CaptureRouter, PlaybackRouter};
-use nvb_config::{BridgeConfig, LimitsConfig, LiveKeys, ServerProfile, validate_bridge_against};
+use nvb_config::{
+    BridgeConfig, LimitsConfig, LiveKeys, ServerProfile, TimingConfig, validate_bridge_against,
+};
 use nvb_discord::{CaptureSink, SharedPool};
 use nvb_matrix_rtc::GhostPool;
 use nvb_matrix_rtc::mgmt::{BridgeStatus, ControlMsg, ControlTx, ReconcileSummary};
@@ -106,6 +108,9 @@ pub struct TenantsCtx {
     /// admission path through [`validate_desired`]; `max_ghosts_per_bridge` is
     /// threaded into each bridge's `GhostPool`.
     pub limits: LimitsConfig,
+    /// Resolved `[timing]` grace-timer profile (#38), passed to every bridge's
+    /// Matrix/RTC side at spawn. Defaults match the historical hardcoded values.
+    pub timing: TimingConfig,
 }
 
 /// Book-keeping for one live bridge, keyed by label in [`Supervisor::running`].
@@ -232,12 +237,15 @@ impl Supervisor {
 
         let span = tracing::info_span!("bridge", name = %label);
         let fut_label = label.clone();
+        // Copied out of `self.ctx` so the `'static` bridge future doesn't borrow it.
+        let timing = self.ctx.timing;
         let fut = async move {
             tokio::select! {
                 biased;
                 result = nvb_matrix_rtc::run(
                     &bridge.matrix,
                     &bridge.livekit,
+                    timing,
                     router,
                     ghost_pool,
                     fut_label.clone(),
@@ -741,6 +749,7 @@ mod tests {
             static_keys: LiveKeys::from_bridges([&stat]),
             static_labels: HashSet::from(["Main Voice".to_string()]),
             limits: LimitsConfig::default(),
+            timing: TimingConfig::default(),
         };
         // Label collision with a static bridge.
         let t = tenant("Main Voice", "!t:x");
@@ -767,6 +776,7 @@ mod tests {
             static_keys: LiveKeys::default(),
             static_labels: HashSet::new(),
             limits: LimitsConfig::default(),
+            timing: TimingConfig::default(),
         };
         let a = tenant("a", "!a:x");
         let b = tenant("b", "!b:x");
@@ -781,6 +791,7 @@ mod tests {
             static_keys: LiveKeys::default(),
             static_labels: HashSet::new(),
             limits: LimitsConfig { max_tenants: Some(2), ..Default::default() },
+            timing: TimingConfig::default(),
         };
         let a = tenant("a", "!a:x");
         let b = tenant("b", "!b:x");

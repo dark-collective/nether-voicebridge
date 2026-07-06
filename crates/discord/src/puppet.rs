@@ -62,7 +62,7 @@ use tokio_util::sync::CancellationToken;
 
 use nvb_audio::mixer::PlaybackMixer;
 use nvb_audio::routing::{CaptureRouter, ParticipantSink, PlaybackRouter};
-use nvb_config::PuppetsConfig;
+use nvb_config::{PuppetsConfig, TimingConfig};
 
 use crate::{
     BotIdSet, CaptureSink, ConnectionLogger, PlaybackSource, SpeakingLogger, SsrcMap, UserSinkMap,
@@ -72,28 +72,10 @@ use crate::{
 /// Sentinel for "no anchor currently elected" in [`ChannelState::anchor`].
 const NO_ANCHOR: usize = usize::MAX;
 
-/// Quarantine backoff after a bot's `manager.join` times out (skipped by the
-/// allocator until a recovery timer makes it eligible again). The cooldown grows
-/// exponentially per consecutive failure — `QUARANTINE_BASE * 2^n`, capped at
-/// `QUARANTINE_MAX` — so a transient hop-glitch heals fast while a genuinely
-/// wedged gateway backs off instead of thrashing rejoin attempts. The counter
-/// (`PuppetSlot::fail_count`) resets on a successful join.
-const QUARANTINE_BASE: Duration = Duration::from_secs(15);
-const QUARANTINE_MAX: Duration = Duration::from_secs(120);
-
-/// How often the reconcile sweep probes each active puppet's voice connection
-/// (a backstop for a silent connection death that never fired a
-/// `DriverDisconnect`). The probe is cheap and only acts when a bot the
-/// allocator believes is live is genuinely out of voice (`current_channel()`
-/// is `None`), so the interval can be generous.
-const VOICE_HEALTH_SWEEP: Duration = Duration::from_secs(15);
-
-/// How long a capture-only anchor (one held in voice with no Matrix participant of
-/// its own, only Discord speakers remaining) lingers before it leaves the Discord
-/// channel. Long enough to absorb a Matrix membership flap (which would otherwise
-/// churn the songbird/SSRC session) but bounded so no nameless bot idles in voice
-/// once the call is genuinely empty of Matrix users.
-const ANCHOR_IDLE_GRACE: Duration = Duration::from_secs(90);
+// The quarantine backoff, voice-health sweep, and anchor-idle grace timers
+// were hardcoded consts here until #38; they now come from the resolved
+// `[timing]` config (`nvb_config::TimingConfig`, defaults identical) and live
+// as fields on [`SharedPool`].
 
 
 /// Speaking-gate poll cadence. One Discord tick; well under the mixer's 150 ms
@@ -184,7 +166,7 @@ enum PuppetCommand {
     SetNickname { guild: GuildId, name: String },
     /// Wear the standby label (`[puppets] standby_nickname`, a WHOLE nickname —
     /// no prefix) while idling as a capture-only anchor in `guild` during the
-    /// [`ANCHOR_IDLE_GRACE`] window, so Discord users can tell "the bridge is
+    /// anchor-idle grace window, so Discord users can tell "the bridge is
     /// idling here briefly" from a bridged participant (#59 UX).
     SetStandbyNickname { guild: GuildId },
     /// Reset the nickname, leave voice, drop the SSRC exclusion — for this bot's
@@ -354,8 +336,8 @@ struct SessionHealth {
     /// until a recovery timer clears it after the backoff cooldown.
     unhealthy: bool,
     /// Consecutive join failures here with no intervening success. Drives the
-    /// exponential quarantine backoff (`QUARANTINE_BASE * 2^n`, capped at
-    /// `QUARANTINE_MAX`); reset only by a successful join.
+    /// exponential quarantine backoff (`quarantine_base * 2^n`, capped at
+    /// `quarantine_max`); reset only by a successful join.
     fail_count: u32,
     /// A mid-session voice-disconnect recovery (rejoin) is in flight for this
     /// guild's Call. Debounces repeated `DriverDisconnect`/sweep signals; gated
@@ -420,13 +402,38 @@ pub struct SharedPool {
     alloc: StdMutex<AllocState>,
     /// `/bridge approve` wiring (#47) — `None` unless two-sided link auth is on.
     link_approval: std::sync::OnceLock<LinkApprovalCfg>,
+    /// Base quarantine cooldown after a bot's `manager.join` times out (skipped
+    /// by the allocator until a recovery timer makes it eligible again). The
+    /// cooldown grows exponentially per consecutive failure —
+    /// `quarantine_base * 2^n`, capped at `quarantine_max` — so a transient
+    /// hop-glitch heals fast while a genuinely wedged gateway backs off instead
+    /// of thrashing rejoin attempts. The counter (`SessionHealth::fail_count`)
+    /// resets on a successful join. Default 15 s (`[timing]`, #38).
+    quarantine_base: Duration,
+    /// Cap on the exponential quarantine backoff. Default 120 s.
+    quarantine_max: Duration,
+    /// How often the reconcile sweep probes each active puppet's voice
+    /// connection (a backstop for a silent connection death that never fired a
+    /// `DriverDisconnect`). The probe is cheap and only acts when a bot the
+    /// allocator believes is live is genuinely out of voice
+    /// (`current_channel()` is `None`), so the interval can be generous.
+    /// Default 15 s.
+    voice_health_sweep: Duration,
+    /// How long a capture-only anchor (one held in voice with no Matrix
+    /// participant of its own, only Discord speakers remaining) lingers before
+    /// it leaves the Discord channel. Long enough to absorb a Matrix membership
+    /// flap (which would otherwise churn the songbird/SSRC session) but bounded
+    /// so no nameless bot idles in voice once the call is genuinely empty of
+    /// Matrix users. Default 90 s.
+    anchor_idle_grace: Duration,
 }
 
 impl SharedPool {
-    /// Build the pool from the shared `[puppets]` config. Cheap and synchronous —
-    /// clients are not started until [`run`](Self::run), so the returned `Arc` and
-    /// its [`ChannelView`]s can be handed to the Matrix side up front.
-    pub fn new(cfg: &PuppetsConfig) -> Arc<Self> {
+    /// Build the pool from the shared `[puppets]` config and the resolved
+    /// timing profile. Cheap and synchronous — clients are not started until
+    /// [`run`](Self::run), so the returned `Arc` and its [`ChannelView`]s can
+    /// be handed to the Matrix side up front.
+    pub fn new(cfg: &PuppetsConfig, timing: &TimingConfig) -> Arc<Self> {
         let slots = cfg
             .tokens
             .iter()
@@ -475,6 +482,10 @@ impl SharedPool {
                 health: HashMap::new(),
             }),
             link_approval: std::sync::OnceLock::new(),
+            quarantine_base: timing.quarantine_base(),
+            quarantine_max: timing.quarantine_max(),
+            voice_health_sweep: timing.voice_health_sweep(),
+            anchor_idle_grace: timing.anchor_idle_grace(),
         })
     }
 
@@ -595,7 +606,7 @@ impl SharedPool {
             let pool = self.clone();
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
-                let mut tick = tokio::time::interval(VOICE_HEALTH_SWEEP);
+                let mut tick = tokio::time::interval(pool.voice_health_sweep);
                 tick.tick().await; // consume the immediate first tick
                 loop {
                     tokio::select! {
@@ -1362,15 +1373,17 @@ impl SharedPool {
         let guard = &mut *guard;
 
         // Quarantine the stuck (bot, guild) regardless (cleared after the backoff
-        // cooldown). Exponential backoff: QUARANTINE_BASE * 2^n, capped at
-        // QUARANTINE_MAX. `n` = prior consecutive failures here; clamp the shift
+        // cooldown). Exponential backoff: quarantine_base * 2^n, capped at
+        // quarantine_max. `n` = prior consecutive failures here; clamp the shift
         // so it can't overflow.
         let backoff = {
             let h = guard.health.entry((idx, guild)).or_default();
             h.unhealthy = true;
             let shift = h.fail_count.min(6);
             h.fail_count += 1;
-            QUARANTINE_BASE.saturating_mul(1u32 << shift).min(QUARANTINE_MAX)
+            self.quarantine_base
+                .saturating_mul(1u32 << shift)
+                .min(self.quarantine_max)
         };
 
         // Locate the (bridge, key) this bot was serving in the failed guild.
@@ -1787,7 +1800,7 @@ impl SharedPool {
     ///
     /// `keep_capture_anchor` (#59): on a call-end (`release_all`) a channel whose
     /// Discord speakers are still present keeps its anchor as capture-only under
-    /// the [`ANCHOR_IDLE_GRACE`] timer — a Matrix user returning within the grace
+    /// the anchor-idle grace timer — a Matrix user returning within the grace
     /// (e.g. after an Element Call membership flap) reuses the live session with
     /// no join latency and no SSRC-map reset. `false` (`unregister_channel`)
     /// drains unconditionally: teardown must return the connection count to
@@ -1908,7 +1921,7 @@ impl SharedPool {
     }
 
     /// Arm (or re-arm) the grace timer that releases a capture-only anchor if no
-    /// Matrix participant returns within [`ANCHOR_IDLE_GRACE`]. Cancels any prior
+    /// Matrix participant returns within the anchor-idle grace. Cancels any prior
     /// timer for the channel. Must be called with the `alloc` guard already held
     /// (it stores the token under it); the spawned task re-locks on expiry.
     fn schedule_anchor_idle_release(self: &Arc<Self>, guard: &mut AllocState, bridge: &str) {
@@ -1922,7 +1935,7 @@ impl SharedPool {
         tokio::spawn(async move {
             tokio::select! {
                 _ = token.cancelled() => {}
-                _ = tokio::time::sleep(ANCHOR_IDLE_GRACE) => {
+                _ = tokio::time::sleep(pool.anchor_idle_grace) => {
                     pool.release_capture_only_anchor_if_idle(&bridge);
                 }
             }
@@ -3260,7 +3273,7 @@ mod tests {
             nickname_prefix: "[Matrix] ".to_string(),
             standby_nickname: "[Matrix: Standby]".to_string(),
         };
-        SharedPool::new(&cfg)
+        SharedPool::new(&cfg, &TimingConfig::default())
     }
 
     /// Register a channel `label` at guild/channel ids derived from `g`/`c`, and
@@ -3699,7 +3712,8 @@ mod tests {
         channel(&p, "A", 1, 10);
         p.assign("A", "alice", "Alice");
         let sa = p.test_slot_of("A", "alice").unwrap();
-        // Consecutive failures back off exponentially, capped at QUARANTINE_MAX.
+        // Consecutive failures back off exponentially, capped at quarantine_max
+        // (the default [timing] profile: base 15 s, cap 120 s).
         let g = GuildId::new(1);
         assert_eq!(p.on_join_failed(sa, g), Duration::from_secs(15));
         assert_eq!(p.on_join_failed(sa, g), Duration::from_secs(30));

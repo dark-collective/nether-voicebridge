@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use nvb_audio::routing::PlaybackRouter;
-use nvb_config::{LiveKitConfig, MatrixConfig};
+use nvb_config::{LiveKitConfig, MatrixConfig, TimingConfig};
 
 pub use rtc::ghost::GhostPool;
 
@@ -45,6 +45,10 @@ pub use rtc::ghost::GhostPool;
 pub async fn run(
     matrix_cfg: &MatrixConfig,
     livekit_cfg: &LiveKitConfig,
+    // Resolved `[timing]` grace-timer profile (#38): the leave-grace debounce
+    // and the stale-membership reaper cadence. Defaults match the historical
+    // hardcoded values; the supervisor resolves it once per process.
+    timing: TimingConfig,
     router: Arc<dyn PlaybackRouter>,
     ghost_pool: Arc<GhostPool>,
     bridge: Arc<str>,
@@ -177,6 +181,7 @@ pub async fn run(
             client.clone(),
             matrix_cfg,
             media_e2ee,
+            timing.leave_grace(),
             call_active_tx,
             members_gen_tx,
             router.clone(),
@@ -188,6 +193,8 @@ pub async fn run(
             livekit_cfg,
             matrix_cfg,
             media_e2ee,
+            timing.reap_interval(),
+            timing.reap_grace(),
             call_active_rx,
             router,
             bridge.clone(),

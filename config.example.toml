@@ -107,6 +107,22 @@
 # max_tenants_per_owner = 2     # bridges one self-serve user may own at once (#43;
 #                               # counts pending approvals too; operators exempt)
 
+# ── Timing (test harness only — leave unset in production) ──────────────────
+# Grace-timer profile (#38). Defaults are the production values; the automated
+# test harness compresses them so lifecycle scenarios run in seconds. Setting
+# ANY key (or NVB_TIMING=compressed in the environment; explicit keys below
+# override the preset) logs a loud startup warning. All values in milliseconds
+# and must be > 0.
+#
+# [timing]
+# leave_grace_ms = 12000        # membership-leave debounce before puppet release
+# reap_grace_ms = 45000         # phantom m.call.member absence before the reaper empties it
+# reap_interval_ms = 20000      # reaper sweep cadence while a call is active
+# anchor_idle_grace_ms = 90000  # capture-only anchor linger before leaving voice
+# quarantine_base_ms = 15000    # base voice-join-failure backoff (doubles per failure)
+# quarantine_max_ms = 120000    # cap on that backoff
+# voice_health_sweep_ms = 15000 # silent-voice-death probe cadence
+
 [puppets]
 # One entry per puppet bot — each is a SEPARATE Discord application with its own
 # bot token, created deliberately at discord.com/developers/applications. This is

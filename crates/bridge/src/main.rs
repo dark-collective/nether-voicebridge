@@ -112,7 +112,20 @@ async fn main() -> Result<()> {
         data_dir,
         management,
         limits,
+        timing,
+        ..
     } = cfg;
+
+    // Loud guard (#38): a non-default [timing]/NVB_TIMING profile compresses
+    // the lifecycle grace timers — meant ONLY for the test harness. Make it
+    // impossible to miss on a production deployment.
+    if !timing.is_default() {
+        tracing::warn!(
+            ?timing,
+            "NON-DEFAULT TIMING PROFILE ACTIVE — grace timers differ from production \
+             defaults; this is a test-harness feature, do not run real traffic with it"
+        );
+    }
 
     // Captured before `servers`/`data_dir` move into the supervisor's ctx: the
     // management bot only needs the profile NAMES (for `link`'s server
@@ -127,7 +140,7 @@ async fn main() -> Result<()> {
     // clients started once (`pool.run`), dynamically allocated across every
     // bridge's channel. Each bridge registers its channel and gets a `ChannelView`
     // (its `PlaybackRouter`). The Matrix/RTC side stays per-bridge.
-    let pool = SharedPool::new(&puppets);
+    let pool = SharedPool::new(&puppets, &timing);
     // The pool's own shutdown root: Ctrl-C cancels it to drain every puppet.
     let pool_shutdown = CancellationToken::new();
 
@@ -169,6 +182,7 @@ async fn main() -> Result<()> {
             static_keys,
             static_labels,
             limits,
+            timing,
         },
     );
 

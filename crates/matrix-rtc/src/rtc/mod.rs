@@ -51,11 +51,11 @@ use nvb_config::{LiveKitConfig, MatrixConfig};
 use keys::CallEncryptionKeysEventContent;
 use well_known::LivekitFocusInfo;
 
-/// How often, while a call is active, to sweep for stale `m.call.member`
-/// phantoms (users in the Matrix roster with no live LiveKit participant). With
-/// `matrix::REAP_GRACE` (45 s), a pre-existing phantom clears within ~a minute of
-/// the call becoming active. See [`matrix::reap_stale_memberships`].
-const REAP_INTERVAL: Duration = Duration::from_secs(20);
+// The reaper's sweep interval (20 s default — with the default 45 s reap
+// grace, a pre-existing phantom clears within ~a minute of the call becoming
+// active) was a hardcoded const here until #38; it now comes from the resolved
+// `[timing]` config (`TimingConfig::reap_interval`) as `run`'s `reap_interval`
+// parameter. See [`matrix::reap_stale_memberships`].
 
 /// State held while the bridge bot is connected to a live call (subscribe-only).
 struct ActiveSession {
@@ -86,6 +86,11 @@ pub(crate) async fn run(
     // `lib::run`), NOT the raw `lk_cfg.media_e2ee` Option. Gates the subscriber's
     // `m.call.member` post and LiveKit frame-decrypt setup.
     media_e2ee: bool,
+    // Stale-membership reaper timing (#25), from the resolved `[timing]`
+    // config: how often to sweep, and how long a phantom must be continuously
+    // absent from the LiveKit roster before it is emptied.
+    reap_interval: Duration,
+    reap_grace: Duration,
     mut call_active_rx: watch::Receiver<bool>,
     router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
@@ -189,7 +194,7 @@ pub(crate) async fn run(
     // Stale-membership reaper state: per-state-key "phantom since" grace clocks,
     // and the periodic tick that drives the sweep while a call is active (#25).
     let mut phantom_since: HashMap<String, Instant> = HashMap::new();
-    let mut reap_interval = tokio::time::interval(REAP_INTERVAL);
+    let mut reap_interval = tokio::time::interval(reap_interval);
     // First tick fires immediately; skip the missed tick rather than bursting.
     reap_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -298,6 +303,7 @@ pub(crate) async fn run(
                     let live_mxids = live_roster_mxids(&sess.lk_session.room);
                     crate::matrix::reap_stale_memberships(
                         &client, &room_id, &bot_user_id, &ghost_prefix, &live_mxids, &mut phantom_since,
+                        reap_grace,
                     )
                     .await;
                 }

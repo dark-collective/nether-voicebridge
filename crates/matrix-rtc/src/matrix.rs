@@ -32,13 +32,10 @@ use nvb_config::MatrixConfig;
 /// to parse the state_key format.
 type ParticipantSet = Arc<Mutex<HashSet<(OwnedUserId, String)>>>;
 
-/// Grace period before a membership "leave" takes effect. Element Call memberships
-/// spuriously flap active→inactive→active (~2-3s gap, ~every 90s) due to
-/// expiry/heartbeat refresh (MSC4140 delayed events) — the member never really
-/// leaves. We defer the release this long and cancel it if the member reappears,
-/// so a flap no longer tears down the puppet, the capture anchor, or the
-/// subscriber. Far below the ~90s reflap period and EC's ~4h hard expiry.
-const LEAVE_GRACE: Duration = Duration::from_secs(12);
+// The leave-grace debounce (12 s default — far below EC's ~90 s reflap period
+// and ~4 h hard expiry) was a hardcoded const here until #38; it now comes
+// from the resolved `[timing]` config (`TimingConfig::leave_grace`) and is
+// threaded into `apply_member_event` as the `leave_grace` parameter.
 
 /// Pending debounced leaves: MXID → cancel handle for its in-flight grace timer.
 /// A reappear cancels it; a fresh leave replaces it (one timer per MXID).
@@ -112,6 +109,7 @@ async fn apply_member_event(
     call_active_tx: &watch::Sender<bool>,
     members_gen_tx: &watch::Sender<u64>,
     pending_leaves: &PendingLeaves,
+    leave_grace: Duration,
     shutdown: &CancellationToken,
     bridge: &Arc<str>,
     room: &Room,
@@ -200,10 +198,10 @@ async fn apply_member_event(
         tracing::info!(mxid = %user_id, display_name = %name, "member joined — assigning puppet");
         router.assign(user_id.as_str(), &name);
     } else if gone {
-        // Debounce: defer the release; a reappear within LEAVE_GRACE cancels it.
-        // Element Call memberships flap spuriously (expiry/heartbeat) — the member
-        // is usually still present, so an immediate release would needlessly tear
-        // down the puppet, the capture anchor, and the subscriber.
+        // Debounce: defer the release; a reappear within the leave grace cancels
+        // it. Element Call memberships flap spuriously (expiry/heartbeat) — the
+        // member is usually still present, so an immediate release would
+        // needlessly tear down the puppet, the capture anchor, and the subscriber.
         tracing::info!(mxid = %user_id, "membership gone — starting leave grace timer");
         let token = CancellationToken::new();
         {
@@ -225,7 +223,7 @@ async fn apply_member_event(
                     biased;
                     _ = shutdown.cancelled() => return, // teardown owns final release
                     _ = token.cancelled() => return,    // reappeared within grace
-                    _ = tokio::time::sleep(LEAVE_GRACE) => {}
+                    _ = tokio::time::sleep(leave_grace) => {}
                 }
                 // Authoritative re-check under the lock: only release if still absent.
                 let (still_absent, now_empty) = {
@@ -859,6 +857,7 @@ pub(crate) async fn run(
     client: Client,
     cfg: &MatrixConfig,
     media_e2ee: bool,
+    leave_grace: Duration,
     call_active_tx: watch::Sender<bool>,
     members_gen_tx: watch::Sender<u64>,
     router: Arc<dyn PlaybackRouter>,
@@ -918,6 +917,7 @@ pub(crate) async fn run(
                     &call_active_tx,
                     &members_gen_tx,
                     &pending_leaves,
+                    leave_grace,
                     &shutdown,
                     &bridge,
                     &room,
@@ -954,6 +954,7 @@ pub(crate) async fn run(
                 &call_active_tx,
                 &members_gen_tx,
                 &pending_leaves,
+                leave_grace,
                 &shutdown,
                 &bridge,
                 &room,
@@ -1024,12 +1025,12 @@ pub(crate) async fn run(
     }
 }
 
-/// How long a non-ghost `m.call.member` must be continuously absent from the
-/// LiveKit roster before the reaper empties it. Long enough to never reap a user
-/// still establishing their RTC connection; short enough to clear a failed-to-
-/// connect phantom within ~a minute of a call becoming active. See
-/// [`reap_stale_memberships`].
-pub(crate) const REAP_GRACE: Duration = Duration::from_secs(45);
+// The reap grace (45 s default — long enough to never reap a user still
+// establishing their RTC connection, short enough to clear a failed-to-connect
+// phantom within ~a minute of a call becoming active) was a hardcoded const
+// here until #38; it now comes from the resolved `[timing]` config
+// (`TimingConfig::reap_grace`) and reaches `reap_stale_memberships` as its
+// `grace` parameter.
 
 /// One `m.call.member` entry, reduced to just the fields the reaper decision
 /// needs. Keeping the decision pure (this + a live-MXID set + a clock) makes it
@@ -1096,8 +1097,10 @@ fn classify_stale_memberships(
 /// `_@…` state-key (not `@`-prefixed, so not owner-restricted) and the room sets
 /// `m.call.member` at PL 0. `live_mxids` is the set of bare MXIDs currently in the
 /// LiveKit room (built by the caller from `remote_participants()`); `phantom_since`
-/// carries each entry's grace clock across calls. Best-effort: read/write failures
-/// are logged, never fatal.
+/// carries each entry's grace clock across calls; `grace` is the resolved
+/// `[timing]` reap grace. Best-effort: read/write failures are logged, never
+/// fatal.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn reap_stale_memberships(
     client: &Client,
     room_id: &RoomId,
@@ -1105,6 +1108,7 @@ pub(crate) async fn reap_stale_memberships(
     ghost_prefix: &str,
     live_mxids: &HashSet<String>,
     phantom_since: &mut HashMap<String, Instant>,
+    grace: Duration,
 ) {
     let Some(room) = client.get_room(room_id) else { return };
     let raws = match room.get_state_events_static::<CallMemberEventContent>().await {
@@ -1140,7 +1144,7 @@ pub(crate) async fn reap_stale_memberships(
         .collect();
 
     let to_reap: HashSet<String> =
-        classify_stale_memberships(live_mxids, &entries, phantom_since, Instant::now(), REAP_GRACE)
+        classify_stale_memberships(live_mxids, &entries, phantom_since, Instant::now(), grace)
             .into_iter()
             .collect();
     if to_reap.is_empty() {
