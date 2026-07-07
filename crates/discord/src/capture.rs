@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::BufWriter,
-    sync::Mutex,
+    sync::{Mutex, PoisonError},
 };
 
 use hound::{SampleFormat, WavSpec, WavWriter};
@@ -32,8 +32,12 @@ struct SsrcState {
 }
 
 /// Shared, thread-safe capture sink.  Wrap in `Arc` and clone freely.
+///
+/// The per-SSRC value is an `Option`: `None` marks an SSRC whose WAV file could
+/// not be opened (primary and fallback both failed) — capture for it is skipped
+/// rather than panicking on the audio hot path.
 pub struct CaptureSink {
-    inner: Mutex<HashMap<u32, SsrcState>>,
+    inner: Mutex<HashMap<u32, Option<SsrcState>>>,
 }
 
 impl Default for CaptureSink {
@@ -55,27 +59,40 @@ impl CaptureSink {
     /// Computes RMS and logs it roughly once per second.
     /// All errors are logged as warnings; the audio path never panics.
     pub fn write_frame(&self, ssrc: u32, pcm: &[i16]) {
-        let mut map = self.inner.lock().expect("CaptureSink mutex poisoned");
+        let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
 
         let state = map.entry(ssrc).or_insert_with(|| {
             let path = format!("capture_{ssrc}.wav");
             match Self::open_writer(&path) {
                 Ok(w) => {
                     tracing::info!(ssrc, path, "capturing SSRC → WAV file");
-                    SsrcState { writer: w, frame_count: 0 }
+                    Some(SsrcState { writer: w, frame_count: 0 })
                 }
                 Err(e) => {
-                    // This should be unreachable in practice, but we can't
-                    // return an error from or_insert_with.  Log and write to a
-                    // temp path so the caller doesn't panic.
+                    // Primary open failed (unwritable dir / full disk). Try a
+                    // fallback path once; if that also fails, give up on this SSRC
+                    // (mark it `None`) rather than panicking — capture is a
+                    // diagnostic and the audio hot path must never crash (review
+                    // F2-7/F8-3; the sink's own doc guarantees "never panics").
                     let fallback = format!("capture_{ssrc}_err.wav");
-                    tracing::warn!(ssrc, error = %e, fallback, "failed to open WAV; using fallback");
-                    let w = Self::open_writer(&fallback)
-                        .expect("even fallback WAV open failed — filesystem error");
-                    SsrcState { writer: w, frame_count: 0 }
+                    match Self::open_writer(&fallback) {
+                        Ok(w) => {
+                            tracing::warn!(ssrc, error = %e, fallback, "failed to open WAV; using fallback");
+                            Some(SsrcState { writer: w, frame_count: 0 })
+                        }
+                        Err(e2) => {
+                            tracing::warn!(
+                                ssrc, error = %e, fallback_error = %e2,
+                                "failed to open WAV (primary and fallback) — skipping capture for this SSRC"
+                            );
+                            None
+                        }
+                    }
                 }
             }
         });
+        // Skip an SSRC whose WAV could not be opened.
+        let Some(state) = state else { return };
 
         // Write samples; skip the rest of the frame on any individual error.
         for &sample in pcm {
@@ -100,8 +117,9 @@ impl CaptureSink {
     /// correct RIFF/data header lengths on drop.  Calling this produces files
     /// that every player can open; skipping it leaves truncated headers.
     pub fn finalize_all(&self) {
-        let mut map = self.inner.lock().expect("CaptureSink mutex poisoned");
+        let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         for (ssrc, state) in map.drain() {
+            let Some(state) = state else { continue };
             let frames = state.frame_count;
             match state.writer.finalize() {
                 Ok(()) => tracing::info!(ssrc, frames, "WAV finalised"),
