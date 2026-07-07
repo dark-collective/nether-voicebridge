@@ -47,12 +47,29 @@ pub fn generate_config(cfg: &E2eConfig) -> String {
 
 /// One `[[bridge]]` tenants.toml entry (tenants must carry an explicit name).
 pub fn tenant_entry(name: &str, room_id: &str, guild_id: &str, channel_id: &str) -> String {
+    tenant_entry_opts(name, room_id, guild_id, channel_id, false)
+}
+
+/// [`tenant_entry`] with the `capture_wav` diagnostic taps switched on: the
+/// bridge writes Tap A (`capture_<ssrc>.wav`, Discord ingress) and Tap B
+/// (`publish_<key>.wav`, the mono PCM handed to LiveKit) into its cwd — which
+/// [`BridgeUnderTest::start`] pins to the scenario workdir, so the taps become
+/// artifacts. The `audio_d2m_enc` scenario oracles Tap B (its Matrix-side
+/// decrypting listener is deferred).
+pub fn tenant_entry_opts(
+    name: &str,
+    room_id: &str,
+    guild_id: &str,
+    channel_id: &str,
+    capture_wav: bool,
+) -> String {
     format!(
-        "[[bridge]]\nname = {}\nserver = \"test\"\nroom_id = {}\n\n[bridge.discord]\nguild_id = {}\nchannel_id = {}\n\n",
+        "[[bridge]]\nname = {}\nserver = \"test\"\nroom_id = {}\n\n[bridge.discord]\nguild_id = {}\nchannel_id = {}\ncapture_wav = {}\n\n",
         toml_str(name),
         toml_str(room_id),
         toml_str(guild_id),
         toml_str(channel_id),
+        capture_wav,
     )
 }
 
@@ -84,6 +101,11 @@ impl BridgeUnderTest {
     ) -> Result<Self> {
         let data_dir = workdir.join("data");
         tokio::fs::create_dir_all(&data_dir).await.context("creating bridge workdir")?;
+        // The child runs with `workdir` as cwd, so every path handed to it
+        // (CONFIG_PATH, NVB_DATA_DIR) must be absolute — an artifacts dir
+        // given relative to the HARNESS cwd would otherwise dangle.
+        let workdir = &tokio::fs::canonicalize(workdir).await.context("resolving bridge workdir")?;
+        let data_dir = workdir.join("data");
         let config_path = workdir.join("config.toml");
         tokio::fs::write(&config_path, generate_config(cfg)).await?;
         let tenants_path = data_dir.join("tenants.toml");
@@ -94,7 +116,11 @@ impl BridgeUnderTest {
         }
 
         let mut cmd = Command::new(&cfg.bridge_bin);
-        cmd.env("CONFIG_PATH", &config_path)
+        // The child's cwd is its workdir so relative diagnostic outputs (the
+        // capture_wav taps) land in the scenario artifacts. `bridge_bin` is
+        // canonicalized at config load, so a relative path still resolves.
+        cmd.current_dir(workdir)
+            .env("CONFIG_PATH", &config_path)
             .env("NVB_DATA_DIR", &data_dir)
             .env("NVB_LOG_JSON", "1")
             .env(
@@ -232,6 +258,9 @@ mod tests {
             guild_id: "111".into(),
             channel_a: "222".into(),
             room_a: "!a:nether.im".into(),
+            channel_b: None,
+            room_b: None,
+            test_as_token: None,
             artifacts_dir: "art".into(),
         }
     }

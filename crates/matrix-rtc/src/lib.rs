@@ -33,6 +33,11 @@ use nvb_config::{LiveKitConfig, MatrixConfig, TimingConfig};
 
 pub use rtc::ghost::GhostPool;
 
+// #38 e2e testkit: fake Matrix call participants for the nvb-e2e harness.
+// Feature-gated — a default build compiles none of it (see `rtc/testkit.rs`).
+#[cfg(feature = "testkit")]
+pub use rtc::ghost::testkit;
+
 /// Run the Matrix side of the bridge to completion.
 ///
 /// Builds the matrix-sdk client, then drives the sync loop (which raises

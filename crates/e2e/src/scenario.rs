@@ -145,6 +145,9 @@ mod tests {
             guild_id: "1".into(),
             channel_a: "2".into(),
             room_a: "!r:x".into(),
+            channel_b: None,
+            room_b: None,
+            test_as_token: None,
             artifacts_dir: artifacts,
         }
     }

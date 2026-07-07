@@ -2020,6 +2020,15 @@ fn build_membership(device_id: &OwnedDeviceId, focus: &LivekitFocusInfo) -> Call
     )
 }
 
+// #38 e2e testkit: fake Matrix call participants for the live harness. Declared
+// as a CHILD of this module (not a sibling of `rtc`) so it can drive the private
+// ghost machinery — `GhostConfig`, register/join/membership/`connect_and_publish`,
+// `distribute_key_loop` — without widening any production visibility. The file
+// itself lives at `rtc/testkit.rs`; `lib.rs` re-exports it feature-gated.
+#[cfg(feature = "testkit")]
+#[path = "testkit.rs"]
+pub mod testkit;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,9 +1,12 @@
 //! Fake participants the harness drives against the bridge-under-test.
 //!
-//! D1 ships the Discord side ([`discord::DiscordSpeaker`]); the Matrix actors
-//! (speaker/phantom/listener over the `nvb-matrix-rtc` testkit) arrive in D2.
+//! Discord side: [`discord::DiscordSpeaker`] (D1) + [`discord::DiscordListener`]
+//! (D2). Matrix side (D2, over the `nvb-matrix-rtc` testkit):
+//! [`matrix::MatrixSpeaker`] / [`matrix::MatrixPhantom`] /
+//! [`matrix::MatrixListener`].
 
 pub mod discord;
+pub mod matrix;
 
 use anyhow::Result;
 use async_trait::async_trait;

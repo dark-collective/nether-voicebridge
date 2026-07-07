@@ -8,6 +8,12 @@ license.workspace = true
 name = "nvb_matrix_rtc"
 path = "src/lib.rs"
 
+[features]
+# #38 e2e testkit: fake Matrix call participants (speaker/phantom/listener) for
+# the nvb-e2e live harness. Adds no dependencies; a default build compiles the
+# module out entirely, so production is byte-identical without it.
+testkit = []
+
 [dependencies]
 nvb-audio = { workspace = true }
 nvb-config = { workspace = true }

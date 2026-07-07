@@ -462,6 +462,17 @@ impl GhostCrypto {
         Ok(me)
     }
 
+    /// The crypto device id this engine logged in as (and uploaded device keys +
+    /// one-time keys under). The e2e testkit's *listener* posts its `m.call.member`
+    /// under this id so key senders — which target the membership device — reach
+    /// the device that can actually answer `/keys/claim`. Production never needs
+    /// it: ghosts are send-only, so their membership ("call") device id and crypto
+    /// device id deliberately differ.
+    #[cfg(feature = "testkit")]
+    pub(crate) fn device_id(&self) -> &str {
+        &self.crypto_device_id
+    }
+
     /// Rotate this ghost's outbound Olm sessions (#52): rebuild the machine from the
     /// bootstrap account pickle with a fresh `MemoryStore`, dropping every established
     /// session so the next send claims fresh one-time keys — exactly what a process

@@ -3669,6 +3669,7 @@ dependencies = [
  "libc",
  "nvb-audio",
  "nvb-config",
+ "nvb-matrix-rtc",
  "reqwest 0.12.28",
  "rustls 0.23.40",
  "serde",

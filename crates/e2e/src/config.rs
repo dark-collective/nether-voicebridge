@@ -56,6 +56,9 @@ struct FileConfig {
     guild_id: Option<String>,
     channel_a: Option<String>,
     room_a: Option<String>,
+    channel_b: Option<String>,
+    room_b: Option<String>,
+    test_as_token: Option<String>,
     artifacts_dir: Option<String>,
 }
 
@@ -80,6 +83,15 @@ pub struct E2eConfig {
     /// Auto Test 01: unencrypted room + its voice channel.
     pub channel_a: String,
     pub room_a: String,
+    /// Auto Test 02: ENCRYPTED room + its voice channel. Optional — only the
+    /// `audio_*_enc` scenarios need them (they bail with a clear message when
+    /// absent, so unencrypted-only runs need no AT02 provisioning).
+    pub channel_b: Option<String>,
+    pub room_b: Option<String>,
+    /// The TEST appservice's `as_token` (the `nvbtest` registration) — the
+    /// fake Matrix participants (D2 testkit) masquerade under it. Optional:
+    /// only scenarios with Matrix actors need it.
+    pub test_as_token: Option<String>,
     /// Where per-run artifacts (bridge log, report.json, WAVs) land.
     pub artifacts_dir: PathBuf,
 }
@@ -114,10 +126,15 @@ impl E2eConfig {
             })
         };
 
+        // The bridge child runs with its workdir as cwd (so diagnostic WAV taps
+        // land in the artifacts), so a relative binary path must be resolved
+        // to absolute here. A missing binary keeps the raw path — the spawn
+        // path reports it with a clear error.
+        let bridge_bin_raw: PathBuf = pick("NVB_E2E_BRIDGE_BIN", file.bridge_bin)
+            .unwrap_or_else(|| "target/debug/nether-voicebridge".into())
+            .into();
         let cfg = Self {
-            bridge_bin: pick("NVB_E2E_BRIDGE_BIN", file.bridge_bin)
-                .unwrap_or_else(|| "target/debug/nether-voicebridge".into())
-                .into(),
+            bridge_bin: std::fs::canonicalize(&bridge_bin_raw).unwrap_or(bridge_bin_raw),
             homeserver_url: req("NVB_E2E_HOMESERVER_URL", pick("NVB_E2E_HOMESERVER_URL", file.homeserver_url)),
             matrix_domain: pick("NVB_E2E_MATRIX_DOMAIN", file.matrix_domain),
             appservice_id: req("NVB_E2E_APPSERVICE_ID", pick("NVB_E2E_APPSERVICE_ID", file.appservice_id)),
@@ -134,6 +151,9 @@ impl E2eConfig {
             guild_id: req("NVB_E2E_GUILD_ID", pick("NVB_E2E_GUILD_ID", file.guild_id)),
             channel_a: req("NVB_E2E_CHANNEL_A", pick("NVB_E2E_CHANNEL_A", file.channel_a)),
             room_a: req("NVB_E2E_ROOM_A", pick("NVB_E2E_ROOM_A", file.room_a)),
+            channel_b: pick("NVB_E2E_CHANNEL_B", file.channel_b),
+            room_b: pick("NVB_E2E_ROOM_B", file.room_b),
+            test_as_token: pick("NVB_E2E_TEST_AS_TOKEN", file.test_as_token),
             artifacts_dir: pick("NVB_E2E_ARTIFACTS", file.artifacts_dir)
                 .unwrap_or_else(|| "e2e-artifacts".into())
                 .into(),
@@ -152,6 +172,29 @@ impl E2eConfig {
             bail!("NVB_E2E_SPEAKER_TOKENS must list at least one speaker bot token");
         }
         Ok(cfg)
+    }
+
+    /// The AT02 (encrypted) room + channel pair, or a clear error naming the
+    /// missing keys — used by the `audio_*_enc` scenarios.
+    pub fn encrypted_pair(&self) -> Result<(&str, &str)> {
+        match (self.room_b.as_deref(), self.channel_b.as_deref()) {
+            (Some(r), Some(c)) => Ok((r, c)),
+            _ => bail!(
+                "this scenario needs the encrypted test room: set NVB_E2E_ROOM_B and \
+                 NVB_E2E_CHANNEL_B (or room_b/channel_b in e2e.toml) to Auto Test 02's ids"
+            ),
+        }
+    }
+
+    /// The test appservice token, or a clear error — required by every
+    /// scenario that drives fake Matrix participants.
+    pub fn test_as_token(&self) -> Result<&str> {
+        self.test_as_token.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "this scenario needs the test appservice: set NVB_E2E_TEST_AS_TOKEN \
+                 (or test_as_token in e2e.toml) to the nvbtest registration's as_token"
+            )
+        })
     }
 
     /// The bridge bot's full MXID, derived the same way the bridge derives it
@@ -200,6 +243,9 @@ mod tests {
             guild_id: "1".into(),
             channel_a: "2".into(),
             room_a: "!r:nether.im".into(),
+            channel_b: None,
+            room_b: None,
+            test_as_token: None,
             artifacts_dir: "art".into(),
         };
         assert_eq!(cfg.server_domain(), "100.64.0.21");

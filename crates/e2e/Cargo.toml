@@ -18,6 +18,11 @@ path = "src/main.rs"
 [dependencies]
 nvb-config = { workspace = true }
 nvb-audio = { workspace = true }
+# The D2 fake-Matrix-participant seam. `testkit` is additive-only (a
+# feature-gated module; no production code path changes), but note cargo's
+# feature unification: a full-workspace build compiles nvb-matrix-rtc WITH the
+# feature — the shipped binary is built `-p nether-voicebridge`, which doesn't.
+nvb-matrix-rtc = { workspace = true, features = ["testkit"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs", "signal"] }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }
