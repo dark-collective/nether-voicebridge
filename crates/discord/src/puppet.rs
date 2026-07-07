@@ -507,6 +507,13 @@ impl SharedPool {
         })
     }
 
+    /// Lock the allocator state, recovering a poisoned mutex rather than cascading
+    /// the panic across every bridge (a panicked holder leaves the state
+    /// structurally intact). All production allocator access goes through here.
+    fn alloc(&self) -> std::sync::MutexGuard<'_, AllocState> {
+        self.alloc.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Load the persisted opt-out list (#63) and arm the `/bridge optout`/
     /// `optin` commands. Call once before [`run`](Self::run); a missing file is
     /// an empty list.
@@ -533,7 +540,7 @@ impl SharedPool {
     /// the channel); with the ghost sink gone the demux has nothing to feed and
     /// `maybe_release_idle_anchor` sees the channel correctly.
     fn apply_optout(&self, user_id: u64) {
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         for ch in guard.channels.values_mut() {
             let removed = ch
                 .user_sinks
@@ -549,7 +556,7 @@ impl SharedPool {
         drop(guard);
         // A lone opted-out speaker may leave a capture-only anchor idle.
         let bridges: Vec<String> = {
-            let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+            let guard = self.alloc();
             guard.channels.keys().cloned().collect()
         };
         for b in bridges {
@@ -616,7 +623,7 @@ impl SharedPool {
             presence: HashSet::new(),
             anchor_idle_release: None,
         };
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         // A silently-replaced ChannelState would orphan the old channel's
         // assignments and routes; with runtime registration (#45) a duplicate
         // label is a real possibility, so refuse it.
@@ -755,7 +762,7 @@ impl SharedPool {
     /// bot, if any, anchors it), returning its [`ChannelCtx`]. Used to attribute a
     /// voice member to its room without holding the anchor.
     fn by_channel(&self, guild_id: GuildId, channel_id: ChannelId) -> Option<ChannelCtx> {
-        let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = self.alloc();
         let ch = guard
             .channels
             .values()
@@ -768,7 +775,7 @@ impl SharedPool {
     /// against all the guild's channels, so presence detection is not gated on
     /// holding the anchor.
     fn channels_in_guild(&self, guild_id: GuildId) -> Vec<ChannelCtx> {
-        let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = self.alloc();
         guard
             .channels
             .values()
@@ -804,7 +811,7 @@ impl SharedPool {
     /// self-corrects — typically before the ghost ever publishes or posts
     /// membership. Mirrors `drop_ghost`'s teardown.
     fn retract_self_ghost(&self, user_id: u64) {
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         for ch in guard.channels.values_mut() {
             ch.presence.remove(&user_id);
             let removed = ch
@@ -826,7 +833,7 @@ impl SharedPool {
     /// in the guild; the shared `presence` set under the alloc lock makes duplicates
     /// idempotent, so exactly one observer drives the ghost create/retire.
     fn note_presence(&self, bridge: &str, user_id: u64, present: bool) -> bool {
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         let Some(ch) = guard.channels.get_mut(bridge) else {
             return false;
         };
@@ -1249,7 +1256,7 @@ impl SharedPool {
     }
 
     fn assign(&self, bridge: &str, key: &str, display_name: &str) -> Arc<dyn ParticipantSink> {
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         // Reborrow as `&mut AllocState` so `channels`/`sessions` split-borrow.
         let guard = &mut *guard;
 
@@ -1437,7 +1444,7 @@ impl SharedPool {
     /// is deferred from the assign paths so a timed-out join never falsely reports
     /// the anchor live.
     fn on_join_succeeded(&self, idx: usize, guild: GuildId) {
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         // Activate capture on whichever channel elected this bot as its anchor —
         // even a capture-only anchor whose own participant left mid-join (#59): the
         // elected anchor still owns the channel's capture path and must register it,
@@ -1465,7 +1472,7 @@ impl SharedPool {
     /// fake-live anchor. Returns the quarantine backoff the caller should wait
     /// before scheduling a recovery (`recover_bot`).
     fn on_join_failed(&self, idx: usize, guild: GuildId) -> Duration {
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         let guard = &mut *guard;
 
         // Quarantine the stuck (bot, guild) regardless (cleared after the backoff
@@ -1608,7 +1615,7 @@ impl SharedPool {
     /// unavailable. `fail_count` deliberately survives — the backoff keeps
     /// growing across repeat failures and resets only on a successful join.
     fn recover_bot(&self, idx: usize, guild: GuildId) {
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         let guard = &mut *guard;
         let clear = match guard.health.get_mut(&(idx, guild)) {
             Some(h) => {
@@ -1636,7 +1643,7 @@ impl SharedPool {
     /// still being live in another guild.
     fn should_recover_disconnect(&self, idx: usize, guild: GuildId) -> bool {
         // Serialize against the allocator's own session/anchor mutations.
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         let guard = &mut *guard;
         if !guard.sessions.contains_key(&(idx, guild)) {
             return false;
@@ -1653,7 +1660,7 @@ impl SharedPool {
     /// Release the recovery latch claimed by [`should_recover_disconnect`],
     /// pruning the health record if nothing else keeps it alive.
     fn finish_recovery(&self, idx: usize, guild: GuildId) {
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         let guard = &mut *guard;
         let clear = match guard.health.get_mut(&(idx, guild)) {
             Some(h) => {
@@ -1673,7 +1680,7 @@ impl SharedPool {
     /// `DriverDisconnect`. Skips bots already quarantined or mid-recovery.
     fn sweep_voice_health(&self) {
         let probes: Vec<(usize, GuildId)> = {
-            let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+            let guard = self.alloc();
             guard
                 .sessions
                 .keys()
@@ -1692,7 +1699,7 @@ impl SharedPool {
     }
 
     fn set_muted(&self, bridge: &str, key: &str, muted: bool) {
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         let guard = &mut *guard;
         let Some(ch) = guard.channels.get_mut(bridge) else { return };
         let guild = ch.guild_id;
@@ -1715,7 +1722,7 @@ impl SharedPool {
     }
 
     fn release(self: &Arc<Self>, bridge: &str, key: &str) {
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         let guard = &mut *guard;
         // Remove the assignment; act on what it was.
         let (removed, guild) = match guard.channels.get_mut(bridge) {
@@ -1899,7 +1906,7 @@ impl SharedPool {
     }
 
     fn release_all(self: &Arc<Self>, bridge: &str) {
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         let guard = &mut *guard;
         // Call-end teardown (#59): KEEP a capture-only anchor when Discord
         // speakers remain, mirroring the single-participant `release` path.
@@ -1994,7 +2001,7 @@ impl SharedPool {
     /// Per-(bot, guild) `health` entries are intentionally kept: they describe the
     /// guild's voice server, not this channel, and prune on their own schedule.
     pub fn unregister_channel(self: &Arc<Self>, bridge: &str) {
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         let guard = &mut *guard;
         // Full drain (#59): never keep a capture-only anchor here — the channel
         // is going away and teardown must return connections to baseline.
@@ -2013,7 +2020,7 @@ impl SharedPool {
     /// last Discord speaker leaves (see `drop_ghost`). No-op if there is no held
     /// anchor or either side is still active.
     fn maybe_release_idle_anchor(&self, bridge: &str) {
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         let (idx, guild) = {
             let Some(ch) = guard.channels.get(bridge) else { return };
             let anchor = ch.anchor.load(Ordering::Relaxed);
@@ -2078,7 +2085,7 @@ impl SharedPool {
     /// grace elapsed with nobody returning. A no-op if a participant reused the
     /// anchor in the meantime (then it serves someone and must stay).
     fn release_capture_only_anchor_if_idle(&self, bridge: &str) {
-        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.alloc();
         let (idx, guild) = {
             let Some(ch) = guard.channels.get(bridge) else { return };
             let anchor = ch.anchor.load(Ordering::Relaxed);
@@ -2116,7 +2123,7 @@ impl SharedPool {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(guild);
         if added {
-            let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut guard = self.alloc();
             self.rebalance(&mut guard);
         }
     }
@@ -2133,7 +2140,7 @@ impl SharedPool {
 
     /// Whether bot `idx` currently holds a session in `guild`.
     fn bot_has_session_in(&self, idx: usize, guild: GuildId) -> bool {
-        let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = self.alloc();
         guard.sessions.contains_key(&(idx, guild))
     }
 
@@ -2141,7 +2148,7 @@ impl SharedPool {
     /// e.g. a capture-only anchor). Used by the rejoin path, which runs in the
     /// bot's command loop and has no live reference into the alloc state.
     fn session_display_name(&self, idx: usize, guild: GuildId) -> String {
-        let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = self.alloc();
         guard
             .sessions
             .get(&(idx, guild))
