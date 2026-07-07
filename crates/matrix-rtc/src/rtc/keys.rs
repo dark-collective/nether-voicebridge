@@ -197,3 +197,99 @@ pub fn install_peer_key(
     );
     ok
 }
+
+// ── Peer-key cache: survive a subscriber LiveKit rejoin (#66) ─────────────────
+
+/// Every peer media key delivered to the subscriber, keyed
+/// `(sender_mxid, claimed_device_id, key_index)` — last writer wins per triple.
+///
+/// Why: a disconnect recovery re-runs `join_livekit`, which mints a fresh, EMPTY
+/// `KeyProvider`. Peers don't re-send keys on our LiveKit reconnect (they can't
+/// see it — it's not a Matrix event), and an idempotent membership re-post is a
+/// no-change to their membership diff, so nothing would re-deliver — the rejoined
+/// subscriber couldn't decrypt anyone until their next natural rotation. But the
+/// bot's Matrix sync never dies during an SFU outage, so every key ever sent
+/// (including mid-outage rotations) still reaches the to-device handler: record
+/// them all here (write-through, before the provider install) and [`replay`]
+/// into each fresh provider. No roster flicker, no forced key rotation.
+///
+/// [`replay`]: PeerKeyCache::replay
+#[derive(Default)]
+pub(crate) struct PeerKeyCache {
+    keys: std::sync::Mutex<std::collections::HashMap<(String, String, u8), String>>,
+}
+
+impl PeerKeyCache {
+    /// Record a delivered peer key (overwrites any previous key for the triple).
+    pub(crate) fn record(
+        &self,
+        sender_user_id: &str,
+        claimed_device_id: &str,
+        key_index: u8,
+        key_b64: &str,
+    ) {
+        self.keys.lock().expect("peer-key cache mutex poisoned").insert(
+            (
+                sender_user_id.to_owned(),
+                claimed_device_id.to_owned(),
+                key_index,
+            ),
+            key_b64.to_owned(),
+        );
+    }
+
+    /// Install every cached key into `key_provider` (a fresh provider after a
+    /// rejoin). A no-op on the first join of a call (nothing recorded yet).
+    pub(crate) fn replay(&self, key_provider: &KeyProvider) {
+        let keys = self.keys.lock().expect("peer-key cache mutex poisoned");
+        if keys.is_empty() {
+            return;
+        }
+        tracing::info!(count = keys.len(), "replaying cached peer media keys into fresh provider");
+        for ((sender, device, index), key_b64) in keys.iter() {
+            install_peer_key(sender, device, *index, key_b64, key_provider);
+        }
+    }
+
+    /// Forget everything (call ended — the next call's keys are all fresh).
+    pub(crate) fn clear(&self) {
+        self.keys.lock().expect("peer-key cache mutex poisoned").clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_key_cache_records_last_writer_and_clears() {
+        let cache = PeerKeyCache::default();
+        cache.record("@a:x", "DEV1", 0, "old");
+        cache.record("@a:x", "DEV1", 0, "new"); // same triple → overwrite
+        cache.record("@a:x", "DEV1", 1, "idx1"); // distinct index coexists
+        cache.record("@a:x", "DEV2", 0, "dev2"); // distinct device coexists
+        cache.record("@b:x", "DEV1", 0, "b"); // distinct sender coexists
+        {
+            let keys = cache.keys.lock().unwrap();
+            assert_eq!(keys.len(), 4);
+            assert_eq!(keys[&("@a:x".into(), "DEV1".into(), 0)], "new");
+        }
+        cache.clear();
+        assert!(cache.keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn peer_key_cache_replays_into_a_fresh_provider() {
+        use livekit::e2ee::key_provider::{KeyProvider, KeyProviderOptions};
+        use livekit::id::ParticipantIdentity;
+
+        let cache = PeerKeyCache::default();
+        // A real (valid-base64, 16-byte) key so install_peer_key succeeds.
+        cache.record("@a:x", "DEV1", 0, &encode_key(&[7u8; 16]));
+
+        let provider = KeyProvider::new(KeyProviderOptions::default());
+        cache.replay(&provider);
+        let installed = provider.get_key(&ParticipantIdentity::from("@a:x:DEV1".to_owned()), 0);
+        assert_eq!(installed, Some([7u8; 16].to_vec()));
+    }
+}

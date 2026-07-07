@@ -114,6 +114,9 @@ pub(crate) async fn run(
     // The to-device handler uses this to install incoming peer keys so the
     // subscriber can decrypt remote frames (only relevant when E2EE is on).
     let shared_provider: Arc<Mutex<Option<KeyProvider>>> = Arc::new(Mutex::new(None));
+    // Every peer key delivered this call, replayed into the fresh provider a
+    // disconnect-recovery rejoin mints (#66) — see [`keys::PeerKeyCache`].
+    let peer_keys: Arc<keys::PeerKeyCache> = Arc::new(keys::PeerKeyCache::default());
 
     // Bridge-bot identity, used to post/retract call membership when E2EE is on.
     let bot_user_id: OwnedUserId = mx_cfg.bot_user_id.parse()?;
@@ -124,11 +127,13 @@ pub(crate) async fn run(
     // auto-decrypts before delivery; in an unencrypted room they arrive in clear.
     {
         let provider_ref = shared_provider.clone();
+        let peer_keys_ref = peer_keys.clone();
         // Runs in matrix-sdk's sync task (no inherited span) — tag per bridge.
         let bridge = bridge.clone();
         client.add_event_handler(
             move |ev: matrix_sdk::ruma::events::ToDeviceEvent<CallEncryptionKeysEventContent>| {
                 let provider_ref = provider_ref.clone();
+                let peer_keys_ref = peer_keys_ref.clone();
                 let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
                 async move {
                     let sender = ev.sender.as_str().to_owned();
@@ -152,6 +157,10 @@ pub(crate) async fn run(
                         "received io.element.call.encryption_keys to-device"
                     );
 
+                    // Record BEFORE installing: keys that arrive while the session
+                    // is down (disconnect recovery, #66) must be retained so the
+                    // rejoin's replay restores them into the fresh provider.
+                    peer_keys_ref.record(&sender, &claimed_device_id, key_index, &key_b64);
                     let guard = provider_ref.lock().expect("provider mutex poisoned");
                     if let Some(provider) = guard.as_ref() {
                         keys::install_peer_key(
@@ -164,7 +173,7 @@ pub(crate) async fn run(
                     } else {
                         tracing::debug!(
                             sender = %sender,
-                            "received encryption_keys but no active session — ignoring"
+                            "received encryption_keys with no active session — cached for the next join"
                         );
                     }
                 }
@@ -190,6 +199,14 @@ pub(crate) async fn run(
     // E2EE membership-retry task for the current activation (cancel + its handle).
     let mut membership_cancel: Option<CancellationToken> = None;
     let mut membership_handle: Option<tokio::task::JoinHandle<()>> = None;
+    // True while an E2EE membership we posted may still be in room state. Usually
+    // tracks `joined`, EXCEPT during disconnect recovery (#66): the recovery arm
+    // sets `joined = false` but deliberately leaves the membership posted (we
+    // intend to rejoin). If the call then ends before the rejoin lands, the
+    // normal (true,false) teardown never runs — the guarded (false,false) arm
+    // below retracts via this flag so the bot's membership can't linger forever
+    // (the reaper skips bridge-owned entries, so nothing else would clean it).
+    let mut membership_lingering = false;
 
     // Stale-membership reaper state: per-state-key "phantom since" grace clocks,
     // and the periodic tick that drives the sweep while a call is active (#25).
@@ -222,6 +239,7 @@ pub(crate) async fn run(
                     &room_id_str,
                     mx_cfg.device_id.as_str(),
                     &shared_provider,
+                    &peer_keys,
                     media_e2ee,
                     lk_cfg.lk_jwt_url.as_deref(),
                     lk_cfg.url.as_deref(),
@@ -254,6 +272,7 @@ pub(crate) async fn run(
                                 )
                                 .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
                             ));
+                            membership_lingering = true;
                         }
                     }
                     Err(e) => {
@@ -271,6 +290,8 @@ pub(crate) async fn run(
                 // No live roster anymore — drop the reaper's grace clocks so the
                 // next call starts fresh.
                 phantom_since.clear();
+                // The next call's peer keys are all fresh — drop the replay cache.
+                peer_keys.clear();
                 // Stop the membership-retry task and await it before retracting, so
                 // a late retry-join can't race past the leave and linger.
                 if let Some(mc) = membership_cancel.take() {
@@ -283,12 +304,45 @@ pub(crate) async fn run(
                 if media_e2ee {
                     retract_membership(&client, &room_id, &bot_user_id, &device_id).await;
                 }
+                membership_lingering = false;
+            }
+
+            (false, false) if membership_lingering => {
+                // The call ended while we were disconnected/rejoining (#66): the
+                // (true,false) arm never ran because recovery had already dropped
+                // `joined`, so the membership recovery left posted must be
+                // retracted here or it lingers between calls.
+                tracing::info!("call ended during disconnect recovery — retracting lingering membership");
+                // This is the call-end path for a call that died disconnected —
+                // same as (true,false): the next call's peer keys are all fresh.
+                peer_keys.clear();
+                if let Some(mc) = membership_cancel.take() {
+                    mc.cancel();
+                }
+                if let Some(h) = membership_handle.take() {
+                    let _ = h.await;
+                }
+                if media_e2ee {
+                    retract_membership(&client, &room_id, &bot_user_id, &device_id).await;
+                }
+                membership_lingering = false;
             }
 
             _ => {}
         }
 
-        // Wait for the next call-active transition, a reaper tick, or shutdown.
+        // The current session's disconnect signal (#66). Snapshotted per
+        // iteration: every teardown path takes `active_session` to `None` before
+        // the next snapshot, so a close-induced Disconnected on an old session's
+        // token is never selected (no spurious recovery from teardown echo).
+        let disc = active_session
+            .as_ref()
+            .map(|s| s.lk_session.disconnected.clone());
+
+        // Wait for the next call-active transition, a room disconnect, a reaper
+        // tick, or shutdown. Ordering (biased): a simultaneous call-end +
+        // disconnect must prefer the normal (true,false) teardown (which also
+        // retracts membership) over the rejoin-intent recovery arm.
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
@@ -297,15 +351,53 @@ pub(crate) async fn run(
                     break;
                 }
             }
+            _ = async {
+                match &disc {
+                    Some(t) => t.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // The LiveKit room died (SDK reconnect exhausted, or the event
+                // stream ended). Tear the dead session down and rejoin: humans
+                // are still in the call, so keep the puppet routes (the fresh
+                // session's TrackSubscribed re-fires and consumers re-attach)
+                // and keep the posted membership (we're coming back). The next
+                // iteration's (false,true) arm re-runs join_livekit; failures
+                // retry at reaper-tick cadence, same as an initial join.
+                tracing::warn!("LiveKit room disconnected — tearing down for rejoin");
+                teardown(&mut active_session, &shared_provider, &router, false).await;
+                joined = false;
+                // The dead-room window produced bogus absence observations —
+                // drop the grace clocks so nobody gets reaped off them.
+                phantom_since.clear();
+                // Stop the membership-retry task (the rejoin arm respawns it) but
+                // do NOT retract: the membership is still valid and retract+repost
+                // would flap the EC roster and rotate everyone's keys.
+                if let Some(mc) = membership_cancel.take() {
+                    mc.cancel();
+                }
+                if let Some(h) = membership_handle.take() {
+                    let _ = h.await;
+                }
+                // membership_lingering stays true — the guarded (false,false) arm
+                // retracts if the call ends before the rejoin lands.
+            }
             _ = reap_interval.tick() => {
                 // Only meaningful with a live LiveKit roster to compare against.
+                // A dead room reads as an empty/frozen roster — every real human
+                // would look phantom — so skip when the disconnect signal has
+                // fired but the recovery arm hasn't run yet (#66 race window).
                 if let Some(sess) = &active_session {
-                    let live_mxids = live_roster_mxids(&sess.lk_session.room);
-                    crate::matrix::reap_stale_memberships(
-                        &client, &room_id, &bot_user_id, &ghost_prefix, &live_mxids, &mut phantom_since,
-                        reap_grace,
-                    )
-                    .await;
+                    if sess.lk_session.disconnected.is_cancelled() {
+                        tracing::debug!("skipping reap tick — room disconnected, awaiting rejoin");
+                    } else {
+                        let live_mxids = live_roster_mxids(&sess.lk_session.room);
+                        crate::matrix::reap_stale_memberships(
+                            &client, &room_id, &bot_user_id, &ghost_prefix, &live_mxids, &mut phantom_since,
+                            reap_grace,
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -316,8 +408,13 @@ pub(crate) async fn run(
     // `router.release_all()` here would be fire-and-forget and could empty the
     // assignment map out from under that drain (losing the await guarantee), so
     // we pass `release_routes = false`.
-    if joined {
+    // `joined` can be false with cleanup still owed: a shutdown that lands
+    // mid-disconnect-recovery (#66) has no active session but a lingering
+    // membership. Gate the two halves independently.
+    if active_session.is_some() || joined {
         teardown(&mut active_session, &shared_provider, &router, false).await;
+    }
+    if membership_lingering {
         if let Some(mc) = membership_cancel.take() {
             mc.cancel();
         }
@@ -425,6 +522,7 @@ async fn join_livekit(
     room_id_str: &str,
     device_id: &str,
     shared_provider: &Arc<Mutex<Option<KeyProvider>>>,
+    peer_keys: &Arc<keys::PeerKeyCache>,
     use_e2ee: bool,
     // Optional config overrides; when `None` the values are auto-derived from
     // the focus (lk-jwt endpoint) and the lk-jwt response (SFU ws URL).
@@ -463,9 +561,15 @@ async fn join_livekit(
         if let Some(ref key_provider) = lk_session.key_provider {
             // Make the provider visible to the to-device receive handler so it can
             // install peers' keys and decrypt their inbound frames.
-            let mut guard = shared_provider.lock().expect("provider mutex poisoned");
-            *guard = Some(key_provider.clone());
+            {
+                let mut guard = shared_provider.lock().expect("provider mutex poisoned");
+                *guard = Some(key_provider.clone());
+            }
             tracing::info!("E2EE key provider shared with to-device handler (subscribe decrypt)");
+            // A rejoin after a disconnect (#66) mints this provider EMPTY; peers
+            // won't re-send unprompted. Restore every key delivered this call
+            // (no-op on the first join of a call).
+            peer_keys.replay(key_provider);
         }
     } else {
         tracing::info!("media E2EE disabled — connecting without frame encryption");
