@@ -3,6 +3,17 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.13] - 2026-07-07
+
+### Added
+- **Unlink-side disclosure notice (#64, closing the issue).** When a bridge
+  link is removed — by `unlink` or by a ban's teardown sweep — the bot posts
+  "no longer bridged" into the voice channel's text chat, completing the
+  disclosure story started in alpha.12. Neutral wording either way (a ban is
+  not broadcast in-channel). Best-effort: a bot without Send Messages on the
+  channel degrades to a log warning. Removals made by hand-editing
+  `tenants.toml` + SIGHUP bypass the management bot and carry no notice.
+
 ## [0.3.0-alpha.12] - 2026-07-07
 
 ### Added
