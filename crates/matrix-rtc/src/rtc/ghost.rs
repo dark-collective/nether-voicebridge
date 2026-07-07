@@ -56,7 +56,7 @@ use matrix_sdk::{
                 CallMemberEventContent, CallMemberStateKey, CallScope, Focus, LivekitFocus,
             },
         },
-        OwnedDeviceId, OwnedUserId, RoomId, UserId,
+        MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, RoomId, UserId,
     },
     Client,
 };
@@ -809,7 +809,6 @@ async fn run_ghost(
         if let Some(media_key) = media_key {
             tokio::spawn(
                 distribute_key_task(
-                    client,
                     cfg.clone(),
                     localpart.clone(),
                     ghost_mxid.clone(),
@@ -1240,7 +1239,6 @@ const OLM_BOOTSTRAP_RETRY: Duration = Duration::from_secs(5);
 /// bridge never chooses it for them at runtime.
 #[allow(clippy::too_many_arguments)]
 async fn distribute_key_task(
-    client: Client,
     cfg: GhostConfig,
     localpart: String,
     ghost_mxid: String,
@@ -1279,7 +1277,7 @@ async fn distribute_key_task(
     // sessions); the config knob can turn it off entirely.
     let rotate_sessions =
         cfg.rotate_ghost_sessions && matches!(cfg.key_transport, KeyTransportMode::Olm);
-    let source: Arc<dyn RecipientSource> = Arc::new(CallRecipients { client, cfg });
+    let source: Arc<dyn RecipientSource> = Arc::new(CallRecipients { cfg, ghost_mxid });
     distribute_key_loop(source, key, transport, rotate_sessions, members_gen, cancel).await;
 }
 
@@ -1291,16 +1289,18 @@ trait RecipientSource: Send + Sync {
     async fn recipients(&self) -> Result<Vec<KeyRecipient>>;
 }
 
-/// Production source: reads call memberships via the bridge bot's joined client.
+/// Production source: reads call memberships over the raw CS-API, masquerading as
+/// the ghost (a joined member) — the media-key path has no matrix-rust-sdk
+/// `Client` dependency (#50).
 struct CallRecipients {
-    client: Client,
     cfg: GhostConfig,
+    ghost_mxid: String,
 }
 
 #[async_trait]
 impl RecipientSource for CallRecipients {
     async fn recipients(&self) -> Result<Vec<KeyRecipient>> {
-        enumerate_key_recipients(&self.client, &self.cfg).await
+        enumerate_key_recipients(&self.cfg, &self.ghost_mxid).await
     }
 }
 
@@ -1585,38 +1585,83 @@ async fn distribute_key_loop(
     tracing::debug!("ghost media-key distribution stopped");
 }
 
-/// Enumerate the call's human members (key-send recipients), read via the bridge
-/// bot's joined client. Excludes our ghosts ([`is_ghost_identity`], which also
-/// drops *this* ghost) and the bridge bot itself (the subscriber skips ghost
-/// tracks, so it never needs ghost keys — constraint #5). Deduplicated by MXID.
-async fn enumerate_key_recipients(client: &Client, cfg: &GhostConfig) -> Result<Vec<KeyRecipient>> {
-    let room_id = RoomId::parse(&cfg.room_id)
-        .with_context(|| format!("parsing room_id '{}'", cfg.room_id))?;
-    let Some(room) = client.get_room(&room_id) else {
-        return Ok(Vec::new());
-    };
-    let raws = room
-        .get_state_events_static::<CallMemberEventContent>()
+/// Enumerate the call's human members (key-send recipients), read via a raw
+/// masqueraded `GET /rooms/{room_id}/state` — the ghost is already a joined
+/// member, so the read is authorized; no matrix-rust-sdk `Client` involved (#50).
+/// Excludes our ghosts ([`is_ghost_identity`], which also drops *this* ghost) and
+/// the bridge bot itself (the subscriber skips ghost tracks, so it never needs
+/// ghost keys — constraint #5). Deduplicated by (user, device).
+async fn enumerate_key_recipients(cfg: &GhostConfig, ghost_mxid: &str) -> Result<Vec<KeyRecipient>> {
+    let url = cs_url(
+        &cfg.homeserver_url,
+        &["rooms", &cfg.room_id, "state"],
+        Some(ghost_mxid),
+    )?;
+    let resp = cfg
+        .http
+        .get(url)
+        .bearer_auth(&cfg.as_token)
+        .send()
         .await
-        .context("reading call memberships for key distribution")?;
+        .context("GET /rooms/{roomId}/state")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "reading call memberships for key distribution failed: {}",
+            err_body(resp).await
+        ));
+    }
+    let events: Vec<serde_json::Value> = resp
+        .json()
+        .await
+        .context("parsing room state for key distribution")?;
+    Ok(recipients_from_room_state(
+        events,
+        &cfg.ghost_localpart_prefix,
+        &cfg.bot_user_id,
+    ))
+}
 
-    // One recipient per ACTIVE membership = one (user, device) actually in the call.
-    // m.call.member is per-device, so this targets exactly the in-call device(s) — not
-    // every device the user owns (which would waste Olm OTK claims on offline sessions).
+/// The subset of a full state event [`recipients_from_room_state`] reads. The raw
+/// `/state` endpoint returns full-event JSON (not the sync-format wrapper the SDK
+/// used to hand us), so the shape is hand-rolled; `content` stays raw until the
+/// event-type filter has matched.
+#[derive(serde::Deserialize)]
+struct RawStateEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    sender: OwnedUserId,
+    origin_server_ts: MilliSecondsSinceUnixEpoch,
+    content: serde_json::Value,
+}
+
+/// Filter a room's full state down to the key-send recipients: one recipient per
+/// ACTIVE `m.call.member` membership = one (user, device) actually in the call.
+/// m.call.member is per-device, so this targets exactly the in-call device(s) — not
+/// every device the user owns (which would waste Olm OTK claims on offline sessions).
+/// Tolerant per event: anything unparseable is skipped (a redacted membership's
+/// pruned `{}` content deserializes to the empty variant → no active memberships).
+fn recipients_from_room_state(
+    events: Vec<serde_json::Value>,
+    ghost_localpart_prefix: &str,
+    bot_user_id: &str,
+) -> Vec<KeyRecipient> {
     let mut recipients: Vec<KeyRecipient> = Vec::new();
-    for raw in raws {
-        let Ok(ev) = raw.deserialize() else { continue };
-        let orig = match ev {
-            SyncOrStrippedState::Sync(SyncStateEvent::Original(o)) => o,
-            _ => continue,
-        };
-        let sender = orig.sender;
-        if is_bridge_excluded_identity(sender.as_str(), &cfg.ghost_localpart_prefix) || sender.as_str() == cfg.bot_user_id {
+    for raw in events {
+        let Ok(ev) = serde_json::from_value::<RawStateEvent>(raw) else { continue };
+        if ev.event_type != CALL_MEMBER_EVENT_TYPE {
             continue;
         }
-        for m in orig.content.active_memberships(Some(orig.origin_server_ts)) {
+        if is_bridge_excluded_identity(ev.sender.as_str(), ghost_localpart_prefix)
+            || ev.sender.as_str() == bot_user_id
+        {
+            continue;
+        }
+        let Ok(content) = serde_json::from_value::<CallMemberEventContent>(ev.content) else {
+            continue;
+        };
+        for m in content.active_memberships(Some(ev.origin_server_ts)) {
             let r = KeyRecipient {
-                user_id: sender.clone(),
+                user_id: ev.sender.clone(),
                 device_id: m.device_id().to_owned(),
             };
             if !recipients.contains(&r) {
@@ -1624,7 +1669,7 @@ async fn enumerate_key_recipients(client: &Client, cfg: &GhostConfig) -> Result<
             }
         }
     }
-    Ok(recipients)
+    recipients
 }
 
 
@@ -2137,6 +2182,170 @@ mod tests {
         assert_eq!(v["session"]["application"], "m.call");
         assert_eq!(v["session"]["scope"], "m.room");
         assert_eq!(v["sent_ts"], 1234);
+    }
+
+    // ── recipients_from_room_state, on raw /rooms/{id}/state JSON ───────────────
+
+    /// Wrap a content object in the full-event JSON shape the raw `/state`
+    /// endpoint returns (only the fields [`RawStateEvent`] reads, plus the usual
+    /// bystanders).
+    fn state_event(
+        event_type: &str,
+        sender: &str,
+        ts_ms: u64,
+        content: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "type": event_type,
+            "sender": sender,
+            "state_key": format!("_{sender}_DEV1_m.call"),
+            "origin_server_ts": ts_ms,
+            "event_id": "$test",
+            "content": content,
+        })
+    }
+
+    /// A currently-active session-format membership for `device_id` (the shape
+    /// `rtc::membership::join` posts), as raw content JSON.
+    fn session_member_content(device_id: &str, expires: Option<Duration>) -> serde_json::Value {
+        let content = CallMemberEventContent::new(
+            Application::Call(CallApplicationContent::new(String::new(), CallScope::Room)),
+            device_id.into(),
+            ActiveFocus::Livekit(ActiveLivekitFocus::new()),
+            Vec::new(),
+            None,
+            expires,
+        );
+        serde_json::to_value(&content).unwrap()
+    }
+
+    fn now_ms() -> u64 {
+        u64::from(matrix_sdk::ruma::MilliSecondsSinceUnixEpoch::now().get())
+    }
+
+    const PFX: &str = "nether-voicebridge_";
+    const BOT: &str = "@nether-voicebridge_bot:nether.im";
+
+    #[test]
+    fn room_state_recipients_include_active_humans_only() {
+        let events = vec![
+            // A human with an active membership → included, right device.
+            state_event(
+                CALL_MEMBER_EVENT_TYPE,
+                "@alice:nether.im",
+                now_ms(),
+                session_member_content("ALICEDEV", None),
+            ),
+            // Our own ghost and a stale legacy ghost → excluded (constraint #5).
+            state_event(
+                CALL_MEMBER_EVENT_TYPE,
+                "@nether-voicebridge_123:nether.im",
+                now_ms(),
+                session_member_content("D123", None),
+            ),
+            state_event(
+                CALL_MEMBER_EVENT_TYPE,
+                "@discord_456:nether.im",
+                now_ms(),
+                session_member_content("D456", None),
+            ),
+            // The bridge bot (subscriber) → excluded.
+            state_event(
+                CALL_MEMBER_EVENT_TYPE,
+                BOT,
+                now_ms(),
+                session_member_content("BOTDEV", None),
+            ),
+            // Non-call.member state → ignored even with a plausible content.
+            state_event(
+                "m.room.member",
+                "@bob:nether.im",
+                now_ms(),
+                serde_json::json!({"membership": "join"}),
+            ),
+        ];
+        let recipients = recipients_from_room_state(events, PFX, BOT);
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0].user_id.as_str(), "@alice:nether.im");
+        assert_eq!(recipients[0].device_id.as_str(), "ALICEDEV");
+    }
+
+    #[test]
+    fn room_state_recipients_skip_expired_and_empty_memberships() {
+        let events = vec![
+            // Expired: posted at t=1s epoch with a 1 ms expiry.
+            state_event(
+                CALL_MEMBER_EVENT_TYPE,
+                "@alice:nether.im",
+                1_000,
+                session_member_content("ALICEDEV", Some(Duration::from_millis(1))),
+            ),
+            // Left the call (Empty content, as posted by a leave/retraction).
+            state_event(
+                CALL_MEMBER_EVENT_TYPE,
+                "@bob:nether.im",
+                now_ms(),
+                serde_json::to_value(CallMemberEventContent::new_empty(None)).unwrap(),
+            ),
+            // Redacted membership: pruned `{}` content parses to Empty → no actives.
+            state_event(
+                CALL_MEMBER_EVENT_TYPE,
+                "@carol:nether.im",
+                now_ms(),
+                serde_json::json!({}),
+            ),
+        ];
+        assert!(recipients_from_room_state(events, PFX, BOT).is_empty());
+    }
+
+    #[test]
+    fn room_state_recipients_dedupe_and_tolerate_malformed_events() {
+        let dup = state_event(
+            CALL_MEMBER_EVENT_TYPE,
+            "@alice:nether.im",
+            now_ms(),
+            session_member_content("ALICEDEV", None),
+        );
+        let events = vec![
+            // Garbage / missing fields must not fail the rest of the scan.
+            serde_json::json!("not-an-object"),
+            serde_json::json!({"type": CALL_MEMBER_EVENT_TYPE, "content": {}}),
+            state_event(
+                CALL_MEMBER_EVENT_TYPE,
+                "@mallory:nether.im",
+                now_ms(),
+                serde_json::json!({"memberships": "not-an-array"}),
+            ),
+            // The same (user, device) twice (e.g. two state keys) → one recipient.
+            dup.clone(),
+            dup,
+            // Legacy-format membership (memberships array) still enumerates.
+            state_event(
+                CALL_MEMBER_EVENT_TYPE,
+                "@bob:nether.im",
+                now_ms(),
+                serde_json::to_value(CallMemberEventContent::new_legacy(vec![
+                    matrix_sdk::ruma::events::call::member::LegacyMembershipDataInit {
+                        application: Application::Call(CallApplicationContent::new(
+                            String::new(),
+                            CallScope::Room,
+                        )),
+                        device_id: "BOBDEV".into(),
+                        expires: Duration::from_secs(3600),
+                        foci_active: Vec::new(),
+                        membership_id: "0".to_owned(),
+                    }
+                    .into(),
+                ]))
+                .unwrap(),
+            ),
+        ];
+        let recipients = recipients_from_room_state(events, PFX, BOT);
+        assert_eq!(recipients.len(), 2);
+        assert_eq!(recipients[0].user_id.as_str(), "@alice:nether.im");
+        assert_eq!(recipients[0].device_id.as_str(), "ALICEDEV");
+        assert_eq!(recipients[1].user_id.as_str(), "@bob:nether.im");
+        assert_eq!(recipients[1].device_id.as_str(), "BOBDEV");
     }
 
     // ── distribute_key_loop, driven with mock transport + recipient source ──────
