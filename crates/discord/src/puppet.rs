@@ -1055,6 +1055,29 @@ impl SharedPool {
             .map(|(k, ch)| (k.clone(), ch.guild_id))
             .collect();
         for (key, guild) in pending {
+            // A channel left anchor-less but still served by a dedicated puppet
+            // (its former anchor's participant left, or the anchor's join failed,
+            // leaving a sibling puppet behind) just needs that live puppet promoted
+            // to capture anchor — it is already in voice, so elect it directly with
+            // no fresh bot (review F1-3). Only a channel with solely overflow
+            // speakers waiting needs a new bot to anchor.
+            let existing = guard.channels.get(&key).and_then(|ch| {
+                ch.assignments.values().find_map(|a| match a {
+                    Assign::Puppet { idx, .. } => Some(*idx),
+                    Assign::Overflow { .. } => None,
+                })
+            });
+            if let Some(idx) = existing {
+                guard
+                    .channels
+                    .get_mut(&key)
+                    .unwrap()
+                    .anchor
+                    .store(idx, Ordering::Relaxed);
+                self.send_cmd(idx, PuppetCommand::BecomeAnchor { guild });
+                tracing::info!(channel = %key, idx, "re-elected surviving puppet as capture anchor");
+                continue;
+            }
             if let Some(idx) = self.take_free_bot(guard, guild) {
                 self.activate_channel_with(guard, &key, idx);
             }
@@ -1409,12 +1432,13 @@ impl SharedPool {
     /// the anchor live.
     fn on_join_succeeded(&self, idx: usize, guild: GuildId) {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        // Activate capture on whichever channel elected this bot as its anchor —
+        // even a capture-only anchor whose own participant left mid-join (#59): the
+        // elected anchor still owns the channel's capture path and must register it,
+        // else Discord→Matrix stays silent until the channel fully re-elects (review
+        // F1-2). A bot holds one session per guild, so at most one channel matches.
         for ch in guard.channels.values().filter(|ch| ch.guild_id == guild) {
-            let serves = ch
-                .assignments
-                .values()
-                .any(|a| matches!(a, Assign::Puppet { idx: i, .. } if *i == idx));
-            if serves && ch.anchor.load(Ordering::Relaxed) == idx {
+            if ch.anchor.load(Ordering::Relaxed) == idx {
                 self.send_cmd(idx, PuppetCommand::BecomeAnchor { guild });
                 tracing::info!(bridge = %ch.bridge, idx, "puppet joined — activating capture anchor");
                 break;
@@ -1464,8 +1488,33 @@ impl SharedPool {
                 })
             });
         let Some((bridge, key)) = found else {
-            // Participant already left during the join — just free the bot there.
+            // No live Assign::Puppet for this bot in the guild. Either the
+            // participant left during the join, OR this bot is a capture-only
+            // anchor (kept after the last participant left with Discord speakers
+            // still present, #59) whose rejoin failed. Free the bot; and if it was
+            // still the elected anchor of a channel, clear that election and cancel
+            // its idle-release grace — otherwise the channel keeps a session-less
+            // anchor that panics the next assign() at the reuse-capture-only-anchor
+            // path (review F1-1/F2-1), and a stale grace timer would later tear down
+            // whichever channel next reuses this (idx, guild).
             guard.sessions.remove(&(idx, guild));
+            let stale = guard
+                .channels
+                .iter()
+                .find(|(_, ch)| {
+                    ch.guild_id == guild && ch.anchor.load(Ordering::Relaxed) == idx
+                })
+                .map(|(bk, _)| bk.clone());
+            if let Some(bk) = stale {
+                Self::cancel_anchor_idle_release(guard, &bk);
+                guard
+                    .channels
+                    .get_mut(&bk)
+                    .unwrap()
+                    .anchor
+                    .store(NO_ANCHOR, Ordering::Relaxed);
+                tracing::warn!(idx, bridge = %bk, "puppet join failed for a capture-only anchor — cleared stale anchor election");
+            }
             tracing::warn!(idx, "puppet join failed; assignment already gone — quarantined");
             return backoff;
         };
@@ -4097,6 +4146,98 @@ mod tests {
         p.assign("A", "dave", "Dave");
         assert_eq!(p.test_slot_of("A", "dave"), Some(anchor), "dave reused the anchor bot");
         assert_eq!(p.test_free_count(), 1, "the spare bot stayed free (no fresh allocation)");
+    }
+
+    /// Drain and return the command names queued on bot `idx`'s command channel
+    /// (test-only: the async command loop that would consume them isn't running).
+    fn drain_cmd_names(p: &Arc<SharedPool>, idx: usize) -> Vec<&'static str> {
+        let mut slot_rx = p.slots[idx].cmd_rx.lock().unwrap();
+        let mut rx = slot_rx.take().expect("cmd_rx present");
+        let mut names = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            names.push(cmd.label());
+        }
+        *slot_rx = Some(rx); // restore for later drains / the real command loop
+        names
+    }
+
+    #[tokio::test]
+    async fn join_failure_on_capture_only_anchor_clears_stale_anchor() {
+        // review F1-1/F2-1: a capture-only anchor (kept after its participant left
+        // with Discord speakers present) whose rejoin then FAILS used to leave the
+        // channel's `anchor` pointing at a session-less bot — the next assign()
+        // panicked at the reuse-capture-only-anchor path. on_join_failed's
+        // assignment-gone branch must clear that stale election.
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        let anchor = p.test_anchor("A").unwrap();
+        mark_speaker(&p, "A", 999);
+        p.release("A", "alice"); // capture-only anchor retained, grace armed
+        assert_eq!(p.test_anchor("A"), Some(anchor));
+        assert!(p.test_slot_of("A", "alice").is_none());
+
+        // The kept anchor's rejoin fails (voice server still down).
+        p.on_join_failed(anchor, GuildId::new(1));
+        assert_eq!(p.test_anchor("A"), None, "stale capture-only anchor cleared");
+
+        // The formerly-panicking assign must now succeed and land dave consistently.
+        p.assign("A", "dave", "Dave");
+        // bot `anchor` is quarantined, so dave overflows until it recovers.
+        assert!(p.test_is_overflow("A", "dave") || p.test_slot_of("A", "dave").is_some());
+        p.recover_bot(anchor, GuildId::new(1));
+        assert!(p.test_anchor("A").is_some(), "channel re-anchored after recovery");
+        assert!(p.test_slot_of("A", "dave").is_some(), "dave served on a live bot");
+    }
+
+    #[tokio::test]
+    async fn demoted_mid_join_anchor_still_activates_capture() {
+        // review F1-2: an elected anchor demoted to capture-only while its join was
+        // in flight (its own participant left) must still receive BecomeAnchor when
+        // the join completes — otherwise the anchor sits in voice with no capture
+        // handler and Discord→Matrix audio is silent.
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        let anchor = p.test_anchor("A").unwrap();
+        let _ = drain_cmd_names(&p, anchor); // clear the Assign queued so far
+        mark_speaker(&p, "A", 999);
+        p.release("A", "alice"); // demote to capture-only (keep anchor), grace armed
+        assert_eq!(p.test_anchor("A"), Some(anchor));
+
+        // The join (started before the demotion) now completes.
+        p.on_join_succeeded(anchor, GuildId::new(1));
+        let names = drain_cmd_names(&p, anchor);
+        assert!(
+            names.contains(&"BecomeAnchor"),
+            "demoted capture-only anchor must still activate capture, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_reelects_surviving_puppet_without_a_free_bot() {
+        // review F1-3: a channel left anchor-less but still served by a dedicated
+        // puppet (the failed anchor's participant left, a sibling puppet remains)
+        // must re-elect that surviving puppet as capture anchor — even with no free
+        // bot to hand out. Previously service_pending could only anchor a channel by
+        // promoting an overflow speaker, so the channel stayed capture-less.
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice"); // bot 0, anchor
+        p.assign("A", "bob", "Bob"); // bot 1, dedicated
+        let anchor = p.test_anchor("A").unwrap();
+        let survivor = p.test_slot_of("A", "bob").unwrap();
+        assert_ne!(anchor, survivor);
+
+        // The anchor bot's join fails; no spare (bot 1 is busy serving bob).
+        p.on_join_failed(anchor, GuildId::new(1));
+        // With the fix, the surviving puppet is re-elected immediately.
+        assert_eq!(
+            p.test_anchor("A"),
+            Some(survivor),
+            "surviving puppet re-elected as anchor with no free bot"
+        );
+        assert!(p.test_slot_of("A", "bob").is_some(), "bob still served");
     }
 
     /// Mark a Discord speaker present in channel `label` (in production this
