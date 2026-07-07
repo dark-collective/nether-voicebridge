@@ -433,6 +433,11 @@ pub struct SharedPool {
     optout_set: OptoutSet,
     /// Path of the persisted opt-out list; unset (tests) disables the commands.
     optout_path: std::sync::OnceLock<String>,
+    /// Serializes the opt-out file read-modify-write + in-memory `optout_set`
+    /// update so two concurrent `/bridge optout|optin` interactions (serenity
+    /// dispatches each event on its own task) can't lose an update or diverge
+    /// the file from the set (review F5-2). Mirrors the mgmt bot's `mutate_lock`.
+    optout_write_lock: tokio::sync::Mutex<()>,
     /// `ready` refires on reconnect; register the `/bridge` command once.
     command_registered: AtomicBool,
 }
@@ -497,6 +502,7 @@ impl SharedPool {
             anchor_idle_grace: timing.anchor_idle_grace(),
             optout_set: Arc::new(RwLock::new(HashSet::new())),
             optout_path: std::sync::OnceLock::new(),
+            optout_write_lock: tokio::sync::Mutex::new(()),
             command_registered: AtomicBool::new(false),
         })
     }
@@ -2505,10 +2511,25 @@ async fn handle_optout_command(
         return;
     };
     let user_id = cmd.user.id.get();
-    let write = if opting_out {
-        nvb_config::add_optout(path, user_id)
-    } else {
-        nvb_config::remove_optout(path, user_id)
+    // Serialize the file RMW and the in-memory set update together so concurrent
+    // optout/optin interactions can't lose an update or diverge the two (F5-2).
+    // No `.await` is held under the guard (both ops are synchronous).
+    let write = {
+        let _guard = pool.optout_write_lock.lock().await;
+        let write = if opting_out {
+            nvb_config::add_optout(path, user_id)
+        } else {
+            nvb_config::remove_optout(path, user_id)
+        };
+        if write.is_ok() {
+            let mut set = pool.optout_set.write().unwrap_or_else(PoisonError::into_inner);
+            if opting_out {
+                set.insert(user_id);
+            } else {
+                set.remove(&user_id);
+            }
+        }
+        write
     };
     let changed = match write {
         Ok(c) => c,
@@ -2523,14 +2544,6 @@ async fn handle_optout_command(
             return;
         }
     };
-    {
-        let mut set = pool.optout_set.write().unwrap_or_else(PoisonError::into_inner);
-        if opting_out {
-            set.insert(user_id);
-        } else {
-            set.remove(&user_id);
-        }
-    }
     if opting_out {
         pool.apply_optout(user_id);
         tracing::info!(user_id, user = %cmd.user.name, changed, "user opted out of bridging");
