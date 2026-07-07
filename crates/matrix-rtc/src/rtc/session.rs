@@ -42,6 +42,13 @@ pub struct LiveSession {
     pub our_identity: String,
     /// Cancels the event task and all per-track playback consumers on teardown.
     cancel: CancellationToken,
+    /// Fired by the event task when the room dies (terminal `Disconnected`, or
+    /// the event stream ending) — the owner loop selects on this to tear down
+    /// and rejoin (#66). Dedicated token, deliberately NOT `cancel`: `cancel` is
+    /// a child of the bridge shutdown and means "stop consumers"; a shutdown
+    /// must never read as a room disconnect. Per-instance, so a signal from a
+    /// session that was already replaced can never trigger a spurious recovery.
+    pub(crate) disconnected: CancellationToken,
     _event_task: tokio::task::JoinHandle<()>,
 }
 
@@ -157,9 +164,19 @@ pub async fn connect(
     // Child of the bridge shutdown token, so a process-wide shutdown also closes
     // this session's event task + per-track consumers.
     let cancel = parent_cancel.child_token();
+    let disconnected = CancellationToken::new();
     let event_task = tokio::spawn(
-        handle_room_events(events, client, room_id, router, cancel.clone(), bridge.clone(), ghost_prefix)
-            .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
+        handle_room_events(
+            events,
+            client,
+            room_id,
+            router,
+            cancel.clone(),
+            disconnected.clone(),
+            bridge.clone(),
+            ghost_prefix,
+        )
+        .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
     );
 
     Ok(LiveSession {
@@ -167,6 +184,7 @@ pub async fn connect(
         key_provider,
         our_identity,
         cancel,
+        disconnected,
         _event_task: event_task,
     })
 }
@@ -306,12 +324,19 @@ async fn playback_consumer(
 
 /// Drain LiveKit room events: log for observability, and route subscribed audio
 /// tracks into the playback mixer (one consumer task per track, keyed by SID).
+///
+/// When the loop ends — a terminal `Disconnected` (the SDK only emits it after
+/// its internal auto-reconnect is exhausted) or the event stream closing — the
+/// `disconnected` token is fired unconditionally so the owner loop can tear the
+/// dead session down and rejoin (#66).
+#[allow(clippy::too_many_arguments)]
 async fn handle_room_events(
     mut events: UnboundedReceiver<RoomEvent>,
     client: Client,
     room_id: OwnedRoomId,
     router: Arc<dyn PlaybackRouter>,
     cancel: CancellationToken,
+    disconnected: CancellationToken,
     bridge: Arc<str>,
     ghost_prefix: Arc<str>,
 ) {
@@ -406,6 +431,15 @@ async fn handle_room_events(
                 tracing::warn!(reason = ?reason, "LiveKit: room disconnected");
                 break;
             }
+            // The SDK handles transient drops itself (resume/restart); these are
+            // informational. Only a terminal `Disconnected` (above) — emitted when
+            // the SDK's own retries are exhausted — needs app-level recovery.
+            RoomEvent::Reconnecting => {
+                tracing::info!("LiveKit: connection lost — SDK auto-reconnecting");
+            }
+            RoomEvent::Reconnected => {
+                tracing::info!("LiveKit: reconnected");
+            }
             // Per-participant frame-decrypt state (MissingKey / KeyRatcheted /
             // DecryptionFailed / Ok). This subscriber decrypts HUMAN publishers (ghost
             // tracks are echo-skipped above), so it reports the human→bridge direction —
@@ -419,11 +453,21 @@ async fn handle_room_events(
             }
         }
     }
+
+    // The room is dead (terminal Disconnected above, or the event channel closed
+    // because the room object was dropped/closed). Signal the owner loop — it
+    // decides whether this is teardown-echo (session already replaced/being
+    // closed; token never selected) or a mid-call death needing a rejoin.
+    disconnected.cancel();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::participant_mxid;
+    use super::*;
+    use livekit::DisconnectReason;
+    use nvb_audio::routing::ParticipantSink;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
 
     #[test]
     fn strips_device_suffix() {
@@ -436,5 +480,79 @@ mod tests {
         // Legacy `{mxid}`-only identity: the trailing `:`-segment is the server,
         // not a device — must NOT be stripped (the remaining `@a` is not a MXID).
         assert_eq!(participant_mxid("@a:b.com"), "@a:b.com");
+    }
+
+    // ── handle_room_events disconnect signalling (#66) ──────────────────────────
+
+    struct NoopSink;
+    impl ParticipantSink for NoopSink {
+        fn push(&self, _mono: &[i16]) {}
+    }
+
+    struct NoopRouter;
+    impl PlaybackRouter for NoopRouter {
+        fn assign(&self, _key: &str, _display_name: &str) -> Arc<dyn ParticipantSink> {
+            Arc::new(NoopSink)
+        }
+        fn set_muted(&self, _key: &str, _muted: bool) {}
+        fn release(&self, _key: &str) {}
+        fn release_all(&self) {}
+    }
+
+    /// Spawn `handle_room_events` with an offline Client (URL parse only, no I/O)
+    /// and return the event sender + the disconnected token it should fire.
+    async fn spawn_event_loop() -> (mpsc::UnboundedSender<RoomEvent>, CancellationToken) {
+        let client = Client::builder()
+            .homeserver_url("https://example.invalid")
+            .build()
+            .await
+            .expect("offline client");
+        let room_id: OwnedRoomId = "!r:example.invalid".try_into().expect("room id");
+        let (tx, rx) = mpsc::unbounded_channel();
+        let disconnected = CancellationToken::new();
+        tokio::spawn(handle_room_events(
+            rx,
+            client,
+            room_id,
+            Arc::new(NoopRouter),
+            CancellationToken::new(),
+            disconnected.clone(),
+            Arc::from("test"),
+            Arc::from("nether-voicebridge_"),
+        ));
+        (tx, disconnected)
+    }
+
+    #[tokio::test]
+    async fn disconnected_event_fires_signal() {
+        let (tx, disconnected) = spawn_event_loop().await;
+        tx.send(RoomEvent::Disconnected {
+            reason: DisconnectReason::UnknownReason,
+        })
+        .expect("send");
+        tokio::time::timeout(Duration::from_secs(1), disconnected.cancelled())
+            .await
+            .expect("disconnected token must fire on RoomEvent::Disconnected");
+    }
+
+    #[tokio::test]
+    async fn event_stream_end_fires_signal() {
+        let (tx, disconnected) = spawn_event_loop().await;
+        drop(tx); // room object dropped/closed → event channel closes
+        tokio::time::timeout(Duration::from_secs(1), disconnected.cancelled())
+            .await
+            .expect("disconnected token must fire when the event stream ends");
+    }
+
+    #[tokio::test]
+    async fn sdk_reconnect_events_do_not_fire_signal() {
+        let (tx, disconnected) = spawn_event_loop().await;
+        tx.send(RoomEvent::Reconnecting).expect("send");
+        tx.send(RoomEvent::Reconnected).expect("send");
+        // Give the loop time to process; the token must stay unfired (the SDK
+        // is handling the drop itself — only terminal Disconnected recovers).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!disconnected.is_cancelled());
+        drop(tx);
     }
 }
