@@ -3,6 +3,40 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.12] - 2026-07-07
+
+### Added
+- **Per-user opt-out: `/bridge optout` / `/bridge optin` (#63).** Any Discord
+  user can exclude themselves from bridging, instance-wide: their voice is
+  never relayed to Matrix (dropped at the capture demux) and no ghost
+  represents them (existing ghosts are retired on the spot; minting — including
+  the anchor's member seeding — is gated). Persisted at `<data_dir>/optout.toml`
+  across restarts. The `/bridge` command is no longer restricted to Manage
+  Server as a whole — the approve subcommand keeps its server-side
+  Manage Server check, while optout/optin are open to everyone (Discord has no
+  per-subcommand permissions). Note: clients cache command definitions —
+  reload Discord (Ctrl+R) if `/bridge` shows as outdated after upgrading.
+- **In-channel disclosure notice (#64, link side).** When a link is approved,
+  the bot posts into the bridged voice channel's text chat: bridged to Matrix,
+  voice relayed off-platform (live only, never recorded), who approved it, and
+  the privacy-policy link — visible to people who join long after the
+  approval. Requires Send Messages on the voice channel (degrades to a log
+  warning without it). The unlink-side notice remains open on #64.
+- **ToS follow-up docs and disclosure plumbing (#43).** A hostable privacy
+  policy (`docs/privacy-policy.md`), the App-Verification runbook with a
+  ready-to-send developer-support inquiry
+  (`docs/nether-voicebridge-verification-runbook.md`), a `[management]
+  privacy_policy_url` knob appended to the link/approve disclosure texts, and
+  `/bridge approve` outcomes now post publicly (the in-server record of the
+  manager's consent).
+- **`[timing]` grace-timer profile (#38).** The lifecycle grace timers
+  (quarantine backoff, voice-health sweep, anchor idle grace) are now
+  configurable for the test harness — with a loud startup warning when a
+  non-default profile is active. Production configs need no change.
+
+### Internal
+- Testing framework (#38): Tier-2 named lifecycle scenarios.
+
 ## [0.3.0-alpha.11] - 2026-07-07
 
 ### Added
