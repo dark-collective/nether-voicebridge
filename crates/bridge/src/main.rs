@@ -261,10 +261,14 @@ fn load_config() -> Result<nvb_config::Config> {
     match std::env::var("CONFIG_PATH") {
         Ok(path) => match nvb_config::Config::load(&path) {
             Ok(cfg) => Ok(cfg),
-            // File not found: CONFIG_PATH may be baked into the image as a default
+            // File *not found*: CONFIG_PATH may be baked into the image as a default
             // location (e.g. /app/config.toml) but no file was mounted — fall back to
-            // env vars just like the no-file path below.
-            Err(nvb_config::ConfigError::Io { .. }) => {
+            // env vars just like the no-file path below. A genuine read error
+            // (permission denied, EISDIR, I/O failure) must NOT be silently swallowed
+            // into an env fallback — surface it (review F5-4).
+            Err(nvb_config::ConfigError::Io { ref source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
                 tracing::info!(
                     "config file not found at {path}, \
                      loading config from environment variables"
@@ -276,7 +280,9 @@ fn load_config() -> Result<nvb_config::Config> {
         },
         Err(_) => match nvb_config::Config::load("config.toml") {
             Ok(cfg) => Ok(cfg),
-            Err(nvb_config::ConfigError::Io { .. }) => {
+            Err(nvb_config::ConfigError::Io { ref source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
                 tracing::info!("no config.toml found, loading config from environment variables");
                 nvb_config::Config::from_env().context(
                     "no config.toml found; set CONFIG_PATH or supply all NETHER_* environment variables",
