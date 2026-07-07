@@ -31,28 +31,7 @@ async fn main() -> Result<()> {
     // Process-global: installed once here, never inside the per-bridge loop.
     rustls::crypto::ring::default_provider().install_default().ok();
 
-    // Default filter enables info for every workspace crate. The split moved the
-    // log targets from `nether_voicebridge` to per-crate names (`nvb_audio`,
-    // `nvb_discord`, `nvb_matrix_rtc`, `nvb_config`), so RUST_LOG now targets
-    // those — e.g. `RUST_LOG=nvb_discord=debug,nvb_matrix_rtc=debug`.
-    //
-    // `NVB_LOG_JSON=1` switches stdout to newline-delimited JSON events — the
-    // machine-readable feed the #38 e2e harness scrapes (`nvb-e2e`'s
-    // LogScraper). Anything else (unset, "0", …) keeps the human format, so
-    // production output is unchanged.
-    let env_filter = || {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new(
-                "nether_voicebridge=info,nvb_audio=info,nvb_discord=info,\
-                 nvb_matrix_rtc=info,nvb_config=info",
-            )
-        })
-    };
-    if std::env::var("NVB_LOG_JSON").is_ok_and(|v| v == "1") {
-        tracing_subscriber::fmt().json().with_env_filter(env_filter()).init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter()).init();
-    }
+    init_tracing();
 
     // Raise the open-file (nofile) soft limit. Each ghost (one per Discord speaker)
     // is its own matrix-sdk client with a SQLite crypto store (db + -wal + -shm) plus
@@ -161,30 +140,8 @@ async fn main() -> Result<()> {
     // The pool's own shutdown root: Ctrl-C cancels it to drain every puppet.
     let pool_shutdown = CancellationToken::new();
 
-    // Two-sided link auth (#47): when the management bot requires Discord-side
-    // approval, wire the pool's `/bridge approve` command to the bot. The two
-    // crates don't know each other, so an adapter task converts the pool's
-    // `LinkApproval` into the bot's `DiscordApproval` (the reply oneshot passes
-    // through untouched).
-    let mut mgmt_approval_rx = None;
-    if let Some((m, _, _)) = &mgmt_inputs {
-        if m.require_discord_approval {
-            let (pool_tx, mut pool_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (mgmt_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            pool.enable_link_approval(m.approval_bot_index, pool_tx);
-            tokio::spawn(async move {
-                while let Some((a, reply)) = pool_rx.recv().await {
-                    let _ = mgmt_tx.send(nvb_matrix_rtc::mgmt::DiscordApproval {
-                        code: a.code,
-                        guild_id: a.guild_id,
-                        invoker: a.invoker,
-                        reply,
-                    });
-                }
-            });
-            mgmt_approval_rx = Some(rx);
-        }
-    }
+    let mgmt_approval_rx =
+        wire_mgmt_pool_adapter(&pool, mgmt_inputs.as_ref().map(|(m, _, _)| m));
 
     // The supervisor owns every running bridge (and drives the pool's future):
     // one independent Matrix/RTC pipeline per bridge, all `!Send`, all driven on
@@ -252,6 +209,63 @@ async fn main() -> Result<()> {
     supervisor.run().await;
 
     Ok(())
+}
+
+/// Install the process-wide `tracing` subscriber.
+///
+/// The default filter enables info for every workspace crate. The split moved
+/// the log targets from `nether_voicebridge` to per-crate names (`nvb_audio`,
+/// `nvb_discord`, `nvb_matrix_rtc`, `nvb_config`), so RUST_LOG now targets
+/// those — e.g. `RUST_LOG=nvb_discord=debug,nvb_matrix_rtc=debug`.
+///
+/// `NVB_LOG_JSON=1` switches stdout to newline-delimited JSON events — the
+/// machine-readable feed the #38 e2e harness scrapes (`nvb-e2e`'s LogScraper).
+/// Anything else (unset, "0", …) keeps the human format, so production output
+/// is unchanged.
+fn init_tracing() {
+    let env_filter = || {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(
+                "nether_voicebridge=info,nvb_audio=info,nvb_discord=info,\
+                 nvb_matrix_rtc=info,nvb_config=info",
+            )
+        })
+    };
+    if std::env::var("NVB_LOG_JSON").is_ok_and(|v| v == "1") {
+        tracing_subscriber::fmt().json().with_env_filter(env_filter()).init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter()).init();
+    }
+}
+
+/// Two-sided link auth (#47): when the management bot requires Discord-side
+/// approval, wire the pool's `/bridge approve` command to the bot. The two
+/// crates don't know each other, so an adapter task converts the pool's
+/// `LinkApproval` into the bot's `DiscordApproval` (the reply oneshot passes
+/// through untouched). Returns the receiver the management bot reads approvals
+/// from, or `None` when approval isn't required.
+fn wire_mgmt_pool_adapter(
+    pool: &SharedPool,
+    mgmt: Option<&nvb_config::ManagementConfig>,
+) -> Option<tokio::sync::mpsc::UnboundedReceiver<nvb_matrix_rtc::mgmt::DiscordApproval>> {
+    let m = mgmt?;
+    if !m.require_discord_approval {
+        return None;
+    }
+    let (pool_tx, mut pool_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (mgmt_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    pool.enable_link_approval(m.approval_bot_index, pool_tx);
+    tokio::spawn(async move {
+        while let Some((a, reply)) = pool_rx.recv().await {
+            let _ = mgmt_tx.send(nvb_matrix_rtc::mgmt::DiscordApproval {
+                code: a.code,
+                guild_id: a.guild_id,
+                invoker: a.invoker,
+                reply,
+            });
+        }
+    });
+    Some(rx)
 }
 
 /// Load the static config: CONFIG_PATH (default `config.toml`), falling back to
