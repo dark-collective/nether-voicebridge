@@ -3,6 +3,43 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.11] - 2026-07-07
+
+### Added
+- **Open registration (#43).** With `[management] open_registration = true`
+  (default off; config validation requires BOTH two-sided-auth knobs), Matrix
+  users not on the operator allowlist can DM the bot — direct invites only,
+  deny-listed users refused — and self-serve a scoped command set: `link`
+  (room authority + Discord approval mandatory), `unlink`/`list` limited to
+  bridges they created (via the owner records), and `help`.
+  `ban`/`unban`/`bans` stay operator-only. New `[limits]
+  max_tenants_per_owner` caps bridges per self-serve owner (pending approval
+  codes count toward it; operators exempt).
+- **Standby label for idling bridge bots.** After the last Matrix user leaves
+  a call while Discord users remain, the bot that lingers through the
+  reconnect grace window now wears `[puppets] standby_nickname` (default
+  `"[Matrix: Standby]"`, a whole nickname — the prefix is not applied) instead
+  of a bare prefix that read like a participant's name.
+
+### Fixed
+- **The bridge no longer goes dormant with Discord users still in the channel
+  (#59).** The Matrix call-end teardown used to release the capture anchor
+  ~0.5 s after the pool had decided to keep it for the reconnect grace,
+  leaving the bridge dead until a Matrix user happened to return (observed 36
+  minutes on prod). The call-end path now honors the keep decision: the anchor
+  idles as capture-only for the 90 s grace — a returning Matrix user gets
+  instant audio with no reconnect churn — then releases to baseline.
+  Process/tenant teardown still drains unconditionally.
+- **A force-moved puppet bot now returns to its assigned channel (#62).** A
+  moderator moving a bridge bot to another voice channel keeps the voice
+  connection alive, so no disconnect fires and the health sweep saw a
+  "connected" (but misplaced) bot. The pool now watches its own bots'
+  voice-state events and verifies actual-vs-assigned channel (the periodic
+  sweep checks it too), recovering the same bot back in ~3 seconds via the
+  existing epoch-checked rejoin — including a settle pause that stops the
+  in-flight move from cancelling the rejoin and needlessly quarantining the
+  bot.
+
 ## [0.3.0-alpha.10] - 2026-07-06
 
 ### Added
