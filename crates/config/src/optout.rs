@@ -105,6 +105,16 @@ impl ApprovalOutcome {
     }
 }
 
+/// A one-way disclosure notice from the management bot to a Discord channel
+/// (#64 unlink side): posted into the bridged voice channel's text chat by the
+/// pool's command bot. Plain data — crosses the `nvb-matrix-rtc` → `nvb-discord`
+/// boundary through the binary's wiring.
+#[derive(Debug)]
+pub struct DiscordNotice {
+    pub channel_id: u64,
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

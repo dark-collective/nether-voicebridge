@@ -62,7 +62,7 @@ use tokio_util::sync::CancellationToken;
 
 use nvb_audio::mixer::PlaybackMixer;
 use nvb_audio::routing::{CaptureRouter, ParticipantSink, PlaybackRouter};
-use nvb_config::{ApprovalOutcome, PuppetsConfig, TimingConfig};
+use nvb_config::{ApprovalOutcome, DiscordNotice, PuppetsConfig, TimingConfig};
 
 use crate::{
     BotIdSet, CaptureSink, ConnectionLogger, OptoutSet, PlaybackSource, SpeakingLogger, SsrcMap,
@@ -435,6 +435,10 @@ pub struct SharedPool {
     optout_path: std::sync::OnceLock<String>,
     /// `ready` refires on reconnect; register the `/bridge` command once.
     command_registered: AtomicBool,
+    /// Disclosure notices pushed by the management bot (#64 unlink side),
+    /// consumed once by the command bot's `ready` (same take-once shape as
+    /// `PuppetSlot.cmd_rx`).
+    notices: StdMutex<Option<mpsc::UnboundedReceiver<DiscordNotice>>>,
 }
 
 impl SharedPool {
@@ -498,7 +502,15 @@ impl SharedPool {
             optout_set: Arc::new(RwLock::new(HashSet::new())),
             optout_path: std::sync::OnceLock::new(),
             command_registered: AtomicBool::new(false),
+            notices: StdMutex::new(None),
         })
+    }
+
+    /// Wire the management bot's disclosure notices (#64): the command bot
+    /// posts each one into its target channel's text chat. Call before
+    /// [`run`](Self::run).
+    pub fn enable_notices(&self, rx: mpsc::UnboundedReceiver<DiscordNotice>) {
+        *self.notices.lock().unwrap_or_else(PoisonError::into_inner) = Some(rx);
     }
 
     /// Load the persisted opt-out list (#63) and arm the `/bridge optout`/
@@ -2192,6 +2204,36 @@ impl EventHandler for PuppetHandler {
                     self.pool.command_registered.store(false, Ordering::SeqCst);
                     tracing::error!(idx = self.idx, error = %e, "failed to register the /bridge command");
                 }
+            }
+        }
+
+        // Disclosure notices (#64): the command bot drains the management
+        // bot's notice channel for the life of the process. Taken once —
+        // `ready` refires on reconnect, and the task's `Arc<Http>` REST
+        // client is independent of the gateway connection.
+        if self.pool.command_bot_index() == self.idx {
+            let rx = self
+                .pool
+                .notices
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(mut rx) = rx {
+                let http = ctx.http.clone();
+                let idx = self.idx;
+                tokio::spawn(async move {
+                    while let Some(n) = rx.recv().await {
+                        if let Err(e) = ChannelId::new(n.channel_id).say(&http, &n.message).await
+                        {
+                            tracing::warn!(
+                                idx,
+                                channel_id = n.channel_id,
+                                error = %e,
+                                "could not post a bridge disclosure notice (missing Send Messages?)"
+                            );
+                        }
+                    }
+                });
             }
         }
 

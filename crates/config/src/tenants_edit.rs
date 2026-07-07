@@ -38,6 +38,10 @@ pub struct NewTenant {
 /// exist.
 pub type PriorContent = Option<String>;
 
+/// A tenant removed by [`remove_tenant_entries_matching`]: `(name, discord
+/// channel_id)` — the channel id feeds the unlink disclosure notice (#64).
+pub type RemovedTenant = (String, Option<String>);
+
 /// Append a `[[bridge]]` entry for `t` to the tenants file (creating the file
 /// if absent). Fails without touching the file when an entry named `t.name`
 /// already exists. Returns the prior content for [`restore_tenants_file`].
@@ -105,13 +109,13 @@ pub fn remove_tenant_entry(path: &str, name: &str) -> Result<PriorContent, Confi
 /// guild/room/owner and every tenant it matches is removed in one atomic
 /// write, then reconciled away). `pred` sees each entry's `(owner, guild_id,
 /// room_id)`, any of which may be absent on hand-written entries. Returns the
-/// removed entry names (possibly empty — an empty match is not an error) and
-/// the prior content for [`restore_tenants_file`]. The file is not rewritten
-/// when nothing matches.
+/// removed entries as `(name, discord channel_id)` — the channel id feeds the
+/// unlink disclosure notice (#64) — plus the prior content for
+/// [`restore_tenants_file`]. The file is not rewritten when nothing matches.
 pub fn remove_tenant_entries_matching(
     path: &str,
     pred: impl Fn(Option<&str>, Option<&str>, Option<&str>) -> bool,
-) -> Result<(Vec<String>, PriorContent), ConfigError> {
+) -> Result<(Vec<RemovedTenant>, PriorContent), ConfigError> {
     let prior = read_prior(path)?;
     let mut doc = parse_doc(prior.as_deref())?;
 
@@ -128,9 +132,16 @@ pub fn remove_tenant_entries_matching(
                 .and_then(|v| v.as_str());
             let room = t.get("room_id").and_then(|v| v.as_str());
             if pred(owner, guild, room) {
-                removed.push(
+                let chan = t
+                    .get("discord")
+                    .and_then(|d| d.as_table_like())
+                    .and_then(|d| d.get("channel_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                removed.push((
                     t.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>").to_string(),
-                );
+                    chan,
+                ));
                 arr.remove(idx);
             } else {
                 idx += 1;
@@ -161,6 +172,24 @@ pub fn tenant_owners(path: &str) -> Result<Vec<(String, Option<String>)>, Config
         }
     }
     Ok(out)
+}
+
+/// The Discord channel id recorded on the `[[bridge]]` entry named `name`
+/// (`None` = no such entry, or a hand-written entry without one). Read-only;
+/// the unlink disclosure notice (#64) targets this channel.
+pub fn tenant_discord_channel(path: &str, name: &str) -> Result<Option<String>, ConfigError> {
+    let prior = read_prior(path)?;
+    let doc = parse_doc(prior.as_deref())?;
+    let Some(idx) = find_entry(&doc, name) else { return Ok(None) };
+    let chan = doc["bridge"]
+        .as_array_of_tables()
+        .and_then(|arr| arr.get(idx))
+        .and_then(|t| t.get("discord"))
+        .and_then(|d| d.as_table_like())
+        .and_then(|d| d.get("channel_id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    Ok(chan)
 }
 
 /// Roll the tenants file back to `prior` (the return value of a mutation):
@@ -388,12 +417,12 @@ mod tests {
         // Owner match removes only a; entries without an owner never match.
         let (removed, _prior) =
             remove_tenant_entries_matching(&path, |o, _, _| o == Some("@evil:x")).unwrap();
-        assert_eq!(removed, vec!["a".to_string()]);
+        assert_eq!(removed, vec![("a".to_string(), Some("222".to_string()))]);
 
         // Guild match removes b; c (guild 111) stays.
         let (removed, _prior) =
             remove_tenant_entries_matching(&path, |_, g, _| g == Some("999")).unwrap();
-        assert_eq!(removed, vec!["b".to_string()]);
+        assert_eq!(removed, vec![("b".to_string(), Some("222".to_string()))]);
 
         // No match: file untouched, empty result, prior still returned.
         let before = std::fs::read_to_string(&path).unwrap();
@@ -406,7 +435,7 @@ mod tests {
         // Room match removes the rest.
         let (removed, _prior) =
             remove_tenant_entries_matching(&path, |_, _, r| r == Some("!c:nether.im")).unwrap();
-        assert_eq!(removed, vec!["c".to_string()]);
+        assert_eq!(removed, vec![("c".to_string(), Some("222".to_string()))]);
     }
 
     #[test]
@@ -450,5 +479,9 @@ mod tests {
                 ("legacy".to_string(), None),
             ]
         );
+
+        // The unlink-notice lookup (#64): channel id by name, None for unknown.
+        assert_eq!(tenant_discord_channel(&path, "mine").unwrap(), Some("222".to_string()));
+        assert_eq!(tenant_discord_channel(&path, "nope").unwrap(), None);
     }
 }

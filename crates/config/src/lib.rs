@@ -10,12 +10,13 @@ mod tenants;
 mod tenants_edit;
 pub use banlist::{BanKind, BanList, add_ban, banlist_path, load_banlist, remove_ban};
 pub use optout::{
-    ApprovalOutcome, OptoutList, add_optout, load_optout, optout_path, remove_optout,
+    ApprovalOutcome, DiscordNotice, OptoutList, add_optout, load_optout, optout_path,
+    remove_optout,
 };
 pub use tenants::{TenantsFile, list_tenant_names, load_tenants, tenants_path};
 pub use tenants_edit::{
     NewTenant, PriorContent, add_tenant_entry, remove_tenant_entries_matching,
-    remove_tenant_entry, restore_tenants_file, tenant_owners,
+    remove_tenant_entry, restore_tenants_file, tenant_discord_channel, tenant_owners,
 };
 
 #[derive(Debug, Error)]

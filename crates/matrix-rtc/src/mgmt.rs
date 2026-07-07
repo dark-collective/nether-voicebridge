@@ -82,6 +82,16 @@ pub struct DiscordApproval {
     pub reply: oneshot::Sender<ApprovalOutcome>,
 }
 
+/// The management bot's Discord-pool IO, bundled so `run`'s signature stays
+/// flat: `/bridge approve` invocations in (#47), disclosure notices out (#64).
+/// Either side may be absent (approval only exists with two-sided auth; the
+/// notice channel is wired whenever the pool runs).
+#[derive(Default)]
+pub struct PoolIo {
+    pub approval_rx: Option<mpsc::UnboundedReceiver<DiscordApproval>>,
+    pub notice_tx: Option<mpsc::UnboundedSender<DiscordNotice>>,
+}
+
 use anyhow::{Context, Result};
 use matrix_sdk::{
     Client, Room, RoomState, SessionMeta,
@@ -104,7 +114,7 @@ use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use nvb_config::{ApprovalOutcome, BanKind, ManagementConfig, NewTenant};
+use nvb_config::{ApprovalOutcome, BanKind, DiscordNotice, ManagementConfig, NewTenant};
 
 /// How long a command handler waits for the supervisor to answer a control
 /// request. The reconcile itself is synchronous bookkeeping (teardown happens
@@ -165,6 +175,9 @@ struct BotCtx {
     /// Public privacy-policy URL (#43 ToS follow-ups): appended to the `link`
     /// disclosure texts when configured.
     privacy_policy_url: Option<String>,
+    /// Disclosure notices to the Discord pool (#64): posted into a bridged
+    /// voice channel's text chat by the command bot. Best-effort.
+    notice_tx: Option<mpsc::UnboundedSender<DiscordNotice>>,
 }
 
 impl BotCtx {
@@ -175,6 +188,16 @@ impl BotCtx {
             .as_deref()
             .map(|u| format!("\nPrivacy policy: {u}"))
             .unwrap_or_default()
+    }
+
+    /// Post a disclosure notice into a Discord channel via the pool's command
+    /// bot (#64). Best-effort: no notice wiring, an absent/unparsable channel
+    /// id, or a closed channel all degrade silently (the notice is a courtesy,
+    /// never a gate).
+    fn send_notice(&self, channel_id: Option<&str>, message: &str) {
+        let (Some(tx), Some(ch)) = (&self.notice_tx, channel_id) else { return };
+        let Ok(id) = ch.parse::<u64>() else { return };
+        let _ = tx.send(DiscordNotice { channel_id: id, message: message.to_string() });
     }
 }
 
@@ -352,7 +375,7 @@ pub async fn run(
     data_dir: String,
     limits: nvb_config::LimitsConfig,
     control: ControlTx,
-    approval_rx: Option<mpsc::UnboundedReceiver<DiscordApproval>>,
+    pool_io: PoolIo,
     shutdown: CancellationToken,
 ) -> Result<()> {
     // Pair the device identity with the crypto store (#30) — same rule as the
@@ -445,12 +468,13 @@ pub async fn run(
         open_registration: cfg.open_registration,
         max_tenants_per_owner: limits.max_tenants_per_owner,
         privacy_policy_url: cfg.privacy_policy_url.clone(),
+        notice_tx: pool_io.notice_tx,
     });
 
     // Discord-side approvals (#47 two-sided link auth): consume `/bridge
     // approve` invocations forwarded by the puppet pool. Separate task so a
     // slow commit (reconcile round-trip) never stalls the sync loop.
-    if let Some(mut rx) = approval_rx {
+    if let Some(mut rx) = pool_io.approval_rx {
         let ctx = ctx.clone();
         let client = client.clone();
         let shutdown = shutdown.clone();
@@ -741,6 +765,12 @@ const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridg
 /// Help for self-serve users (#43): only the verbs they may run, plus the
 /// consent flow they will hit.
 const SELF_SERVE_HELP_TEXT: &str = "Voice bridge commands:\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> — bridge a Discord voice channel to a Matrix room. You must be a moderator of the Matrix room, and someone with Manage Server on the Discord side must approve the link with the `/bridge approve` command and the code you'll receive.\n  unlink <name> — remove a bridge you created\n  list — your bridges\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+
+/// Posted into a bridged voice channel's text chat when its link is removed
+/// (#64) — by `unlink` and by a ban's teardown sweep. Deliberately neutral:
+/// the channel learns the bridge is gone, not why.
+const UNLINK_NOTICE_TEXT: &str =
+    "🔌 This voice channel is no longer bridged to Matrix — the link was removed.";
 
 /// The self-serve command tier (#43): which verbs a non-operator may run when
 /// `open_registration` is on. Ownership scoping inside `list`/`unlink` narrows
@@ -1613,6 +1643,10 @@ async fn handle_unlink(ctx: &BotCtx, room: &Room, sender: &str, name: &str) {
             }
         }
     }
+    // The bridged channel, read before the entry disappears — target of the
+    // unlink disclosure notice (#64). Best-effort.
+    let notice_channel =
+        nvb_config::tenant_discord_channel(&ctx.tenants_path, name).ok().flatten();
     let prior = match nvb_config::remove_tenant_entry(&ctx.tenants_path, name) {
         Ok(p) => p,
         Err(e) => {
@@ -1625,6 +1659,10 @@ async fn handle_unlink(ctx: &BotCtx, room: &Room, sender: &str, name: &str) {
             audit(ctx, sender, "unlink_ok", serde_json::json!({
                 "name": name, "was_running": summary.removed.iter().any(|l| l == name),
             }));
+            ctx.send_notice(
+                notice_channel.as_deref(),
+                UNLINK_NOTICE_TEXT,
+            );
             if summary.removed.iter().any(|l| l == name) {
                 reply(room, &format!("🛑 Bridge '{name}' is stopping (teardown takes a few seconds).")).await;
             } else {
@@ -1719,14 +1757,20 @@ async fn handle_ban(ctx: &BotCtx, room: &Room, sender: &str, kind_str: &str, val
 
     match request_reconcile(ctx).await {
         Some(Ok(_)) => {
+            let names: Vec<&str> = removed.iter().map(|(n, _)| n.as_str()).collect();
             audit(ctx, sender, "ban", serde_json::json!({
-                "kind": kind.as_str(), "value": value, "removed": removed,
+                "kind": kind.as_str(), "value": value, "removed": names,
             }));
+            // Disclose the teardown to each affected channel (#64) — same
+            // neutral text as unlink; the ban itself is not broadcast.
+            for (_, chan) in &removed {
+                ctx.send_notice(chan.as_deref(), UNLINK_NOTICE_TEXT);
+            }
             reply(room, &format!(
                 "🔨 Banned {} `{value}` and unlinked {} tenant(s): {}.",
                 kind.as_str(),
                 removed.len(),
-                removed.join(", ")
+                names.join(", ")
             ))
             .await;
         }
@@ -1748,7 +1792,8 @@ async fn handle_ban(ctx: &BotCtx, room: &Room, sender: &str, kind_str: &str, val
         }
         None => {
             audit(ctx, sender, "ban", serde_json::json!({
-                "kind": kind.as_str(), "value": value, "removed": removed,
+                "kind": kind.as_str(), "value": value,
+                "removed": removed.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
                 "reconcile": "no answer",
             }));
             reply(room, "The ban was recorded and the entries removed, but the supervisor did not respond — matching bridges may still be running. Check the bridge logs.").await;

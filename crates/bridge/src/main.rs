@@ -166,7 +166,15 @@ async fn main() -> Result<()> {
     // crates don't know each other, so an adapter task converts the pool's
     // `LinkApproval` into the bot's `DiscordApproval` (the reply oneshot passes
     // through untouched).
-    let mut mgmt_approval_rx = None;
+    let mut mgmt_pool_io = nvb_matrix_rtc::mgmt::PoolIo::default();
+    if mgmt_inputs.is_some() {
+        // Disclosure notices (#64): mgmt → pool, posted by the command bot.
+        // Wired whenever the management bot runs (unlink/ban notices don't
+        // depend on the two-sided-auth knobs).
+        let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        pool.enable_notices(notice_rx);
+        mgmt_pool_io.notice_tx = Some(notice_tx);
+    }
     if let Some((m, _, _)) = &mgmt_inputs {
         if m.require_discord_approval {
             let (pool_tx, mut pool_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -182,7 +190,7 @@ async fn main() -> Result<()> {
                     });
                 }
             });
-            mgmt_approval_rx = Some(rx);
+            mgmt_pool_io.approval_rx = Some(rx);
         }
     }
 
@@ -233,7 +241,7 @@ async fn main() -> Result<()> {
                 data_dir,
                 limits,
                 control,
-                mgmt_approval_rx,
+                mgmt_pool_io,
                 shutdown,
             )
             .await
