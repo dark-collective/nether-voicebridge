@@ -390,10 +390,19 @@ pub async fn join_and_publish(
         // a subscriber that processes the membership wants the track already
         // live). `connect_and_publish` installs the media key on the frame
         // crypto and spawns the room-event drain that closes LiveKit on cancel.
-        let (source, track) =
-            connect_and_publish(&gcfg, &focus, &mxid, &device_id, media_key, cancel.clone())
-                .await
-                .context("test speaker LiveKit connect/publish")?;
+        // The `disconnected` token (#66) is unused here: this test speaker has no
+        // reconnect loop — a room death just ends the actor, bounded by `cancel`.
+        let (source, track) = connect_and_publish(
+            &gcfg,
+            &focus,
+            &mxid,
+            &device_id,
+            media_key,
+            cancel.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .context("test speaker LiveKit connect/publish")?;
         post_membership_join(&gcfg, &mxid, &device_id, &focus).await?;
 
         // Feed task: reframe caller chunks to 10 ms and hand them to LiveKit.

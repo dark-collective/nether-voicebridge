@@ -721,8 +721,8 @@ async fn run_ghost(
     key: String,
     display_name: String,
     avatar_url: Option<String>,
-    frame_rx: mpsc::Receiver<Vec<i16>>,
-    mute_rx: watch::Receiver<bool>,
+    mut frame_rx: mpsc::Receiver<Vec<i16>>,
+    mut mute_rx: watch::Receiver<bool>,
     cancel: CancellationToken,
     crypto_cache: GhostCryptoCache,
     key_cache: GhostKeyCache,
@@ -878,7 +878,11 @@ async fn run_ghost(
         // minted for one of our OWN puppet bots in a startup race, see
         // `retract_self_ghost`), we must abort BEFORE publishing a track or posting
         // membership, or the puppet would briefly surface in the call (echo).
-        let (source, track) = tokio::select! {
+        // Per-connection-attempt disconnect signal, fired by the drain task when
+        // the room dies (#66). Replaced with a fresh token on every reconnect so
+        // a stale room's death can't re-trigger recovery.
+        let mut disconnected = CancellationToken::new();
+        let (mut source, mut track) = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 if let Some(h) = presence_membership.take() {
@@ -890,7 +894,7 @@ async fn run_ghost(
                 tracing::info!("ghost retired (cancelled before publish)");
                 return;
             }
-            res = connect_and_publish(&cfg, &focus, &ghost_mxid, &device_id, media_key, cancel.clone()) => match res {
+            res = connect_and_publish(&cfg, &focus, &ghost_mxid, &device_id, media_key, cancel.clone(), disconnected.clone()) => match res {
                 Ok(out) => out,
                 Err(e) => {
                     tracing::error!(error = %e, "ghost LiveKit connect/publish failed — retracting");
@@ -923,10 +927,70 @@ async fn run_ghost(
         // (Key distribution + crypto bootstrap were started on presence — step 3b —
         // so a pre-warmed ghost can deliver its key the instant a human joins.)
 
-        // 6. Pump frames until cancelled, mirroring the Discord user's mute state
+        // 6. Pump frames until retired, mirroring the Discord user's mute state
         // onto the track as it changes (and applying the current state up front, so
-        // a user who joined muted starts muted).
-        pump_audio(frame_rx, &source, &track, mute_rx, &cancel, cfg.capture_wav, &key).await;
+        // a user who joined muted starts muted). If the LiveKit room dies mid-call
+        // (#66) reconnect with backoff instead of retiring: the ghost's membership
+        // is posted and its media key distributed, so a silent retire here would
+        // leave the speaker visibly in the call but inaudible until they left and
+        // rejoined Discord. Membership + key tasks keep running across reconnects —
+        // the identity, device id, and media key are all stable, so peers need
+        // nothing re-delivered; the fresh room just republishes the track.
+        'pump: loop {
+            match pump_audio(
+                &mut frame_rx,
+                &source,
+                &track,
+                &mut mute_rx,
+                &cancel,
+                &disconnected,
+                cfg.capture_wav,
+                &key,
+            )
+            .await
+            {
+                // Retire: the ghost was released (cancel) or the Discord side
+                // dropped the speaker's sink (channel closed) — step 7 below.
+                PumpExit::Cancelled | PumpExit::SourceClosed => break 'pump,
+                PumpExit::Disconnected => {
+                    tracing::warn!("ghost LiveKit room disconnected — reconnecting");
+                    let mut backoff = Duration::from_secs(2);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break 'pump,
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        disconnected = CancellationToken::new();
+                        match connect_and_publish(
+                            &cfg,
+                            &focus,
+                            &ghost_mxid,
+                            &device_id,
+                            media_key,
+                            cancel.clone(),
+                            disconnected.clone(),
+                        )
+                        .await
+                        {
+                            Ok((s, t)) => {
+                                source = s;
+                                track = t;
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "ghost LiveKit reconnect failed — retrying");
+                            }
+                        }
+                    }
+                    // Frames buffered while the room was down are stale audio —
+                    // drop them so the rejoined track starts live, not delayed.
+                    while frame_rx.try_recv().is_ok() {}
+                    tracing::info!("ghost LiveKit reconnected — resuming publish");
+                }
+            }
+        }
 
         // 7. Teardown. Stop the membership-retry task first (it observes `cancel`)
         // and await it so a late join can't race past the leave below and linger.
@@ -942,23 +1006,43 @@ async fn run_ghost(
     .await;
 }
 
+/// Why the ghost's audio pump stopped — drives `run_ghost`'s retire-vs-reconnect
+/// decision (#66).
+#[derive(Debug, PartialEq, Eq)]
+enum PumpExit {
+    /// The ghost is retiring (`cancel` fired).
+    Cancelled,
+    /// The Discord side dropped the speaker's sink (frame channel closed) — a
+    /// legitimate retire, not a fault.
+    SourceClosed,
+    /// The LiveKit room died (the drain task fired this attempt's `disconnected`
+    /// token) — reconnect and pump again.
+    Disconnected,
+}
+
 /// Drain the ghost's frame channel through a jitter buffer into its LiveKit
 /// source as 10 ms mono frames. Mirrors the bridge bot's former audio consumer,
-/// one per ghost. Returns when cancelled or the Discord side drops the sender.
+/// one per ghost. Returns when cancelled, when the Discord side drops the
+/// sender, or when the room dies ([`PumpExit`] says which). Takes the receivers
+/// by `&mut` so a reconnect can re-enter with the same channels; note a re-entry
+/// with `capture_wav` truncates and rewrites `publish_<key>.wav` (diagnostic tap,
+/// acceptable).
 ///
 /// Diagnostics (issue #32, always on): a periodic per-ghost health line (frames
 /// in/out, jitter overflow drops + depth, `capture_frame` errors, RMS) and a
 /// frame-shape warning. When `capture_wav` is set it also writes "Tap B" — the
 /// exact mono PCM handed to LiveKit — to `publish_<key>.wav`.
+#[allow(clippy::too_many_arguments)]
 async fn pump_audio(
-    mut frame_rx: mpsc::Receiver<Vec<i16>>,
+    frame_rx: &mut mpsc::Receiver<Vec<i16>>,
     source: &NativeAudioSource,
     track: &LocalAudioTrack,
-    mut mute_rx: watch::Receiver<bool>,
+    mute_rx: &mut watch::Receiver<bool>,
     cancel: &CancellationToken,
+    disconnected: &CancellationToken,
     capture_wav: bool,
     key: &str,
-) {
+) -> PumpExit {
     // Mirror the Discord speaker's mute state onto the LiveKit track. `mute()`/
     // `unmute()` signal the server so Element Call peers see the mic-off indicator
     // (constraint: a muted Discord user must show muted in EC). Apply the current
@@ -990,10 +1074,11 @@ async fn pump_audio(
     let mut capture_errs: u64 = 0;
     let mut shape_warns: u64 = 0;
     let mut last_rms = f32::NEG_INFINITY;
-    loop {
+    let exit = loop {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => break,
+            _ = cancel.cancelled() => break PumpExit::Cancelled,
+            _ = disconnected.cancelled() => break PumpExit::Disconnected,
             res = mute_rx.changed() => {
                 // Sender drops only when the ghost retires (which also cancels,
                 // handled by the biased arm above); ignore Err and re-check.
@@ -1004,7 +1089,7 @@ async fn pump_audio(
                 }
             }
             frame = frame_rx.recv() => {
-                let Some(frame20) = frame else { break };
+                let Some(frame20) = frame else { break PumpExit::SourceClosed };
                 frames_in += 1;
                 jitter.push(&frame20);
                 while let Some(f10) = jitter.pop_10ms() {
@@ -1057,7 +1142,7 @@ async fn pump_audio(
                 }
             }
         }
-    }
+    };
 
     // Final health snapshot + finalize Tap B so the WAV header is valid.
     tracing::info!(
@@ -1067,6 +1152,7 @@ async fn pump_audio(
         jitter_dropped = jitter.dropped_samples(),
         capture_errs,
         shape_warns,
+        exit = ?exit,
         "ghost audio pump exiting"
     );
     if let Some(w) = tap_b {
@@ -1075,6 +1161,7 @@ async fn pump_audio(
             Err(e) => tracing::warn!(key, error = %e, "publish-tap WAV finalise failed"),
         }
     }
+    exit
 }
 
 /// Set the ghost track's mute state to `muted`. `LocalAudioTrack::mute`/`unmute`
@@ -1092,7 +1179,10 @@ fn apply_track_mute(track: &LocalAudioTrack, muted: bool) {
 /// room-event drain. Returns the source to feed and, when media E2EE is on, the
 /// 16-byte media key this ghost encrypts its frames under (to be distributed to
 /// the call's humans by [`distribute_key_loop`]). The `Room` is owned by the
-/// drain task (kept up until `cancel`, then closed).
+/// drain task (kept up until `cancel` or room death, then closed). `disconnected`
+/// is this attempt's death signal: the drain fires it when the room dies so
+/// `run_ghost` can reconnect (#66).
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_publish(
     cfg: &GhostConfig,
     focus: &LivekitFocusInfo,
@@ -1100,6 +1190,7 @@ async fn connect_and_publish(
     device_id: &str,
     media_key: Option<[u8; 16]>,
     cancel: CancellationToken,
+    disconnected: CancellationToken,
 ) -> Result<(NativeAudioSource, LocalAudioTrack)> {
     let openid_token = fetch_openid_token(cfg, ghost_mxid).await?;
     let jwt_resp = lk_jwt::fetch_livekit_token(
@@ -1173,33 +1264,48 @@ async fn connect_and_publish(
 
     // Move the room + events into a drain task: it keeps the connection alive,
     // logs events so the unbounded channel never fills, and closes the room when
-    // cancelled (ghost retired).
+    // the drain ends — ghost retired (`cancel`) or room death (which also fires
+    // `disconnected` so run_ghost reconnects, #66).
     tokio::spawn(async move {
-        let mut events = events;
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => break,
-                ev = events.recv() => match ev {
-                    Some(livekit::RoomEvent::Disconnected { reason }) => {
-                        tracing::warn!(reason = ?reason, "ghost LiveKit room disconnected");
-                        break;
-                    }
-                    // The ghost's own frame-ENCRYPT state (it's a pure publisher). Surfaced
-                    // at INFO to correlate with a listener that can't decrypt this ghost.
-                    Some(livekit::RoomEvent::E2eeStateChanged { participant, state }) => {
-                        tracing::info!(identity = %participant.identity(), ?state, "ghost LiveKit E2EE state changed");
-                    }
-                    Some(other) => tracing::trace!(event = ?other, "ghost LiveKit room event"),
-                    None => break,
-                },
-            }
-        }
+        drain_room_events(events, cancel, disconnected).await;
         let _ = room.close().await;
         tracing::debug!("ghost LiveKit room closed");
     });
 
     Ok((source, track))
+}
+
+/// Drain a ghost room's LiveKit events until the ghost retires (`cancel` — return
+/// without signalling) or the room dies. Room death — a terminal `Disconnected`
+/// (the SDK only emits it once its internal auto-reconnect is exhausted) or the
+/// event stream ending — fires `disconnected` so `run_ghost`'s reconnect loop can
+/// act (#66). Extracted from the spawn wrapper (which owns the `Room` and closes
+/// it after this returns) so the signalling is unit-testable.
+async fn drain_room_events(
+    mut events: mpsc::UnboundedReceiver<livekit::RoomEvent>,
+    cancel: CancellationToken,
+    disconnected: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            ev = events.recv() => match ev {
+                Some(livekit::RoomEvent::Disconnected { reason }) => {
+                    tracing::warn!(reason = ?reason, "ghost LiveKit room disconnected");
+                    break;
+                }
+                // The ghost's own frame-ENCRYPT state (it's a pure publisher). Surfaced
+                // at INFO to correlate with a listener that can't decrypt this ghost.
+                Some(livekit::RoomEvent::E2eeStateChanged { participant, state }) => {
+                    tracing::info!(identity = %participant.identity(), ?state, "ghost LiveKit E2EE state changed");
+                }
+                Some(other) => tracing::trace!(event = ?other, "ghost LiveKit room event"),
+                None => break,
+            },
+        }
+    }
+    disconnected.cancel();
 }
 
 // ─── E2EE media-key distribution (Path 2 plaintext / Path 3 Olm) ────────────────
@@ -2355,6 +2461,56 @@ mod tests {
         assert_eq!(recipients[0].device_id.as_str(), "ALICEDEV");
         assert_eq!(recipients[1].user_id.as_str(), "@bob:nether.im");
         assert_eq!(recipients[1].device_id.as_str(), "BOBDEV");
+    }
+
+    // ── drain_room_events disconnect signalling (#66) ───────────────────────────
+
+    #[tokio::test]
+    async fn ghost_drain_fires_disconnected_on_room_death() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let disconnected = CancellationToken::new();
+        tokio::spawn(drain_room_events(
+            rx,
+            CancellationToken::new(),
+            disconnected.clone(),
+        ));
+        tx.send(livekit::RoomEvent::Disconnected {
+            reason: livekit::DisconnectReason::UnknownReason,
+        })
+        .expect("send");
+        tokio::time::timeout(Duration::from_secs(1), disconnected.cancelled())
+            .await
+            .expect("disconnected token must fire on RoomEvent::Disconnected");
+    }
+
+    #[tokio::test]
+    async fn ghost_drain_fires_disconnected_on_stream_end() {
+        let (tx, rx) = mpsc::unbounded_channel::<livekit::RoomEvent>();
+        let disconnected = CancellationToken::new();
+        tokio::spawn(drain_room_events(
+            rx,
+            CancellationToken::new(),
+            disconnected.clone(),
+        ));
+        drop(tx); // room object dropped/closed → event channel closes
+        tokio::time::timeout(Duration::from_secs(1), disconnected.cancelled())
+            .await
+            .expect("disconnected token must fire when the event stream ends");
+    }
+
+    #[tokio::test]
+    async fn ghost_drain_cancel_does_not_fire_disconnected() {
+        let (tx, rx) = mpsc::unbounded_channel::<livekit::RoomEvent>();
+        let cancel = CancellationToken::new();
+        let disconnected = CancellationToken::new();
+        let handle = tokio::spawn(drain_room_events(rx, cancel.clone(), disconnected.clone()));
+        cancel.cancel(); // retire — must NOT read as a room death
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("drain must return on cancel")
+            .expect("drain task must not panic");
+        assert!(!disconnected.is_cancelled());
+        drop(tx);
     }
 
     // ── distribute_key_loop, driven with mock transport + recipient source ──────
