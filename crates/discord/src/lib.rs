@@ -40,6 +40,11 @@ pub type UserSinkMap = Arc<RwLock<HashMap<u64, Arc<dyn GhostSink>>>>;
 /// the channel is not a Discord human). Filled from each puppet's `ready`.
 pub type BotIdSet = Arc<RwLock<HashSet<u64>>>;
 
+/// Discord user ids that opted out of being bridged (#63): never forwarded
+/// Discord→Matrix and never ghosted. Shared between the pool (command handler,
+/// ghost gate) and every anchor's [`VoiceReceiver`] (capture gate).
+pub type OptoutSet = Arc<RwLock<HashSet<u64>>>;
+
 /// Output sample rate / channel layout for the Discord playback track. We hand
 /// songbird mono 48 kHz f32 PCM and let it upmix to stereo and Opus-encode.
 const PLAYBACK_SAMPLE_RATE: u32 = 48_000;
@@ -178,6 +183,9 @@ struct VoiceReceiver {
     user_sinks: UserSinkMap,
     /// Optional Phase 3 WAV capture, enabled via `[discord] capture_wav`.
     capture_sink: Option<Arc<CaptureSink>>,
+    /// Users who opted out of being bridged (#63) — their audio is dropped at
+    /// this demux even if a ghost sink somehow exists.
+    optout: OptoutSet,
     /// Shared current-anchor marker and this puppet's own slot index. This
     /// handler only captures while `anchor == idx`, so capture moves cleanly
     /// between puppets on handoff (no doubled or dropped capture).
@@ -208,6 +216,7 @@ impl VoiceReceiver {
         ssrc_map: SsrcMap,
         user_sinks: UserSinkMap,
         capture_sink: Option<Arc<CaptureSink>>,
+        optout: OptoutSet,
         anchor: Arc<std::sync::atomic::AtomicUsize>,
         idx: usize,
     ) -> Self {
@@ -217,6 +226,7 @@ impl VoiceReceiver {
             ssrc_map,
             user_sinks,
             capture_sink,
+            optout,
             anchor,
             idx,
             dropped: AtomicU64::new(0),
@@ -233,6 +243,7 @@ impl VoiceReceiver {
         let excluded = self.exclude.read().unwrap_or_else(PoisonError::into_inner);
         let ssrc_map = self.ssrc_map.read().unwrap_or_else(PoisonError::into_inner);
         let sinks = self.user_sinks.read().unwrap_or_else(PoisonError::into_inner);
+        let optout = self.optout.read().unwrap_or_else(PoisonError::into_inner);
         let mut dropped = 0u64;
         for (ssrc, data) in &tick.speaking {
             if excluded.contains(ssrc) {
@@ -260,8 +271,15 @@ impl VoiceReceiver {
             // Attribute SSRC → user → ghost. A speaker with no mapping yet (their
             // SpeakingStateUpdate or ghost assign hasn't landed) is dropped this
             // tick; the next tick (or their next utterance) resolves it.
-            match ssrc_map.get(ssrc).and_then(|uid| sinks.get(uid)) {
-                Some(sink) => sink.push(&audio::downmix_stereo_to_mono(pcm)),
+            // Opted-out users (#63) are dropped HERE, unconditionally — even if
+            // a ghost sink still exists (e.g. mid-retirement), their audio never
+            // crosses to Matrix. This is the single Discord→Matrix choke point.
+            match ssrc_map.get(ssrc) {
+                Some(uid) if optout.contains(uid) => {}
+                Some(uid) => match sinks.get(uid) {
+                    Some(sink) => sink.push(&audio::downmix_stereo_to_mono(pcm)),
+                    None => dropped += 1,
+                },
                 None => dropped += 1,
             }
         }

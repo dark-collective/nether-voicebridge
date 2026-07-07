@@ -62,11 +62,11 @@ use tokio_util::sync::CancellationToken;
 
 use nvb_audio::mixer::PlaybackMixer;
 use nvb_audio::routing::{CaptureRouter, ParticipantSink, PlaybackRouter};
-use nvb_config::{PuppetsConfig, TimingConfig};
+use nvb_config::{ApprovalOutcome, PuppetsConfig, TimingConfig};
 
 use crate::{
-    BotIdSet, CaptureSink, ConnectionLogger, PlaybackSource, SpeakingLogger, SsrcMap, UserSinkMap,
-    VoiceReceiver, PLAYBACK_CHANNELS, PLAYBACK_SAMPLE_RATE,
+    BotIdSet, CaptureSink, ConnectionLogger, OptoutSet, PlaybackSource, SpeakingLogger, SsrcMap,
+    UserSinkMap, VoiceReceiver, PLAYBACK_CHANNELS, PLAYBACK_SAMPLE_RATE,
 };
 
 /// Sentinel for "no anchor currently elected" in [`ChannelState::anchor`].
@@ -137,6 +137,9 @@ struct ChannelCtx {
     capture_sink: Option<Arc<CaptureSink>>,
     /// Global puppet-bot-id set — never minted as ghosts.
     bot_ids: BotIdSet,
+    /// Users who opted out of being bridged (#63) — never ghosted, never
+    /// captured (the demux drops them too).
+    optout: OptoutSet,
     /// This channel's anchor marker (slot index, or [`NO_ANCHOR`]). The anchor's
     /// `VoiceReceiver` only captures while it equals its own idx.
     anchor: Arc<AtomicUsize>,
@@ -379,9 +382,7 @@ pub struct LinkApproval {
 /// N pool bots each registering one would show N duplicates).
 struct LinkApprovalCfg {
     bot_index: usize,
-    tx: mpsc::UnboundedSender<(LinkApproval, oneshot::Sender<String>)>,
-    /// `ready` fires again on every gateway reconnect; register the command once.
-    registered: AtomicBool,
+    tx: mpsc::UnboundedSender<(LinkApproval, oneshot::Sender<ApprovalOutcome>)>,
 }
 
 /// The shared puppet pool. Built once per process; every bridge's Discord side is
@@ -426,6 +427,14 @@ pub struct SharedPool {
     /// so no nameless bot idles in voice once the call is genuinely empty of
     /// Matrix users. Default 90 s.
     anchor_idle_grace: Duration,
+    /// Users who opted out of being bridged (#63). Kept in lock-step with
+    /// `<data_dir>/optout.toml` (loaded at boot via [`enable_optout`], edited
+    /// by the `/bridge optout`/`optin` commands).
+    optout_set: OptoutSet,
+    /// Path of the persisted opt-out list; unset (tests) disables the commands.
+    optout_path: std::sync::OnceLock<String>,
+    /// `ready` refires on reconnect; register the `/bridge` command once.
+    command_registered: AtomicBool,
 }
 
 impl SharedPool {
@@ -486,7 +495,60 @@ impl SharedPool {
             quarantine_max: timing.quarantine_max(),
             voice_health_sweep: timing.voice_health_sweep(),
             anchor_idle_grace: timing.anchor_idle_grace(),
+            optout_set: Arc::new(RwLock::new(HashSet::new())),
+            optout_path: std::sync::OnceLock::new(),
+            command_registered: AtomicBool::new(false),
         })
+    }
+
+    /// Load the persisted opt-out list (#63) and arm the `/bridge optout`/
+    /// `optin` commands. Call once before [`run`](Self::run); a missing file is
+    /// an empty list.
+    pub fn enable_optout(&self, path: String) -> Result<()> {
+        let list = nvb_config::load_optout(&path)
+            .map_err(|e| anyhow!("loading opt-out list: {e}"))?;
+        {
+            let mut set = self.optout_set.write().unwrap_or_else(PoisonError::into_inner);
+            for u in &list.users {
+                match u.parse::<u64>() {
+                    Ok(id) => {
+                        set.insert(id);
+                    }
+                    Err(_) => tracing::warn!(entry = %u, "ignoring non-numeric opt-out entry"),
+                }
+            }
+        }
+        let _ = self.optout_path.set(path);
+        Ok(())
+    }
+
+    /// Apply a fresh opt-out to the live state (#63): retire the user's ghost
+    /// in every bridged channel. Their presence records stay (they ARE still in
+    /// the channel); with the ghost sink gone the demux has nothing to feed and
+    /// `maybe_release_idle_anchor` sees the channel correctly.
+    fn apply_optout(&self, user_id: u64) {
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        for ch in guard.channels.values_mut() {
+            let removed = ch
+                .user_sinks
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&user_id)
+                .is_some();
+            if removed {
+                ch.capture_router.release(&user_id.to_string());
+                tracing::info!(user_id, bridge = %ch.bridge, "ghost retired — user opted out of bridging");
+            }
+        }
+        drop(guard);
+        // A lone opted-out speaker may leave a capture-only anchor idle.
+        let bridges: Vec<String> = {
+            let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.channels.keys().cloned().collect()
+        };
+        for b in bridges {
+            self.maybe_release_idle_anchor(&b);
+        }
     }
 
     /// Turn on the `/bridge approve` command (#47 two-sided link auth): bot
@@ -496,15 +558,18 @@ impl SharedPool {
     pub fn enable_link_approval(
         &self,
         bot_index: usize,
-        tx: mpsc::UnboundedSender<(LinkApproval, oneshot::Sender<String>)>,
+        tx: mpsc::UnboundedSender<(LinkApproval, oneshot::Sender<ApprovalOutcome>)>,
     ) {
-        if self
-            .link_approval
-            .set(LinkApprovalCfg { bot_index, tx, registered: AtomicBool::new(false) })
-            .is_err()
-        {
+        if self.link_approval.set(LinkApprovalCfg { bot_index, tx }).is_err() {
             tracing::warn!("enable_link_approval called twice — keeping the first wiring");
         }
+    }
+
+    /// Which bot registers/serves the `/bridge` command: the approval bot when
+    /// two-sided auth is wired (#47), else bot 0 (the `optout`/`optin`
+    /// subcommands are useful on any instance, #63).
+    fn command_bot_index(&self) -> usize {
+        self.link_approval.get().map(|c| c.bot_index).unwrap_or(0)
     }
 
     /// Register a bridge's channel and return its [`PlaybackRouter`] view. Parses
@@ -674,6 +739,7 @@ impl SharedPool {
             capture_router: ch.capture_router.clone(),
             capture_sink: ch.capture_sink.clone(),
             bot_ids: self.bot_ids.clone(),
+            optout: self.optout_set.clone(),
             anchor: ch.anchor.clone(),
             overflow_mixer: ch.overflow_mixer.clone(),
         }
@@ -2108,20 +2174,23 @@ impl EventHandler for PuppetHandler {
             self.pool.note_bot_guild(self.idx, ug.id);
         }
 
-        // #47 two-sided link auth: the designated bot registers the global
-        // `/bridge approve` command. Once per process — `ready` refires on
-        // reconnect and registration is an upsert HTTP call we needn't repeat.
-        if let Some(cfg) = self.pool.link_approval.get() {
-            if cfg.bot_index == self.idx && !cfg.registered.swap(true, Ordering::SeqCst) {
-                match register_bridge_command(&ctx).await {
-                    Ok(()) => {
-                        tracing::info!(idx = self.idx, "registered the /bridge approve command")
-                    }
-                    Err(e) => {
-                        // Cleared so the next reconnect retries.
-                        cfg.registered.store(false, Ordering::SeqCst);
-                        tracing::error!(idx = self.idx, error = %e, "failed to register the /bridge command");
-                    }
+        // #47/#63: the designated bot registers the global `/bridge` command
+        // (approve for two-sided link auth; optout/optin whenever the opt-out
+        // store is armed). Once per process — `ready` refires on reconnect and
+        // registration is an upsert HTTP call we needn't repeat.
+        if self.pool.command_bot_index() == self.idx
+            && (self.pool.link_approval.get().is_some()
+                || self.pool.optout_path.get().is_some())
+            && !self.pool.command_registered.swap(true, Ordering::SeqCst)
+        {
+            match register_bridge_command(&ctx).await {
+                Ok(()) => {
+                    tracing::info!(idx = self.idx, "registered the /bridge command")
+                }
+                Err(e) => {
+                    // Cleared so the next reconnect retries.
+                    self.pool.command_registered.store(false, Ordering::SeqCst);
+                    tracing::error!(idx = self.idx, error = %e, "failed to register the /bridge command");
                 }
             }
         }
@@ -2258,8 +2327,7 @@ impl EventHandler for PuppetHandler {
     /// happens at the pending-link table on the Matrix side.
     #[tracing::instrument(parent = None, name = "puppet", skip_all, fields(idx = self.idx))]
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        let Some(cfg) = self.pool.link_approval.get() else { return };
-        if cfg.bot_index != self.idx {
+        if self.pool.command_bot_index() != self.idx {
             return;
         }
         let Interaction::Command(cmd) = interaction else { return };
@@ -2271,81 +2339,186 @@ impl EventHandler for PuppetHandler {
                 .await;
             return;
         };
-        // `default_member_permissions` already hides the command from
-        // non-managers, but server admins can re-expose it in Integration
-        // settings — enforce the gate server-side too.
-        let perms = cmd.member.as_ref().and_then(|m| m.permissions);
-        if !perms.is_some_and(|p| p.manage_guild() || p.administrator()) {
-            respond_ephemeral(
-                &ctx,
-                &cmd,
-                "You need the **Manage Server** permission to approve a bridge link.",
-            )
-            .await;
-            return;
-        }
-        let Some(code) = extract_approve_code(&cmd.data) else {
-            respond_ephemeral(&ctx, &cmd, "Usage: `/bridge approve code:<code>`").await;
-            return;
-        };
-
-        // Defer PUBLICLY (not ephemeral): the approval outcome is the
-        // in-server disclosure record that this channel is now bridged
-        // off-platform (#43 ToS follow-ups, Dev Policy §2/§3) — the manager's
-        // consent and the result stay visible to the server. Deferred because
-        // the commit (file write + reconcile round-trip) can exceed the 3 s
-        // initial-response window. Permission/usage errors above stay
-        // ephemeral — those are for the invoker alone.
-        if let Err(e) = cmd
-            .create_response(
-                &ctx.http,
-                CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new()),
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "failed to defer /bridge approve");
-            return;
-        }
-
-        let (otx, orx) = oneshot::channel();
-        let approval = LinkApproval {
-            code,
-            guild_id: guild_id.get(),
-            invoker: format!("{} ({})", cmd.user.name, cmd.user.id.get()),
-        };
-        let outcome = if cfg.tx.send((approval, otx)).is_err() {
-            "The bridge's management service is not running — try again later.".to_string()
-        } else {
-            match tokio::time::timeout(Duration::from_secs(60), orx).await {
-                Ok(Ok(text)) => text,
-                _ => "No answer from the bridge's management service — ask the operator to check the logs.".to_string(),
+        match bridge_subcommand(&cmd.data) {
+            Some(BridgeSub::Approve { code }) => {
+                handle_approve_command(&ctx, &cmd, guild_id, code, &self.pool).await
             }
-        };
-        if let Err(e) = cmd
-            .edit_response(&ctx.http, EditInteractionResponse::new().content(outcome))
-            .await
-        {
-            tracing::warn!(error = %e, "failed to send the /bridge approve outcome");
+            Some(BridgeSub::Optout) => {
+                handle_optout_command(&ctx, &cmd, &self.pool, true).await
+            }
+            Some(BridgeSub::Optin) => {
+                handle_optout_command(&ctx, &cmd, &self.pool, false).await
+            }
+            None => {
+                respond_ephemeral(
+                    &ctx,
+                    &cmd,
+                    "Usage: `/bridge approve code:<code>`, `/bridge optout`, or `/bridge optin`",
+                )
+                .await
+            }
         }
     }
 }
 
-/// Register the global `/bridge approve <code>` application command (#47).
-/// `default_member_permissions(MANAGE_GUILD)` makes Discord hide it from
-/// regular members by default; guild-only. Registration is an upsert, so a
+/// `/bridge approve <code>` (#47 two-sided link auth). The Manage Server gate
+/// is enforced here from `member.permissions` (computed server-side by Discord
+/// for interactions) — with `optout`/`optin` open to everyone, the command has
+/// no `default_member_permissions`, so this check is the ONLY gate. The
+/// code↔guild match happens at the pending-link table on the Matrix side.
+async fn handle_approve_command(
+    ctx: &Context,
+    cmd: &CommandInteraction,
+    guild_id: GuildId,
+    code: String,
+    pool: &Arc<SharedPool>,
+) {
+    let perms = cmd.member.as_ref().and_then(|m| m.permissions);
+    if !perms.is_some_and(|p| p.manage_guild() || p.administrator()) {
+        respond_ephemeral(
+            ctx,
+            cmd,
+            "You need the **Manage Server** permission to approve a bridge link.",
+        )
+        .await;
+        return;
+    }
+    let Some(cfg) = pool.link_approval.get() else {
+        respond_ephemeral(ctx, cmd, "Link approval is not enabled on this instance.").await;
+        return;
+    };
+
+    // Defer PUBLICLY (not ephemeral): the approval outcome is the in-server
+    // disclosure record that this channel is now bridged off-platform (#43 ToS
+    // follow-ups, Dev Policy §2/§3) — the manager's consent and the result
+    // stay visible to the server. Deferred because the commit (file write +
+    // reconcile round-trip) can exceed the 3 s initial-response window.
+    // Permission/usage errors above stay ephemeral — those are for the invoker
+    // alone.
+    if let Err(e) = cmd
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new()),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "failed to defer /bridge approve");
+        return;
+    }
+
+    let (otx, orx) = oneshot::channel();
+    let approval = LinkApproval {
+        code,
+        guild_id: guild_id.get(),
+        invoker: format!("{} ({})", cmd.user.name, cmd.user.id.get()),
+    };
+    let outcome = if cfg.tx.send((approval, otx)).is_err() {
+        ApprovalOutcome::text_only(
+            "The bridge's management service is not running — try again later.",
+        )
+    } else {
+        match tokio::time::timeout(Duration::from_secs(60), orx).await {
+            Ok(Ok(out)) => out,
+            _ => ApprovalOutcome::text_only(
+                "No answer from the bridge's management service — ask the operator to check the logs.",
+            ),
+        }
+    };
+    if let Err(e) = cmd
+        .edit_response(&ctx.http, EditInteractionResponse::new().content(&outcome.text))
+        .await
+    {
+        tracing::warn!(error = %e, "failed to send the /bridge approve outcome");
+    }
+    // #64: post the disclosure notice into the bridged voice channel's text
+    // chat, so people joining later still see that the channel is relayed.
+    // Best-effort — a bot without Send Messages there degrades to the public
+    // approval record above.
+    if let (Some(chid), Some(notice)) = (outcome.notice_channel_id, outcome.notice.as_deref()) {
+        if let Err(e) = ChannelId::new(chid).say(&ctx.http, notice).await {
+            tracing::warn!(channel_id = chid, error = %e, "could not post the bridge disclosure notice (missing Send Messages on the voice channel?)");
+        }
+    }
+}
+
+/// `/bridge optout` / `/bridge optin` (#63): available to EVERYONE — a user's
+/// choice not to be bridged needs no permission. Persists to
+/// `<data_dir>/optout.toml`, updates the live set (demux + ghost gates see it
+/// immediately), and an opt-out retires any existing ghosts on the spot.
+async fn handle_optout_command(
+    ctx: &Context,
+    cmd: &CommandInteraction,
+    pool: &Arc<SharedPool>,
+    opting_out: bool,
+) {
+    let Some(path) = pool.optout_path.get() else {
+        respond_ephemeral(ctx, cmd, "Opt-out is not enabled on this instance.").await;
+        return;
+    };
+    let user_id = cmd.user.id.get();
+    let write = if opting_out {
+        nvb_config::add_optout(path, user_id)
+    } else {
+        nvb_config::remove_optout(path, user_id)
+    };
+    let changed = match write {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(user_id, error = %e, "failed to update the opt-out list");
+            respond_ephemeral(
+                ctx,
+                cmd,
+                "Could not update the opt-out list — try again later or contact the operator.",
+            )
+            .await;
+            return;
+        }
+    };
+    {
+        let mut set = pool.optout_set.write().unwrap_or_else(PoisonError::into_inner);
+        if opting_out {
+            set.insert(user_id);
+        } else {
+            set.remove(&user_id);
+        }
+    }
+    if opting_out {
+        pool.apply_optout(user_id);
+        tracing::info!(user_id, user = %cmd.user.name, changed, "user opted out of bridging");
+        respond_ephemeral(
+            ctx,
+            cmd,
+            "🔇 You are opted out of voice bridging on this instance: your voice will not be relayed to Matrix and you will not appear in bridged calls. Use `/bridge optin` to undo.",
+        )
+        .await;
+    } else {
+        tracing::info!(user_id, user = %cmd.user.name, changed, "user opted back into bridging");
+        respond_ephemeral(
+            ctx,
+            cmd,
+            "🔊 You are opted back into voice bridging. If you are in a bridged voice channel right now, leave and rejoin it to reappear on the Matrix side.",
+        )
+        .await;
+    }
+}
+
+/// Register the global `/bridge` application command: `approve <code>` (#47),
+/// `optout`/`optin` (#63). NO `default_member_permissions` — opt-out must be
+/// usable by everyone, and Discord has no per-subcommand permissions, so the
+/// Manage Server gate for `approve` lives server-side in
+/// `handle_approve_command`. Guild-only. Registration is an upsert, so a
 /// changed definition converges on restart.
 async fn register_bridge_command(ctx: &Context) -> Result<()> {
     ApplicationCommand::create_global_command(
         &ctx.http,
         CreateCommand::new("bridge")
             .description("Nether voice bridge")
-            .default_member_permissions(Permissions::MANAGE_GUILD)
             .contexts(vec![InteractionContext::Guild])
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::SubCommand,
                     "approve",
-                    "Approve a pending Matrix-Discord voice bridge link",
+                    "Approve a pending Matrix-Discord voice bridge link (Manage Server only)",
                 )
                 .add_sub_option(
                     CreateCommandOption::new(
@@ -2355,33 +2528,53 @@ async fn register_bridge_command(ctx: &Context) -> Result<()> {
                     )
                     .required(true),
                 ),
-            ),
+            )
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "optout",
+                "Opt out of voice bridging: never relay my voice or show me in bridged calls",
+            ))
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "optin",
+                "Opt back into voice bridging",
+            )),
     )
     .await
     .map(|_| ())
     .map_err(|e| anyhow!("registering the /bridge command: {e}"))
 }
 
-/// Pull the `code` argument out of a `/bridge approve` invocation.
-fn extract_approve_code(data: &CommandData) -> Option<String> {
-    for opt in &data.options {
-        if opt.name != "approve" {
-            continue;
-        }
-        if let CommandDataOptionValue::SubCommand(subs) = &opt.value {
-            for sub in subs {
-                if sub.name == "code" {
-                    if let CommandDataOptionValue::String(v) = &sub.value {
-                        let v = v.trim();
-                        if !v.is_empty() {
-                            return Some(v.to_string());
-                        }
-                    }
+/// A parsed `/bridge` invocation.
+#[derive(Debug, PartialEq)]
+enum BridgeSub {
+    Approve { code: String },
+    Optout,
+    Optin,
+}
+
+/// Pull the subcommand (and its arguments) out of a `/bridge` invocation.
+fn bridge_subcommand(data: &CommandData) -> Option<BridgeSub> {
+    let opt = data.options.first()?;
+    match (opt.name.as_str(), &opt.value) {
+        ("approve", CommandDataOptionValue::SubCommand(subs)) => {
+            let code = subs.iter().find_map(|sub| {
+                if sub.name != "code" {
+                    return None;
                 }
-            }
+                match &sub.value {
+                    CommandDataOptionValue::String(v) if !v.trim().is_empty() => {
+                        Some(v.trim().to_string())
+                    }
+                    _ => None,
+                }
+            })?;
+            Some(BridgeSub::Approve { code })
         }
+        ("optout", _) => Some(BridgeSub::Optout),
+        ("optin", _) => Some(BridgeSub::Optin),
+        _ => None,
     }
-    None
 }
 
 /// Immediate ephemeral reply to a slash-command interaction (best-effort).
@@ -2409,6 +2602,17 @@ async fn ensure_ghost(ctx: &Context, channel: &ChannelCtx, user_id: u64, member:
     // SSRCs are also in the capture `excluded` set, registered on DriverConnect.
     if channel
         .bot_ids
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&user_id)
+    {
+        return;
+    }
+    // Opted-out users (#63) are never ghosted — covers live voice events AND
+    // the anchor's member-seeding path, which both route through here. The
+    // capture demux drops their audio independently (defense in depth).
+    if channel
+        .optout
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .contains(&user_id)
@@ -2809,6 +3013,7 @@ async fn puppet_become_anchor(
                 channel.ssrc_map.clone(),
                 channel.user_sinks.clone(),
                 channel.capture_sink.clone(),
+                channel.optout.clone(),
                 channel.anchor.clone(),
                 idx,
             ),
@@ -3237,6 +3442,9 @@ impl SharedPool {
     }
     fn test_has_channel(&self, bridge: &str) -> bool {
         self.alloc.lock().unwrap().channels.contains_key(bridge)
+    }
+    fn is_opted_out(&self, user_id: u64) -> bool {
+        self.optout_set.read().unwrap().contains(&user_id)
     }
     /// Arm a fresh `anchor_idle_release` token on the channel and return a clone,
     /// standing in for the grace timer the gateway path would have started.
@@ -3953,6 +4161,23 @@ mod tests {
         assert_eq!(p.bot_index_of(111), Some(0));
         assert_eq!(p.bot_index_of(222), Some(1));
         assert_eq!(p.bot_index_of(333), None);
+    }
+
+    #[test]
+    fn optout_retires_ghost_and_gates_lookup() {
+        // #63: opting out retires the user's existing ghost sink everywhere
+        // (their audio then has no demux target, and ensure_ghost won't mint
+        // a new one while they stay in the set).
+        let p = pool(1);
+        channel(&p, "A", 1, 10);
+        mark_speaker(&p, "A", 555); // user 555 has a live ghost sink
+        assert!(!p.is_opted_out(555));
+        p.optout_set.write().unwrap().insert(555);
+        assert!(p.is_opted_out(555));
+        p.apply_optout(555);
+        let guard = p.alloc.lock().unwrap();
+        let sinks = guard.channels.get("A").unwrap().user_sinks.read().unwrap();
+        assert!(!sinks.contains_key(&555), "opted-out user's ghost sink retired");
     }
 
     #[test]

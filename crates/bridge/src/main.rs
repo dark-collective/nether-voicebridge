@@ -141,6 +141,13 @@ async fn main() -> Result<()> {
     // bridge's channel. Each bridge registers its channel and gets a `ChannelView`
     // (its `PlaybackRouter`). The Matrix/RTC side stays per-bridge.
     let pool = SharedPool::new(&puppets, &timing);
+    // Per-user bridge opt-out (#63): load the persisted list and arm the
+    // `/bridge optout`/`optin` commands. Refusing to start on an unreadable
+    // list would be worse than starting without it — log loudly instead (the
+    // demux/ghost gates then run on an empty set until an operator fixes it).
+    if let Err(e) = pool.enable_optout(nvb_config::optout_path(&data_dir)) {
+        tracing::error!(error = %e, "opt-out list unreadable — starting with opt-outs NOT enforced");
+    }
     // The pool's own shutdown root: Ctrl-C cancels it to drain every puppet.
     let pool_shutdown = CancellationToken::new();
 

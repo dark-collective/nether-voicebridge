@@ -77,8 +77,9 @@ pub struct DiscordApproval {
     /// Approving Discord user, `name (id)`, for the audit trail and the
     /// Matrix-side notification.
     pub invoker: String,
-    /// Outcome text for the ephemeral interaction follow-up.
-    pub reply: oneshot::Sender<String>,
+    /// Outcome for the interaction follow-up: text plus, on success, the
+    /// disclosure notice for the bridged voice channel (#64).
+    pub reply: oneshot::Sender<ApprovalOutcome>,
 }
 
 use anyhow::{Context, Result};
@@ -103,7 +104,7 @@ use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use nvb_config::{BanKind, ManagementConfig, NewTenant};
+use nvb_config::{ApprovalOutcome, BanKind, ManagementConfig, NewTenant};
 
 /// How long a command handler waits for the supervisor to answer a control
 /// request. The reconcile itself is synchronous bookkeeping (teardown happens
@@ -1403,7 +1404,7 @@ async fn handle_link(
         return;
     }
 
-    let outcome = commit_link(ctx, tenant, &report.warnings, sender, None).await;
+    let (outcome, _ok) = commit_link(ctx, tenant, &report.warnings, sender, None).await;
     reply(room, &outcome).await;
 }
 
@@ -1417,7 +1418,7 @@ async fn commit_link(
     warnings: &[String],
     actor: &str,
     approved_by: Option<&str>,
-) -> String {
+) -> (String, bool) {
     let name = tenant.name.clone();
     let room_id = tenant.room_id.clone();
     let guild_id = tenant.guild_id.clone();
@@ -1426,7 +1427,7 @@ async fn commit_link(
     let _guard = ctx.mutate_lock.lock().await;
     let prior = match nvb_config::add_tenant_entry(&ctx.tenants_path, &tenant) {
         Ok(p) => p,
-        Err(e) => return format!("Cannot add '{name}': {e}"),
+        Err(e) => return (format!("Cannot add '{name}': {e}"), false),
     };
 
     match request_reconcile(ctx).await {
@@ -1435,9 +1436,9 @@ async fn commit_link(
                 audit(ctx, actor, "link_failed_spawn", serde_json::json!({
                     "name": name, "error": err,
                 }));
-                format!(
+                (format!(
                     "The entry was accepted but the bridge FAILED to start: {err}\nIt stays in tenants.toml — fix the cause and `unlink`/`link` again (or reload)."
-                )
+                ), false)
             } else if summary.added.iter().any(|l| l == &name) {
                 audit(ctx, actor, "link_ok", serde_json::json!({
                     "name": name, "room_id": room_id, "guild_id": guild_id,
@@ -1448,7 +1449,7 @@ async fn commit_link(
                 } else {
                     warnings.join("\n")
                 };
-                format!(
+                (format!(
                     "✅ Bridge '{name}' is up: {room_id} ↔ guild {guild_id} channel {channel_id}.\n\
                      Verified before linking:\n\
                      ✓ bridge bot joined the room\n\
@@ -1457,11 +1458,11 @@ async fn commit_link(
                      {guild_line}\n\
                      Not verifiable here: the puppet bots need Connect, Speak, Use Voice Activity and Change Nickname on the voice channel.{}",
                     ctx.policy_line()
-                )
+                ), true)
             } else {
-                format!(
+                (format!(
                     "Reconcile ran but '{name}' was not reported as added (unexpected) — check the bridge logs."
-                )
+                ), false)
             }
         }
         Some(Err(rejection)) => {
@@ -1473,11 +1474,11 @@ async fn commit_link(
             audit(ctx, actor, "link_rejected", serde_json::json!({
                 "name": name, "reason": rejection,
             }));
-            format!("❌ Rejected: {rejection}\ntenants.toml was rolled back.")
+            (format!("❌ Rejected: {rejection}\ntenants.toml was rolled back."), false)
         }
         None => {
             audit(ctx, actor, "link_unconfirmed", serde_json::json!({ "name": name }));
-            "The supervisor did not respond — the entry was written to tenants.toml but may not be running. Check the bridge logs.".to_string()
+            ("The supervisor did not respond — the entry was written to tenants.toml but may not be running. Check the bridge logs.".to_string(), false)
         }
     }
 }
@@ -1490,9 +1491,9 @@ async fn handle_discord_approval(ctx: &BotCtx, client: &Client, approval: Discor
     let Some(ttl) = ctx.approval_ttl else {
         // Unreachable in practice: the channel is only wired when approval is
         // configured. Answer anyway so the interaction never hangs.
-        let _ = approval
-            .reply
-            .send("Discord-side approval is not enabled on this instance.".to_string());
+        let _ = approval.reply.send(ApprovalOutcome::text_only(
+            "Discord-side approval is not enabled on this instance.",
+        ));
         return;
     };
     let code = normalize_code(&approval.code);
@@ -1509,7 +1510,7 @@ async fn handle_discord_approval(ctx: &BotCtx, client: &Client, approval: Discor
                 "code": code, "guild_id": approval.guild_id.to_string(),
                 "reason": &msg,
             }));
-            let _ = approval.reply.send(msg);
+            let _ = approval.reply.send(ApprovalOutcome::text_only(msg));
             return;
         }
     };
@@ -1525,18 +1526,17 @@ async fn handle_discord_approval(ctx: &BotCtx, client: &Client, approval: Discor
                 audit(ctx, &approval.invoker, "approve_rejected", serde_json::json!({
                     "code": code, "reason": "banned",
                 }));
-                let _ = approval
-                    .reply
-                    .send("🚫 This link was banned while awaiting approval.".to_string());
+                let _ = approval.reply.send(ApprovalOutcome::text_only(
+                    "🚫 This link was banned while awaiting approval.",
+                ));
                 return;
             }
         }
         Err(e) => {
             tracing::error!(error = %e, "ban list unreadable — refusing approval (fail-closed)");
-            let _ = approval.reply.send(
-                "The ban list is unreadable — approval refused until an operator fixes it."
-                    .to_string(),
-            );
+            let _ = approval.reply.send(ApprovalOutcome::text_only(
+                "The ban list is unreadable — approval refused until an operator fixes it.",
+            ));
             return;
         }
     }
@@ -1547,7 +1547,10 @@ async fn handle_discord_approval(ctx: &BotCtx, client: &Client, approval: Discor
         tenant = %pending.tenant.name,
         "Discord-side link approval accepted"
     );
-    let outcome = commit_link(
+    // The bridged voice channel, for the #64 disclosure notice (String id in
+    // the tenant record; a parse failure just skips the notice).
+    let notice_channel_id = pending.tenant.channel_id.parse::<u64>().ok();
+    let (outcome, succeeded) = commit_link(
         ctx,
         pending.tenant,
         &pending.warnings,
@@ -1561,7 +1564,21 @@ async fn handle_discord_approval(ctx: &BotCtx, client: &Client, approval: Discor
     if let Some(origin) = client.get_room(&pending.origin_room) {
         reply(&origin, &format!("Discord approval by {}:\n{outcome}", approval.invoker)).await;
     }
-    let _ = approval.reply.send(outcome);
+    // #64: the in-channel disclosure notice, posted Discord-side into the
+    // bridged voice channel's text chat (Dev Policy §2/§3 — visible to people
+    // who join later and never saw the approval).
+    let notice = succeeded.then(|| {
+        format!(
+            "🔗 This voice channel is now bridged to a Matrix room — voice is relayed off-platform (live only, never recorded). Approved by {}.{}",
+            approval.invoker,
+            ctx.policy_line()
+        )
+    });
+    let _ = approval.reply.send(ApprovalOutcome {
+        text: outcome,
+        notice_channel_id: if notice.is_some() { notice_channel_id } else { None },
+        notice,
+    });
 }
 
 async fn handle_unlink(ctx: &BotCtx, room: &Room, sender: &str, name: &str) {

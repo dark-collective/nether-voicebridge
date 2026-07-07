@@ -60,8 +60,10 @@ proxy); parts of the service run on privately operated server hardware.
   the **Manage Server** permission in the Discord server.
 - Bridged Matrix participants appear in Discord with a distinguishing prefix
   (default `[Matrix]`), so their presence is disclosed in-channel.
-- If you do not want your voice relayed, leave the bridged voice channel or ask
-  a server manager to unlink it. (A per-user opt-out command is planned.)
+- If you do not want your voice relayed, run **`/bridge optout`** in the
+  Discord server — your voice will never be relayed and you will not appear in
+  bridged calls, on any channel this instance bridges, until you run
+  `/bridge optin`. (Leaving the bridged voice channel works too, of course.)
 
 ## Retention and deletion
 
