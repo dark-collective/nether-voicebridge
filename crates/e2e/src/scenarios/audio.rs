@@ -48,9 +48,10 @@ pub static AUDIO_D2M_ENC: ScenarioDef = ScenarioDef {
     run: |ctx| Box::pin(run_d2m_enc(ctx)),
 };
 
-/// Probe length: 6 cycles gives the oracle plenty of active segments while
-/// keeping a scenario comfortably inside the compressed-profile timeout.
-const PROBE_MS: u32 = 6_000;
+/// Probe length: 8 cycles — the two boundary cycles absorb startup/teardown
+/// transients (see `oracle_assert`), leaving 6 interior cycles as the
+/// load-bearing signal, all inside the compressed-profile timeout.
+const PROBE_MS: u32 = 8_000;
 
 /// Post-probe drain before reading the far side: LiveKit's capture buffer can
 /// run ~1 s ahead of real time, plus jitter/mixer latency on both ends.
@@ -63,52 +64,143 @@ const SETTLE: Duration = Duration::from_secs(3);
 /// alignment bound widened — the capture window opens well before the probe
 /// plays, so the discovered delay is seconds, not the default 2 s.
 fn oracle_cfg() -> OracleConfig {
-    OracleConfig { max_align_ms: 20_000, ..OracleConfig::default() }
+    // 60 s: the encrypted m2d capture opens when the puppet first transmits,
+    // which precedes the probe by the whole key-delivery + settle window.
+    OracleConfig { max_align_ms: 60_000, ..OracleConfig::default() }
 }
 
-/// Compare `captured` against `probe`, persist both WAVs + the report JSON
-/// into the scenario artifacts, and fail with the scores when below threshold.
-fn oracle_assert(artifacts: &Path, label: &str, probe: &[i16], captured: &[i16]) -> Result<()> {
+/// The probe's cycle length (`nvb_audio::probe` synthesizes per-1 s cycles
+/// with seed-jittered layouts, so each cycle's envelope is distinct enough to
+/// alignment-lock independently).
+const CYCLE_MS: u32 = 1_000;
+
+/// Compare `captured` against the seeded probe **cycle by cycle** and gate on
+/// robust AGGREGATES, persisting the WAVs + a per-cycle report JSON.
+///
+/// Why per-cycle: a live receive path time-warps by design — libwebrtc's NetEQ
+/// (and Discord-side suppression resume) inserts/removes ~10 ms to track
+/// network jitter (live-measured 2026-07-07: cycles align at +0 ms before a
+/// mid-stream slip and +9.7 ms after; per-cycle ncc 0.92–0.99 while a single
+/// global alignment collapsed to 0.22). One global alignment can therefore
+/// never hold across seconds of live audio, so each 1 s cycle is scored with
+/// its own local alignment.
+///
+/// Why aggregate gates, not per-cycle pass/fail: the oracle's default
+/// thresholds allow ZERO dropouts/glitches, which suits a hermetic chain but
+/// not a live public SFU, where a single transient per multi-second stream is
+/// normal (live-measured: an otherwise-pristine cycle at ncc 0.97 tripped on
+/// one glitch). The robust discriminator is **mean per-cycle NCC**, which
+/// showed a wide, stable margin across every live run — 0.86–0.99 when audio
+/// crossed intact vs 0.0–0.47 when it did not (e.g. an undelivered E2EE key
+/// collapsing every cycle). So the gate is: mean NCC over a floor, a majority
+/// of cycles individually well-correlated (catches a half-broken direction),
+/// and a whole-stream transient budget (a #36-class corruption produces dozens
+/// of glitches, not one). Every per-cycle score is still recorded so a nightly
+/// trend catches slow drift a single pass/fail would miss.
+fn oracle_assert(artifacts: &Path, label: &str, seed: u64, captured: &[i16]) -> Result<()> {
+    let probe = synth_probe_mono_48k(seed, PROBE_MS);
     let wav = |suffix: &str, data: &[i16]| -> Result<()> {
         let path = artifacts.join(format!("{label}_{suffix}.wav"));
         nvb_audio::wav::write_wav_mono_48k(path.to_str().context("artifact path")?, data)
     };
-    wav("probe", probe)?;
+    wav("probe", &probe)?;
     wav("captured", captured)?;
 
-    let report = compare_mono_48k(probe, captured, &oracle_cfg());
+    // Stage 1: one global envelope alignment for the BASE delay. Its ncc may
+    // be poor when mid-stream time-warp is present (that's what stage 2
+    // absorbs), but the envelope-derived delay is robust to ±tens of ms.
+    let global = compare_mono_48k(&probe, captured, &oracle_cfg());
+    let base = global.delay_samples;
+    eprintln!(
+        "   oracle[{label}] global: ncc={:.3} delay={base} (base for per-cycle windows)",
+        global.ncc
+    );
+
+    // Stage 2: score each cycle against a ±500 ms window around its PREDICTED
+    // position, with a tight local alignment bound — a far-away mis-lock (a
+    // cycle whose jittered layout happens to resemble another's) is then
+    // structurally impossible.
+    const PAD: isize = 24_000; // 500 ms
+    // "Well-correlated" cycle floor — comfortably above live jitter (healthy
+    // cycles sit 0.93–0.99), comfortably below a corrupted one.
+    const GOOD_NCC: f32 = 0.85;
+    let cycles = (PROBE_MS / CYCLE_MS) as usize;
+    let cycle_len = CYCLE_MS as usize * 48;
+    let mut entries = Vec::new();
+    let mut ncc_sum = 0.0f64;
+    let mut good = 0usize;
+    let mut total_dropouts = 0usize;
+    let mut total_glitches = 0usize;
+    for k in 0..cycles {
+        let src = &probe[k * cycle_len..((k + 1) * cycle_len).min(probe.len())];
+        let start = (base + (k * cycle_len) as isize - PAD).max(0) as usize;
+        let end = ((base + ((k + 1) * cycle_len) as isize + PAD).max(0) as usize)
+            .min(captured.len());
+        let window = if start < end { &captured[start..end] } else { &[][..] };
+        let local_cfg = OracleConfig { max_align_ms: 600, ..OracleConfig::default() };
+        let rep = compare_mono_48k(src, window, &local_cfg);
+        let well_correlated = rep.ncc >= GOOD_NCC;
+        eprintln!(
+            "   oracle[{label}] cycle {k}: ncc={:.3} seg_snr={:.1}dB gain={:.2} delay={} dropouts={} glitches={}{}",
+            rep.ncc,
+            rep.seg_snr_db,
+            rep.gain,
+            rep.delay_samples,
+            rep.dropouts.len(),
+            rep.glitches.len(),
+            if well_correlated { "" } else { "  <-- rough" },
+        );
+        ncc_sum += rep.ncc as f64;
+        if well_correlated {
+            good += 1;
+        }
+        total_dropouts += rep.dropouts.len();
+        total_glitches += rep.glitches.len();
+        entries.push(serde_json::json!({
+            "cycle": k,
+            "ncc": rep.ncc,
+            "seg_snr_db": rep.seg_snr_db,
+            "gain": rep.gain,
+            "delay_samples": rep.delay_samples,
+            "dropouts": rep.dropouts.len(),
+            "glitches": rep.glitches.len(),
+        }));
+    }
+    let mean_ncc = ncc_sum / cycles as f64;
+    // Aggregate gates (see the doc comment): a healthy live path clears all
+    // three with margin; a corrupted/undelivered stream fails the first two,
+    // a #36-class corruption the third.
+    let mean_ok = mean_ncc >= 0.75;
+    let majority_ok = good * 2 >= cycles;
+    let transients_ok = total_dropouts <= cycles && total_glitches <= cycles;
+    let pass = mean_ok && majority_ok && transients_ok;
     let json = serde_json::json!({
         "label": label,
-        "pass": report.pass,
-        "ncc": report.ncc,
-        "seg_snr_db": report.seg_snr_db,
-        "gain": report.gain,
-        "delay_samples": report.delay_samples,
-        "dropouts": report.dropouts.len(),
-        "glitches": report.glitches.len(),
+        "pass": pass,
+        "mean_ncc": mean_ncc,
+        "good_cycles": good,
+        "cycles_total": cycles,
+        "total_dropouts": total_dropouts,
+        "total_glitches": total_glitches,
+        "global_ncc": global.ncc,
+        "base_delay_samples": base,
+        "cycles": entries,
     });
     std::fs::write(
         artifacts.join(format!("{label}_oracle.json")),
         serde_json::to_string_pretty(&json)?,
     )?;
     eprintln!(
-        "   oracle[{label}]: ncc={:.3} seg_snr={:.1}dB gain={:.2} delay={} dropouts={} glitches={} → {}",
-        report.ncc,
-        report.seg_snr_db,
-        report.gain,
-        report.delay_samples,
-        report.dropouts.len(),
-        report.glitches.len(),
-        if report.pass { "PASS" } else { "FAIL" },
+        "   oracle[{label}]: mean_ncc={mean_ncc:.3} good_cycles={good}/{cycles} \
+         dropouts={total_dropouts} glitches={total_glitches} → {}",
+        if pass { "PASS" } else { "FAIL" },
     );
-    if !report.pass {
+    if !pass {
         bail!(
-            "oracle failed for {label}: ncc={:.3} seg_snr={:.1}dB dropouts={} glitches={} \
-             (WAVs + report in artifacts)",
-            report.ncc,
-            report.seg_snr_db,
-            report.dropouts.len(),
-            report.glitches.len(),
+            "oracle failed for {label}: mean_ncc={mean_ncc:.3} (floor 0.75), \
+             good_cycles={good}/{cycles} (need majority), dropouts={total_dropouts} \
+             glitches={total_glitches} (budget {cycles} each) — audio did not cross intact \
+             (WAVs + report in artifacts)"
         );
     }
     Ok(())
@@ -312,8 +404,7 @@ async fn drive_m2d(
     let (uid, captured) = loudest(recordings)
         .context("the Discord listener recorded nothing from any puppet")?;
     eprintln!("   recorded {} samples from puppet {uid}", captured.len());
-    let probe = synth_probe_mono_48k(seed, PROBE_MS);
-    oracle_assert(&ctx.artifacts, "m2d", &probe, &captured)?;
+    oracle_assert(&ctx.artifacts, "m2d", seed, &captured)?;
 
     let errors = bridge.scraper.error_events();
     if !errors.is_empty() {
@@ -424,8 +515,7 @@ async fn drive_d2m_unenc(
         captured.samples.len(),
         captured.identity
     );
-    let probe = synth_probe_mono_48k(seed, PROBE_MS);
-    oracle_assert(&ctx.artifacts, "d2m", &probe, &captured.samples)?;
+    oracle_assert(&ctx.artifacts, "d2m", seed, &captured.samples)?;
 
     let errors = bridge.scraper.error_events();
     if !errors.is_empty() {
@@ -558,8 +648,7 @@ async fn drive_d2m_enc(
     )
     .with_context(|| format!("reading Tap B WAV at {}", tap_b.display()))?;
     eprintln!("   Tap B: {} samples from {}", captured.len(), tap_b.display());
-    let probe = synth_probe_mono_48k(seed, PROBE_MS);
-    oracle_assert(&ctx.artifacts, "d2m_enc_tap_b", &probe, &captured)?;
+    oracle_assert(&ctx.artifacts, "d2m_enc_tap_b", seed, &captured)?;
 
     let errors = bridge.scraper.error_events();
     if !errors.is_empty() {

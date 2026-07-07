@@ -353,8 +353,33 @@ pub async fn join_and_publish(
             let (gen_tx, gen_rx) = watch::channel(0u64);
             members_gen_tx = Some(gen_tx);
             tokio::spawn(
-                distribute_key_loop(source, key, transport, false, gen_rx, cancel.clone())
-                    .instrument(tracing::Span::current()),
+                {
+                    let cancel = cancel.clone();
+                    let source = source.clone();
+                    async move {
+                        // The production loop relies on the bridge sync loop
+                        // bumping `members_gen` when someone joins; the testkit
+                        // has no sync loop, so an EMPTY first enumeration (the
+                        // bridge bot's membership only appears once it reacts
+                        // to this speaker) would sleep out the full 60 s
+                        // heartbeat before retrying (live-measured: a 61 s key
+                        // delay). Poll until the call has a recipient, then
+                        // hand off — the loop's new-recipient burst takes over.
+                        loop {
+                            if let Ok(r) = source.recipients().await {
+                                if !r.is_empty() {
+                                    break;
+                                }
+                            }
+                            tokio::select! {
+                                _ = cancel.cancelled() => return,
+                                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                            }
+                        }
+                        distribute_key_loop(source, key, transport, false, gen_rx, cancel).await;
+                    }
+                }
+                .instrument(tracing::Span::current()),
             );
             device_id
         } else {

@@ -66,11 +66,13 @@ impl MatrixSpeaker {
         self.handle.mxid()
     }
 
-    /// Speak the seeded deterministic probe. Returns once the last chunk is
-    /// queued; LiveKit buffers up to ~1 s ahead, so callers should allow that
-    /// much (plus pipeline latency) before asserting on the far side.
+    /// Speak the warm-up lead-in then the seeded deterministic probe. Returns
+    /// once the last chunk is queued; LiveKit buffers up to ~1 s ahead, so
+    /// callers should allow that much (plus pipeline latency) before asserting
+    /// on the far side.
     pub async fn speak_probe(&self, seed: u64, dur_ms: u32) -> Result<()> {
-        let samples = nvb_audio::probe::synth_probe_mono_48k(seed, dur_ms);
+        let mut samples = super::warmup_lead_in();
+        samples.extend(nvb_audio::probe::synth_probe_mono_48k(seed, dur_ms));
         for chunk in samples.chunks(SAMPLES_20MS) {
             self.frames_tx
                 .send(chunk.to_vec())

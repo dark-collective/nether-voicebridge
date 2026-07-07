@@ -113,21 +113,24 @@ impl DiscordSpeaker {
         })
     }
 
-    /// Play the seeded deterministic probe (Phase B synthesis — the same
-    /// signal the audio oracle aligns against) and wait out its duration.
+    /// Play the warm-up lead-in then the seeded deterministic probe (Phase B
+    /// synthesis — the same signal the audio oracle aligns against) and wait
+    /// out its duration.
     pub async fn speak_probe(&self, seed: u64, dur_ms: u32) -> Result<()> {
         let call = self
             .songbird
             .get(self.guild)
             .ok_or_else(|| anyhow!("speaker is not in voice (call missing)"))?;
-        let samples = nvb_audio::probe::synth_probe_mono_48k(seed, dur_ms);
+        let mut samples = super::warmup_lead_in();
+        samples.extend(nvb_audio::probe::synth_probe_mono_48k(seed, dur_ms));
+        let playout_ms = (samples.len() / 48) as u64;
         let input = Input::from(RawAdapter::new(ProbeSource::from_mono_i16(&samples), 48_000, 1));
         let handle = {
             let mut call = call.lock().await;
             call.play_input(input)
         };
-        // Let the whole probe play out (plus scheduler slack), then stop.
-        tokio::time::sleep(Duration::from_millis(dur_ms as u64 + 500)).await;
+        // Let the whole lead-in + probe play out (plus scheduler slack), then stop.
+        tokio::time::sleep(Duration::from_millis(playout_ms + 500)).await;
         let _ = handle.stop();
         Ok(())
     }
@@ -188,8 +191,28 @@ impl SongbirdEventHandler for ListenerSpeakingMap {
     }
 }
 
+/// One 20 ms mono tick of digital silence (the zero-fill unit).
+const MONO_20MS: usize = 960;
+
 /// Per-`VoiceTick` recorder: appends each targeted speaker's decoded 20 ms
-/// frame (downmixed to mono) to their recording buffer.
+/// frame (downmixed to mono) to their recording buffer, reconstructing a
+/// continuous wall-clock timeline on the 50 Hz tick.
+///
+/// **Zero-fill only on songbird's explicit `silent` set.** A receiver must
+/// keep the recording wall-clock-continuous — otherwise the probe's silence
+/// windows compress out and the oracle can't align (live-diagnosed
+/// 2026-07-07). But the fill source matters: an earlier version filled
+/// whenever a target was merely *absent from* `tick.speaking`, which conflates
+/// genuine silence with a transient opus/DAVE receive gap (a dropped/coalesced
+/// tick). Those phantom fills accumulate — measured ~300 ms of over-length
+/// across an 8 s capture, drifting the tail out of alignment (interior cycles
+/// collapsing to ncc ~0.2 while the head stayed clean). songbird partitions
+/// each tick into `speaking` (sent audio) and `silent` (a tracked SSRC that
+/// sent a silence frame); a target in NEITHER is a real packet-loss gap, which
+/// we must NOT fill. So: audio when speaking, 20 ms zeros only when explicitly
+/// silent, nothing on a loss gap. The bridge puppet plays a continuous stream
+/// (silence on underrun, never EOF), so in practice it is in one of the two
+/// sets every tick and the timeline stays true.
 struct ListenerTick {
     ssrc_map: SsrcMap,
     /// Only these user ids are recorded (pass the bridge's puppet bot ids).
@@ -203,15 +226,26 @@ impl SongbirdEventHandler for ListenerTick {
         if let EventContext::VoiceTick(tick) = ctx {
             let ssrc_map = self.ssrc_map.lock().unwrap_or_else(PoisonError::into_inner);
             let mut recs = self.recordings.lock().unwrap_or_else(PoisonError::into_inner);
+            // Targets that sent audio this tick → append it.
             for (ssrc, data) in &tick.speaking {
                 let Some(pcm) = &data.decoded_voice else { continue };
                 let Some(uid) = ssrc_map.get(ssrc) else { continue };
-                if !self.targets.contains(uid) {
-                    continue;
+                if self.targets.contains(uid) {
+                    recs.entry(*uid)
+                        .or_default()
+                        .extend_from_slice(&nvb_audio::downmix_stereo_to_mono(pcm));
                 }
-                recs.entry(*uid)
-                    .or_default()
-                    .extend_from_slice(&nvb_audio::downmix_stereo_to_mono(pcm));
+            }
+            // Targets explicitly silent this tick → 20 ms of zeros (genuine
+            // suppression gap), but only once they've started recording. A
+            // target in neither set is a loss gap and is deliberately skipped.
+            for ssrc in &tick.silent {
+                let Some(uid) = ssrc_map.get(ssrc) else { continue };
+                if self.targets.contains(uid) {
+                    if let Some(buf) = recs.get_mut(uid) {
+                        buf.resize(buf.len() + MONO_20MS, 0i16);
+                    }
+                }
             }
         }
         None
