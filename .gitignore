@@ -10,6 +10,11 @@ config.local.toml
 .env
 .env.*
 
+# e2e harness (#38): the local config holds bot/appservice tokens; run
+# artifacts hold bridge logs + generated configs (which embed tokens too).
+e2e.toml
+/e2e-artifacts/
+
 # matrix-sdk SQLite store (Olm crypto keys + state + media cache) — local runtime
 # data, never commit.
 /nether-store/

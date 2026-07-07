@@ -1,0 +1,32 @@
+# nvb-e2e harness configuration — copy to e2e.toml (gitignored) and fill in
+# the secrets, or pass everything as NVB_E2E_* env vars (same names,
+# uppercased with the prefix; lists are comma-separated in env form).
+# Env always wins over the file. See crates/e2e/src/config.rs.
+#
+# The ids below are the standing test environment (#38): Discord guild
+# "Nether Voice Bridge" + the Matrix "Automated Testing" space.
+
+# Path to the bridge binary under test.
+# bridge_bin = "target/debug/nether-voicebridge"
+
+homeserver_url = "https://nether.im"
+# matrix_domain = "nether.im"          # only when homeserver_url isn't the public domain
+appservice_id = "voicebridge"
+sender_localpart = "nether-voicebridge"
+# appservice_token = "..."             # SECRET — the bridge appservice's as_token
+
+# Dedicated harness puppet bots for the bridge-under-test. NEVER prod's
+# puppet tokens while prod is running (one token in two processes = two
+# fighting voice sessions).
+# puppet_tokens = ["...", "..."]       # SECRET
+
+# Hand-created speaker bots (nvb-test-speaker-*), invited to the guild with
+# Connect / Speak / Use Voice Activity.
+# speaker_tokens = ["...", "..."]      # SECRET
+
+guild_id = "1523348036040790087"
+# Auto Test 01 (unencrypted; m.call.member at PL 0).
+channel_a = "1523349282416103454"
+room_a = "!iICkB3Qu8tQemzFqDl:nether.im"
+
+# artifacts_dir = "e2e-artifacts"

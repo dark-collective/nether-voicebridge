@@ -35,14 +35,24 @@ async fn main() -> Result<()> {
     // log targets from `nether_voicebridge` to per-crate names (`nvb_audio`,
     // `nvb_discord`, `nvb_matrix_rtc`, `nvb_config`), so RUST_LOG now targets
     // those — e.g. `RUST_LOG=nvb_discord=debug,nvb_matrix_rtc=debug`.
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+    //
+    // `NVB_LOG_JSON=1` switches stdout to newline-delimited JSON events — the
+    // machine-readable feed the #38 e2e harness scrapes (`nvb-e2e`'s
+    // LogScraper). Anything else (unset, "0", …) keeps the human format, so
+    // production output is unchanged.
+    let env_filter = || {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new(
                 "nether_voicebridge=info,nvb_audio=info,nvb_discord=info,\
                  nvb_matrix_rtc=info,nvb_config=info",
             )
-        }))
-        .init();
+        })
+    };
+    if std::env::var("NVB_LOG_JSON").is_ok_and(|v| v == "1") {
+        tracing_subscriber::fmt().json().with_env_filter(env_filter()).init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter()).init();
+    }
 
     // Raise the open-file (nofile) soft limit. Each ghost (one per Discord speaker)
     // is its own matrix-sdk client with a SQLite crypto store (db + -wal + -shm) plus

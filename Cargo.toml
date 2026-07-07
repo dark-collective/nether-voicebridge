@@ -6,6 +6,16 @@ members = [
     "crates/discord",
     "crates/matrix-rtc",
     "crates/bridge",
+    "crates/e2e",
+]
+# Plain `cargo build` (and the Dockerfile) still builds exactly the shipping
+# five — the #38 e2e harness is opt-in via `-p nvb-e2e` (or `--workspace`).
+default-members = [
+    "crates/config",
+    "crates/audio",
+    "crates/discord",
+    "crates/matrix-rtc",
+    "crates/bridge",
 ]
 
 # Shared package metadata. Every crate inherits these with `<field>.workspace =
@@ -56,7 +66,7 @@ toml = "0.8"
 # 0.22 line toml 0.8 already pulls in transitively.
 toml_edit = "0.22"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
 thiserror = "2"
 # `builder` powers the `/bridge approve` slash-command registration + responses
@@ -75,6 +85,9 @@ base64 = "0.22"
 rand = "0.8"
 tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = { version = "0.3", default-features = false }
+# Unix signals for the e2e harness's bridge-under-test control (SIGHUP reload,
+# SIGTERM drain) — already in the tree transitively via tokio/serenity.
+libc = "0.2"
 # Enables symphonia's PCM (f32) decoder in the SAME symphonia crate songbird
 # compiles (Cargo feature unification). Without it, songbird's RawAdapter live-PCM
 # path fails to promote ("no compatible track found"). Matches songbird 0.6's
