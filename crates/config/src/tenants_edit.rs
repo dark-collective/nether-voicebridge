@@ -225,6 +225,20 @@ pub(crate) fn write_atomic(path: &str, content: &str) -> Result<(), ConfigError>
     std::fs::rename(&tmp, target).map_err(io_err)
 }
 
+/// Serialize a small list-store (`value`) to pretty TOML and atomically write it
+/// to `path`. Shared by the ban list (#47) and opt-out list (#63), whose saves
+/// were byte-for-byte identical apart from the `what` used in the serialization
+/// error text.
+pub(crate) fn save_toml_list<T: serde::Serialize>(
+    path: &str,
+    value: &T,
+    what: &str,
+) -> Result<(), ConfigError> {
+    let content = toml::to_string_pretty(value)
+        .map_err(|e| ConfigError::Validation(format!("serializing {what}: {e}")))?;
+    write_atomic(path, &content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ConfigError;
-use crate::tenants_edit::write_atomic;
+use crate::tenants_edit::save_toml_list;
 
 /// The persisted opt-out list. Default-empty; a missing file is an empty list.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -78,9 +78,7 @@ pub fn remove_optout(path: &str, user_id: u64) -> Result<bool, ConfigError> {
 }
 
 fn save(path: &str, list: &OptoutList) -> Result<(), ConfigError> {
-    let content = toml::to_string_pretty(list)
-        .map_err(|e| ConfigError::Validation(format!("serializing opt-out list: {e}")))?;
-    write_atomic(path, &content)
+    save_toml_list(path, list, "opt-out list")
 }
 
 /// The `/bridge approve` reply payload (#64): the outcome text for the

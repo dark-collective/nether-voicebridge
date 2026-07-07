@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ConfigError;
-use crate::tenants_edit::write_atomic;
+use crate::tenants_edit::save_toml_list;
 
 /// What a ban matches against. The string forms are the management-bot
 /// command arguments (`ban owner @x:y`, `ban guild 123`, `ban room !r:y`).
@@ -130,9 +130,7 @@ pub fn remove_ban(path: &str, kind: BanKind, value: &str) -> Result<bool, Config
 }
 
 fn save(path: &str, bans: &BanList) -> Result<(), ConfigError> {
-    let content = toml::to_string_pretty(bans)
-        .map_err(|e| ConfigError::Validation(format!("serializing ban list: {e}")))?;
-    write_atomic(path, &content)
+    save_toml_list(path, bans, "ban list")
 }
 
 #[cfg(test)]
