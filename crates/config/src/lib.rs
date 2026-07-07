@@ -338,6 +338,13 @@ pub struct ManagementConfig {
     /// non-allowlisted users entirely, the pre-#43 behavior.
     #[serde(default)]
     pub open_registration: bool,
+    /// Public URL of the instance's privacy policy (#43 ToS follow-ups,
+    /// Developer Terms §5a). When set it is appended to the `link` disclosure
+    /// texts (pending-approval reply, `/bridge approve` outcome, link
+    /// success). Also link it in each Discord application's Developer-Portal
+    /// privacy-policy field — that part can't be automated.
+    #[serde(default)]
+    pub privacy_policy_url: Option<String>,
     // --- resolved from the referenced [server.<name>] profile ---
     #[serde(default)]
     pub homeserver_url: String,

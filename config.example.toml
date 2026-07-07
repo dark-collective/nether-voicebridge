@@ -93,6 +93,9 @@
 # # plus `unlink`/`list` scoped to bridges they created. ban/unban/bans stay
 # # operator-only. Pair with [limits] max_tenants_per_owner.
 # # open_registration = true
+# # privacy_policy_url = "https://example.org/privacy"  # appended to link/approve
+# #                                  # disclosure texts (also link it in each Discord
+# #                                  # app's Developer-Portal privacy-policy field)
 
 # ── Admission limits (optional) ──────────────────────────────────────────────
 # Hard caps for a hosted deployment (#47). Every field is optional; an absent

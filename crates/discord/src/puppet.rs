@@ -2289,15 +2289,17 @@ impl EventHandler for PuppetHandler {
             return;
         };
 
-        // Defer (ephemeral): the approval commits a tenant (file write +
-        // reconcile round-trip), which can exceed the 3 s initial-response
-        // window.
+        // Defer PUBLICLY (not ephemeral): the approval outcome is the
+        // in-server disclosure record that this channel is now bridged
+        // off-platform (#43 ToS follow-ups, Dev Policy §2/§3) — the manager's
+        // consent and the result stay visible to the server. Deferred because
+        // the commit (file write + reconcile round-trip) can exceed the 3 s
+        // initial-response window. Permission/usage errors above stay
+        // ephemeral — those are for the invoker alone.
         if let Err(e) = cmd
             .create_response(
                 &ctx.http,
-                CreateInteractionResponse::Defer(
-                    CreateInteractionResponseMessage::new().ephemeral(true),
-                ),
+                CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new()),
             )
             .await
         {

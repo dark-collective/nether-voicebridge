@@ -350,6 +350,13 @@ allowlist-only, deny-listed users are refused at the door, and
 without both `require_room_authority` and `require_discord_approval` — without
 those, any Matrix user could bridge rooms and guilds they don't control.
 
+For a hosted instance, set `privacy_policy_url` — it is appended to the link
+and approval disclosure texts, and the `/bridge approve` outcome is posted
+publicly in the channel where it was run, so every bridged server has a
+visible record of the link and its approver. A hostable policy template lives
+at `docs/privacy-policy.md`, and `docs/nether-voicebridge-verification-runbook.md`
+covers the 100-server App Verification gate.
+
 ## Community & contributing
 
 - **Development & support space:**

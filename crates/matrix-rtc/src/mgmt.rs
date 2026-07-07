@@ -161,6 +161,20 @@ struct BotCtx {
     /// `[limits] max_tenants_per_owner` — per-owner tenant cap, enforced at
     /// `link` for non-operators only. `None` ⇒ unlimited.
     max_tenants_per_owner: Option<usize>,
+    /// Public privacy-policy URL (#43 ToS follow-ups): appended to the `link`
+    /// disclosure texts when configured.
+    privacy_policy_url: Option<String>,
+}
+
+impl BotCtx {
+    /// `"\nPrivacy policy: <url>"` when configured, else empty — appended to
+    /// the disclosure-bearing replies.
+    fn policy_line(&self) -> String {
+        self.privacy_policy_url
+            .as_deref()
+            .map(|u| format!("\nPrivacy policy: {u}"))
+            .unwrap_or_default()
+    }
 }
 
 impl BotCtx {
@@ -429,6 +443,7 @@ pub async fn run(
         pending: StdMutex::new(HashMap::new()),
         open_registration: cfg.open_registration,
         max_tenants_per_owner: limits.max_tenants_per_owner,
+        privacy_policy_url: cfg.privacy_policy_url.clone(),
     });
 
     // Discord-side approvals (#47 two-sided link auth): consume `/bridge
@@ -1377,8 +1392,9 @@ async fn handle_link(
                     "⏳ All room checks passed — Discord-side approval required.\n\
                      Have someone with **Manage Server** permission in Discord guild {guild_id} run:\n\
                      `/bridge approve code:{code}`\n\
-                     The code expires in {} minutes; nothing is written until it is approved.",
-                    ttl.as_secs().div_ceil(60)
+                     The code expires in {} minutes; nothing is written until it is approved.{}",
+                    ttl.as_secs().div_ceil(60),
+                    ctx.policy_line()
                 ))
                 .await;
             }
@@ -1439,7 +1455,8 @@ async fn commit_link(
                      ✓ call power levels allow the bridge's ghosts\n\
                      ✓ MatrixRTC focus discovered\n\
                      {guild_line}\n\
-                     Not verifiable here: the puppet bots need Connect, Speak, Use Voice Activity and Change Nickname on the voice channel."
+                     Not verifiable here: the puppet bots need Connect, Speak, Use Voice Activity and Change Nickname on the voice channel.{}",
+                    ctx.policy_line()
                 )
             } else {
                 format!(
