@@ -34,7 +34,7 @@ pub(crate) mod well_known;
 mod tone;
 
 use anyhow::Result;
-use livekit::e2ee::key_provider::KeyProvider;
+use livekit::e2ee::key_provider::{KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions};
 use matrix_sdk::{
     Client,
     ruma::{OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId},
@@ -56,6 +56,13 @@ use well_known::LivekitFocusInfo;
 // active) was a hardcoded const here until #38; it now comes from the resolved
 // `[timing]` config (`TimingConfig::reap_interval`) as `run`'s `reap_interval`
 // parameter. See [`matrix::reap_stale_memberships`].
+
+/// Shared slot for the live session's key-install notifier (#73): the to-device
+/// handler pushes the LiveKit identity of every peer whose media key it just
+/// installed, and the session's room-event loop re-subscribes any track that
+/// was subscribed before its key arrived. Set on join, cleared on teardown —
+/// same lifecycle as the shared `KeyProvider`.
+type KeyInstalledTx = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>;
 
 /// State held while the bridge bot is connected to a live call (subscribe-only).
 struct ActiveSession {
@@ -117,6 +124,8 @@ pub(crate) async fn run(
     // Every peer key delivered this call, replayed into the fresh provider a
     // disconnect-recovery rejoin mints (#66) — see [`keys::PeerKeyCache`].
     let peer_keys: Arc<keys::PeerKeyCache> = Arc::new(keys::PeerKeyCache::default());
+    // Key-install notifier for the live session's #73 heal gate.
+    let key_installed_tx: KeyInstalledTx = Arc::new(Mutex::new(None));
 
     // Bridge-bot identity, used to post/retract call membership when E2EE is on.
     let bot_user_id: OwnedUserId = mx_cfg.bot_user_id.parse()?;
@@ -128,12 +137,14 @@ pub(crate) async fn run(
     {
         let provider_ref = shared_provider.clone();
         let peer_keys_ref = peer_keys.clone();
+        let key_tx_ref = key_installed_tx.clone();
         // Runs in matrix-sdk's sync task (no inherited span) — tag per bridge.
         let bridge = bridge.clone();
         client.add_event_handler(
             move |ev: matrix_sdk::ruma::events::ToDeviceEvent<CallEncryptionKeysEventContent>| {
                 let provider_ref = provider_ref.clone();
                 let peer_keys_ref = peer_keys_ref.clone();
+                let key_tx_ref = key_tx_ref.clone();
                 let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
                 async move {
                     let sender = ev.sender.as_str().to_owned();
@@ -161,20 +172,33 @@ pub(crate) async fn run(
                     // is down (disconnect recovery, #66) must be retained so the
                     // rejoin's replay restores them into the fresh provider.
                     peer_keys_ref.record(&sender, &claimed_device_id, key_index, &key_b64);
-                    let guard = provider_ref.lock().expect("provider mutex poisoned");
-                    if let Some(provider) = guard.as_ref() {
-                        keys::install_peer_key(
-                            &sender,
-                            &claimed_device_id,
-                            key_index,
-                            &key_b64,
-                            provider,
-                        );
-                    } else {
-                        tracing::debug!(
-                            sender = %sender,
-                            "received encryption_keys with no active session — cached for the next join"
-                        );
+                    let installed = {
+                        let guard = provider_ref.lock().expect("provider mutex poisoned");
+                        match guard.as_ref() {
+                            Some(provider) => keys::install_peer_key(
+                                &sender,
+                                &claimed_device_id,
+                                key_index,
+                                &key_b64,
+                                provider,
+                            ),
+                            None => {
+                                tracing::debug!(
+                                    sender = %sender,
+                                    "received encryption_keys with no active session — cached for the next join"
+                                );
+                                false
+                            }
+                        }
+                    };
+                    // #73: nudge the session's heal gate — a track already
+                    // subscribed keyless for this identity is re-subscribed
+                    // now that its key exists.
+                    if installed {
+                        let slot = key_tx_ref.lock().expect("key-installed slot mutex poisoned");
+                        if let Some(tx) = slot.as_ref() {
+                            let _ = tx.send(keys::peer_livekit_identity(&sender, &claimed_device_id));
+                        }
                     }
                 }
                 .instrument(span)
@@ -239,6 +263,7 @@ pub(crate) async fn run(
                     &room_id_str,
                     mx_cfg.device_id.as_str(),
                     &shared_provider,
+                    &key_installed_tx,
                     &peer_keys,
                     media_e2ee,
                     lk_cfg.lk_jwt_url.as_deref(),
@@ -285,7 +310,7 @@ pub(crate) async fn run(
                 // All humans left — tear down. This is a normal call-end, so
                 // release the puppets too (they leave voice).
                 tracing::info!("call ended — disconnecting subscriber");
-                teardown(&mut active_session, &shared_provider, &router, true).await;
+                teardown(&mut active_session, &shared_provider, &key_installed_tx, &router, true).await;
                 joined = false;
                 // No live roster anymore — drop the reaper's grace clocks so the
                 // next call starts fresh.
@@ -365,7 +390,7 @@ pub(crate) async fn run(
                 // iteration's (false,true) arm re-runs join_livekit; failures
                 // retry at reaper-tick cadence, same as an initial join.
                 tracing::warn!("LiveKit room disconnected — tearing down for rejoin");
-                teardown(&mut active_session, &shared_provider, &router, false).await;
+                teardown(&mut active_session, &shared_provider, &key_installed_tx, &router, false).await;
                 joined = false;
                 // The dead-room window produced bogus absence observations —
                 // drop the grace clocks so nobody gets reaped off them.
@@ -412,7 +437,7 @@ pub(crate) async fn run(
     // mid-disconnect-recovery (#66) has no active session but a lingering
     // membership. Gate the two halves independently.
     if active_session.is_some() || joined {
-        teardown(&mut active_session, &shared_provider, &router, false).await;
+        teardown(&mut active_session, &shared_provider, &key_installed_tx, &router, false).await;
     }
     if membership_lingering {
         if let Some(mc) = membership_cancel.take() {
@@ -510,9 +535,14 @@ async fn retract_membership(
 }
 
 /// Fetch a fresh JWT, connect to LiveKit and subscribe to remote tracks. When
-/// E2EE is enabled, share the key provider so the to-device handler can install
-/// peer keys for decryption. Does **not** publish — the bridge bot is the
-/// subscriber; Discord → Matrix audio is published by ghosts.
+/// E2EE is enabled, the key provider is built, shared with the to-device
+/// handler, and re-seeded from the peer-key cache **before** connecting:
+/// inbound frames can only start after the post-connect subscribe, so every key
+/// already delivered — and any arriving mid-connect — beats the first frame to
+/// the decryptor. Frames-before-key permanently wedges libwebrtc's inbound
+/// decryptor (#73), so this ordering is correctness, not style. Does **not**
+/// publish — the bridge bot is the subscriber; Discord → Matrix audio is
+/// published by ghosts.
 #[allow(clippy::too_many_arguments)]
 async fn join_livekit(
     client: &Client,
@@ -522,6 +552,7 @@ async fn join_livekit(
     room_id_str: &str,
     device_id: &str,
     shared_provider: &Arc<Mutex<Option<KeyProvider>>>,
+    key_installed_tx: &KeyInstalledTx,
     peer_keys: &Arc<keys::PeerKeyCache>,
     use_e2ee: bool,
     // Optional config overrides; when `None` the values are auto-derived from
@@ -544,10 +575,44 @@ async fn join_livekit(
     )
     .await?;
 
-    let lk_session = session::connect(
+    let (key_provider, key_installed_rx) = if use_e2ee {
+        // ratchet_salt is used as the HKDF salt when deriving the actual AES-GCM key
+        // from the raw key bytes supplied via set_key. EC's livekit-client-js uses the
+        // livekit SDK default "LKFrameEncryptionKey". Empty salt produces a different
+        // derived key → decryption fails → raw encrypted bytes output as audio = noise.
+        let key_provider = KeyProvider::new(KeyProviderOptions {
+            ratchet_window_size: 16, // match livekit-client-js default
+            ratchet_salt: b"LKFrameEncryptionKey".to_vec(),
+            failure_tolerance: -1,
+            key_ring_size: 256,
+            key_derivation_algorithm: KeyDerivationAlgorithm::HKDF,
+        });
+        // Make the provider visible to the to-device receive handler so it can
+        // install peers' keys and decrypt their inbound frames.
+        {
+            let mut guard = shared_provider.lock().expect("provider mutex poisoned");
+            *guard = Some(key_provider.clone());
+        }
+        tracing::info!("E2EE key provider shared with to-device handler (subscribe decrypt)");
+        // A rejoin after a disconnect (#66) mints this provider EMPTY; peers
+        // won't re-send unprompted. Restore every key delivered this call
+        // (no-op on the first join of a call).
+        peer_keys.replay(&key_provider);
+        // Key-install notifications for the session's heal gate (#73).
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *key_installed_tx.lock().expect("key-installed slot mutex poisoned") = Some(tx);
+        (Some(key_provider), Some(rx))
+    } else {
+        tracing::info!("media E2EE disabled — connecting without frame encryption");
+        (None, None)
+    };
+
+    let lk_session = match session::connect(
         url_override.unwrap_or(&jwt_resp.url),
         &jwt_resp.jwt,
-        use_e2ee,
+        key_provider,
+        key_installed_rx,
+        peer_keys.clone(),
         client.clone(),
         room_id.to_owned(),
         router,
@@ -555,27 +620,30 @@ async fn join_livekit(
         ghost_prefix.clone(),
         shutdown,
     )
-    .await?;
-
-    if use_e2ee {
-        if let Some(ref key_provider) = lk_session.key_provider {
-            // Make the provider visible to the to-device receive handler so it can
-            // install peers' keys and decrypt their inbound frames.
-            {
-                let mut guard = shared_provider.lock().expect("provider mutex poisoned");
-                *guard = Some(key_provider.clone());
-            }
-            tracing::info!("E2EE key provider shared with to-device handler (subscribe decrypt)");
-            // A rejoin after a disconnect (#66) mints this provider EMPTY; peers
-            // won't re-send unprompted. Restore every key delivered this call
-            // (no-op on the first join of a call).
-            peer_keys.replay(key_provider);
+    .await
+    {
+        Ok(sess) => sess,
+        Err(e) => {
+            // Keep the provider/notifier slots strictly session-scoped: a
+            // failed connect leaves no session, so leave no slots behind (keys
+            // arriving meanwhile are still cache-recorded and replay next try).
+            clear_session_slots(shared_provider, key_installed_tx);
+            return Err(e);
         }
-    } else {
-        tracing::info!("media E2EE disabled — connecting without frame encryption");
-    }
+    };
 
     Ok(ActiveSession { lk_session })
+}
+
+/// Clear the per-session shared slots (key provider + #73 key-install
+/// notifier). Called on teardown and on a failed join, so the slots always
+/// mirror "a session exists".
+fn clear_session_slots(
+    shared_provider: &Arc<Mutex<Option<KeyProvider>>>,
+    key_installed_tx: &KeyInstalledTx,
+) {
+    *shared_provider.lock().expect("provider mutex poisoned") = None;
+    *key_installed_tx.lock().expect("key-installed slot mutex poisoned") = None;
 }
 
 /// Tear down an active session, clearing the shared provider. When
@@ -586,6 +654,7 @@ async fn join_livekit(
 async fn teardown(
     active_session: &mut Option<ActiveSession>,
     shared_provider: &Arc<Mutex<Option<KeyProvider>>>,
+    key_installed_tx: &KeyInstalledTx,
     router: &Arc<dyn PlaybackRouter>,
     release_routes: bool,
 ) {
@@ -597,6 +666,5 @@ async fn teardown(
         // is belt-and-suspenders in case a consumer was mid-push during teardown.
         router.release_all();
     }
-    let mut guard = shared_provider.lock().expect("provider mutex poisoned");
-    *guard = None;
+    clear_session_slots(shared_provider, key_installed_tx);
 }

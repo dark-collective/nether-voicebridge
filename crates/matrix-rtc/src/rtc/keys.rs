@@ -238,6 +238,19 @@ impl PeerKeyCache {
         );
     }
 
+    /// Whether ANY key has been delivered for the peer publishing as this
+    /// LiveKit identity (`{mxid}:{device}` — see [`peer_livekit_identity`]).
+    /// Drives the #73 heal gate: a track subscribed while this is `false` had
+    /// its first frames hit the decryptor keyless, which wedges it permanently
+    /// — the session re-subscribes once the key lands.
+    pub(crate) fn has_key_for_identity(&self, identity: &str) -> bool {
+        self.keys
+            .lock()
+            .expect("peer-key cache mutex poisoned")
+            .keys()
+            .any(|(sender, device, _)| peer_livekit_identity(sender, device) == identity)
+    }
+
     /// Install every cached key into `key_provider` (a fresh provider after a
     /// rejoin). A no-op on the first join of a call (nothing recorded yet).
     pub(crate) fn replay(&self, key_provider: &KeyProvider) {
@@ -276,6 +289,18 @@ mod tests {
         }
         cache.clear();
         assert!(cache.keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn peer_key_cache_knows_which_identities_are_keyed() {
+        let cache = PeerKeyCache::default();
+        assert!(!cache.has_key_for_identity("@a:x:DEV1"));
+        cache.record("@a:x", "DEV1", 3, "key");
+        assert!(cache.has_key_for_identity("@a:x:DEV1"));
+        // Same user, different device (LiveKit identities are per-device).
+        assert!(!cache.has_key_for_identity("@a:x:DEV2"));
+        cache.clear();
+        assert!(!cache.has_key_for_identity("@a:x:DEV1"));
     }
 
     #[test]

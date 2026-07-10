@@ -12,30 +12,33 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose};
 use futures_util::StreamExt;
 use livekit::{Room, RoomOptions};
-use livekit::e2ee::{E2eeOptions, EncryptionType, key_provider::{KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions}};
+use livekit::e2ee::{E2eeOptions, EncryptionType, key_provider::KeyProvider};
+use livekit::publication::RemoteTrackPublication;
 use livekit::track::RemoteTrack;
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
 use matrix_sdk::Client;
 use matrix_sdk::ruma::{OwnedRoomId, RoomId, UserId};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use livekit::RoomEvent;
 
 use nvb_audio::routing::PlaybackRouter;
+use super::keys::PeerKeyCache;
 
 /// Sample rate / channel count we ask libwebrtc to resample inbound tracks to.
 /// 48 kHz mono matches the playback path (songbird upmixes mono → stereo).
 const PLAYBACK_SAMPLE_RATE: i32 = 48_000;
 const PLAYBACK_CHANNELS: i32 = 1;
 
-/// A live LiveKit session: room handle, optional key provider, and our participant identity.
+/// A live LiveKit session: room handle and our participant identity. The E2EE
+/// key provider (when on) is owned by the caller, which builds and shares it
+/// *before* connecting (#73) — see [`connect`].
 pub struct LiveSession {
     pub room: Room,
-    /// Present only when E2EE is enabled (`media_e2ee = true` in config).
-    pub key_provider: Option<KeyProvider>,
     /// Our LiveKit participant identity (the JWT `sub` claim). Read only on the
     /// dormant E2EE publish path (subscribe-only bot no longer sets its own key).
     #[allow(dead_code)]
@@ -95,14 +98,22 @@ pub fn decode_jwt_claims(jwt: &str) -> Result<(String, Option<String>)> {
 
 /// Connect to a LiveKit room.
 ///
-/// When `use_e2ee` is true, configures HKDF/GCM frame encryption and returns
-/// a `KeyProvider` in the session. When false (the common case for deployments
-/// that run EC without media E2EE), connects plainly — no frame encryption.
+/// When `key_provider` is `Some`, configures HKDF/GCM frame encryption with it
+/// (the caller builds + shares the provider *before* connecting, so every peer
+/// key already delivered is installed before the first inbound frame can hit
+/// the decryptor — see #73). When `None` (the common case for deployments that
+/// run EC without media E2EE), connects plainly — no frame encryption.
+///
+/// `key_installed_rx` (E2EE only) delivers the LiveKit identity of each peer
+/// whose media key just got installed; the room-event loop uses it to heal
+/// tracks that were subscribed before their key arrived (#73).
 #[allow(clippy::too_many_arguments)]
 pub async fn connect(
     url: &str,
     jwt: &str,
-    use_e2ee: bool,
+    key_provider: Option<KeyProvider>,
+    key_installed_rx: Option<UnboundedReceiver<String>>,
+    peer_keys: Arc<PeerKeyCache>,
     client: Client,
     room_id: OwnedRoomId,
     router: Arc<dyn PlaybackRouter>,
@@ -110,6 +121,7 @@ pub async fn connect(
     ghost_prefix: Arc<str>,
     parent_cancel: CancellationToken,
 ) -> Result<LiveSession> {
+    let use_e2ee = key_provider.is_some();
     let span = tracing::info_span!("rtc.session", sfu_url = %url, use_e2ee);
     let _guard = span.enter();
 
@@ -117,28 +129,17 @@ pub async fn connect(
     let (our_identity, jwt_room) = decode_jwt_claims(jwt)?;
     tracing::info!(identity = %our_identity, livekit_room = ?jwt_room, "LiveKit JWT claims decoded");
 
-    let (room_opts, key_provider) = if use_e2ee {
-        // ratchet_salt is used as the HKDF salt when deriving the actual AES-GCM key
-        // from the raw key bytes supplied via set_key. EC's livekit-client-js uses the
-        // livekit SDK default "LKFrameEncryptionKey". Empty salt produces a different
-        // derived key → decryption fails → raw encrypted bytes output as audio = noise.
-        let key_provider_opts = KeyProviderOptions {
-            ratchet_window_size: 16, // match livekit-client-js default
-            ratchet_salt: b"LKFrameEncryptionKey".to_vec(),
-            failure_tolerance: -1,
-            key_ring_size: 256,
-            key_derivation_algorithm: KeyDerivationAlgorithm::HKDF,
-        };
-        let key_provider = KeyProvider::new(key_provider_opts);
-        let e2ee = E2eeOptions {
-            encryption_type: EncryptionType::Gcm,
-            key_provider: key_provider.clone(),
-        };
-        let mut opts = RoomOptions::default();
-        opts.encryption = Some(e2ee);
-        (opts, Some(key_provider))
-    } else {
-        (RoomOptions::default(), None)
+    let room_opts = match &key_provider {
+        Some(kp) => {
+            let e2ee = E2eeOptions {
+                encryption_type: EncryptionType::Gcm,
+                key_provider: kp.clone(),
+            };
+            let mut opts = RoomOptions::default();
+            opts.encryption = Some(e2ee);
+            opts
+        }
+        None => RoomOptions::default(),
     };
 
     tracing::info!(use_e2ee, "connecting to LiveKit room");
@@ -175,13 +176,14 @@ pub async fn connect(
             disconnected.clone(),
             bridge.clone(),
             ghost_prefix,
+            peer_keys,
+            key_installed_rx,
         )
         .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
     );
 
     Ok(LiveSession {
         room,
-        key_provider,
         our_identity,
         cancel,
         disconnected,
@@ -322,6 +324,77 @@ async fn playback_consumer(
     tracing::info!(track = %key, "playback consumer ended (puppet kept; membership owns release)");
 }
 
+/// #73 heal gate: per subscribed publisher identity, whether that peer's media
+/// key was already delivered when its track was subscribed.
+///
+/// Why: libwebrtc's inbound frame decryptor wedges *permanently* when a track's
+/// first frames arrive before the publisher's key is installed — E2EE state
+/// reports `Ok` after the key lands, the frame counter advances, but every
+/// output frame stays digital silence, and later key installs/rotations don't
+/// heal it (live-proven on encrypted Dark Voice). All of that wedged state is
+/// per-receiver (transformer + decode chain), so re-subscribing — which mints a
+/// fresh receiver and frame cryptor against the now-keyed provider — reduces
+/// the wedge case to the known-good "key before frames" case. This gate decides
+/// *when* that one re-subscribe is owed: exactly once per keyless subscribe,
+/// on the first key install for that identity.
+#[derive(Default)]
+struct HealGate {
+    /// LiveKit identity (`{mxid}:{device}`) → had a key at subscribe time.
+    had_key: HashMap<String, bool>,
+}
+
+impl HealGate {
+    fn on_subscribed(&mut self, identity: &str, had_key: bool) {
+        self.had_key.insert(identity.to_owned(), had_key);
+    }
+
+    fn on_unsubscribed(&mut self, identity: &str) {
+        self.had_key.remove(identity);
+    }
+
+    /// A key was just installed for `identity`: `true` if its track was
+    /// subscribed keyless and hasn't been healed yet. Flips the entry so
+    /// follow-up installs (index rotations) don't re-subscribe again — the
+    /// re-subscribe's own `TrackSubscribed` re-records it as keyed anyway.
+    fn should_heal(&mut self, identity: &str) -> bool {
+        match self.had_key.get_mut(identity) {
+            Some(had_key) if !*had_key => {
+                *had_key = true;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Re-subscribe a track whose first frames beat its peer media key (#73).
+///
+/// Unsubscribe→resubscribe makes the SFU renegotiate the track: the SDK mints a
+/// fresh RtpReceiver + frame cryptor (and we get fresh `TrackUnsubscribed` /
+/// `TrackSubscribed` events, so the playback consumer is cleanly restarted).
+/// The provider's key ring — which now holds the key — is the only state that
+/// survives, which is exactly the known-good "key before frames" join order.
+/// Runs as a short task so the brief settle delay between the two subscription
+/// updates never stalls the room-event loop.
+fn heal_keyless_subscription(identity: &str, publication: &RemoteTrackPublication) {
+    tracing::info!(
+        from_identity = %identity,
+        track_sid = %publication.sid(),
+        "peer media key installed for a track subscribed keyless — re-subscribing to rebuild its decryptor (#73)"
+    );
+    let publication = publication.clone();
+    tokio::spawn(
+        async move {
+            publication.set_subscribed(false);
+            // Let the unsubscribe reach the SFU before requesting the track
+            // again, so the two updates can't collapse into a no-op.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            publication.set_subscribed(true);
+        }
+        .instrument(tracing::Span::current()),
+    );
+}
+
 /// Drain LiveKit room events: log for observability, and route subscribed audio
 /// tracks into the playback mixer (one consumer task per track, keyed by SID).
 ///
@@ -329,6 +402,11 @@ async fn playback_consumer(
 /// its internal auto-reconnect is exhausted) or the event stream closing — the
 /// `disconnected` token is fired unconditionally so the owner loop can tear the
 /// dead session down and rejoin (#66).
+///
+/// `key_installed_rx` (E2EE only): each received LiveKit identity just had a
+/// media key installed; a track subscribed *before* its key arrived is
+/// re-subscribed once so its wedged decryptor is rebuilt keyed (#73, see
+/// [`HealGate`]).
 #[allow(clippy::too_many_arguments)]
 async fn handle_room_events(
     mut events: UnboundedReceiver<RoomEvent>,
@@ -339,18 +417,56 @@ async fn handle_room_events(
     disconnected: CancellationToken,
     bridge: Arc<str>,
     ghost_prefix: Arc<str>,
+    peer_keys: Arc<PeerKeyCache>,
+    mut key_installed_rx: Option<UnboundedReceiver<String>>,
 ) {
     // Per-track child tokens so an individual unsubscribe can stop just that
     // consumer; cancelling the parent (teardown) stops them all.
     let mut consumers: HashMap<String, CancellationToken> = HashMap::new();
+    // #73 heal state: the gate decides IF a re-subscribe is owed; the
+    // publication handles (per publisher identity, human audio tracks only)
+    // are what we re-subscribe with.
+    let mut heal_gate = HealGate::default();
+    let mut audio_pubs: HashMap<String, RemoteTrackPublication> = HashMap::new();
 
-    while let Some(ev) = events.recv().await {
+    loop {
+        let key_installed = async {
+            match key_installed_rx.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        let ev = tokio::select! {
+            ev = events.recv() => match ev {
+                Some(ev) => ev,
+                None => break,
+            },
+            installed = key_installed => {
+                match installed {
+                    Some(identity) => {
+                        if heal_gate.should_heal(&identity) {
+                            if let Some(publication) = audio_pubs.get(&identity) {
+                                heal_keyless_subscription(&identity, publication);
+                            }
+                        }
+                    }
+                    // Sender gone (owner tore the session down) — stop polling.
+                    None => key_installed_rx = None,
+                }
+                continue;
+            }
+        };
         match ev {
             RoomEvent::ParticipantConnected(p) => {
                 tracing::info!(identity = %p.identity(), "LiveKit: remote participant connected");
             }
             RoomEvent::ParticipantDisconnected(p) => {
-                tracing::info!(identity = %p.identity(), "LiveKit: remote participant disconnected");
+                let identity = p.identity().to_string();
+                tracing::info!(identity = %identity, "LiveKit: remote participant disconnected");
+                // #73: belt-and-suspenders — TrackUnsubscribed usually fires
+                // too, but never leave a dangling publication handle behind.
+                heal_gate.on_unsubscribed(&identity);
+                audio_pubs.remove(&identity);
             }
             RoomEvent::LocalTrackPublished { publication, .. } => {
                 tracing::info!(sid = %publication.sid(), kind = ?publication.kind(), muted = publication.is_muted(), "LiveKit: local track published to SFU");
@@ -377,6 +493,22 @@ async fn handle_room_events(
                 if super::ghost::is_bridge_excluded_identity(&identity, &ghost_prefix) {
                     tracing::debug!(from_identity = %identity, "skipping bridge-owned ghost track (echo prevention)");
                     continue;
+                }
+                // #73 heal gate (E2EE only): remember whether this publisher's
+                // media key was already delivered. Subscribed keyless ⇒ the
+                // inbound decryptor is (about to be) wedged; the key install
+                // triggers one re-subscribe to rebuild it keyed.
+                if key_installed_rx.is_some() && matches!(track, RemoteTrack::Audio(_)) {
+                    let had_key = peer_keys.has_key_for_identity(&identity);
+                    if !had_key {
+                        tracing::info!(
+                            from_identity = %identity,
+                            track_sid = %sid,
+                            "track subscribed before its peer media key — will re-subscribe when the key lands (#73)"
+                        );
+                    }
+                    heal_gate.on_subscribed(&identity, had_key);
+                    audio_pubs.insert(identity.clone(), publication.clone());
                 }
                 let initial_muted = publication.is_muted();
                 // Per-track cancel token, keyed by SID (a participant may have
@@ -410,14 +542,20 @@ async fn handle_room_events(
             }
             RoomEvent::TrackUnsubscribed { publication, participant, .. } => {
                 let sid = publication.sid().to_string();
+                let identity = participant.identity().to_string();
                 tracing::info!(
-                    from_identity = %participant.identity(),
+                    from_identity = %identity,
                     track_sid = %sid,
                     "LiveKit: unsubscribed from remote participant track"
                 );
                 if let Some(ct) = consumers.remove(&sid) {
                     ct.cancel();
                 }
+                // #73: drop the heal-gate entry — a later re-subscribe records
+                // fresh state (a heal's own unsubscribe→subscribe cycle passes
+                // through here by design).
+                heal_gate.on_unsubscribed(&identity);
+                audio_pubs.remove(&identity);
             }
             RoomEvent::TrackPublished { publication, participant } => {
                 tracing::info!(
@@ -482,6 +620,47 @@ mod tests {
         assert_eq!(participant_mxid("@a:b.com"), "@a:b.com");
     }
 
+    // ── HealGate (#73) ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn heal_gate_heals_keyless_subscription_exactly_once() {
+        let mut gate = HealGate::default();
+        gate.on_subscribed("@a:x:DEV", false);
+        // First key install after a keyless subscribe → heal.
+        assert!(gate.should_heal("@a:x:DEV"));
+        // Follow-up installs (key index rotations) must not re-subscribe.
+        assert!(!gate.should_heal("@a:x:DEV"));
+    }
+
+    #[test]
+    fn heal_gate_never_heals_a_keyed_subscription() {
+        let mut gate = HealGate::default();
+        gate.on_subscribed("@a:x:DEV", true);
+        assert!(!gate.should_heal("@a:x:DEV"));
+    }
+
+    #[test]
+    fn heal_gate_ignores_unknown_and_unsubscribed_identities() {
+        let mut gate = HealGate::default();
+        assert!(!gate.should_heal("@nobody:x:DEV"));
+        gate.on_subscribed("@a:x:DEV", false);
+        gate.on_unsubscribed("@a:x:DEV");
+        assert!(!gate.should_heal("@a:x:DEV"));
+    }
+
+    #[test]
+    fn heal_gate_resubscribe_records_fresh_state() {
+        let mut gate = HealGate::default();
+        // Keyless subscribe → key lands → heal fires…
+        gate.on_subscribed("@a:x:DEV", false);
+        assert!(gate.should_heal("@a:x:DEV"));
+        // …the heal's own unsubscribe→subscribe cycle re-records the entry
+        // (now keyed) and must stay quiet on later installs.
+        gate.on_unsubscribed("@a:x:DEV");
+        gate.on_subscribed("@a:x:DEV", true);
+        assert!(!gate.should_heal("@a:x:DEV"));
+    }
+
     // ── handle_room_events disconnect signalling (#66) ──────────────────────────
 
     struct NoopSink;
@@ -519,6 +698,8 @@ mod tests {
             disconnected.clone(),
             Arc::from("test"),
             Arc::from("nether-voicebridge_"),
+            Arc::new(PeerKeyCache::default()),
+            None,
         ));
         (tx, disconnected)
     }
