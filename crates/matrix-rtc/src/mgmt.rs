@@ -523,6 +523,15 @@ pub async fn run(
             if room.state() != RoomState::Joined || ev.sender == ctx.own_user {
                 return;
             }
+            // DM-only gate (#71): the shared bot account is joined to every
+            // bridged voice room, so parsing/replying anywhere but a direct chat
+            // would leak usage text, operator-only refusals, ban notices, and
+            // approval codes into those rooms. Operators keep full function — they
+            // DM the bot. Fronted before EVERY reply path (including `Parsed::Usage`,
+            // which used to bypass the multi-user check).
+            if !is_command_room(room.joined_members_count()) {
+                return;
+            }
             let MessageType::Text(text) = &ev.content.msgtype else { return };
             let sender = ev.sender.as_str();
             if !ctx.is_operator(sender) && !ctx.open_registration {
@@ -558,13 +567,10 @@ pub async fn run(
                     handle_command(&ctx, &room, sender, cmd).await
                 }
                 Parsed::Usage(usage) => reply(&room, &usage).await,
-                // Unrecognized chatter: help out in a DM, stay silent in a
-                // multi-user room (the bot may share a room with real traffic).
+                // Unrecognized chatter: the handler already gated to a DM above,
+                // so help out unconditionally.
                 Parsed::Unknown => {
-                    if room.joined_members_count() <= 2 {
-                        reply(&room, "Unrecognized command — send `help` for the command list.")
-                            .await;
-                    }
+                    reply(&room, "Unrecognized command — send `help` for the command list.").await;
                 }
             }
         },
@@ -716,6 +722,19 @@ async fn reply(room: &Room, text: &str) {
     if let Err(e) = room.send(RoomMessageEventContent::text_plain(text)).await {
         tracing::warn!(room_id = %room.room_id(), error = %e, "failed to send reply");
     }
+}
+
+/// Is `room` a direct chat the bot may serve commands in (#71)? The bot account
+/// is SHARED with the bridges — it is a joined member of every bridged voice
+/// room, and a `link` probe permanently joins it to arbitrary user-named rooms —
+/// so the self-serve command tier's DM-only contract (#43) must be enforced on
+/// the command path, not just at the invite gate. A joined-member count of two
+/// (bot + one human) is the same heuristic the `Parsed::Unknown` arm already
+/// used; one (the pre-join state race) also counts as direct. Anything larger is
+/// a shared/bridged room where NO command, refusal, ban notice, or approval code
+/// may fire.
+fn is_command_room(joined_members_count: u64) -> bool {
+    joined_members_count <= 2
 }
 
 // ---- command grammar ----
@@ -1863,6 +1882,18 @@ fn is_numeric_id(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_room_is_dm_only() {
+        // Bot + one human (or the pre-join race with just the bot) → a DM the
+        // command path serves.
+        assert!(is_command_room(2));
+        assert!(is_command_room(1));
+        // A shared/bridged voice room the bot account also sits in → never a
+        // command room, so no reply/refusal/ban/approval-code can fire there.
+        assert!(!is_command_room(3));
+        assert!(!is_command_room(50));
+    }
 
     #[test]
     fn cooldown_gates_within_window_and_stamps_attempts() {
