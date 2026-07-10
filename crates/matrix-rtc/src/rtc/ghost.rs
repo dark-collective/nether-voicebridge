@@ -871,9 +871,11 @@ async fn run_ghost(
                         tracing::info!("ghost retired (was presence-only)");
                         return;
                     }
-                    // Sender drops only on shutdown, which also cancels (handled above
-                    // by the biased arm); ignore the result and re-check.
-                    _ = call_active_rx.changed() => {}
+                    // A `call_active` transition (or, if the sender was dropped
+                    // without our cancel firing, a park on cancel — never a
+                    // busy-spin on the closed channel, #67). Re-check at the loop
+                    // top either way; the biased cancel arm retracts + retires.
+                    _ = changed_or_park(&mut call_active_rx, &cancel) => {}
                 }
             }
         }
@@ -1093,10 +1095,12 @@ async fn pump_audio(
             biased;
             _ = cancel.cancelled() => break PumpExit::Cancelled,
             _ = disconnected.cancelled() => break PumpExit::Disconnected,
-            res = mute_rx.changed() => {
-                // Sender drops only when the ghost retires (which also cancels,
-                // handled by the biased arm above); ignore Err and re-check.
-                if res.is_ok() {
+            changed = changed_or_park(mute_rx, cancel) => {
+                // Only a real change reaches here as `true`; a dropped sender
+                // without our cancel firing parks on cancel (returns `false`)
+                // rather than busy-spinning on the closed channel (#67), and the
+                // biased cancel arm exits the pump on the next poll.
+                if changed {
                     let muted = *mute_rx.borrow_and_update();
                     apply_track_mute(track, muted);
                     tracing::info!(muted, "ghost track mute mirrored from Discord");
@@ -1176,6 +1180,28 @@ async fn pump_audio(
         }
     }
     exit
+}
+
+/// Await the next value on a `watch` receiver, parking on `cancel` if the sender
+/// has been dropped.
+///
+/// `watch::Receiver::changed()` returns Err *immediately and on every call* once
+/// the sender is gone. The graceful teardown paths drop a ghost's `mute_tx` /
+/// `call_active_tx` only AFTER cancelling it, so the biased `cancel` arm wins and
+/// this is never reached — but a sender that drops WITHOUT the ghost's cancel
+/// firing (the bridge-fatal error path that detaches a ghost, #67) would turn a
+/// bare `res = rx.changed()` select arm into a 100% CPU busy-spin. Returning
+/// `true` only on a real change and otherwise parking on `cancel` (which fires
+/// imminently once the ghost pool drains) keeps the select cheap. Mirrors
+/// [`distribute_key_loop`]'s handling of a closed `members_gen`.
+async fn changed_or_park(rx: &mut watch::Receiver<bool>, cancel: &CancellationToken) -> bool {
+    match rx.changed().await {
+        Ok(()) => true,
+        Err(_) => {
+            cancel.cancelled().await;
+            false
+        }
+    }
 }
 
 /// Set the ghost track's mute state to `muted`. `LocalAudioTrack::mute`/`unmute`
@@ -2283,6 +2309,33 @@ mod tests {
         assert_eq!(ghost_device_id("42", "abc"), "D42-abc");
         // Empty salt (no store) → unchanged legacy bare id.
         assert_eq!(ghost_device_id("42", ""), "D42");
+    }
+
+    #[tokio::test]
+    async fn changed_or_park_returns_true_on_real_change() {
+        let (tx, mut rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
+        tx.send(true).unwrap();
+        assert!(changed_or_park(&mut rx, &cancel).await);
+    }
+
+    #[tokio::test]
+    async fn changed_or_park_parks_on_dropped_sender_until_cancel() {
+        // The #67 hazard: sender dropped WITHOUT cancel → `changed()` returns Err
+        // on every call. The helper must PARK (neither spin nor return) until
+        // cancel fires — otherwise the ghost's mute/presence select busy-spins.
+        let (tx, mut rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
+        drop(tx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), changed_or_park(&mut rx, &cancel))
+                .await
+                .is_err(),
+            "must park on a dropped sender, not spin or return early"
+        );
+        // Once cancel fires it exits with `false` (a teardown, not a real change).
+        cancel.cancel();
+        assert!(!changed_or_park(&mut rx, &cancel).await);
     }
 
     #[test]
