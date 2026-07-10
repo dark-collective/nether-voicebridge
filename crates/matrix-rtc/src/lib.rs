@@ -181,40 +181,84 @@ pub async fn run(
     // still observed via the changed value (vs. a Notify's lost-wakeup risk).
     let (members_gen_tx, members_gen_rx) = watch::channel(0u64);
 
-    tokio::try_join!(
-        matrix::run(
-            client.clone(),
-            matrix_cfg,
-            media_e2ee,
-            timing.leave_grace(),
-            call_active_tx,
-            members_gen_tx,
-            router.clone(),
-            bridge.clone(),
-            shutdown.clone(),
+    // Drive the sync loop, the RTC subscriber, and the ghost-pool driver to
+    // completion. A bare `tokio::try_join!` would DROP the sibling futures the
+    // instant one returned Err — WITHOUT cancelling `shutdown` — so a mid-call
+    // failure (e.g. matrix::run hitting a fatal 401/403 sync error, or a state
+    // read failing) detached every live ghost task: their `m.call.member` is
+    // never retracted (phantom users linger in Element Call), key-distribution
+    // loops heartbeat to a dead call, and the RTC subscriber keeps retrying (#67).
+    // Instead, `guard_sibling` cancels `shutdown` the moment ANY of the three
+    // exits with an error, and `join3` then keeps polling the others so they
+    // observe the cancellation and run their bounded teardown drains — the ghost
+    // pool cancels and awaits every ghost's leave PUT — before `run` returns the
+    // error. On the happy path (`shutdown` cancelled by the supervisor) nothing
+    // errors, the guard never fires, and all three drain exactly as before. The
+    // whole teardown is bounded by the supervisor's TEARDOWN_TIMEOUT force-drop,
+    // armed the instant `shutdown` fires.
+    let (matrix_res, rtc_res, ghost_res) = futures_util::future::join3(
+        guard_sibling(
+            matrix::run(
+                client.clone(),
+                matrix_cfg,
+                media_e2ee,
+                timing.leave_grace(),
+                call_active_tx,
+                members_gen_tx,
+                router.clone(),
+                bridge.clone(),
+                shutdown.clone(),
+            ),
+            &shutdown,
         ),
-        rtc::run(
-            client.clone(),
-            livekit_cfg,
-            matrix_cfg,
-            media_e2ee,
-            timing.reap_interval(),
-            timing.reap_grace(),
-            call_active_rx,
-            router,
-            bridge.clone(),
-            shutdown.clone(),
+        guard_sibling(
+            rtc::run(
+                client.clone(),
+                livekit_cfg,
+                matrix_cfg,
+                media_e2ee,
+                timing.reap_interval(),
+                timing.reap_grace(),
+                call_active_rx,
+                router,
+                bridge.clone(),
+                shutdown.clone(),
+            ),
+            &shutdown,
         ),
-        ghost_pool.run(
-            client,
-            media_e2ee,
-            key_transport,
-            members_gen_rx,
-            call_active_rx_ghost,
-            bridge.clone(),
-            shutdown.clone()
+        guard_sibling(
+            ghost_pool.run(
+                client,
+                media_e2ee,
+                key_transport,
+                members_gen_rx,
+                call_active_rx_ghost,
+                bridge.clone(),
+                shutdown.clone(),
+            ),
+            &shutdown,
         ),
-    )?;
+    )
+    .await;
+    // Surface the first error (positionally; the siblings return Ok once they
+    // drain on the cancelled `shutdown`, so this is the originating failure).
+    matrix_res.and(rtc_res).and(ghost_res)?;
 
     Ok(())
+}
+
+/// Drive one of [`run`]'s three top-level futures, cancelling `shutdown` if it
+/// exits with an error so the siblings observe the failure and run their
+/// (bounded) teardown drains before `run` returns — see the `join3` call in
+/// [`run`] (#67). On the happy path `shutdown` is cancelled externally and the
+/// inner future returns Ok, so the re-cancel never fires.
+async fn guard_sibling(
+    fut: impl std::future::Future<Output = Result<()>>,
+    shutdown: &CancellationToken,
+) -> Result<()> {
+    let result = fut.await;
+    if result.is_err() {
+        shutdown.cancel();
+    }
+    result
 }

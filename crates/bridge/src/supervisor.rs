@@ -315,6 +315,13 @@ impl Supervisor {
     fn on_bridge_complete(&mut self, label: &str) {
         self.pool.unregister_channel(label);
         let Some(rb) = self.running.remove(label) else { return };
+        // Cancel the root even on a voluntary/error exit (not just an operator
+        // stop): the Matrix side already tears itself down before returning (#67),
+        // but this is the belt-and-suspenders that guarantees any task still
+        // holding a clone of this root — a detached ghost, a key loop, a
+        // membership-retry — is signalled to stop, and it can never touch a
+        // respawn (that gets a fresh root in `spawn_bridge`).
+        rb.root.cancel();
         if let Some(sink) = &rb.capture_sink {
             tracing::info!(bridge = label, "finalising WAV files");
             sink.finalize_all();
@@ -859,6 +866,46 @@ mod tests {
         // No cap configured ⇒ unlimited (pre-limits behavior).
         ctx.limits.max_tenants = None;
         validate_desired(&[a, b, c], &ctx).expect("uncapped set accepted");
+    }
+
+    /// #67: a bridge future resolving on its own (voluntary exit, error, or a
+    /// contained panic) must cancel its cancellation root, so any task still
+    /// holding a clone of it — a detached ghost, a key-distribution loop, a
+    /// membership-retry — is torn down instead of leaking (phantom Element Call
+    /// participants, key heartbeats to a dead call).
+    #[test]
+    fn on_bridge_complete_cancels_root() {
+        use nvb_config::PuppetsConfig;
+        let pool = SharedPool::new(&PuppetsConfig::default(), &TimingConfig::default());
+        let ctx = TenantsCtx {
+            servers: HashMap::new(),
+            data_dir: "/data".into(),
+            static_keys: LiveKeys::default(),
+            static_labels: HashSet::new(),
+            limits: LimitsConfig::default(),
+            timing: TimingConfig::default(),
+        };
+        let mut sup = Supervisor::new(pool, CancellationToken::new(), ctx);
+
+        let root = CancellationToken::new();
+        sup.running.insert(
+            "b".to_string(),
+            RunningBridge {
+                cfg: Arc::new(tenant("b", "!b:x")),
+                root: root.clone(),
+                capture_sink: None,
+                origin: Origin::Static,
+                pending_respawn: None,
+            },
+        );
+
+        assert!(!root.is_cancelled());
+        sup.on_bridge_complete("b");
+        assert!(
+            root.is_cancelled(),
+            "a completed bridge's root must be cancelled so detached ghost tasks are torn down"
+        );
+        assert!(!sup.running.contains_key("b"), "book-keeping dropped on completion");
     }
 
     /// A bridge future that panics mid-poll. Explicit `Arc<str>` return type so the
