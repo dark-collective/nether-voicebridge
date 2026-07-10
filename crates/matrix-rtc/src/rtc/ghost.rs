@@ -109,6 +109,12 @@ const SAMPLES_10MS: u32 = 480;
 /// than let a stale backlog build (matches the rest of the audio path).
 const FRAME_CHANNEL_DEPTH: usize = 50;
 
+/// Per-request timeout on the ghost HTTP client (#67). Every ghost control-plane
+/// request (register/join/membership/leave, key sends, `/keys/query`) is bounded
+/// so a hung homeserver connection can't wedge the single-task driver, which
+/// awaits ghost teardown inline.
+const GHOST_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Is this LiveKit participant identity one of our ghosts? Used by the bridge
 /// bot's subscriber to skip ghost tracks (echo prevention, constraint #5). The
 /// identity is `@{sender_localpart}_{id}:server[:device]`; the localpart is the
@@ -322,6 +328,14 @@ impl GhostPool {
             .with_context(|| format!("parsing bot_user_id '{}'", matrix_cfg.bot_user_id))?;
         let http = reqwest::Client::builder()
             .use_rustls_tls()
+            // Bound every ghost request (#67). The single-task `GhostPool::run`
+            // driver awaits ghost teardown inline (`handle.join.await`), and
+            // `run_ghost`'s teardown does un-raced HTTP (the final leave PUT); a
+            // homeserver that accepts the connection but never answers would
+            // otherwise wedge the whole bridge's ghost lifecycle until the
+            // process restarts. This client is cloned into every transport, so
+            // key sends and `/keys/query` are bounded too.
+            .timeout(GHOST_HTTP_TIMEOUT)
             .build()
             .context("building ghost HTTP client")?;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
