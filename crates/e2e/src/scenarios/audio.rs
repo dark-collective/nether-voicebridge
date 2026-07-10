@@ -17,10 +17,10 @@
 
 use crate::actors::ParticipantDriver;
 use crate::actors::discord::{DiscordListener, DiscordSpeaker};
-use crate::actors::matrix::{MatrixListener, MatrixSpeaker};
+use crate::actors::matrix::{MatrixListener, MatrixPhantom, MatrixSpeaker};
 use crate::bridge_proc::{BridgeUnderTest, tenant_entry, tenant_entry_opts};
 use crate::config::E2eConfig;
-use crate::observers::{RoomStatePoller, SenderClass, decode_bot_user_id};
+use crate::observers::{ConnCountProbe, RoomStatePoller, SenderClass, decode_bot_user_id};
 use crate::scenario::{Ctx, Expectation, ScenarioDef};
 use anyhow::{Context as _, Result, bail};
 use nvb_audio::oracle::{OracleConfig, compare_mono_48k};
@@ -33,7 +33,7 @@ use std::time::Duration;
 pub static AUDIO_M2D_UNENC: ScenarioDef = ScenarioDef {
     name: "audio_m2d_unenc",
     expectation: Expectation::Pass,
-    run: |ctx| Box::pin(run_m2d(ctx, false)),
+    run: |ctx| Box::pin(run_m2d(ctx, false, PROBE_MS)),
 };
 pub static AUDIO_D2M_UNENC: ScenarioDef = ScenarioDef {
     name: "audio_d2m_unenc",
@@ -43,7 +43,7 @@ pub static AUDIO_D2M_UNENC: ScenarioDef = ScenarioDef {
 pub static AUDIO_M2D_ENC: ScenarioDef = ScenarioDef {
     name: "audio_m2d_enc",
     expectation: Expectation::Pass,
-    run: |ctx| Box::pin(run_m2d(ctx, true)),
+    run: |ctx| Box::pin(run_m2d(ctx, true, PROBE_MS)),
 };
 pub static AUDIO_D2M_ENC: ScenarioDef = ScenarioDef {
     name: "audio_d2m_enc",
@@ -55,6 +55,36 @@ pub static AUDIO_M2D_ENC_FRESHJOIN: ScenarioDef = ScenarioDef {
     expectation: Expectation::Pass,
     run: |ctx| Box::pin(run_m2d_enc_freshjoin(ctx)),
 };
+/// #14 — SIGTERM mid-call drains cleanly and returns to baseline.
+pub static SHUTDOWN_DRAIN: ScenarioDef = ScenarioDef {
+    name: "shutdown_drain",
+    expectation: Expectation::Pass,
+    run: |ctx| Box::pin(run_shutdown_drain(ctx)),
+};
+/// #16 — sustained-audio drift sweep (opt-in via NVB_E2E_LONG; nightly-only).
+pub static LONG_GLITCH_SWEEP: ScenarioDef = ScenarioDef {
+    name: "long_glitch_sweep",
+    expectation: Expectation::Pass,
+    run: |ctx| Box::pin(run_long_glitch_sweep(ctx)),
+};
+/// #11 — a wiped crypto store re-mints a fresh device; encrypted audio must
+/// still cross (#30/#51/#53 self-heal).
+pub static FRESH_STORE_REKEY: ScenarioDef = ScenarioDef {
+    name: "fresh_store_rekey",
+    expectation: Expectation::Pass,
+    run: |ctx| Box::pin(run_fresh_store_rekey(ctx)),
+};
+/// #12 — a membership change past the 90s min-interval rotates the ghost's Olm
+/// outbound sessions (#52).
+pub static GHOST_SESSION_ROTATION: ScenarioDef = ScenarioDef {
+    name: "ghost_session_rotation",
+    expectation: Expectation::Pass,
+    run: |ctx| Box::pin(run_ghost_session_rotation(ctx)),
+};
+
+/// Long-probe length for the nightly drift sweep (#16). 3 minutes — needs the
+/// `real` profile's 900 s scenario timeout (the compressed ceiling is 300 s).
+const LONG_PROBE_MS: u32 = 180_000;
 
 /// Probe length: 8 cycles — the two boundary cycles absorb startup/teardown
 /// transients (see `oracle_assert`), leaving 6 interior cycles as the
@@ -105,8 +135,14 @@ const CYCLE_MS: u32 = 1_000;
 /// and a whole-stream transient budget (a #36-class corruption produces dozens
 /// of glitches, not one). Every per-cycle score is still recorded so a nightly
 /// trend catches slow drift a single pass/fail would miss.
-fn oracle_assert(artifacts: &Path, label: &str, seed: u64, captured: &[i16]) -> Result<()> {
-    let probe = synth_probe_mono_48k(seed, PROBE_MS);
+fn oracle_assert(
+    artifacts: &Path,
+    label: &str,
+    seed: u64,
+    probe_ms: u32,
+    captured: &[i16],
+) -> Result<()> {
+    let probe = synth_probe_mono_48k(seed, probe_ms);
     let wav = |suffix: &str, data: &[i16]| -> Result<()> {
         let path = artifacts.join(format!("{label}_{suffix}.wav"));
         nvb_audio::wav::write_wav_mono_48k(path.to_str().context("artifact path")?, data)
@@ -132,7 +168,7 @@ fn oracle_assert(artifacts: &Path, label: &str, seed: u64, captured: &[i16]) -> 
     // "Well-correlated" cycle floor — comfortably above live jitter (healthy
     // cycles sit 0.93–0.99), comfortably below a corrupted one.
     const GOOD_NCC: f32 = 0.85;
-    let cycles = (PROBE_MS / CYCLE_MS) as usize;
+    let cycles = (probe_ms / CYCLE_MS) as usize;
     let cycle_len = CYCLE_MS as usize * 48;
     let mut entries = Vec::new();
     let mut ncc_sum = 0.0f64;
@@ -304,7 +340,7 @@ fn loudest(recordings: HashMap<u64, Vec<i16>>) -> Option<(u64, Vec<i16>)> {
 
 // ─── Matrix → Discord (unenc + enc share the flow; the room differs) ─────────────
 
-async fn run_m2d(ctx: Arc<Ctx>, encrypted: bool) -> Result<()> {
+async fn run_m2d(ctx: Arc<Ctx>, encrypted: bool, probe_ms: u32) -> Result<()> {
     let cfg = &ctx.cfg;
     let (room, channel, bridge_name, seed) = if encrypted {
         let (room_b, channel_b) = cfg.encrypted_pair()?;
@@ -325,8 +361,9 @@ async fn run_m2d(ctx: Arc<Ctx>, encrypted: bool) -> Result<()> {
         return Err(e);
     }
 
-    let result = drive_m2d(&ctx, &bridge, &room, &channel, bridge_name, seed, encrypted, targets)
-        .await;
+    let result =
+        drive_m2d(&ctx, &bridge, &room, &channel, bridge_name, seed, encrypted, probe_ms, targets)
+            .await;
     match result {
         Ok(()) => {
             let _ = await_quiescent(&poller, &room).await;
@@ -348,6 +385,7 @@ async fn drive_m2d(
     bridge_name: &str,
     seed: u64,
     encrypted: bool,
+    probe_ms: u32,
     targets: HashSet<u64>,
 ) -> Result<()> {
     let cfg = &ctx.cfg;
@@ -393,10 +431,10 @@ async fn drive_m2d(
                     .context("bridge never installed the test speaker's media key")?;
             }
             tokio::time::sleep(SETTLE).await;
-            speaker.speak_probe(seed, PROBE_MS).await?;
+            speaker.speak_probe(seed, probe_ms).await?;
             // The probe runs ~real-time from here (LiveKit self-pacing);
             // wait it out plus the drain margin.
-            tokio::time::sleep(Duration::from_millis(PROBE_MS as u64)).await;
+            tokio::time::sleep(Duration::from_millis(probe_ms as u64)).await;
             tokio::time::sleep(DRAIN).await;
             Ok::<(), anyhow::Error>(())
         }
@@ -412,7 +450,7 @@ async fn drive_m2d(
     let (uid, captured) = loudest(recordings)
         .context("the Discord listener recorded nothing from any puppet")?;
     eprintln!("   recorded {} samples from puppet {uid}", captured.len());
-    oracle_assert(&ctx.artifacts, "m2d", seed, &captured)?;
+    oracle_assert(&ctx.artifacts, "m2d", seed, probe_ms, &captured)?;
 
     let errors = bridge.scraper.error_events();
     if !errors.is_empty() {
@@ -596,7 +634,7 @@ async fn run_m2d_enc_freshjoin(ctx: Arc<Ctx>) -> Result<()> {
     let (uid, captured) = loudest(recordings)
         .context("the Discord listener recorded nothing from any puppet")?;
     eprintln!("   recorded {} samples from puppet {uid}", captured.len());
-    oracle_assert(&ctx.artifacts, "m2d_enc_freshjoin", seed, &captured)
+    oracle_assert(&ctx.artifacts, "m2d_enc_freshjoin", seed, PROBE_MS, &captured)
 }
 
 // ─── Discord → Matrix, unencrypted (full oracle on the Matrix listener) ──────────
@@ -701,7 +739,7 @@ async fn drive_d2m_unenc(
         captured.samples.len(),
         captured.identity
     );
-    oracle_assert(&ctx.artifacts, "d2m", seed, &captured.samples)?;
+    oracle_assert(&ctx.artifacts, "d2m", seed, PROBE_MS, &captured.samples)?;
 
     let errors = bridge.scraper.error_events();
     if !errors.is_empty() {
@@ -834,11 +872,342 @@ async fn drive_d2m_enc(
     )
     .with_context(|| format!("reading Tap B WAV at {}", tap_b.display()))?;
     eprintln!("   Tap B: {} samples from {}", captured.len(), tap_b.display());
-    oracle_assert(&ctx.artifacts, "d2m_enc_tap_b", seed, &captured)?;
+    oracle_assert(&ctx.artifacts, "d2m_enc_tap_b", seed, PROBE_MS, &captured)?;
 
     let errors = bridge.scraper.error_events();
     if !errors.is_empty() {
         bail!("bridge logged {} ERROR event(s); first: {}", errors.len(), errors[0].message);
     }
     Ok(())
+}
+
+// ─── #14 shutdown_drain: SIGTERM mid-call, clean drain + baseline ─────────────
+
+/// Bring an unencrypted M→D call up with audio actively flowing, then SIGTERM
+/// **mid-probe**. The graceful shutdown that every other scenario runs as an
+/// afterthought is the whole assertion here: the bridge must exit 0, log
+/// `all bridges drained cleanly`, and leave no puppet in Discord voice.
+async fn run_shutdown_drain(ctx: Arc<Ctx>) -> Result<()> {
+    let cfg = &ctx.cfg;
+    let bridge_name = "Auto Test 01";
+    let seed = 0x5D14;
+    let poller = RoomStatePoller::new(cfg)?;
+    let targets = puppet_ids(cfg)?;
+    sweep_test_memberships(cfg, &poller, &cfg.room_a).await?;
+
+    let tenants = tenant_entry(bridge_name, &cfg.room_a, &cfg.guild_id, &cfg.channel_a);
+    let bridge = BridgeUnderTest::start(cfg, ctx.profile, &tenants, &ctx.artifacts.join("bridge"))
+        .await
+        .context("starting bridge-under-test")?;
+    if let Err(e) = bridge.await_ready(&[bridge_name], Duration::from_secs(120)).await {
+        bridge.kill().await;
+        return Err(e);
+    }
+    // Keep the log ring alive past sigterm_and_wait, which consumes the bridge.
+    let scraper = bridge.scraper.clone();
+
+    let driven = async {
+        let speaker =
+            MatrixSpeaker::join(cfg, &cfg.room_a, false, "nvbtest_alice", "NVB Test Alice").await?;
+        let active = async {
+            // The bridge assigns a puppet and subscribes the speaker's track.
+            bridge
+                .scraper
+                .await_event(Duration::from_secs(90), |e| {
+                    e.message.contains("playback consumer started") && e.in_bridge(bridge_name)
+                })
+                .await
+                .context("bridge never subscribed the test speaker's track")?;
+            tokio::time::sleep(SETTLE).await;
+            // Start the probe, then let it run halfway before pulling the plug —
+            // audio is genuinely crossing when the drain begins.
+            speaker.speak_probe(seed, PROBE_MS).await?;
+            tokio::time::sleep(Duration::from_millis((PROBE_MS / 2) as u64)).await;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        // Retract the fake membership regardless of the bridge's state.
+        speaker.leave().await;
+        active
+    }
+    .await;
+    if let Err(e) = driven {
+        bridge.kill().await;
+        return Err(e);
+    }
+
+    // ── The scenario proper: SIGTERM mid-call must drain cleanly (exit 0) ────
+    bridge
+        .sigterm_and_wait(Duration::from_secs(20))
+        .await
+        .context("SIGTERM drain (mid-call)")?;
+
+    // The stdout pump can lag the child's exit by a few ms — poll the ring for
+    // the supervisor's drain-complete line.
+    let mut drained = false;
+    for _ in 0..30 {
+        if scraper
+            .events_matching(|e| e.message.contains("all bridges drained cleanly"))
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        } else {
+            drained = true;
+            break;
+        }
+    }
+    if !drained {
+        bail!("bridge exited 0 after SIGTERM but never logged 'all bridges drained cleanly'");
+    }
+
+    // ── Baseline: no puppet lingers in Discord voice after the drain ─────────
+    // Generous window: SIGTERM tears the process down milliseconds after the
+    // puppet's songbird leave, so the ACTIVE capture anchor's voice-leave may
+    // not flush to Discord's gateway before exit — Discord then clears its voice
+    // state via the RTC keepalive timeout (~90 s) rather than promptly. The
+    // bridge's own "puppet left voice and released" + "all bridges drained
+    // cleanly" (asserted above) prove the drain issued the leave; this only
+    // confirms Discord eventually reflects baseline. (Prompter flush-on-shutdown
+    // is a bridge follow-up, tracked separately.)
+    let probe =
+        ConnCountProbe::connect(cfg.speaker_tokens.last().context("probe token")?, &cfg.guild_id)
+            .await?;
+    let baseline = probe.await_baseline(&targets, Duration::from_secs(150)).await;
+    probe.shutdown().await;
+    baseline?;
+
+    let errors = scraper.error_events();
+    if !errors.is_empty() {
+        bail!("bridge logged {} ERROR event(s); first: {}", errors.len(), errors[0].message);
+    }
+    Ok(())
+}
+
+// ─── #16 long_glitch_sweep: sustained-audio drift sweep (nightly, opt-in) ─────
+
+/// The unencrypted M→D audio path over a 3-minute probe — a #32/#36 drift guard
+/// that a single 8 s cycle can't surface. Opt-in via `NVB_E2E_LONG=1` (so the
+/// default `--all` fast suite skips it) and run under `--profile real` (its
+/// 900 s scenario timeout accommodates the long probe; compressed's 300 s does
+/// not).
+async fn run_long_glitch_sweep(ctx: Arc<Ctx>) -> Result<()> {
+    if std::env::var("NVB_E2E_LONG").ok().filter(|v| !v.is_empty()).is_none() {
+        eprintln!(
+            "   long_glitch_sweep skipped — opt-in via NVB_E2E_LONG=1 \
+             (nightly-only; run with --profile real for the {}s probe)",
+            LONG_PROBE_MS / 1000
+        );
+        return Ok(());
+    }
+    run_m2d(ctx, false, LONG_PROBE_MS).await
+}
+
+// ─── #11 fresh_store_rekey: wiped crypto store → re-mint → audio still crosses ─
+
+/// Prove the #30/#53 self-heal end to end: establish encrypted D→M audio, tear
+/// the bridge down, **wipe its crypto store**, and restart on the SAME workdir.
+/// The bridge re-provisions a brand-new device (a fresh store can't reuse the
+/// old device's keys — #30) and encrypted audio must still cross.
+///
+/// Scope note: each pass uses a fresh `MatrixListener` (a send-only test-crypto
+/// peer with no receive-side device memory), so this asserts the re-minted
+/// device delivers keys to a fresh peer — the strongest check the current
+/// testkit allows. The "peer remembers the OLD device and rejects a changed
+/// key" path needs a full-crypto peer (workstream D) and is covered by the live
+/// #53 deployment history.
+async fn run_fresh_store_rekey(ctx: Arc<Ctx>) -> Result<()> {
+    let cfg = &ctx.cfg;
+    let bridge_name = "Auto Test 02";
+    let (room_b, channel_b) = {
+        let (r, c) = cfg.encrypted_pair()?;
+        (r.to_owned(), c.to_owned())
+    };
+    let poller = RoomStatePoller::new(cfg)?;
+    sweep_test_memberships(cfg, &poller, &room_b).await?;
+
+    // One workdir reused across both starts so the crypto store persists (and
+    // is ours to wipe). capture_wav=true → the Tap B oracle target.
+    let workdir = ctx.artifacts.join("bridge");
+    let tenants = tenant_entry_opts(bridge_name, &room_b, &cfg.guild_id, &channel_b, true);
+    let data_dir = workdir.join("data");
+
+    // ── Pass 1: establish encrypted D→M and confirm audio crosses ───────────
+    fresh_store_pass(&ctx, &tenants, bridge_name, &room_b, &channel_b, &workdir, &poller, 0x11EC)
+        .await
+        .context("pass 1 (initial store) — encrypted audio should cross")?;
+
+    // ── Wipe the crypto store so the restart re-mints a fresh device ────────
+    // Remove the whole data dir (a single-tenant bridge keeps only this
+    // bridge's bot + ghost stores there); `start` recreates it and rewrites
+    // tenants.toml. This avoids depending on the private store-slug derivation.
+    if !data_dir.exists() {
+        bail!("expected a crypto store under {} after pass 1 — nothing to wipe", data_dir.display());
+    }
+    std::fs::remove_dir_all(&data_dir)
+        .with_context(|| format!("wiping crypto store dir {}", data_dir.display()))?;
+    eprintln!("   wiped crypto store dir {}", data_dir.display());
+
+    // ── Pass 2: same workdir, fresh store → new device, audio must STILL cross ─
+    fresh_store_pass(&ctx, &tenants, bridge_name, &room_b, &channel_b, &workdir, &poller, 0x11ED)
+        .await
+        .context("pass 2 (wiped store, re-minted device) — encrypted audio should still cross")?;
+    Ok(())
+}
+
+/// One start→drive→drain cycle of the encrypted D→M path on a fixed workdir,
+/// used by `run_fresh_store_rekey` for both the initial and post-wipe passes.
+#[allow(clippy::too_many_arguments)]
+async fn fresh_store_pass(
+    ctx: &Ctx,
+    tenants: &str,
+    bridge_name: &str,
+    room_b: &str,
+    channel_b: &str,
+    workdir: &Path,
+    poller: &RoomStatePoller,
+    seed: u64,
+) -> Result<()> {
+    let bridge = BridgeUnderTest::start(&ctx.cfg, ctx.profile, tenants, workdir)
+        .await
+        .context("starting bridge-under-test")?;
+    if let Err(e) = bridge.await_ready(&[bridge_name], Duration::from_secs(120)).await {
+        bridge.kill().await;
+        return Err(e);
+    }
+    let result = drive_d2m_enc(ctx, &bridge, bridge_name, room_b, channel_b, seed).await;
+    match result {
+        Ok(()) => {
+            let _ = await_quiescent(poller, room_b).await;
+            bridge.sigterm_and_wait(Duration::from_secs(20)).await.context("SIGTERM drain")
+        }
+        Err(e) => {
+            bridge.kill().await;
+            Err(e)
+        }
+    }
+}
+
+// ─── #12 ghost_session_rotation: membership change rotates Olm sessions ───────
+
+/// Guard #52: with an encrypted D→M call live, a membership change past the 90 s
+/// `SESSION_ROTATE_MIN_INTERVAL` rotates the ghost's outbound Olm sessions with
+/// `reason=membership`. Log-asserted (the rotation is internal to the ghost's
+/// crypto).
+///
+/// Timing: the min-interval is a hardcoded 90 s const (not a `TimingConfig`
+/// knob), so this scenario carries an inherent ~90 s floor even under the
+/// compressed profile — it still fits compressed's 300 s ceiling. A future
+/// follow-up could thread the interval into `TimingConfig` to compress it.
+async fn run_ghost_session_rotation(ctx: Arc<Ctx>) -> Result<()> {
+    let cfg = &ctx.cfg;
+    let bridge_name = "Auto Test 02";
+    let (room_b, channel_b) = {
+        let (r, c) = cfg.encrypted_pair()?;
+        (r.to_owned(), c.to_owned())
+    };
+    let poller = RoomStatePoller::new(cfg)?;
+    sweep_test_memberships(cfg, &poller, &room_b).await?;
+
+    let tenants = tenant_entry(bridge_name, &room_b, &cfg.guild_id, &channel_b);
+    let bridge = BridgeUnderTest::start(cfg, ctx.profile, &tenants, &ctx.artifacts.join("bridge"))
+        .await
+        .context("starting bridge-under-test")?;
+    if let Err(e) = bridge.await_ready(&[bridge_name], Duration::from_secs(120)).await {
+        bridge.kill().await;
+        return Err(e);
+    }
+
+    // A persistent Matrix listener keeps the call active (a claimable
+    // encrypted-room key recipient) so the ghost stays LIVE and its
+    // key-distribution loop — which owns the rotation timer — actually runs.
+    // Without a Matrix member the ghost is presence-only and never publishes
+    // (the smoke case), so the loop never starts and nothing can rotate.
+    let listener = match MatrixListener::join(cfg, &room_b, true, "nvbtest_listener", "NVB Test Listener")
+        .await
+    {
+        Ok(l) => l,
+        Err(e) => {
+            bridge.kill().await;
+            return Err(e);
+        }
+    };
+
+    // A Discord speaker gives the ghost audio to publish. Created outside the
+    // inner block so its gateway/voice session is always torn down, even on
+    // failure.
+    let speaker_token = match cfg.speaker_tokens.first() {
+        Some(t) => t,
+        None => {
+            let _ = listener.stop().await;
+            bridge.kill().await;
+            bail!("speaker token missing");
+        }
+    };
+    let mut speaker = match DiscordSpeaker::connect(speaker_token, &cfg.guild_id, &channel_b).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = listener.stop().await;
+            bridge.kill().await;
+            return Err(e);
+        }
+    };
+    let outcome = async {
+        speaker.join().await.context("speaker voice join")?;
+        bridge
+            .scraper
+            .await_event(Duration::from_secs(90), |e| {
+                e.message.contains("ghost publishing Discord speaker audio")
+                    && e.in_bridge(bridge_name)
+            })
+            .await
+            .context("ghost never went live for the Discord speaker")?;
+        // Confirm the key-distribution loop is actually delivering — it owns the
+        // rotation timer.
+        bridge
+            .scraper
+            .await_event(Duration::from_secs(90), |e| {
+                e.message.contains("ghost media key sent")
+                    || e.message.contains("ghost media key delivered")
+            })
+            .await
+            .context("ghost never delivered its media key (key loop not running)")?;
+
+        // The min-interval measures from the key loop's start; a membership
+        // change only rotates once >90 s have elapsed. Wait it out, then join a
+        // SECOND member (bob) — a membership change distinct from the listener —
+        // to set the pending flag; the next distribution tick then rotates.
+        tokio::time::sleep(Duration::from_secs(95)).await;
+        let phantom =
+            MatrixPhantom::join(cfg, &room_b, true, true, "nvbtest_bob", "NVB Test Bob").await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        phantom.leave().await;
+
+        // The rotation fires on a distribution tick after the flap. Assert the
+        // success log with reason=membership (the message is fixed; the reason
+        // is a structured field on the raw JSON line).
+        bridge
+            .scraper
+            .await_event(Duration::from_secs(90), |e| {
+                e.message.contains("rotated Olm outbound sessions") && e.raw.contains("membership")
+            })
+            .await
+            .context("ghost never rotated its Olm sessions with reason=membership")?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let left = speaker.leave().await;
+    speaker.shutdown().await;
+    let _ = listener.stop().await;
+    let driven = outcome.and(left.context("speaker voice leave"));
+
+    match driven {
+        Ok(()) => {
+            let _ = await_quiescent(&poller, &room_b).await;
+            bridge.sigterm_and_wait(Duration::from_secs(20)).await.context("SIGTERM drain")
+        }
+        Err(e) => {
+            bridge.kill().await;
+            Err(e)
+        }
+    }
 }

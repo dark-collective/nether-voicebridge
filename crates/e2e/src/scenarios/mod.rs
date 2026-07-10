@@ -14,6 +14,10 @@ pub fn all() -> Vec<&'static ScenarioDef> {
         &audio::AUDIO_M2D_ENC,
         &audio::AUDIO_D2M_ENC,
         &audio::AUDIO_M2D_ENC_FRESHJOIN,
+        &audio::SHUTDOWN_DRAIN,
+        &audio::LONG_GLITCH_SWEEP,
+        &audio::FRESH_STORE_REKEY,
+        &audio::GHOST_SESSION_ROTATION,
     ]
 }
 
