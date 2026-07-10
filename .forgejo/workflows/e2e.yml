@@ -107,11 +107,22 @@ jobs:
             target/debug/nvb-e2e run $args --profile "$PROF"
           fi
 
-      # Always publish the artifact bundle (report.json + WAVs + bridge logs) so
-      # a red run is triageable without re-running.
-      - name: Upload artifacts
+      # Triage record. The job log is the ALWAYS-available record: this Forgejo's
+      # act_runner does not support the upload-artifact@v4 service protocol, so we
+      # dump report.json (+ any bridge ERROR lines) straight into the log. The
+      # artifact upload is a best-effort convenience (continue-on-error so a
+      # missing/older artifact backend never reds an otherwise-green run).
+      - name: Summarize result
         if: always()
-        uses: actions/upload-artifact@v4
+        run: |
+          echo '===== e2e report.json ====='
+          cat e2e-artifacts/report.json 2>/dev/null || echo '(no report.json — harness bailed before running scenarios)'
+          echo '===== bridge ERROR lines (if any) ====='
+          grep -rhE '"level":"ERROR"' e2e-artifacts/*/bridge/bridge.log 2>/dev/null | head -20 || true
+      - name: Upload artifacts (best-effort)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v3
         with:
           name: e2e-artifacts
           path: e2e-artifacts/
