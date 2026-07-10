@@ -3,6 +3,48 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.14] - 2026-07-10
+
+### Fixed
+- **Receive-side E2EE decryptor wedge on fresh joins (#73).** In an encrypted
+  room, a publisher whose frames reached the subscriber before their media key
+  arrived was permanently silent on Discord — libwebrtc's inbound frame
+  decryptor never recovers from decrypting-before-keyed (its E2EE state even
+  reports `Ok`), and later key installs/rotations don't heal it. The bridge now
+  tracks whether a peer's key was present when its track was subscribed and,
+  when the key lands for a keyless-subscribed track, re-subscribes it once —
+  rebuilding the receiver/decryptor against the now-keyed provider (the proven
+  "key before frames" order). The key provider is also built, shared, and
+  re-seeded from the peer-key cache *before* the LiveKit connect, closing the
+  same frames-before-key window on disconnect-recovery rejoins. Unencrypted
+  bridges are unaffected.
+- **LiveKit disconnect recovery for the subscriber and ghosts (#66).** A
+  terminal room death (SFU restart/outage beyond the SDK's own retries) now
+  tears the subscriber session down and rejoins — keeping puppet routes and
+  posted membership, replaying every delivered peer key into the fresh
+  provider — instead of leaving a dead session the stale-membership reaper
+  would then misread (it no longer reaps real humans during the dead-room
+  window). Ghosts get the same treatment: a per-attempt event drain plus a
+  reconnect loop with backoff replaces the silent ghost death, ending the
+  one-way-audio aftermath of an SFU blip.
+
+### Added
+- **e2e testkit, Matrix actors, and audio-crossing scenarios (#38 Phase D2).**
+  `nvb-matrix-rtc` gains a test-only `testkit` feature wrapping the private
+  ghost join/publish machinery; the `nvb-e2e` harness gains MatrixSpeaker /
+  MatrixListener / MatrixPhantom actors and five live scenarios (`smoke`,
+  `audio_{m2d,d2m}_{unenc,enc}`) scored by the Phase-B audio oracle, all
+  runnable against a live homeserver with production untouched.
+- **`audio_m2d_enc_freshjoin` scenario (#73 regression).** Deterministically
+  reproduces the frames-before-key ordering (the speaker streams before the
+  bridge process starts) and asserts the keyless subscribe, the one-shot heal
+  re-subscribe, and intact post-heal audio.
+
+### Changed
+- **Ghost key-recipient enumeration decoupled from the bot Client (#50).**
+  Ghost media-key distribution enumerates recipients from raw room state
+  instead of the bridge bot's matrix-sdk Client internals.
+
 ## [0.3.0-alpha.13] - 2026-07-07
 
 ### Added
