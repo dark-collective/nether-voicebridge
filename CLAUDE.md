@@ -14,7 +14,8 @@ allocated dynamically across all bridged channels, **per (bot, guild)** — one 
 holds an independent voice connection per guild, so N bots serve up to N puppets
 per guild across unlimited guilds simultaneously (#46); one bot per active channel
 is its capture "anchor", the rest are dedicated puppets, with steal-for-activation
-and FCFS overflow — see `crates/discord/src/puppet.rs`. Discord speakers appear
+and FCFS overflow — see `crates/discord/src/puppet/` (the sync allocator core is
+`puppet/alloc.rs`). Discord speakers appear
 in Element Call as appservice ghosts. See the architecture doc for the full
 design; build the phases in order from the build plan, each with its acceptance
 test.
@@ -131,7 +132,7 @@ test.
   `matrix.store_path` is **optional**: when omitted it auto-derives to
   `<data_dir>/<bridge>` (`data_dir` defaults to `./nether-store`, overridden by
   the `NVB_DATA_DIR` env — the Docker image sets it to `/app/data`). Resolution
-  happens in `Config::resolve_store_paths` (`crates/config/src/lib.rs`); an
+  happens in `Config::resolve_store_paths` (`crates/config/src/resolve.rs`); an
   explicit `store_path` always wins. **Server/appservice profiles:** the
   homeserver/appservice fields shared across bridges (`homeserver_url`,
   `matrix_domain`, `bot_user_id`, `appservice_id`, `appservice_token`)
@@ -168,7 +169,16 @@ test.
   channel layout (stereo vs mono) differ — reframe/mix in the core.
 - **Crate structure:** start single-crate with modules; split into the
   workspace (`config`, `audio`, `discord`, `matrix-rtc`, `bridge`) around
-  Phase 5 once `matrix-rtc` and `audio` stabilize.
+  Phase 5 once `matrix-rtc` and `audio` stabilize. The largest files are now
+  module directories rather than single files, each split along its natural
+  seams (a `mod.rs` root holds the shared type defs + public surface, siblings
+  hold the impl blocks): `discord/src/puppet/` (`alloc` = the std-Mutex
+  allocator core, `voice`, `events`, `commands`, `ghosts`, `router`, `sinks`),
+  `matrix-rtc/src/rtc/ghost/` (`identity`, `pool`, `lifecycle`, `keydist`,
+  `appservice` = raw CS-API primitives), `matrix-rtc/src/mgmt/` (`parse`,
+  `authority`, `handlers`, `pending`), and `config/src/` (`schema`, `resolve`,
+  `validate`). External paths (`nvb_discord::SharedPool`, `nvb_config::Config`,
+  `nvb_matrix_rtc::mgmt::*`, …) are unchanged — the splits were pure moves.
 
 ## Licensing
 
