@@ -3,6 +3,41 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.15] - 2026-07-10
+
+### Fixed
+- **Ghost tasks no longer leak on a bridge's error exit (#67).** A mid-call
+  fatal error on the Matrix side (e.g. a sync error carrying an invalidated
+  token) used to drop the sibling futures without cancelling shutdown,
+  detaching every live ghost task — their `m.call.member` was never retracted
+  (phantom participants lingered in Element Call) and their key-distribution
+  loops kept heartbeating to a dead call. The three top-level futures now
+  cancel the shared shutdown token the moment any of them errors, so the
+  others observe it and run their bounded teardown drains (ghosts retract and
+  retire) before the error propagates. Also: the ghost HTTP client gained a
+  request timeout so teardown can't hang on a wedged homeserver connection,
+  and a dropped watch sender no longer busy-spins a ghost's mute/presence
+  select. The supervisor cancels a completed bridge's root token as a
+  belt-and-suspenders backstop.
+- **Stale ghost membership from abort-without-await teardown (#68).** The
+  presence-phase and pre-publish ghost retire paths aborted the membership
+  task and immediately sent the leave, so an in-flight join PUT could be
+  serialized by the server *after* the leave and strand a phantom participant
+  tile. Those paths now cancel-then-await the membership task (mirroring the
+  active-phase teardown), so any in-flight join settles before the leave is
+  sent — the leave is always the last writer.
+- **Management/supervisor robustness (#71).** Management commands are now
+  accepted only in direct (≤2-member) rooms — the shared bot account is joined
+  to every bridged voice room and to rooms a link probe joined it into, so
+  usage text, operator-only refusals, ban notices, and approval codes can no
+  longer be triggered into those shared rooms (operators keep full function
+  via DM). The shared puppet pool now degrades instead of aborting: one
+  bad/revoked bot token is logged and the remaining puppets keep serving,
+  rather than dropping the whole pool and leaving a Discord-less zombie. And
+  tenant reconcile defers a replacement that reuses a removed bridge's
+  store/device/channel until that bridge has fully torn down, so the two
+  sessions can't race on one crypto store.
+
 ## [0.3.0-alpha.14] - 2026-07-10
 
 ### Fixed
