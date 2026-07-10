@@ -9,8 +9,11 @@
 //! * `audio_d2m_enc`   — encrypted Discord→Matrix: ghost key delivery is
 //!   asserted from logs and the audio is oracled at Tap B (the exact PCM the
 //!   ghost hands LiveKit) — a *decrypting* Matrix listener is deferred (D2.5/D3).
+//! * `audio_m2d_enc_freshjoin` — the #73 regression: the speaker streams into
+//!   the encrypted call BEFORE the bridge boots (frames beat the media key),
+//!   the one-shot heal re-subscribe must fire, and audio must cross after it.
 //!
-//! All four run with prod up (dedicated harness bots + the nvbtest appservice).
+//! All run with prod up (dedicated harness bots + the nvbtest appservice).
 
 use crate::actors::ParticipantDriver;
 use crate::actors::discord::{DiscordListener, DiscordSpeaker};
@@ -46,6 +49,11 @@ pub static AUDIO_D2M_ENC: ScenarioDef = ScenarioDef {
     name: "audio_d2m_enc",
     expectation: Expectation::Pass,
     run: |ctx| Box::pin(run_d2m_enc(ctx)),
+};
+pub static AUDIO_M2D_ENC_FRESHJOIN: ScenarioDef = ScenarioDef {
+    name: "audio_m2d_enc_freshjoin",
+    expectation: Expectation::Pass,
+    run: |ctx| Box::pin(run_m2d_enc_freshjoin(ctx)),
 };
 
 /// Probe length: 8 cycles — the two boundary cycles absorb startup/teardown
@@ -411,6 +419,184 @@ async fn drive_m2d(
         bail!("bridge logged {} ERROR event(s); first: {}", errors.len(), errors[0].message);
     }
     Ok(())
+}
+
+// ─── Matrix → Discord, encrypted, FRESH JOIN (the #73 wedge ordering) ────────────
+
+/// #73 regression: the speaker is in the encrypted call AND STREAMING before
+/// the bridge process even starts, so the subscriber's first inbound frames
+/// deterministically beat the Olm-delivered media key. On an unfixed bridge
+/// the inbound decryptor wedges permanently (E2EE state reports Ok, output
+/// stays digital silence); the fix must (a) arm the heal gate at subscribe,
+/// (b) re-subscribe exactly once when the key lands, and (c) deliver real
+/// audio to the puppet afterwards — the oracle is the proof.
+async fn run_m2d_enc_freshjoin(ctx: Arc<Ctx>) -> Result<()> {
+    let cfg = &ctx.cfg;
+    let seed = 0x73F1;
+    let bridge_name = "Auto Test 02";
+    let (room, channel) = {
+        let (r, c) = cfg.encrypted_pair()?;
+        (r.to_owned(), c.to_owned())
+    };
+    let poller = RoomStatePoller::new(cfg)?;
+    let targets = puppet_ids(cfg)?;
+    sweep_test_memberships(cfg, &poller, &room).await?;
+
+    // The far-side ear first — its capture window must be open before the
+    // puppet ever transmits.
+    let listener = DiscordListener::connect(
+        cfg.speaker_tokens.first().context("listener token")?,
+        &cfg.guild_id,
+        &channel,
+        targets,
+    )
+    .await?;
+
+    let outcome = async {
+        listener.join().await?;
+
+        // The Matrix human joins the call and starts speaking with NO bridge
+        // running — the fresh-join half of the #73 race, made deterministic.
+        let speaker =
+            MatrixSpeaker::join(cfg, &room, true, "nvbtest_alice", "NVB Test Alice").await?;
+        let filler = speaker.start_filler();
+
+        // NOW boot the bridge into the already-live call.
+        let tenants = tenant_entry(bridge_name, &room, &cfg.guild_id, &channel);
+        let bridge =
+            match BridgeUnderTest::start(cfg, ctx.profile, &tenants, &ctx.artifacts.join("bridge"))
+                .await
+                .context("starting bridge-under-test")
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    filler.stop().await;
+                    speaker.leave().await;
+                    return Err(e);
+                }
+            };
+
+        let drive = async {
+            bridge.await_ready(&[bridge_name], Duration::from_secs(120)).await?;
+
+            // 1. The subscribe must happen keyless (frames are already flowing,
+            //    the key can only arrive after the bridge posts membership).
+            bridge
+                .scraper
+                .await_event(Duration::from_secs(90), |e| {
+                    e.message.contains("subscribed before its peer media key")
+                        && e.in_bridge(bridge_name)
+                })
+                .await
+                .context("bridge never recorded a keyless subscribe — fresh-join ordering broken?")?;
+
+            // 2. The speaker's key lands…
+            bridge
+                .scraper
+                .await_event(Duration::from_secs(90), |e| {
+                    e.message.contains("installed peer media key")
+                })
+                .await
+                .context("bridge never installed the test speaker's media key")?;
+
+            // 3. …and triggers the one-shot heal.
+            bridge
+                .scraper
+                .await_event(Duration::from_secs(60), |e| {
+                    e.message.contains("re-subscribing to rebuild its decryptor")
+                        && e.in_bridge(bridge_name)
+                })
+                .await
+                .context("the #73 heal (re-subscribe on key install) never fired")?;
+
+            // 4. The re-subscribe restarts the playback consumer — wait for the
+            //    SECOND start (the first belongs to the wedged pre-key chain).
+            let consumer_starts = || {
+                bridge
+                    .scraper
+                    .events_matching(|e| {
+                        e.message.contains("playback consumer started")
+                            && e.in_bridge(bridge_name)
+                    })
+                    .len()
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while consumer_starts() < 2 {
+                if tokio::time::Instant::now() >= deadline {
+                    bail!("the playback consumer never restarted after the #73 heal");
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+
+            listener
+                .await_target_in_voice(Duration::from_secs(60))
+                .await
+                .context("no puppet joined the voice channel for the test speaker")?;
+            tokio::time::sleep(SETTLE).await;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        // Stop the filler before the probe either way (heal proven or not);
+        // its queued tail (~1.3 s) drains at LiveKit pace.
+        filler.stop().await;
+
+        let spoken = match drive {
+            Ok(()) => {
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                let r = speaker.speak_probe(seed, PROBE_MS).await;
+                if r.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(PROBE_MS as u64)).await;
+                    tokio::time::sleep(DRAIN).await;
+                }
+                r
+            }
+            Err(e) => Err(e),
+        };
+        speaker.leave().await;
+
+        let checks = async {
+            spoken?;
+            // Exactly ONE heal: a second re-subscribe would mean the gate
+            // loops (each key-index rotation re-wedging the track).
+            let heals = bridge
+                .scraper
+                .events_matching(|e| e.message.contains("re-subscribing to rebuild its decryptor"))
+                .len();
+            if heals != 1 {
+                bail!("expected exactly 1 #73 heal re-subscribe, saw {heals}");
+            }
+            let errors = bridge.scraper.error_events();
+            if !errors.is_empty() {
+                bail!(
+                    "bridge logged {} ERROR event(s); first: {}",
+                    errors.len(),
+                    errors[0].message
+                );
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        match checks {
+            Ok(()) => {
+                let _ = await_quiescent(&poller, &room).await;
+                bridge.sigterm_and_wait(Duration::from_secs(20)).await.context("SIGTERM drain")
+            }
+            Err(e) => {
+                bridge.kill().await;
+                Err(e)
+            }
+        }
+    }
+    .await;
+
+    let recordings = listener.stop().await;
+    outcome?;
+
+    let (uid, captured) = loudest(recordings)
+        .context("the Discord listener recorded nothing from any puppet")?;
+    eprintln!("   recorded {} samples from puppet {uid}", captured.len());
+    oracle_assert(&ctx.artifacts, "m2d_enc_freshjoin", seed, &captured)
 }
 
 // ─── Discord → Matrix, unencrypted (full oracle on the Matrix listener) ──────────

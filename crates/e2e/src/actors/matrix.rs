@@ -66,6 +66,34 @@ impl MatrixSpeaker {
         self.handle.mxid()
     }
 
+    /// Keep the published track carrying real frames (the warm-up tone,
+    /// looped) until [`Filler::stop`] — the #73 fresh-join scenario needs
+    /// audio FLOWING while the bridge joins, so its first subscribed frames
+    /// deterministically beat the Olm-delivered media key.
+    pub fn start_filler(&self) -> Filler {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tx = self.frames_tx.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        let task = tokio::spawn(async move {
+            let tone = super::warmup_lead_in();
+            'feed: loop {
+                for chunk in tone.chunks(SAMPLES_20MS) {
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break 'feed;
+                    }
+                    // Send failure = the speaker left (testkit dropped the
+                    // receiver) — the filler just winds down.
+                    if tx.send(chunk.to_vec()).await.is_err() {
+                        break 'feed;
+                    }
+                }
+            }
+        });
+        Filler { stop, task }
+    }
+
     /// Speak the warm-up lead-in then the seeded deterministic probe. Returns
     /// once the last chunk is queued; LiveKit buffers up to ~1 s ahead, so
     /// callers should allow that much (plus pipeline latency) before asserting
@@ -85,6 +113,22 @@ impl MatrixSpeaker {
     /// Leave cleanly (stop publishing, retract membership).
     pub async fn leave(self) {
         self.handle.leave_clean().await;
+    }
+}
+
+/// A running [`MatrixSpeaker::start_filler`] feed. Up to ~1.3 s of queued
+/// filler (the channel's depth) still drains at LiveKit pace after `stop`,
+/// so leave a beat before playing anything the oracle must align on.
+pub struct Filler {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Filler {
+    /// Stop feeding and wait for the feed task to wind down.
+    pub async fn stop(self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.task.await;
     }
 }
 

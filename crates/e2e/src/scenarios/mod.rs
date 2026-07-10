@@ -13,6 +13,7 @@ pub fn all() -> Vec<&'static ScenarioDef> {
         &audio::AUDIO_D2M_UNENC,
         &audio::AUDIO_M2D_ENC,
         &audio::AUDIO_D2M_ENC,
+        &audio::AUDIO_M2D_ENC_FRESHJOIN,
     ]
 }
 
