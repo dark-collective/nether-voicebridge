@@ -189,6 +189,7 @@ fn build_ghost_config(cfg: &TestCallConfig, self_mxid: &str) -> Result<GhostConf
         ghost_localpart_prefix: cfg.bridge_ghost_prefix.clone(),
         prune_stale_devices: false,
         rotate_ghost_sessions: false,
+        session_rotate_min_interval: std::time::Duration::from_secs(90),
         max_ghosts: None,
     })
 }
@@ -376,7 +377,18 @@ pub async fn join_and_publish(
                                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                             }
                         }
-                        distribute_key_loop(source, key, transport, false, gen_rx, cancel).await;
+                        // Test speaker never rotates (rotate=false), so the
+                        // min-interval is inert; pass the production default.
+                        distribute_key_loop(
+                            source,
+                            key,
+                            transport,
+                            false,
+                            std::time::Duration::from_secs(90),
+                            gen_rx,
+                            cancel,
+                        )
+                        .await;
                     }
                 }
                 .instrument(tracing::Span::current()),

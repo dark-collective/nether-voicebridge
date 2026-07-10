@@ -206,6 +206,7 @@ impl Supervisor {
             &bridge.livekit,
             bridge.discord.capture_wav,
             self.ctx.limits.max_ghosts_per_bridge,
+            self.ctx.timing.session_rotate_min_interval(),
         )
         .context("building ghost pool")?;
         let capture_router: Arc<dyn CaptureRouter> = ghost_pool.clone();

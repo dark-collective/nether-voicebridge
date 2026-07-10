@@ -125,6 +125,7 @@
 # quarantine_base_ms = 15000    # base voice-join-failure backoff (doubles per failure)
 # quarantine_max_ms = 120000    # cap on that backoff
 # voice_health_sweep_ms = 15000 # silent-voice-death probe cadence
+# session_rotate_min_interval_ms = 90000  # min spacing between ghost Olm session rotations (#52)
 
 [puppets]
 # One entry per puppet bot — each is a SEPARATE Discord application with its own

@@ -157,6 +157,11 @@ pub struct TimingConfig {
     /// connection (backstop for a silent connection death). Historical
     /// value 15 s.
     pub voice_health_sweep_ms: u64,
+    /// Minimum spacing between a ghost's membership-driven Olm session
+    /// rotations (#52) — rate-limits rotations so Element Call's ~90 s
+    /// membership flaps don't churn one-time keys on every flap. Historical
+    /// value 90 s.
+    pub session_rotate_min_interval_ms: u64,
 }
 
 impl Default for TimingConfig {
@@ -170,6 +175,7 @@ impl Default for TimingConfig {
             quarantine_base_ms: 15_000,
             quarantine_max_ms: 120_000,
             voice_health_sweep_ms: 15_000,
+            session_rotate_min_interval_ms: 90_000,
         }
     }
 }
@@ -188,6 +194,7 @@ impl TimingConfig {
             quarantine_base_ms: 1_000,
             quarantine_max_ms: 3_000,
             voice_health_sweep_ms: 1_000,
+            session_rotate_min_interval_ms: 3_000,
         }
     }
 
@@ -218,6 +225,9 @@ impl TimingConfig {
     pub fn voice_health_sweep(&self) -> Duration {
         Duration::from_millis(self.voice_health_sweep_ms)
     }
+    pub fn session_rotate_min_interval(&self) -> Duration {
+        Duration::from_millis(self.session_rotate_min_interval_ms)
+    }
 }
 
 /// The raw `[timing]` block: per-key overrides, each optional. Kept separate
@@ -240,6 +250,8 @@ pub struct TimingOverrides {
     pub quarantine_max_ms: Option<u64>,
     #[serde(default)]
     pub voice_health_sweep_ms: Option<u64>,
+    #[serde(default)]
+    pub session_rotate_min_interval_ms: Option<u64>,
 }
 
 impl TimingOverrides {
@@ -279,6 +291,7 @@ impl TimingOverrides {
         apply!(quarantine_base_ms);
         apply!(quarantine_max_ms);
         apply!(voice_health_sweep_ms);
+        apply!(session_rotate_min_interval_ms);
         Ok(t)
     }
 }

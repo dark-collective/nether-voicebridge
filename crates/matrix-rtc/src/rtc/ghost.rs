@@ -305,6 +305,11 @@ struct GhostConfig {
     /// changes + max-age. Mirrors `matrix.rotate_ghost_sessions` (default on);
     /// only effective on the Olm transport.
     rotate_ghost_sessions: bool,
+    /// Minimum spacing between membership-driven Olm session rotations (#52),
+    /// from the resolved `[timing]` profile (`TimingConfig::
+    /// session_rotate_min_interval`). Historical const was 90 s; the compressed
+    /// test profile shrinks it so the rotation scenario runs in seconds.
+    session_rotate_min_interval: Duration,
     /// Admission cap on concurrent ghosts for this bridge (`[limits]
     /// max_ghosts_per_bridge`, #47). At the cap a NEW speaker is not bridged
     /// (WARN + null sink); a slot frees when a ghost is released. `None` ⇒
@@ -321,6 +326,7 @@ impl GhostPool {
         livekit_cfg: &LiveKitConfig,
         capture_wav: bool,
         max_ghosts: Option<usize>,
+        session_rotate_min_interval: Duration,
     ) -> Result<Arc<Self>> {
         let bot_user: OwnedUserId = matrix_cfg
             .bot_user_id
@@ -367,6 +373,7 @@ impl GhostPool {
                 ghost_localpart_prefix: ghost_localpart_prefix(matrix_cfg.sender_localpart.as_deref()),
                 prune_stale_devices: matrix_cfg.prune_stale_devices.unwrap_or(true),
                 rotate_ghost_sessions: matrix_cfg.rotate_ghost_sessions.unwrap_or(true),
+                session_rotate_min_interval,
                 max_ghosts,
             },
         }))
@@ -1369,9 +1376,14 @@ const KEY_BURST_INTERVAL: Duration = Duration::from_secs(3);
 /// dropped even by the burst. Mild (≈1/ghost/min) vs. the old 5s spam.
 const KEY_HEARTBEAT: Duration = Duration::from_secs(60);
 
-/// Minimum spacing between Olm session rotations (#52). Membership-driven rotations
-/// are rate-limited to this so Element Call's ~90s membership flaps don't churn
-/// one-time keys on every flap.
+/// Historical minimum spacing between Olm session rotations (#52) — the
+/// production default now lives in `TimingConfig` (byte-identical 90 s) and is
+/// threaded in as `distribute_key_loop`'s `rotate_min_interval` (so the
+/// compressed test profile can shrink it). Retained purely as the value the
+/// unit tests + test helpers pass, hence `#[cfg(test)]`. Membership-driven
+/// rotations are rate-limited to this so Element Call's ~90 s membership flaps
+/// don't churn one-time keys on every flap.
+#[cfg(test)]
 const SESSION_ROTATE_MIN_INTERVAL: Duration = Duration::from_secs(90);
 /// Maximum age of a ghost's outbound Olm sessions before the heartbeat rotates them
 /// anyway (#52). This is what bounds a listener-side dead-session wedge in a static
@@ -1434,8 +1446,19 @@ async fn distribute_key_task(
     // sessions); the config knob can turn it off entirely.
     let rotate_sessions =
         cfg.rotate_ghost_sessions && matches!(cfg.key_transport, KeyTransportMode::Olm);
+    // Capture before `cfg` moves into the recipient source below.
+    let rotate_min_interval = cfg.session_rotate_min_interval;
     let source: Arc<dyn RecipientSource> = Arc::new(CallRecipients { cfg, ghost_mxid });
-    distribute_key_loop(source, key, transport, rotate_sessions, members_gen, cancel).await;
+    distribute_key_loop(
+        source,
+        key,
+        transport,
+        rotate_sessions,
+        rotate_min_interval,
+        members_gen,
+        cancel,
+    )
+    .await;
 }
 
 /// Source of the current key-send recipients (the call's human members). Abstracted
@@ -1563,6 +1586,7 @@ async fn distribute_key_loop(
     key: [u8; 16],
     transport: Arc<dyn KeyTransport>,
     rotate_sessions: bool,
+    rotate_min_interval: Duration,
     mut members_gen: watch::Receiver<u64>,
     cancel: CancellationToken,
 ) {
@@ -1616,7 +1640,7 @@ async fn distribute_key_loop(
                     // fires on a later tick); the max-age path needs no pending flag.
                     if rotate_sessions {
                         let elapsed = last_rotation.elapsed();
-                        let reason = if rotate_pending && elapsed >= SESSION_ROTATE_MIN_INTERVAL {
+                        let reason = if rotate_pending && elapsed >= rotate_min_interval {
                             Some("membership")
                         } else if elapsed >= SESSION_ROTATE_MAX_AGE {
                             Some("max-age")
@@ -2197,8 +2221,14 @@ mod tests {
             bot_user_id: "@bridge:nether.im".into(),
             ..MatrixConfig::default()
         };
-        GhostPool::new(&matrix_cfg, &LiveKitConfig::default(), false, max_ghosts)
-            .expect("test pool")
+        GhostPool::new(
+            &matrix_cfg,
+            &LiveKitConfig::default(),
+            false,
+            max_ghosts,
+            SESSION_ROTATE_MIN_INTERVAL,
+        )
+        .expect("test pool")
     }
 
     fn sink_count(pool: &GhostPool) -> usize {
@@ -2664,6 +2694,7 @@ mod tests {
             [7u8; 16],
             transport.clone(),
             false,
+            SESSION_ROTATE_MIN_INTERVAL,
             gen_rx,
             cancel.clone(),
         ));
@@ -2692,6 +2723,7 @@ mod tests {
             [0u8; 16],
             transport.clone(),
             false,
+            SESSION_ROTATE_MIN_INTERVAL,
             gen_rx,
             cancel.clone(),
         ));
@@ -2773,6 +2805,7 @@ mod tests {
             [1u8; 16],
             transport.clone(),
             false,
+            SESSION_ROTATE_MIN_INTERVAL,
             gen_rx,
             cancel.clone(),
         ));
@@ -2827,6 +2860,7 @@ mod tests {
             [7u8; 16],
             transport.clone(),
             false,
+            SESSION_ROTATE_MIN_INTERVAL,
             gen_rx,
             cancel.clone(),
         ));
@@ -2879,6 +2913,7 @@ mod tests {
             [7u8; 16],
             transport.clone(),
             true,
+            SESSION_ROTATE_MIN_INTERVAL,
             gen_rx,
             cancel.clone(),
         ));
@@ -2923,6 +2958,7 @@ mod tests {
             [7u8; 16],
             transport.clone(),
             true,
+            SESSION_ROTATE_MIN_INTERVAL,
             gen_rx,
             cancel.clone(),
         ));
@@ -2954,6 +2990,7 @@ mod tests {
             [7u8; 16],
             transport.clone(),
             false,
+            SESSION_ROTATE_MIN_INTERVAL,
             gen_rx,
             cancel.clone(),
         ));

@@ -19,7 +19,7 @@ use crate::actors::ParticipantDriver;
 use crate::actors::discord::{DiscordListener, DiscordSpeaker};
 use crate::actors::matrix::{MatrixListener, MatrixPhantom, MatrixSpeaker};
 use crate::bridge_proc::{BridgeUnderTest, tenant_entry, tenant_entry_opts};
-use crate::config::E2eConfig;
+use crate::config::{E2eConfig, Profile};
 use crate::observers::{ConnCountProbe, RoomStatePoller, SenderClass, decode_bot_user_id};
 use crate::scenario::{Ctx, Expectation, ScenarioDef};
 use anyhow::{Context as _, Result, bail};
@@ -1094,10 +1094,10 @@ async fn fresh_store_pass(
 /// `reason=membership`. Log-asserted (the rotation is internal to the ghost's
 /// crypto).
 ///
-/// Timing: the min-interval is a hardcoded 90 s const (not a `TimingConfig`
-/// knob), so this scenario carries an inherent ~90 s floor even under the
-/// compressed profile — it still fits compressed's 300 s ceiling. A future
-/// follow-up could thread the interval into `TimingConfig` to compress it.
+/// Timing: `session_rotate_min_interval` is now a `TimingConfig` knob, so the
+/// compressed profile shrinks the bridge's rotation floor to ~3 s — the wait
+/// below is profile-aware (a few seconds compressed, ~95 s under the real
+/// profile's production 90 s floor).
 async fn run_ghost_session_rotation(ctx: Arc<Ctx>) -> Result<()> {
     let cfg = &ctx.cfg;
     let bridge_name = "Auto Test 02";
@@ -1173,10 +1173,15 @@ async fn run_ghost_session_rotation(ctx: Arc<Ctx>) -> Result<()> {
             .context("ghost never delivered its media key (key loop not running)")?;
 
         // The min-interval measures from the key loop's start; a membership
-        // change only rotates once >90 s have elapsed. Wait it out, then join a
-        // SECOND member (bob) — a membership change distinct from the listener —
-        // to set the pending flag; the next distribution tick then rotates.
-        tokio::time::sleep(Duration::from_secs(95)).await;
+        // change only rotates once it has elapsed. Wait it out (bridge-side ~3 s
+        // compressed / 90 s real), then join a SECOND member (bob) — a membership
+        // change distinct from the listener — to set the pending flag; the next
+        // distribution tick then rotates.
+        let rotate_wait = match ctx.profile {
+            Profile::Compressed => Duration::from_secs(8),
+            Profile::Real => Duration::from_secs(95),
+        };
+        tokio::time::sleep(rotate_wait).await;
         let phantom =
             MatrixPhantom::join(cfg, &room_b, true, true, "nvbtest_bob", "NVB Test Bob").await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
