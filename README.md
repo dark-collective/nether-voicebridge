@@ -139,11 +139,15 @@ The full design and the phased build history live in:
 
 ## Requirements
 
+Don't want to self-host? See [Use the hosted instance](docs/hosted-instance.md)
+to bridge your channel on the project's shared deployment instead.
+
 - A **Matrix homeserver with MatrixRTC / Element Call working** (lk-jwt-service +
   a LiveKit SFU). The bridge is just another call participant — it does not deploy
   or manage the RTC infrastructure.
 - One or more **Discord bot applications** (the puppet pool), each invited to your
-  guild(s) with *Connect, Speak, Use Voice Activity, Change Nickname*.
+  guild(s) with *Connect, Speak, Use Voice Activity, Change Nickname*. See
+  [`docs/discord-bot-setup.md`](docs/discord-bot-setup.md) for a full walkthrough.
 - An **appservice registration** on the homeserver for the bridge bot and the
   Matrix-side ghosts (see `appservice-registration.yaml`). Its users-namespace
   regex stem must equal the bridge's `sender_localpart`, covering both the
