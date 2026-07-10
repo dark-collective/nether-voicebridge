@@ -154,7 +154,22 @@ pub struct ConnCountProbe {
     cache: Arc<serenity::cache::Cache>,
     guild: serenity::model::id::GuildId,
     shard: Arc<serenity::gateway::ShardManager>,
-    client_task: tokio::task::JoinHandle<()>,
+    /// `None` once [`ConnCountProbe::shutdown`] has taken + awaited it on the
+    /// graceful path; `Some` otherwise, so `Drop` can abort it (#72 F6-4).
+    client_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Abort `task` if it's still present and clear the slot — the Drop-time
+/// mitigation for #72 F6-4: a scenario cancelled by the runner's outer
+/// `tokio::time::timeout` (`scenario::run_scenarios`) drops actor/probe
+/// structs mid-await without a chance to run their graceful async shutdown,
+/// which would otherwise leave a detached serenity gateway task (and its
+/// voice connection) running into the next scenario. A no-op once the
+/// graceful path has already `.take()`n the handle.
+pub(crate) fn abort_if_present(task: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = task.take() {
+        task.abort();
+    }
 }
 
 struct ProbeHandler {
@@ -242,7 +257,7 @@ impl ConnCountProbe {
             cache,
             guild: serenity::model::id::GuildId::new(guild_id.parse().context("guild id")?),
             shard,
-            client_task,
+            client_task: Some(client_task),
         })
     }
 
@@ -271,9 +286,20 @@ impl ConnCountProbe {
         await_baseline_with(|| self.voice_members_among(ids), timeout, Duration::from_secs(1)).await
     }
 
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         self.shard.shutdown_all().await;
-        let _ = self.client_task.await;
+        if let Some(task) = self.client_task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for ConnCountProbe {
+    fn drop(&mut self) {
+        // Best-effort: if the graceful `shutdown()` path never ran (e.g. the
+        // scenario was cancelled by the runner's outer timeout mid-await),
+        // abort the detached gateway task rather than leak it (#72 F6-4).
+        abort_if_present(&mut self.client_task);
     }
 }
 
@@ -361,5 +387,50 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    /// #72 F6-4 regression: `abort_if_present` must actually cancel a still
+    /// running detached task (the mitigation for a scenario cancelled mid-
+    /// await leaking a live gateway session), not just forget the handle.
+    /// Modeled without a real serenity client: a task holding a drop-guard
+    /// that never returns on its own (like `client.start()`), aborted via
+    /// the same helper `ConnCountProbe`/`DiscordSpeaker`/`DiscordListener`
+    /// use from `Drop`.
+    #[tokio::test]
+    async fn abort_if_present_actually_cancels_a_detached_task() {
+        struct DropCounter(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guard = DropCounter(drops.clone());
+        let mut task = Some(tokio::spawn(async move {
+            let _guard = guard; // dropped only when the task is cancelled
+            futures_util::future::pending::<()>().await;
+        }));
+
+        abort_if_present(&mut task);
+        assert!(task.is_none(), "abort_if_present must clear the slot");
+
+        // Give the executor a beat to actually cancel + drop the task future.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            drops.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "abort must actually cancel the detached task, not just forget the handle"
+        );
+    }
+
+    /// The graceful path (`shutdown`/`stop`) already `.take()`s the handle
+    /// before `Drop` runs — `abort_if_present` on an already-empty slot must
+    /// be a no-op.
+    #[test]
+    fn abort_if_present_is_a_noop_once_taken() {
+        let mut task: Option<tokio::task::JoinHandle<()>> = None;
+        abort_if_present(&mut task);
+        assert!(task.is_none());
     }
 }

@@ -79,7 +79,9 @@ pub struct DiscordSpeaker {
     channel: ChannelId,
     songbird: Arc<songbird::Songbird>,
     shard: Arc<serenity::gateway::ShardManager>,
-    client_task: tokio::task::JoinHandle<()>,
+    /// `None` once [`DiscordSpeaker::shutdown`] has taken + awaited it on the
+    /// graceful path; `Some` otherwise, so `Drop` can abort it (#72 F6-4).
+    client_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl DiscordSpeaker {
@@ -109,7 +111,7 @@ impl DiscordSpeaker {
             channel: ChannelId::new(channel_id.parse().context("channel id")?),
             songbird,
             shard,
-            client_task,
+            client_task: Some(client_task),
         })
     }
 
@@ -139,7 +141,20 @@ impl DiscordSpeaker {
     pub async fn shutdown(mut self) {
         let _ = self.leave().await;
         self.shard.shutdown_all().await;
-        let _ = self.client_task.await;
+        if let Some(task) = self.client_task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for DiscordSpeaker {
+    fn drop(&mut self) {
+        // Best-effort: if `shutdown()` never ran (e.g. the scenario was
+        // cancelled by the runner's outer timeout mid-await — scenario.rs's
+        // `tokio::time::timeout` around `(def.run)(ctx)`), abort the detached
+        // gateway task rather than leak the speaker's voice session into the
+        // next scenario (#72 F6-4).
+        crate::observers::abort_if_present(&mut self.client_task);
     }
 }
 
@@ -261,7 +276,9 @@ pub struct DiscordListener {
     songbird: Arc<songbird::Songbird>,
     shard: Arc<serenity::gateway::ShardManager>,
     cache: Arc<serenity::cache::Cache>,
-    client_task: tokio::task::JoinHandle<()>,
+    /// `None` once [`DiscordListener::stop`] has taken + awaited it on the
+    /// graceful path; `Some` otherwise, so `Drop` can abort it (#72 F6-4).
+    client_task: Option<tokio::task::JoinHandle<()>>,
     ssrc_map: SsrcMap,
     targets: Arc<HashSet<u64>>,
     recordings: Recordings,
@@ -304,7 +321,7 @@ impl DiscordListener {
             songbird,
             shard,
             cache,
-            client_task,
+            client_task: Some(client_task),
             ssrc_map: Arc::new(StdMutex::new(HashMap::new())),
             targets: Arc::new(targets),
             recordings: Arc::new(StdMutex::new(HashMap::new())),
@@ -363,15 +380,27 @@ impl DiscordListener {
 
     /// Leave voice, disconnect the gateway, and return the per-user recordings
     /// (mono 48 kHz).
-    pub async fn stop(self) -> HashMap<u64, Vec<i16>> {
+    pub async fn stop(mut self) -> HashMap<u64, Vec<i16>> {
         if self.songbird.get(self.guild).is_some() {
             if let Err(e) = self.songbird.remove(self.guild).await {
                 tracing::warn!(error = %e, "listener failed to leave voice");
             }
         }
         self.shard.shutdown_all().await;
-        let _ = self.client_task.await;
+        if let Some(task) = self.client_task.take() {
+            let _ = task.await;
+        }
         let mut recs = self.recordings.lock().unwrap_or_else(PoisonError::into_inner);
         std::mem::take(&mut *recs)
+    }
+}
+
+impl Drop for DiscordListener {
+    fn drop(&mut self) {
+        // Best-effort: if `stop()` never ran (e.g. the scenario was cancelled
+        // by the runner's outer timeout mid-await), abort the detached
+        // gateway task rather than leak the listener's voice session into the
+        // next scenario (#72 F6-4).
+        crate::observers::abort_if_present(&mut self.client_task);
     }
 }
