@@ -861,9 +861,12 @@ async fn run_ghost(
                     biased;
                     _ = cancel.cancelled() => {
                         // Cancelled (Discord user left) before any Matrix human —
-                        // retract and retire without ever touching LiveKit.
+                        // retract and retire without ever touching LiveKit. `cancel`
+                        // has fired, so the membership task will settle; await it (not
+                        // abort) so an in-flight join PUT can't be serialized AFTER the
+                        // leave below and leave a phantom membership behind.
                         if let Some(h) = presence_membership.take() {
-                            h.abort();
+                            let _ = h.await;
                         }
                         if let Err(e) = post_membership(&cfg, &ghost_mxid, &device_id, &focus, true).await {
                             tracing::warn!(error = %e, "ghost post_membership(leave) failed");
@@ -901,8 +904,11 @@ async fn run_ghost(
         let (mut source, mut track) = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                // `cancel` has fired; await the membership task (not abort) so any
+                // in-flight join PUT settles before the leave — otherwise the server
+                // can serialize the join after the leave and strand a phantom member.
                 if let Some(h) = presence_membership.take() {
-                    h.abort();
+                    let _ = h.await;
                 }
                 if let Err(e) = post_membership(&cfg, &ghost_mxid, &device_id, &focus, true).await {
                     tracing::warn!(error = %e, "ghost post_membership(leave) failed");
@@ -914,8 +920,13 @@ async fn run_ghost(
                 Ok(out) => out,
                 Err(e) => {
                     tracing::error!(error = %e, "ghost LiveKit connect/publish failed — retracting");
+                    // Connect failed, not a cancel, so `cancel` is still live: fire it
+                    // first (we are retiring the ghost), THEN await the membership task
+                    // so an in-flight join PUT settles before the leave — an abort here
+                    // could let the join land after the leave and strand a phantom member.
+                    cancel.cancel();
                     if let Some(h) = presence_membership.take() {
-                        h.abort();
+                        let _ = h.await;
                     }
                     if let Err(e) = post_membership(&cfg, &ghost_mxid, &device_id, &focus, true).await {
                         tracing::warn!(error = %e, "ghost post_membership(leave) failed");
