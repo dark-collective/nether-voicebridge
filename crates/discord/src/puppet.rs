@@ -42,6 +42,7 @@ use std::sync::{Arc, Mutex as StdMutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serenity::builder::{
     CreateCommand, CreateCommandOption, CreateInteractionResponse,
     CreateInteractionResponseMessage, EditInteractionResponse,
@@ -656,24 +657,36 @@ impl SharedPool {
             };
             let token = slot.token.clone();
             futs.push(async move {
-                // Puppets both PLAY their participant and (when anchor) CAPTURE
-                // Discord speakers, so they need Opus decode / DAVE-receive.
-                let sb_config = songbird::Config::default()
-                    .decode_mode(DecodeMode::Decode(DecodeConfig::default()));
-                let mut client = Client::builder(&token, intents)
-                    .event_handler(handler)
-                    .register_songbird_from_config(sb_config)
-                    .await
-                    .map_err(|e| anyhow!("failed to build puppet {idx} client: {e}"))?;
-                tracing::info!(idx, "starting puppet gateway");
-                client
-                    .start()
-                    .await
-                    .map_err(|e| anyhow!("puppet {idx} client error: {e}"))
+                let res = async {
+                    // Puppets both PLAY their participant and (when anchor) CAPTURE
+                    // Discord speakers, so they need Opus decode / DAVE-receive.
+                    let sb_config = songbird::Config::default()
+                        .decode_mode(DecodeMode::Decode(DecodeConfig::default()));
+                    let mut client = Client::builder(&token, intents)
+                        .event_handler(handler)
+                        .register_songbird_from_config(sb_config)
+                        .await
+                        .map_err(|e| anyhow!("failed to build puppet {idx} client: {e}"))?;
+                    tracing::info!(idx, "starting puppet gateway");
+                    client
+                        .start()
+                        .await
+                        .map_err(|e| anyhow!("puppet {idx} client error: {e}"))
+                }
+                .await;
+                (idx, res)
             });
         }
 
-        let clients = futures_util::future::try_join_all(futs);
+        // Degrade rather than abort (#71): with `try_join_all`, one bad/revoked
+        // token dropped EVERY other puppet's gateway, leaving a Discord-less
+        // zombie the supervisor still reported as up. `drive_clients` logs each
+        // failed puppet (which index, which error) and keeps the rest serving,
+        // failing only when ALL puppets have exited. A dead puppet never
+        // populates its `guilds` set or `connected` flag, so allocation,
+        // `any_bot_in_guild`, and the drain all skip it — the degraded pool size
+        // flows through the existing per-(bot,guild) membership gates.
+        let clients = drive_clients(futs);
         tokio::pin!(clients);
 
         // Reconcile sweep: periodically nudge each live puppet to verify it is
@@ -697,7 +710,7 @@ impl SharedPool {
         tokio::select! {
             r = &mut clients => {
                 sweeper.abort();
-                return r.map(|_| ());
+                return r;
             }
             _ = shutdown.cancelled() => {}
         }
@@ -3498,6 +3511,37 @@ impl SharedPool {
     }
 }
 
+/// Drive every puppet client future, degrading rather than aborting (#71).
+/// Each future yields `(idx, result)`; a puppet that errors (bad/revoked token,
+/// fatal gateway close) is logged loudly — which index, which error — and the
+/// rest keep running. Resolves only once EVERY puppet has exited (a genuine
+/// total Discord outage), surfaced as `Err`; while at least one puppet is live
+/// this future stays pending, because serenity clients run until shutdown.
+async fn drive_clients<F>(futs: Vec<F>) -> Result<()>
+where
+    F: std::future::Future<Output = (usize, Result<()>)>,
+{
+    let total = futs.len();
+    let mut running: FuturesUnordered<_> = futs.into_iter().collect();
+    while let Some((idx, res)) = running.next().await {
+        match res {
+            Ok(()) => tracing::warn!(idx, "puppet gateway exited"),
+            Err(e) => tracing::error!(
+                idx,
+                error = %e,
+                "puppet client failed — other puppets keep serving"
+            ),
+        }
+        if running.is_empty() {
+            return Err(anyhow!(
+                "all {total} puppet client(s) have exited — the Discord side is down"
+            ));
+        }
+    }
+    // Reached only with an empty pool; `run` guards `slots.is_empty()` first.
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3553,6 +3597,34 @@ mod tests {
                 .unwrap()
                 .insert(GuildId::new(g));
         }
+    }
+
+    #[tokio::test]
+    async fn drive_clients_degrades_and_fails_only_when_all_exit() {
+        use futures_util::future::FutureExt;
+        type ClientFut =
+            std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<()>)>>>;
+
+        // One puppet errors (revoked token); another stays live forever. The
+        // pool must NOT resolve — the healthy puppet keeps serving.
+        let futs: Vec<ClientFut> = vec![
+            Box::pin(async { (0usize, Err(anyhow!("revoked token"))) }),
+            Box::pin(std::future::pending()),
+        ];
+        assert!(
+            drive_clients(futs).now_or_never().is_none(),
+            "a live puppet must keep the pool running after one puppet fails"
+        );
+
+        // Every puppet exits → total outage, surfaced as Err.
+        let futs: Vec<ClientFut> = vec![
+            Box::pin(async { (0usize, Err(anyhow!("revoked token"))) }),
+            Box::pin(async { (1usize, Ok(())) }),
+        ];
+        assert!(
+            drive_clients(futs).await.is_err(),
+            "all puppets gone must fail the pool"
+        );
     }
 
     #[test]
