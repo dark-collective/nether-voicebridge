@@ -185,6 +185,37 @@ pub(crate) async fn await_flag(
     Ok(())
 }
 
+/// Core of [`ConnCountProbe::await_baseline`], parameterized on a snapshot
+/// closure and poll interval so the cache-miss-vs-known distinction
+/// (#72 F6-3) is unit testable without a live gateway cache. `snapshot`
+/// mirrors [`ConnCountProbe::voice_members_among`]'s contract: `None` = the
+/// guild hasn't been observed in cache yet (keep polling), `Some(ids)` = the
+/// guild is known and `ids` is who (of the watched set) is currently in
+/// voice.
+async fn await_baseline_with(
+    mut snapshot: impl FnMut() -> Option<Vec<u64>>,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match snapshot() {
+            Some(present) if present.is_empty() => return Ok(()),
+            Some(present) => {
+                if tokio::time::Instant::now() >= deadline {
+                    bail!("bridge bots still in voice at baseline check: {present:?}");
+                }
+            }
+            None => {
+                if tokio::time::Instant::now() >= deadline {
+                    bail!("guild never appeared in the gateway cache — baseline unknown");
+                }
+            }
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 impl ConnCountProbe {
     /// Connect with `token` (a harness speaker/mod bot — it must be a member
     /// of the test guild). Resolves once the gateway is ready and the guild's
@@ -217,31 +248,27 @@ impl ConnCountProbe {
 
     /// User ids currently in ANY voice channel of the test guild, filtered to
     /// `ids` (pass the bridge's puppet bot ids for the baseline check).
-    pub fn voice_members_among(&self, ids: &HashSet<u64>) -> Vec<u64> {
-        let Some(guild) = self.cache.guild(self.guild) else {
-            return Vec::new();
-        };
-        guild
-            .voice_states
-            .iter()
-            .filter(|(uid, vs)| ids.contains(&uid.get()) && vs.channel_id.is_some())
-            .map(|(uid, _)| uid.get())
-            .collect()
+    /// Returns `None` when the guild is not (yet) in the gateway cache — an
+    /// UNKNOWN state, distinct from "cached and empty" (`Some(vec![])`).
+    /// Callers must not treat a cache miss as a pass (#72 F6-3).
+    pub fn voice_members_among(&self, ids: &HashSet<u64>) -> Option<Vec<u64>> {
+        let guild = self.cache.guild(self.guild)?;
+        Some(
+            guild
+                .voice_states
+                .iter()
+                .filter(|(uid, vs)| ids.contains(&uid.get()) && vs.channel_id.is_some())
+                .map(|(uid, _)| uid.get())
+                .collect(),
+        )
     }
 
-    /// Poll until none of `ids` is in voice (or fail at `timeout`).
+    /// Poll until none of `ids` is in voice (or fail at `timeout`). A guild
+    /// cache miss keeps polling like any other not-yet-satisfied state
+    /// instead of returning `Ok` vacuously (#72 F6-3) — the guild must be
+    /// observed in the cache at least once before this can pass.
     pub async fn await_baseline(&self, ids: &HashSet<u64>, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let present = self.voice_members_among(ids);
-            if present.is_empty() {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                bail!("bridge bots still in voice at baseline check: {present:?}");
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+        await_baseline_with(|| self.voice_members_among(ids), timeout, Duration::from_secs(1)).await
     }
 
     pub async fn shutdown(self) {
@@ -293,5 +320,46 @@ mod tests {
     #[test]
     fn urlencode_room_id() {
         assert_eq!(urlencode("!a b:nether.im"), "%21a%20b%3Anether.im");
+    }
+
+    /// #72 F6-3 regression: a guild that never appears in the gateway cache
+    /// is UNKNOWN, not "zero members" — `await_baseline` must not pass
+    /// vacuously on a cache miss.
+    #[tokio::test]
+    async fn await_baseline_treats_cache_miss_as_unknown_not_pass() {
+        let result =
+            await_baseline_with(|| None, Duration::from_millis(30), Duration::from_millis(5)).await;
+        assert!(result.is_err(), "a guild cache miss must not pass vacuously (#72 F6-3)");
+    }
+
+    /// Once the guild IS observed in cache (even as empty), the baseline
+    /// check passes — the fix must not turn a permanent cache miss into a
+    /// permanent hang, only stop treating "not yet cached" as "empty".
+    #[tokio::test]
+    async fn await_baseline_passes_once_guild_observed_empty() {
+        let polls = std::sync::atomic::AtomicU32::new(0);
+        let result = await_baseline_with(
+            || {
+                let n = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n < 2 { None } else { Some(Vec::new()) }
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+        )
+        .await;
+        assert!(result.is_ok(), "must pass once the guild is observed cached-and-empty: {result:?}");
+        assert!(polls.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+    }
+
+    /// Unchanged behavior: a known-but-nonempty guild still fails/times out.
+    #[tokio::test]
+    async fn await_baseline_still_fails_when_bots_present() {
+        let result = await_baseline_with(
+            || Some(vec![42]),
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+        )
+        .await;
+        assert!(result.is_err());
     }
 }
