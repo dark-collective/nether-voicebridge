@@ -147,7 +147,10 @@ mod tests {
             room_a: "!r:x".into(),
             channel_b: None,
             room_b: None,
+            channel_c: None,
+            room_c: None,
             test_as_token: None,
+            mod_token: None,
             artifacts_dir: artifacts,
         }
     }

@@ -34,9 +34,20 @@ room_a = "!iICkB3Qu8tQemzFqDl:nether.im"
 # channel_b = "..."
 # room_b = "!...:nether.im"
 
+# Auto Test 03 (a SECOND unencrypted room; m.call.member at PL 0). Needed by
+# scenarios requiring a distinct-from-AT01 unencrypted target (force-move,
+# multi-bridge isolation). Leave unset otherwise.
+# channel_c = "1523349353014624507"
+# room_c = "!cOqtiv2SAKjOK8ljxw:nether.im"
+
 # The TEST appservice (`nvbtest` on the homeserver — separate from the
 # bridge's own registration) that the fake Matrix participants (@nvbtest_*)
 # masquerade under. Needed by every scenario with Matrix actors (D2+).
 # test_as_token = "..."                # SECRET
+
+# The nvb-test-mod Discord bot (Move Members + Connect) used by the DiscordMod
+# REST actor to force-move / disconnect a puppet. Needed by the mod-driven
+# scenarios (D3 workstream B).
+# mod_token = "..."                    # SECRET
 
 # artifacts_dir = "e2e-artifacts"

@@ -58,7 +58,10 @@ struct FileConfig {
     room_a: Option<String>,
     channel_b: Option<String>,
     room_b: Option<String>,
+    channel_c: Option<String>,
+    room_c: Option<String>,
     test_as_token: Option<String>,
+    mod_token: Option<String>,
     artifacts_dir: Option<String>,
 }
 
@@ -88,10 +91,22 @@ pub struct E2eConfig {
     /// absent, so unencrypted-only runs need no AT02 provisioning).
     pub channel_b: Option<String>,
     pub room_b: Option<String>,
+    /// Auto Test 03: a SECOND unencrypted room + its voice channel. Optional —
+    /// only scenarios needing a distinct-from-AT01 unencrypted target (e.g. the
+    /// force-move and multi-bridge-isolation scenarios) require them; they bail
+    /// with a clear message when absent. First reader arrives in D3 workstream B.
+    #[allow(dead_code)]
+    pub channel_c: Option<String>,
+    #[allow(dead_code)]
+    pub room_c: Option<String>,
     /// The TEST appservice's `as_token` (the `nvbtest` registration) — the
     /// fake Matrix participants (D2 testkit) masquerade under it. Optional:
     /// only scenarios with Matrix actors need it.
     pub test_as_token: Option<String>,
+    /// A Discord bot token with Move Members + Connect (the `nvb-test-mod`
+    /// application) used by the `DiscordMod` REST actor to force-move /
+    /// disconnect a puppet. Optional — only the mod-driven scenarios need it.
+    pub mod_token: Option<String>,
     /// Where per-run artifacts (bridge log, report.json, WAVs) land.
     pub artifacts_dir: PathBuf,
 }
@@ -153,7 +168,10 @@ impl E2eConfig {
             room_a: req("NVB_E2E_ROOM_A", pick("NVB_E2E_ROOM_A", file.room_a)),
             channel_b: pick("NVB_E2E_CHANNEL_B", file.channel_b),
             room_b: pick("NVB_E2E_ROOM_B", file.room_b),
+            channel_c: pick("NVB_E2E_CHANNEL_C", file.channel_c),
+            room_c: pick("NVB_E2E_ROOM_C", file.room_c),
             test_as_token: pick("NVB_E2E_TEST_AS_TOKEN", file.test_as_token),
+            mod_token: pick("NVB_E2E_MOD_TOKEN", file.mod_token),
             artifacts_dir: pick("NVB_E2E_ARTIFACTS", file.artifacts_dir)
                 .unwrap_or_else(|| "e2e-artifacts".into())
                 .into(),
@@ -193,6 +211,34 @@ impl E2eConfig {
             anyhow::anyhow!(
                 "this scenario needs the test appservice: set NVB_E2E_TEST_AS_TOKEN \
                  (or test_as_token in e2e.toml) to the nvbtest registration's as_token"
+            )
+        })
+    }
+
+    /// The AT03 (second unencrypted) room + channel pair, or a clear error
+    /// naming the missing keys — used by the force-move / multi-bridge scenarios.
+    /// First caller arrives in D3 workstream B.
+    #[allow(dead_code)]
+    pub fn at03_pair(&self) -> Result<(&str, &str)> {
+        match (self.room_c.as_deref(), self.channel_c.as_deref()) {
+            (Some(r), Some(c)) => Ok((r, c)),
+            _ => bail!(
+                "this scenario needs the second unencrypted test room: set \
+                 NVB_E2E_ROOM_C and NVB_E2E_CHANNEL_C (or room_c/channel_c in \
+                 e2e.toml) to Auto Test 03's ids"
+            ),
+        }
+    }
+
+    /// The `nvb-test-mod` Discord token, or a clear error — required by the
+    /// mod-driven scenarios (force-move / disconnect). First caller arrives in
+    /// D3 workstream B (`DiscordMod` actor).
+    #[allow(dead_code)]
+    pub fn mod_token(&self) -> Result<&str> {
+        self.mod_token.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "this scenario needs the mod bot: set NVB_E2E_MOD_TOKEN \
+                 (or mod_token in e2e.toml) to the nvb-test-mod application's token"
             )
         })
     }
@@ -245,7 +291,10 @@ mod tests {
             room_a: "!r:nether.im".into(),
             channel_b: None,
             room_b: None,
+            channel_c: None,
+            room_c: None,
             test_as_token: None,
+            mod_token: None,
             artifacts_dir: "art".into(),
         };
         assert_eq!(cfg.server_domain(), "100.64.0.21");

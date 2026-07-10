@@ -1,0 +1,147 @@
+name: E2E (live)
+
+# Tier-3 LIVE regression harness (#38 Phase D). Runs the real bridge binary
+# against the standing Discord guild + Matrix rooms with dedicated harness bots.
+# NOT a per-PR gate: external services (Discord/Matrix/LiveKit) make it
+# inherently flaky, so a red run is a triage ticket, never a merge block — the
+# per-PR hermetic gate is ci.yml. Public ids are inlined (they're already in
+# the committed e2e.example.toml); only the bot/appservice tokens are secrets.
+on:
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: 'space-separated scenario names, or "--all"'
+        required: false
+        default: 'smoke_open_close'
+      profile:
+        description: 'compressed | real'
+        required: false
+        default: 'compressed'
+  schedule:
+    - cron: '0 6 * * *'   # nightly ~06:00 UTC — runs the full compressed suite
+
+# One live run at a time — the harness and any concurrent CI build share a host,
+# and overlapping audio runs garble each other's timing scores (#38 note).
+concurrency:
+  group: e2e-live
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    runs-on: docker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Same native deps as ci.yml (livekit: cmake/clang/bindgen + protobuf;
+      # opus dynamically linked).
+      - name: Install native build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake clang libclang-dev libopus-dev \
+            pkg-config protobuf-compiler libssl-dev
+
+      # Share ci.yml's cache key so target/ (incl. the libwebrtc download and an
+      # already-compiled bridge) is warm.
+      - name: Cache toolchain + cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ci-
+
+      - name: Install Rust toolchain
+        run: |
+          if ! [ -x "$HOME/.cargo/bin/cargo" ]; then
+            curl -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build bridge + harness
+        run: cargo build --locked -p nether-voicebridge -p nvb-e2e
+
+      - name: Run scenarios
+        env:
+          # Public standing-environment ids (also in e2e.example.toml).
+          NVB_E2E_HOMESERVER_URL: https://nether.im
+          NVB_E2E_APPSERVICE_ID: voicebridge
+          NVB_E2E_SENDER_LOCALPART: nether-voicebridge
+          NVB_E2E_GUILD_ID: '1523348036040790087'
+          NVB_E2E_CHANNEL_A: '1523349282416103454'
+          NVB_E2E_ROOM_A: '!iICkB3Qu8tQemzFqDl:nether.im'
+          NVB_E2E_CHANNEL_B: '1523349327223853077'
+          NVB_E2E_ROOM_B: '!qeb6ZoxkuXOMVhdmDZ:nether.im'
+          NVB_E2E_CHANNEL_C: '1523349353014624507'
+          NVB_E2E_ROOM_C: '!cOqtiv2SAKjOK8ljxw:nether.im'
+          # Secrets (bot + appservice tokens). List secrets are comma-separated.
+          NVB_E2E_APPSERVICE_TOKEN: ${{ secrets.NVB_E2E_APPSERVICE_TOKEN }}
+          NVB_E2E_TEST_AS_TOKEN: ${{ secrets.NVB_E2E_TEST_AS_TOKEN }}
+          NVB_E2E_MOD_TOKEN: ${{ secrets.NVB_E2E_MOD_TOKEN }}
+          NVB_E2E_SPEAKER_TOKENS: ${{ secrets.NVB_E2E_SPEAKER_TOKENS }}
+          NVB_E2E_PUPPET_TOKENS: ${{ secrets.NVB_E2E_PUPPET_TOKENS }}
+          NVB_E2E_BRIDGE_BIN: target/debug/nether-voicebridge
+          NVB_E2E_ARTIFACTS: e2e-artifacts
+          RUST_LOG: nvb_e2e=info,nvb_matrix_rtc=warn
+        run: |
+          set -euo pipefail
+          # workflow_dispatch supplies inputs; the nightly `schedule` event has
+          # none, so it defaults to the full compressed suite. long_glitch_sweep
+          # stays opt-in (gated behind NVB_E2E_LONG) so `--all` skips it.
+          SC="${{ inputs.scenarios }}"
+          if [ -z "$SC" ]; then
+            if [ "${{ github.event_name }}" = "schedule" ]; then
+              SC="--all"
+            else
+              SC="smoke_open_close"
+            fi
+          fi
+          PROF="${{ inputs.profile }}"
+          PROF="${PROF:-compressed}"
+          if [ "$SC" = "--all" ]; then
+            target/debug/nvb-e2e run --all --profile "$PROF"
+          else
+            args=""
+            for s in $SC; do args="$args --scenario $s"; done
+            # shellcheck disable=SC2086
+            target/debug/nvb-e2e run $args --profile "$PROF"
+          fi
+
+      # Real-timing subset — populate when the slow real-profile scenarios land
+      # (#8 reap_release + #13 leave_grace_debounce, D3 workstream B). Runs on
+      # the real profile (45s reap / 12s leave grace), so it stays out of the
+      # compressed `--all` pass above.
+      # - name: Run real-timing subset (nightly)
+      #   if: github.event_name == 'schedule'
+      #   env: ... (same as above)
+      #   run: |
+      #     target/debug/nvb-e2e run \
+      #       --scenario reap_release --scenario leave_grace_debounce \
+      #       --profile real
+
+      # Triage record. The job log is the ALWAYS-available record: this Forgejo's
+      # act_runner does not support the upload-artifact@v4 service protocol, so we
+      # dump report.json (+ any bridge ERROR lines) straight into the log. The
+      # artifact upload is a best-effort convenience (continue-on-error so a
+      # missing/older artifact backend never reds an otherwise-green run).
+      - name: Summarize result
+        if: always()
+        run: |
+          echo '===== e2e report.json ====='
+          cat e2e-artifacts/report.json 2>/dev/null || echo '(no report.json — harness bailed before running scenarios)'
+          echo '===== bridge ERROR lines (if any) ====='
+          grep -rhE '"level":"ERROR"' e2e-artifacts/*/bridge/bridge.log 2>/dev/null | head -20 || true
+      - name: Upload artifacts (best-effort)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v3
+        with:
+          name: e2e-artifacts
+          path: e2e-artifacts/
+          if-no-files-found: warn
