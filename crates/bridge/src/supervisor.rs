@@ -330,9 +330,15 @@ impl Supervisor {
             if self.shutting_down {
                 return; // never spawn into a draining process
             }
-            tracing::info!(bridge = label, "respawning bridge with updated config");
-            if let Err(e) = self.spawn_bridge(Arc::from(label), cfg, rb.origin) {
-                tracing::error!(bridge = label, error = %e,
+            // The queued config is either a same-label "replace" or a renamed
+            // addition deferred behind this removal (#71). Spawn under the
+            // CONFIG's own label — not the completing bridge's — so a rename
+            // (remove "a" + add "b" reusing a's store/device/channel) lands as
+            // "b", now that "a"'s store handle and pool channel key are freed.
+            let respawn_label: Arc<str> = Arc::from(cfg.name.clone().unwrap_or_default().as_str());
+            tracing::info!(bridge = %respawn_label, "spawning queued bridge config");
+            if let Err(e) = self.spawn_bridge(respawn_label.clone(), cfg, rb.origin) {
+                tracing::error!(bridge = %respawn_label, error = %e,
                     "respawn failed — bridge stays down until the next tenants reload");
             }
         }
@@ -377,9 +383,36 @@ impl Supervisor {
             unchanged = summary.unchanged,
             "tenants reload accepted — applying"
         );
+        // Snapshot the removed bridges' effective configs BEFORE cancelling them,
+        // then decide which additions must queue behind a removal (#71): an add
+        // that reuses a removed tenant's store/device/channel may not spawn until
+        // that bridge has fully drained (store handle dropped, pool channel key
+        // freed), or the two sessions race on one SQLite store / device id. Such
+        // an add rides the removed bridge's `pending_respawn` — the same
+        // bounded-teardown-then-respawn path the "replace" case uses.
+        let removed_cfgs: HashMap<String, BridgeConfig> = plan
+            .remove
+            .iter()
+            .filter_map(|l| self.running.get(l).map(|rb| (l.clone(), rb.effective_cfg().clone())))
+            .collect();
+        let (mut deferred, inline_adds) = plan_add_ordering(plan.add, &removed_cfgs);
+
         for label in &plan.remove {
-            tracing::info!(bridge = %label, "tenant removed — stopping bridge");
-            self.stop_bridge(label, None);
+            match deferred.remove(label) {
+                Some(add_cfg) => {
+                    let add_label = add_cfg.name.clone().unwrap_or_default();
+                    tracing::info!(bridge = %label, replacement = %add_label,
+                        "tenant removed — stopping; renamed replacement spawns after teardown");
+                    // Accepted: it will spawn from the completion handler (a
+                    // deferred-spawn failure surfaces in the logs, as on replace).
+                    summary.added.push(add_label);
+                    self.stop_bridge(label, Some(add_cfg));
+                }
+                None => {
+                    tracing::info!(bridge = %label, "tenant removed — stopping bridge");
+                    self.stop_bridge(label, None);
+                }
+            }
             summary.removed.push(label.clone());
         }
         for cfg in plan.replace {
@@ -389,7 +422,7 @@ impl Supervisor {
             self.stop_bridge(&label, Some(cfg));
             summary.replaced.push(label);
         }
-        for cfg in plan.add {
+        for cfg in inline_adds {
             let label: Arc<str> = Arc::from(cfg.name.clone().unwrap_or_default().as_str());
             tracing::info!(bridge = %label, "tenant added — starting bridge");
             if let Err(e) = self.spawn_bridge(label.clone(), cfg, Origin::Tenant) {
@@ -666,6 +699,58 @@ fn diff_tenants(
     plan
 }
 
+/// Does `cfg` reuse a hard resource (matrix device / SQLite store) or the
+/// Discord `(guild, channel)` of any still-draining bridge? A rename (remove
+/// "a" + add "b" sharing a's store/device/channel) must not let "b" open the
+/// store/device "a" is still unwinding on (#71). Uses [`LiveKeys`] so "collision"
+/// matches `validate_desired`'s notion exactly.
+fn collides_with(cfg: &BridgeConfig, draining: &LiveKeys) -> bool {
+    let m = &cfg.matrix;
+    draining.devices.contains(&(
+        m.homeserver_url.clone(),
+        m.bot_user_id.clone(),
+        m.device_id.clone(),
+    )) || draining.stores.contains(&m.store_path)
+        || draining
+            .channels
+            .contains(&(cfg.discord.guild_id.clone(), cfg.discord.channel_id.clone()))
+}
+
+/// Split a reconcile's additions into those that must wait for a concurrent
+/// removal to finish tearing down and those that may spawn immediately (#71).
+/// An addition colliding with a removed bridge is queued behind it (returned in
+/// the `removed-label -> add cfg` map, later attached as that bridge's
+/// `pending_respawn`); the rest spawn inline. Pure, so the ordering contract is
+/// unit-testable. `validate_desired` already rejects add-vs-add and add-vs-static
+/// collisions, so only add-vs-removed remains — the case its checks can't see
+/// (a removed tenant is in neither the static keys nor the desired set).
+fn plan_add_ordering(
+    adds: Vec<BridgeConfig>,
+    removed_cfgs: &HashMap<String, BridgeConfig>,
+) -> (HashMap<String, BridgeConfig>, Vec<BridgeConfig>) {
+    let mut deferred: HashMap<String, BridgeConfig> = HashMap::new();
+    let mut inline: Vec<BridgeConfig> = Vec::new();
+    for cfg in adds {
+        // At most one add defers behind a given removal (a second add colliding
+        // with the same removal would also collide with the first → rejected by
+        // validate_desired for hard keys; a soft channel dupe falls to inline).
+        let behind = removed_cfgs
+            .iter()
+            .find(|(label, rc)| {
+                !deferred.contains_key(label.as_str())
+                    && collides_with(&cfg, &LiveKeys::from_bridges([*rc]))
+            })
+            .map(|(label, _)| label.clone());
+        match behind {
+            Some(label) => {
+                deferred.insert(label, cfg);
+            }
+            None => inline.push(cfg),
+        }
+    }
+    (deferred, inline)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,6 +885,37 @@ mod tests {
         apply_plan(&mut run, plan);
         assert_eq!(run.len(), 1);
         assert!(run.contains_key("b"));
+    }
+
+    #[test]
+    fn add_reusing_removed_resources_defers_behind_it() {
+        // "b" renames "a": new label, but SAME store + device + channel — the
+        // add must queue behind "a"'s teardown, not spawn inline (which would
+        // race two sessions on one SQLite store / device id).
+        let a = tenant("a", "!a:x");
+        let mut b = tenant("b", "!b:x");
+        b.matrix.store_path = a.matrix.store_path.clone();
+        b.matrix.device_id = a.matrix.device_id.clone();
+        b.discord.channel_id = a.discord.channel_id.clone();
+        let removed: HashMap<String, BridgeConfig> = HashMap::from([("a".to_string(), a)]);
+        let (deferred, inline) = plan_add_ordering(vec![b], &removed);
+        assert!(inline.is_empty(), "a colliding add must not spawn inline");
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred["a"].name.as_deref(), Some("b"), "queued behind the removal it reuses");
+    }
+
+    #[test]
+    fn add_with_disjoint_resources_spawns_inline() {
+        // Disjoint store/device (derived from the name) AND a distinct channel,
+        // so nothing a removal is draining is reused → spawn immediately.
+        let a = tenant("a", "!a:x");
+        let mut c = tenant("c", "!c:x");
+        c.discord.channel_id = "999".into();
+        let removed: HashMap<String, BridgeConfig> = HashMap::from([("a".to_string(), a)]);
+        let (deferred, inline) = plan_add_ordering(vec![c], &removed);
+        assert!(deferred.is_empty(), "a disjoint add is never deferred");
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0].name.as_deref(), Some("c"));
     }
 
     #[test]
