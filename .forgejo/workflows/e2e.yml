@@ -1,0 +1,118 @@
+name: E2E (live)
+
+# Tier-3 LIVE regression harness (#38 Phase D). Runs the real bridge binary
+# against the standing Discord guild + Matrix rooms with dedicated harness bots.
+# NOT a per-PR gate: external services (Discord/Matrix/LiveKit) make it
+# inherently flaky, so a red run is a triage ticket, never a merge block — the
+# per-PR hermetic gate is ci.yml. Public ids are inlined (they're already in
+# the committed e2e.example.toml); only the bot/appservice tokens are secrets.
+on:
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: 'space-separated scenario names, or "--all"'
+        required: false
+        default: 'smoke_open_close'
+      profile:
+        description: 'compressed | real'
+        required: false
+        default: 'compressed'
+  # ── DRY-RUN trigger — REMOVE before merge to master (replace with `schedule`).
+  # Pushing the `ci/e2e-smoke-dryrun` branch runs this immediately so the secret
+  # wiring can be proven without the workflow living on the default branch yet.
+  push:
+    branches: ['ci/e2e-smoke-dryrun']
+  # schedule:
+  #   - cron: '0 6 * * *'   # nightly ~06:00 UTC (enable when merging to master)
+
+# One live run at a time — the harness and any concurrent CI build share a host,
+# and overlapping audio runs garble each other's timing scores (#38 note).
+concurrency:
+  group: e2e-live
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    runs-on: docker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Same native deps as ci.yml (livekit: cmake/clang/bindgen + protobuf;
+      # opus dynamically linked).
+      - name: Install native build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake clang libclang-dev libopus-dev \
+            pkg-config protobuf-compiler libssl-dev
+
+      # Share ci.yml's cache key so target/ (incl. the libwebrtc download and an
+      # already-compiled bridge) is warm.
+      - name: Cache toolchain + cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ci-
+
+      - name: Install Rust toolchain
+        run: |
+          if ! [ -x "$HOME/.cargo/bin/cargo" ]; then
+            curl -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build bridge + harness
+        run: cargo build --locked -p nether-voicebridge -p nvb-e2e
+
+      - name: Run scenarios
+        env:
+          # Public standing-environment ids (also in e2e.example.toml).
+          NVB_E2E_HOMESERVER_URL: https://nether.im
+          NVB_E2E_APPSERVICE_ID: voicebridge
+          NVB_E2E_SENDER_LOCALPART: nether-voicebridge
+          NVB_E2E_GUILD_ID: '1523348036040790087'
+          NVB_E2E_CHANNEL_A: '1523349282416103454'
+          NVB_E2E_ROOM_A: '!iICkB3Qu8tQemzFqDl:nether.im'
+          NVB_E2E_CHANNEL_B: '1523349327223853077'
+          NVB_E2E_ROOM_B: '!qeb6ZoxkuXOMVhdmDZ:nether.im'
+          # Secrets (bot + appservice tokens). List secrets are comma-separated.
+          NVB_E2E_APPSERVICE_TOKEN: ${{ secrets.NVB_E2E_APPSERVICE_TOKEN }}
+          NVB_E2E_TEST_AS_TOKEN: ${{ secrets.NVB_E2E_TEST_AS_TOKEN }}
+          NVB_E2E_MOD_TOKEN: ${{ secrets.NVB_E2E_MOD_TOKEN }}
+          NVB_E2E_SPEAKER_TOKENS: ${{ secrets.NVB_E2E_SPEAKER_TOKENS }}
+          NVB_E2E_PUPPET_TOKENS: ${{ secrets.NVB_E2E_PUPPET_TOKENS }}
+          NVB_E2E_BRIDGE_BIN: target/debug/nether-voicebridge
+          NVB_E2E_ARTIFACTS: e2e-artifacts
+          RUST_LOG: nvb_e2e=info,nvb_matrix_rtc=warn
+        run: |
+          set -euo pipefail
+          SC="${{ inputs.scenarios }}"
+          SC="${SC:-smoke_open_close}"
+          PROF="${{ inputs.profile }}"
+          PROF="${PROF:-compressed}"
+          if [ "$SC" = "--all" ]; then
+            target/debug/nvb-e2e run --all --profile "$PROF"
+          else
+            args=""
+            for s in $SC; do args="$args --scenario $s"; done
+            # shellcheck disable=SC2086
+            target/debug/nvb-e2e run $args --profile "$PROF"
+          fi
+
+      # Always publish the artifact bundle (report.json + WAVs + bridge logs) so
+      # a red run is triageable without re-running.
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: e2e-artifacts/
+          if-no-files-found: warn
