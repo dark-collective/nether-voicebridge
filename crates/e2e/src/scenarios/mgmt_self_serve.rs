@@ -17,6 +17,12 @@
 //!   approval code (positive — needs the one-time PL grant, see below);
 //! * `max_tenants_per_owner` — a pending link occupies the slot, so a second
 //!   link is refused;
+//! * `max_link_attempts` (#77) — a fresh user's probe-reaching `link` attempts
+//!   are velocity-limited: the first few pass to the (failing) probe, the next
+//!   is refused as over-budget;
+//! * `max_tenants_per_guild` (#77) — once the seeded tenant plus one pending
+//!   link fill the guild, a DIFFERENT owner's link to it is refused (before its
+//!   probes, so no room authority is needed to observe the cap);
 //! * the deny-list — a link to a banned room is refused;
 //! * self-serve scoping — `list`/`unlink` see/touch only the user's own
 //!   tenants, not a seeded foreign one.
@@ -30,6 +36,8 @@
 //! joined member of Auto Test 01 (`room_a`) with power level ≥ its
 //! `state_default` (grant PL 50 via Element devtools → `m.room.power_levels`).
 //! Without it the positive-link assertion fails with a message that says so.
+//! The other harness users (`nvbtest_mgr2`/`mgrx`/the #77 `nvbtest_mgr3`) need
+//! NO setup — they only drive negative/pre-probe paths that never require power.
 
 use crate::actors::mgmt_client::{MatrixManagementClient, register_and_join};
 use crate::bridge_proc::{BridgeUnderTest, tenant_entry};
@@ -162,6 +170,37 @@ async fn drive(cfg: &E2eConfig, bridge: &BridgeUnderTest) -> Result<()> {
         bail!("expected a room-authority refusal for a non-moderator; got: {refusal:?}");
     }
 
+    // 4b. max_link_attempts (#77): a FRESH user's `link` attempts that reach the
+    //     probe stage are velocity-limited. Run here, while the guild still holds
+    //     only the seeded tenant (< the per-guild cap), so every attempt clears
+    //     the cheaper caps and reaches the gate. Each targets room_a WITHOUT
+    //     authority, so it fails at the probe (creating no tenant/pending) after
+    //     spending one attempt — until the budget (3) is exhausted and the 4th is
+    //     refused as over-budget. A distinct user so the earlier/later budgets
+    //     are untouched.
+    let mgr3 = MatrixManagementClient::register(cfg, "nvbtest_mgr3", "NVB Test Manager 3").await?;
+    let dm3 = mgr3.create_dm().await.context("open mgr3 DM")?;
+    mgr3.await_bot_joined(&dm3, Duration::from_secs(60)).await?;
+    mgr3.await_greeting(&dm3, Duration::from_secs(30)).await?;
+    for attempt in 1..=3 {
+        let ev = mgr3
+            .send(&dm3, &format!("link Burst{attempt} {} {} {}", cfg.room_a, cfg.guild_id, cfg.channel_a))
+            .await?;
+        let reply = mgr3.wait_for_reply(&dm3, &ev, reply_to).await?;
+        // Within budget → reaches the probe, which refuses for lack of authority.
+        if reply.contains("Too many link attempts") || !reply.contains("moderator power") {
+            bail!("attempt {attempt} should have reached the probe (not the rate gate); got: {reply:?}");
+        }
+    }
+    // 4th attempt: budget spent → velocity-refused before any probe.
+    let ev = mgr3
+        .send(&dm3, &format!("link Burst4 {} {} {}", cfg.room_a, cfg.guild_id, cfg.channel_a))
+        .await?;
+    let gated = mgr3.wait_for_reply(&dm3, &ev, reply_to).await?;
+    if !gated.contains("Too many link attempts") {
+        bail!("expected a link-attempt rate-limit refusal on the 4th attempt; got: {gated:?}");
+    }
+
     // 5. require_room_authority POSITIVE → pending approval code. Needs the
     //    one-time PL grant for @nvbtest_mgr in room_a (see the module doc).
     let ev = mgr
@@ -184,6 +223,19 @@ async fn drive(cfg: &E2eConfig, bridge: &BridgeUnderTest) -> Result<()> {
     let cap = mgr.wait_for_reply(&dm, &ev, reply_to).await?;
     if !cap.contains("awaiting approval") || !cap.contains("the limit is 1") {
         bail!("expected a per-owner cap refusal; got: {cap:?}");
+    }
+
+    // 6b. max_tenants_per_guild (#77): the guild now holds the seeded tenant (1)
+    //     plus mgr's pending GoodLink (1) = the cap (2). A DIFFERENT owner (mgr2,
+    //     under its own per-owner cap) linking to it is refused by the per-guild
+    //     cap. This check precedes the room-authority probe, so mgr2's lack of
+    //     power in room_a is irrelevant — the guild-cap message fires first.
+    let ev = mgr2
+        .send(&dm2, &format!("link GuildFull {} {} {}", cfg.room_a, cfg.guild_id, cfg.channel_a))
+        .await?;
+    let guild_cap = mgr2.wait_for_reply(&dm2, &ev, reply_to).await?;
+    if !guild_cap.contains("the limit is 2 per guild") {
+        bail!("expected a per-guild cap refusal; got: {guild_cap:?}");
     }
 
     // 7. Deny-list: a link to the banned room is refused (checked before the

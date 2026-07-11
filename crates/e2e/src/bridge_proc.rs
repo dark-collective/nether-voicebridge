@@ -80,8 +80,16 @@ fn management_and_limits_block(cfg: &E2eConfig) -> String {
     out.push_str("\n[limits]\n");
     // Small per-owner cap so the scenario can exercise the ceiling (a pending
     // link counts toward it). mgmt_cooldown_secs is left unset (unlimited) so
-    // the multi-command run is never rate-gated.
+    // the multi-command run is never single-shot rate-gated.
     out.push_str("max_tenants_per_owner = 1\n");
+    // #77 anti-Sybil knobs. Per-guild cap 2 = the seeded foreign tenant (1) plus
+    // one self-serve pending link fills the guild, so a THIRD owner's link to it
+    // is refused — the scenario exercises exactly that ceiling. Link-attempt
+    // budget 3 = a fresh user's 4th probe-reaching `link` within the window is
+    // velocity-refused (the window defaults to 1 h, and the gate state is
+    // in-memory so it resets with the fresh bridge process each run).
+    out.push_str("max_tenants_per_guild = 2\n");
+    out.push_str("max_link_attempts = 3\n");
     out.push_str("\n[management]\n");
     out.push_str("server = \"test\"\n");
     out.push_str(&format!(
@@ -478,6 +486,12 @@ mod tests {
         // bot_user_id derives from the profile's sender_localpart.
         assert_eq!(m.bot_user_id, "@nether-voicebridge_bot:nether.im");
         assert_eq!(loaded.limits.max_tenants_per_owner, Some(1));
+        // #77 anti-Sybil knobs resolve too.
+        assert_eq!(loaded.limits.max_tenants_per_guild, Some(2));
+        assert_eq!(
+            loaded.limits.link_attempt_budget(),
+            Some((3, std::time::Duration::from_secs(3600)))
+        );
         // The harness config is a tenants-only hosting deployment (no static
         // `[[bridge]]`), so it uses the no-bridges validation path — which still
         // runs `validate_management` (the #76 knobs) but skips the ≥1-bridge rule.
