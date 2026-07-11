@@ -278,6 +278,23 @@ impl ConnCountProbe {
         )
     }
 
+    /// Like [`Self::voice_members_among`], but filtered to one SPECIFIC voice
+    /// channel — the force-move scenario needs "which puppet is in AT01's
+    /// channel", not "in any channel of the guild". Same `None` = cache-miss
+    /// contract (#72 F6-3).
+    pub fn voice_members_in_channel(&self, ids: &HashSet<u64>, channel: u64) -> Option<Vec<u64>> {
+        let channel = serenity::model::id::ChannelId::new(channel);
+        let guild = self.cache.guild(self.guild)?;
+        Some(
+            guild
+                .voice_states
+                .iter()
+                .filter(|(uid, vs)| ids.contains(&uid.get()) && vs.channel_id == Some(channel))
+                .map(|(uid, _)| uid.get())
+                .collect(),
+        )
+    }
+
     /// Poll until none of `ids` is in voice (or fail at `timeout`). A guild
     /// cache miss keeps polling like any other not-yet-satisfied state
     /// instead of returning `Ok` vacuously (#72 F6-3) — the guild must be

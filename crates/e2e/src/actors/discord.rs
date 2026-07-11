@@ -6,6 +6,8 @@
 //! * [`DiscordListener`] (D2): a harness bot that RECEIVES in the channel and
 //!   records selected users (the bridge's puppets) to mono PCM for the audio
 //!   oracle — the far-side ear of the Matrix→Discord direction.
+//! * [`DiscordMod`] (D3): the adversarial moderator — a REST-only bot that
+//!   voice-kicks / force-moves a bridge puppet to exercise the recovery paths.
 //!
 //! Both mirror the bridge's own songbird idioms (pinned versions, constraint
 //! #7): an explicit `Songbird` manager attached to a serenity client; playback
@@ -16,9 +18,10 @@
 use super::ParticipantDriver;
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
+use serenity::builder::EditMember;
 use serenity::client::{Context, EventHandler};
 use serenity::model::gateway::{GatewayIntents, Ready};
-use serenity::model::id::{ChannelId, GuildId};
+use serenity::model::id::{ChannelId, GuildId, UserId};
 use songbird::input::{Input, RawAdapter};
 use songbird::model::payload::Speaking;
 use songbird::{CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler};
@@ -354,6 +357,24 @@ impl DiscordListener {
         }
     }
 
+    /// Target user ids currently in THIS voice channel, per the gateway
+    /// cache. Returns `None` when the guild is not (yet) cached — an UNKNOWN
+    /// state, distinct from "cached and empty" (the same contract as
+    /// `ConnCountProbe::voice_members_among`, #72 F6-3).
+    pub fn targets_in_channel(&self) -> Option<Vec<u64>> {
+        let guild = self.cache.guild(self.guild)?;
+        Some(
+            guild
+                .voice_states
+                .iter()
+                .filter(|(uid, vs)| {
+                    self.targets.contains(&uid.get()) && vs.channel_id == Some(self.channel)
+                })
+                .map(|(uid, _)| uid.get())
+                .collect(),
+        )
+    }
+
     /// Join voice and start recording the target users.
     pub async fn join(&self) -> Result<()> {
         let call = self
@@ -402,5 +423,63 @@ impl Drop for DiscordListener {
         // gateway task rather than leak the listener's voice session into the
         // next scenario (#72 F6-4).
         crate::observers::abort_if_present(&mut self.client_task);
+    }
+}
+
+// ─── DiscordMod (D3) ─────────────────────────────────────────────────────────────
+
+/// The adversarial moderator (D3): the `nvb-test-mod` application (Move
+/// Members + Connect, no admin) voice-kicking or force-moving a bridge puppet
+/// to exercise the recovery paths (#46 external disconnect, #62 force-move
+/// displacement). REST-only — no gateway, no voice, no cache — so it acts
+/// out-of-band while the listener/probe actors keep their live view.
+pub struct DiscordMod {
+    http: serenity::http::Http,
+    guild: GuildId,
+}
+
+impl DiscordMod {
+    /// Build the REST client and validate the token up front (a dead token
+    /// would otherwise only surface as a mid-scenario 401 — the same reason
+    /// the run recipe validates every bot token with `GET /users/@me`).
+    pub async fn connect(token: &str, guild_id: &str) -> Result<Self> {
+        let http = serenity::http::Http::new(token);
+        let me = http
+            .get_current_user()
+            .await
+            .context("validating mod bot token (GET /users/@me)")?;
+        tracing::info!(user = %me.name, "discord mod bot ready");
+        Ok(Self { http, guild: GuildId::new(guild_id.parse().context("guild id")?) })
+    }
+
+    /// Force-move `user` into `channel` (needs Move Members) — the #62 shape:
+    /// the voice connection survives, so no `DriverDisconnect` fires and only
+    /// the bridge's own voice-state probe can notice the displacement.
+    pub async fn force_move(&self, user: u64, channel: u64) -> Result<()> {
+        self.http
+            .edit_member(
+                self.guild,
+                UserId::new(user),
+                &EditMember::new().voice_channel(ChannelId::new(channel)),
+                Some("nvb-e2e force-move"),
+            )
+            .await
+            .context("mod force-move failed")?;
+        Ok(())
+    }
+
+    /// Kick `user` out of voice entirely (`channel_id: null`) — the external
+    /// disconnect the #46 recovery must rejoin from.
+    pub async fn disconnect(&self, user: u64) -> Result<()> {
+        self.http
+            .edit_member(
+                self.guild,
+                UserId::new(user),
+                &EditMember::new().disconnect_member(),
+                Some("nvb-e2e voice-kick"),
+            )
+            .await
+            .context("mod voice-disconnect failed")?;
+        Ok(())
     }
 }

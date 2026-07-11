@@ -89,14 +89,14 @@ const LONG_PROBE_MS: u32 = 180_000;
 /// Probe length: 8 cycles — the two boundary cycles absorb startup/teardown
 /// transients (see `oracle_assert`), leaving 6 interior cycles as the
 /// load-bearing signal, all inside the compressed-profile timeout.
-const PROBE_MS: u32 = 8_000;
+pub(super) const PROBE_MS: u32 = 8_000;
 
 /// Post-probe drain before reading the far side: LiveKit's capture buffer can
 /// run ~1 s ahead of real time, plus jitter/mixer latency on both ends.
-const DRAIN: Duration = Duration::from_secs(4);
+pub(super) const DRAIN: Duration = Duration::from_secs(4);
 /// Settle after the media path reports live before speaking (DAVE epoch
 /// changes, mixer priming, subscription plumbing).
-const SETTLE: Duration = Duration::from_secs(3);
+pub(super) const SETTLE: Duration = Duration::from_secs(3);
 
 /// Live-path oracle thresholds: defaults (Opus in the loop), with the
 /// alignment bound widened — the capture window opens well before the probe
@@ -135,7 +135,7 @@ const CYCLE_MS: u32 = 1_000;
 /// and a whole-stream transient budget (a #36-class corruption produces dozens
 /// of glitches, not one). Every per-cycle score is still recorded so a nightly
 /// trend catches slow drift a single pass/fail would miss.
-fn oracle_assert(
+pub(super) fn oracle_assert(
     artifacts: &Path,
     label: &str,
     seed: u64,
@@ -254,7 +254,7 @@ fn oracle_assert(
 /// left behind (the bridge's own startup sweep only clears ITS ghosts). A
 /// stale test membership would flip the bridge call-active at boot and skew
 /// the scenario's lifecycle assertions.
-async fn sweep_test_memberships(cfg: &E2eConfig, poller: &RoomStatePoller, room: &str) -> Result<()> {
+pub(super) async fn sweep_test_memberships(cfg: &E2eConfig, poller: &RoomStatePoller, room: &str) -> Result<()> {
     let as_token = cfg.test_as_token()?;
     let stale: Vec<_> = poller
         .call_members(room)
@@ -306,7 +306,7 @@ fn urlencoding(s: &str) -> String {
 
 /// Wait for the room to show no active ghost membership (the bridge's startup
 /// sweep clears residue) — the same precondition the smoke scenario uses.
-async fn await_quiescent(poller: &RoomStatePoller, room: &str) -> Result<()> {
+pub(super) async fn await_quiescent(poller: &RoomStatePoller, room: &str) -> Result<()> {
     poller
         .await_members(room, Duration::from_secs(30), "quiescent precondition", |m| {
             !m.iter().any(|e| e.class == SenderClass::Ghost && e.active)
@@ -316,7 +316,7 @@ async fn await_quiescent(poller: &RoomStatePoller, room: &str) -> Result<()> {
 }
 
 /// Decode the harness puppet ids (the users a DiscordListener records).
-fn puppet_ids(cfg: &E2eConfig) -> Result<HashSet<u64>> {
+pub(super) fn puppet_ids(cfg: &E2eConfig) -> Result<HashSet<u64>> {
     let ids: HashSet<u64> =
         cfg.puppet_tokens.iter().filter_map(|t| decode_bot_user_id(t)).collect();
     if ids.len() != cfg.puppet_tokens.len() {
@@ -327,7 +327,7 @@ fn puppet_ids(cfg: &E2eConfig) -> Result<HashSet<u64>> {
 
 /// Pick the loudest recording (by RMS) — the puppet actually carrying the
 /// probe; the anchor's overflow track and idle puppets record near-silence.
-fn loudest(recordings: HashMap<u64, Vec<i16>>) -> Option<(u64, Vec<i16>)> {
+pub(super) fn loudest(recordings: HashMap<u64, Vec<i16>>) -> Option<(u64, Vec<i16>)> {
     recordings
         .into_iter()
         .filter(|(_, s)| !s.is_empty())

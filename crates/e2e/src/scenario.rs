@@ -15,7 +15,9 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expectation {
     Pass,
-    /// First constructed by the D3 force-move scenario (#62 gap).
+    /// No live scenario constructs this yet: the force-move gap it was
+    /// designed for (#62) was fixed in v0.3.0-alpha.11, so that scenario
+    /// ships as `Pass`. Kept (with runner tests) for the next filed gap.
     #[allow(dead_code)]
     KnownFail { issue: &'static str },
 }

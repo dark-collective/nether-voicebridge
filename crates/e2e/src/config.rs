@@ -94,10 +94,8 @@ pub struct E2eConfig {
     /// Auto Test 03: a SECOND unencrypted room + its voice channel. Optional —
     /// only scenarios needing a distinct-from-AT01 unencrypted target (e.g. the
     /// force-move and multi-bridge-isolation scenarios) require them; they bail
-    /// with a clear message when absent. First reader arrives in D3 workstream B.
-    #[allow(dead_code)]
+    /// with a clear message when absent.
     pub channel_c: Option<String>,
-    #[allow(dead_code)]
     pub room_c: Option<String>,
     /// The TEST appservice's `as_token` (the `nvbtest` registration) — the
     /// fake Matrix participants (D2 testkit) masquerade under it. Optional:
@@ -217,8 +215,6 @@ impl E2eConfig {
 
     /// The AT03 (second unencrypted) room + channel pair, or a clear error
     /// naming the missing keys — used by the force-move / multi-bridge scenarios.
-    /// First caller arrives in D3 workstream B.
-    #[allow(dead_code)]
     pub fn at03_pair(&self) -> Result<(&str, &str)> {
         match (self.room_c.as_deref(), self.channel_c.as_deref()) {
             (Some(r), Some(c)) => Ok((r, c)),
@@ -231,9 +227,7 @@ impl E2eConfig {
     }
 
     /// The `nvb-test-mod` Discord token, or a clear error — required by the
-    /// mod-driven scenarios (force-move / disconnect). First caller arrives in
-    /// D3 workstream B (`DiscordMod` actor).
-    #[allow(dead_code)]
+    /// mod-driven scenarios (force-move / disconnect).
     pub fn mod_token(&self) -> Result<&str> {
         self.mod_token.as_deref().ok_or_else(|| {
             anyhow::anyhow!(
