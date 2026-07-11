@@ -18,9 +18,8 @@ anything yourself.
 > (`@nether-voicebridge_bot:nether.im`) and link your own room — see the
 > **[self-serve walkthrough](self-serve-bridging.md)**. Consent is required
 > from both sides: you must be a moderator of the Matrix room, and someone
-> with Manage Server must approve the link inside Discord. Prefer a human?
-> Bridges can still be requested by hand in the community room — see
-> [How to request a bridge](#how-to-request-a-bridge) below.
+> with Manage Server must approve the link inside Discord. (Prefer a human?
+> Ask in [`#nether-voicebridge-help:nether.im`](https://matrix.to/#/%23nether-voicebridge-help%3Anether.im).)
 
 ## What it is
 
@@ -44,10 +43,12 @@ link a channel, and no plan to charge for it.
 Only what's needed to relay the call and know who's in it: live voice audio
 (relayed, never recorded), Discord/Matrix display names and user ids for
 call participants, and the bridge-link admin record (who requested it, who
-approved it). Full detail, retention, and your rights are in the
-**[hosted-instance privacy policy](privacy-policy.md)** — read it before
-linking a room, especially if your server or room has participants who care
-about this. In short: no recording, no transcripts, no ML training, no
+approved it). Full detail, retention, and your rights are in the live
+**[privacy policy](https://nether.wiki/matrix/voice-bridge-privacy/)** and
+**[terms of service](https://nether.wiki/matrix/voice-bridge-terms/)**
+(the in-repo [template](privacy-policy.md) is their hostable source) — read
+them before linking a room, especially if your server or room has
+participants who care about this. In short: no recording, no transcripts, no ML training, no
 data sale. You can opt out of being relayed at any time with `/bridge optout`
 in a bridged Discord server.
 
@@ -112,11 +113,10 @@ presence).
 
 The fastest path is the **[self-serve DM flow](self-serve-bridging.md)** — DM
 `@nether-voicebridge_bot:nether.im`, run `link`, and have a Discord server
-manager approve the code. If you'd rather have a human do it (or self-serve is
-temporarily disabled), ask in
-[#nether-voicebridge:nether.im](https://matrix.to/#/%23nether-voicebridge:nether.im)
-(bridged 1:1 with the project's [Discord server](https://discord.gg/BQYxEdu7s2),
-so either side works). Please have ready:
+manager approve the code — self-serve is **enabled on the hosted instance**
+(open beta). If you'd rather have a human walk you through it, ask in
+[#nether-voicebridge-help:nether.im](https://matrix.to/#/%23nether-voicebridge-help%3Anether.im).
+Either way, have ready:
 
 - **Discord:** the guild ID and the voice channel ID (right-click each →
   "Copy Server ID" / "Copy Channel ID" — enable Developer Mode first under
@@ -128,6 +128,6 @@ so either side works). Please have ready:
   explicit approval of a Discord server manager, and confirmation that the
   Matrix room meets the power-level requirement above.
 
-The operator (or, once self-serve is enabled, the management bot's `link`
-flow) verifies both sides' prerequisites before wiring anything up, and
+The management bot's `link` flow (or the operator, for a hand-held request)
+verifies both sides' prerequisites before wiring anything up, and
 you'll be told exactly what's missing if something isn't ready yet.

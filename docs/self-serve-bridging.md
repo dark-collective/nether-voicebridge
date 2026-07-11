@@ -24,8 +24,10 @@ code.
   the bot is reachable over federation. (It's the *room* that must be reachable
   by the instance's homeserver, not you.)
 - **Moderator power in the Matrix room** you want to bridge: you must be a
-  joined member with power level ≥ the room's `state_default` (on a default
-  Element room, that's the "Moderator" role). This is checked, not assumed.
+  joined member with an **explicit personal power-level grant** — at least 50
+  (Element's "Moderator" role), and above the room's default level. Power
+  everyone inherits from the room default does **not** count, even if that
+  default is high. This is checked, not assumed.
 - **The Discord IDs**: the server (guild) ID and the voice channel ID.
   Right-click each → "Copy Server ID" / "Copy Channel ID" (enable Developer
   Mode first: User Settings → Advanced → Developer Mode).
@@ -153,7 +155,7 @@ retry.
 | --- | --- |
 | The bot never joins your DM | The instance may not have open registration enabled — ask the operator. Or you're banned. |
 | The bot joined but never answers | You're messaging it in a group room — commands only work in a 2-person DM. |
-| "not a moderator" style refusal on `link` | You need PL ≥ `state_default` in the target room — ask a room admin to promote you. |
+| "not a moderator" style refusal on `link` | You need a personal Moderator role (an explicit power-level grant ≥ 50, above the room default) in the target room — ask a room admin to promote *you specifically*; a permissive room-wide default isn't enough. |
 | Probe failure about power levels | The room doesn't allow PL 0 for `org.matrix.msc3401.call.member` — see Step 1. |
 | Probe failure joining the room | Restricted room and the bot isn't invited — see Step 1. |
 | `/bridge approve` says unknown/expired | The code timed out, was already used, was minted for a different guild — or you ran it on a different bridge instance's bot (each instance only knows its own codes). Run `link` again for a fresh code. |

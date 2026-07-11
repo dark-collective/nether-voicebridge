@@ -87,37 +87,28 @@ named participants.*
 
 ## Future directions
 
-The north star is **hosted, mautrix-style bridging** — so you don't have to run the
-appservice yourself. A server owner would invite the shared pool of "slot" bots to
-their Discord and a management bot to their Matrix room, then **configure everything
-over DM commands** (the way the public mautrix bridges let you `!login` and go),
-bridging voice channels without installing anything. Getting there is a sequence:
+The original north star — **hosted, mautrix-style bridging**, where a server
+owner invites the shared bot pool and configures everything **over DM commands**
+without installing anything — **has shipped**: runtime provisioning with tenant
+state that survives restarts ([#4](https://nether.codes/dark/nether-voicebridge/issues/4)),
+the per-`(bot, guild)` shared puppet pool ([#46](https://nether.codes/dark/nether-voicebridge/issues/46)),
+lean send-only ghost crypto ([#44](https://nether.codes/dark/nether-voicebridge/issues/44)),
+the [management bot](#runtime-bridges--the-management-bot) with
+[two-sided link auth](#two-sided-link-auth),
+[open registration](#open-registration), and the
+[abuse controls](#abuse-controls) ([#43](https://nether.codes/dark/nether-voicebridge/issues/43),
+[#47](https://nether.codes/dark/nether-voicebridge/issues/47)). It's live as the
+[hosted instance](#two-ways-to-get-a-bridge), currently in open beta.
 
-**1. Lighten the cost of encrypted calls first.** Today each Discord speaker's
-Matrix-side **ghost** runs a full crypto client (its own store + a perpetual `/sync`)
-in encrypted rooms, which doesn't scale to many concurrent calls. Slimming the ghost
-to a lean, send-only crypto identity is the precondition for hosting anyone.
-([#44](https://nether.codes/dark/nether-voicebridge/issues/44))
+What genuinely remains:
 
-**2. Build toward configure-without-install hosting, step by step.**
-
-- **Runtime provisioning.** The bridge currently spawns its bridges once at startup
-  from a config file. Hosting needs to add and remove a bridge *while running*, with
-  tenant state that survives a restart.
-- **Per-guild puppet sharing.** Let the one shared bot pool serve many Discord
-  servers at once, instead of being claimed by a single channel at a time.
-- **A management bot + `!` commands.** Bind a Matrix room to a Discord voice channel,
-  check status, and unbridge — all over chat, with an auth model so only the right
-  people can bridge a given room/server.
-  ([#4](https://nether.codes/dark/nether-voicebridge/issues/4))
-- **Multi-tenant hardening.** Per-tenant resource isolation, automatic room-prereq
-  checks, and a careful read of Discord's terms for a public voice relay.
-  ([#43](https://nether.codes/dark/nether-voicebridge/issues/43))
-
-**3. Clean up and review.** An independent **human code review / security audit** —
-especially of the key-handling and echo-exclusion paths — plus a simplification pass,
-before picking the next big thing.
-([#41](https://nether.codes/dark/nether-voicebridge/issues/41))
+- **Clean up and review.** An independent **human code review / security audit** —
+  especially of the key-handling and echo-exclusion paths — plus a simplification
+  pass, before picking the next big thing.
+  ([#41](https://nether.codes/dark/nether-voicebridge/issues/41))
+- **Per-tenant process isolation.** Tenants currently share one process; a
+  crashing bridge shouldn't be able to take its neighbors down. Fine for the
+  beta, a real decision at scale.
 
 ### Further out
 
@@ -422,9 +413,12 @@ path that feeds the deny-list.
 
 ## Community & contributing
 
-- **Development & support space:**
+- **Hosted-instance help:**
+  [`#nether-voicebridge-help:nether.im`](https://matrix.to/#/%23nether-voicebridge-help%3Anether.im)
+  — using the nether.im bridge, beta feedback, "something broke".
+- **Development space:**
   [`#nether-voicebridge:nether.im`](https://matrix.to/#/%23nether-voicebridge:nether.im)
-  — questions, help, and where the work happens.
+  — where the work happens.
 - Issues and roadmap: the project's Forgejo repo at
   [nether.codes/dark/nether-voicebridge](https://nether.codes/dark/nether-voicebridge)
   — see the [roadmap board](https://nether.codes/dark/nether-voicebridge/projects).
