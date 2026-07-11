@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Abuse observability + report path for open registration (#78).** Reactive
+  abuse tooling — voice content is unmoderatable by design (never recorded or
+  transcribed), so the bridge consolidates a durable audit trail and a report
+  path that feeds the existing deny-list.
+  - **`report <owner|guild|room> <value> [reason]`** — a self-serve-tier
+    management command (available to non-operators, the people most likely to be
+    harmed) that files an abuse report to the audit trail for an operator to
+    review. It never acts on its own; auto-banning untrusted input would itself
+    be an abuse vector, so it is advisory and feeds *manual* bans. Rate-limited
+    via the shared `mgmt_cooldown_secs` budget so it can't flood the trail;
+    free-text reasons are trimmed and length-capped.
+  - **`reports [count]`** — an operator-only review command that renders the most
+    recent report events from `<data_dir>/audit.jsonl` over DM (no host shell
+    needed), each next to the exact `ban` command to run — wiring the report path
+    straight into the deny-list tooling.
+  - The audit trail now also records **invite accept/reject** decisions
+    (operator / open-registration / banned / not-direct / not-allowlisted),
+    closing the reachability-attempt coverage gap alongside the existing
+    link/approve/unlink/ban events.
 - **Anti-Sybil admission controls for open registration (#77).** Two new
   `[limits]` knobs harden the self-serve `link` flow beyond the per-owner tenant
   cap, which keys on the federation-reachable (thus throwaway) owner MXID:

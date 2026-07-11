@@ -301,6 +301,7 @@ Bridges don't have to be static config. Two ways to add/remove them at runtime:
 - **The management bot** (`[management]` in config.toml): allowlisted operators
   DM the bridge's bot user on Matrix and drive the same mechanism with commands
   — `link <name> <room-id> <guild-id> <channel-id>`, `unlink <name>`, `list`,
+  `ban`/`unban`/`bans`, `report`/`reports` (see [Abuse controls](#abuse-controls)),
   `help`. The bot writes `tenants.toml` and triggers the reconcile in-process,
   rolling the file back if validation rejects it, so bot edits and hand edits
   never conflict. It only accepts room invites from allowlisted MXIDs. With
@@ -346,8 +347,9 @@ With both two-sided knobs on, `open_registration = true` turns the management
 bot into a self-serve service: any Matrix user (not just the `allow` list) can
 DM the bot — direct invites only, so no one can pull it into arbitrary rooms —
 and use a scoped command set: `link` (room authority + Discord approval are
-mandatory), `unlink` and `list` limited to bridges they created, and `help`.
-Operator commands (`ban`/`unban`/`bans`, unscoped unlink/list) remain
+mandatory), `unlink` and `list` limited to bridges they created, `report` (flag
+an abusive bridge — see [Abuse controls](#abuse-controls)), and `help`.
+Operator commands (`ban`/`unban`/`bans`, `reports`, unscoped unlink/list) remain
 allowlist-only, deny-listed users are refused at the door, and
 `[limits] max_tenants_per_owner` caps how many bridges one user may own
 (pending approvals count). Config validation refuses `open_registration`
@@ -360,6 +362,30 @@ publicly in the channel where it was run, so every bridged server has a
 visible record of the link and its approver. A hostable policy template lives
 at `docs/privacy-policy.md`, and `docs/nether-voicebridge-verification-runbook.md`
 covers the 100-server App Verification gate.
+
+### Abuse controls
+
+Voice content is unmoderatable by design (never recorded or transcribed), so
+the bridge's abuse tooling is **reactive**: a durable audit trail plus a report
+path that feeds the deny-list.
+
+- **Audit trail** — every lifecycle-security event (`link`, `approve`, `unlink`,
+  `ban`/`unban`, `report`, and invite accept/reject decisions) is appended as one
+  JSON line to `<data_dir>/audit.jsonl`, recording who, which guild/room, when,
+  and — for approvals — the approver. An operator can review it over DM without
+  host access with `reports [count]`, which renders the most recent reports each
+  next to the exact `ban` command to run.
+- **`report <owner|guild|room> <value> [reason]`** — available to self-serve
+  users too (the people most likely to be harmed), this files an abuse report to
+  the audit trail. It is deliberately advisory: a report **never** removes a
+  bridge on its own (auto-acting on untrusted input would itself be an abuse
+  vector) — an operator reviews it and decides whether to `ban`. Reports are
+  rate-limited (shared with the `mgmt_cooldown_secs` budget) so they can't flood
+  the trail, and free-text reasons are length-capped.
+- **`ban <owner|guild|room> <value>`** — operator-only; deny-lists the target and
+  tears down every matching tenant through the normal reconcile path. Banned
+  owners lose self-serve access entirely; the deny-list is re-checked at approval
+  time so a ban that lands while a link is pending still blocks it.
 
 ## Community & contributing
 

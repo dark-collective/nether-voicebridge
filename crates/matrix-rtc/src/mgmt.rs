@@ -690,9 +690,17 @@ async fn stripped_invite_details(room: &Room, own: &UserId) -> Option<InviteDeta
 /// (see `matrix::appservice_join_room`).
 async fn handle_invite(ctx: &BotCtx, invite: Option<&InviteDetails>, room: &Room) {
     let room_id = room.room_id().to_owned();
+    // Reachability decisions feed the audit trail (#78): who tried to open a
+    // DM with the bot, from which room, and whether it was let in — the signal
+    // a public operator watches for probing. `banned` is the fail-closed
+    // reject; `false` accept never gets that far.
+    let inviter = invite.map(|i| i.sender.as_str()).unwrap_or("<unknown>");
     let accept = match invite {
         Some(i) if ctx.is_operator(&i.sender) => {
             tracing::info!(room_id = %room_id, inviter = %i.sender, "accepting invite from allowlisted operator");
+            audit(ctx, &i.sender, "invite_accepted", serde_json::json!({
+                "room_id": room_id.as_str(), "reason": "operator",
+            }));
             true
         }
         Some(i) if ctx.open_registration => {
@@ -706,21 +714,33 @@ async fn handle_invite(ctx: &BotCtx, invite: Option<&InviteDetails>, room: &Room
             };
             if banned {
                 tracing::warn!(room_id = %room_id, inviter = %i.sender, "rejecting invite from banned user");
+                audit(ctx, &i.sender, "invite_rejected", serde_json::json!({
+                    "room_id": room_id.as_str(), "reason": "banned",
+                }));
                 false
             } else if !i.is_direct {
                 tracing::info!(room_id = %room_id, inviter = %i.sender, "rejecting non-direct invite from self-serve user (DMs only)");
+                audit(ctx, &i.sender, "invite_rejected", serde_json::json!({
+                    "room_id": room_id.as_str(), "reason": "not_direct",
+                }));
                 false
             } else {
                 tracing::info!(room_id = %room_id, inviter = %i.sender, "accepting DM invite from self-serve user (open registration)");
+                audit(ctx, &i.sender, "invite_accepted", serde_json::json!({
+                    "room_id": room_id.as_str(), "reason": "open_registration",
+                }));
                 true
             }
         }
         _ => {
             tracing::warn!(
                 room_id = %room_id,
-                inviter = invite.map(|i| i.sender.as_str()).unwrap_or("<unknown>"),
+                inviter = %inviter,
                 "rejecting invite from non-allowlisted user"
             );
+            audit(ctx, inviter, "invite_rejected", serde_json::json!({
+                "room_id": room_id.as_str(), "reason": "not_allowlisted",
+            }));
             false
         }
     };
@@ -815,6 +835,17 @@ enum Command {
         value: String,
     },
     Bans,
+    /// File an abuse report (#78) — recorded for an operator to review, never
+    /// acted on automatically. Self-serve tier.
+    Report {
+        kind: String,
+        value: String,
+        reason: Option<String>,
+    },
+    /// Show recent abuse reports (#78) — operator-only review surface.
+    Reports {
+        count: usize,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -831,12 +862,21 @@ const UNLINK_USAGE: &str = "Usage: `unlink <name>`";
 const BAN_USAGE: &str =
     "Usage: `ban <owner|guild|room> <value>` — e.g. `ban owner @evil:example.org`, `ban guild 123456`, `ban room !abc:example.org`. Banning also unlinks every matching tenant.";
 const UNBAN_USAGE: &str = "Usage: `unban <owner|guild|room> <value>`";
+const REPORT_USAGE: &str = "Usage: `report <owner|guild|room> <value> [reason]` — flag an abusive bridge for an operator to review, e.g. `report guild 123456 harassing users`. This does not remove the bridge; an operator decides.";
+const REPORTS_USAGE: &str = "Usage: `reports [count]` — show the most recent abuse reports (default 10).";
 
-const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridges (static + tenants) and whether they are running\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server] — bridge a Discord voice channel to a Matrix room\n  unlink <name> — remove a bridge created with link\n  ban <owner|guild|room> <value> — deny-list an owner MXID / Discord guild / Matrix room AND unlink every matching tenant\n  unban <owner|guild|room> <value> — remove a ban\n  bans — show the deny-lists\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+/// Longest free-text `report` reason kept in the audit trail. Reports come from
+/// untrusted self-serve users, so cap the bytes appended per line (#78).
+const REPORT_REASON_MAX: usize = 280;
+/// Default / ceiling for how many recent reports the `reports` command renders.
+const DEFAULT_REPORTS: usize = 10;
+const MAX_REPORTS: usize = 50;
+
+const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridges (static + tenants) and whether they are running\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server] — bridge a Discord voice channel to a Matrix room\n  unlink <name> — remove a bridge created with link\n  ban <owner|guild|room> <value> — deny-list an owner MXID / Discord guild / Matrix room AND unlink every matching tenant\n  unban <owner|guild|room> <value> — remove a ban\n  bans — show the deny-lists\n  report <owner|guild|room> <value> [reason] — file an abuse report (recorded, not acted on)\n  reports [count] — show recent abuse reports, each with the `ban` to run\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
 
 /// Help for self-serve users (#43): only the verbs they may run, plus the
 /// consent flow they will hit.
-const SELF_SERVE_HELP_TEXT: &str = "Voice bridge commands:\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> — bridge a Discord voice channel to a Matrix room. You must be a moderator of the Matrix room, and someone with Manage Server on the Discord side must approve the link with the `/bridge approve` command and the code you'll receive.\n  unlink <name> — remove a bridge you created\n  list — your bridges\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+const SELF_SERVE_HELP_TEXT: &str = "Voice bridge commands:\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> — bridge a Discord voice channel to a Matrix room. You must be a moderator of the Matrix room, and someone with Manage Server on the Discord side must approve the link with the `/bridge approve` command and the code you'll receive.\n  unlink <name> — remove a bridge you created\n  list — your bridges\n  report <owner|guild|room> <value> [reason] — report an abusive bridge for an operator to review\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
 
 /// Posted into a bridged voice channel's text chat when its link is removed
 /// (#64) — by `unlink` and by a ban's teardown sweep. Deliberately neutral:
@@ -850,7 +890,11 @@ const UNLINK_NOTICE_TEXT: &str =
 fn allowed_for_self_serve(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::Help | Command::List | Command::Link { .. } | Command::Unlink { .. }
+        Command::Help
+            | Command::List
+            | Command::Link { .. }
+            | Command::Unlink { .. }
+            | Command::Report { .. }
     )
 }
 
@@ -895,6 +939,23 @@ fn parse_command(body: &str) -> Parsed {
         "bans" => match args {
             [] => Parsed::Cmd(Command::Bans),
             _ => Parsed::Usage("Usage: `bans`".to_string()),
+        },
+        "report" => match args {
+            // At least a kind + value; everything after is a free-text reason.
+            [kind, value, reason @ ..] => Parsed::Cmd(Command::Report {
+                kind: kind.clone(),
+                value: value.clone(),
+                reason: (!reason.is_empty()).then(|| reason.join(" ")),
+            }),
+            _ => Parsed::Usage(REPORT_USAGE.to_string()),
+        },
+        "reports" => match args {
+            [] => Parsed::Cmd(Command::Reports { count: DEFAULT_REPORTS }),
+            [n] => match n.parse::<usize>() {
+                Ok(c) if c >= 1 => Parsed::Cmd(Command::Reports { count: c.min(MAX_REPORTS) }),
+                _ => Parsed::Usage(REPORTS_USAGE.to_string()),
+            },
+            _ => Parsed::Usage(REPORTS_USAGE.to_string()),
         },
         _ => Parsed::Unknown,
     }
@@ -955,6 +1016,10 @@ async fn handle_command(ctx: &BotCtx, room: &Room, sender: &str, cmd: Command) {
         Command::Ban { kind, value } => handle_ban(ctx, room, sender, &kind, &value).await,
         Command::Unban { kind, value } => handle_unban(ctx, room, sender, &kind, &value).await,
         Command::Bans => handle_bans(ctx, room).await,
+        Command::Report { kind, value, reason } => {
+            handle_report(ctx, room, sender, &kind, &value, reason.as_deref()).await
+        }
+        Command::Reports { count } => handle_reports(ctx, room, count).await,
     }
 }
 
@@ -1968,6 +2033,142 @@ async fn handle_bans(ctx: &BotCtx, room: &Room) {
     }
 }
 
+/// The `report` command (#78 Need 2): let anyone who can reach the bot flag an
+/// abusive bridge. A report is *reactive tooling* — it never acts on its own
+/// (auto-banning on untrusted input would itself be an abuse vector). It is
+/// recorded to the audit trail for an operator to review via `reports` and, if
+/// warranted, `ban`. Self-serve tier, so a public instance hears from the
+/// people most likely to be harmed.
+async fn handle_report(
+    ctx: &BotCtx,
+    room: &Room,
+    sender: &str,
+    kind_str: &str,
+    value: &str,
+    reason: Option<&str>,
+) {
+    reply(room, &report_core(ctx, sender, kind_str, value, reason)).await;
+}
+
+/// Pure core of `report`, split out for unit testing (mirroring
+/// `cooldown_check`/`window_check`): validate → rate-gate → append the audit
+/// event → return the reply text. The only side effects are the best-effort
+/// audit write and the shared cooldown stamp.
+fn report_core(
+    ctx: &BotCtx,
+    sender: &str,
+    kind_str: &str,
+    value: &str,
+    reason: Option<&str>,
+) -> String {
+    let Some(kind) = BanKind::parse(kind_str) else {
+        return REPORT_USAGE.to_string();
+    };
+    if !ban_value_shape_ok(kind, value) {
+        return format!("'{value}' does not look like a {} — {}", kind.as_str(), REPORT_USAGE);
+    }
+    // Share the state-change cooldown so a self-serve user can't flood the
+    // audit trail with reports. Operators are trusted (and would `ban`, not
+    // spam-report), so they are not gated — matching the self-serve-only shape
+    // of the other velocity limits (#77).
+    if !ctx.is_operator(sender) {
+        if let Some(remaining) = ctx.mutate_cooldown(sender) {
+            return format!("⏳ Rate limited — try again in {remaining}s.");
+        }
+    }
+    // Keep the trail bounded: trim, cap length (by chars so we never split a
+    // UTF-8 boundary), and drop an empty reason to `None`.
+    let reason = reason.and_then(|r| {
+        let trimmed = r.trim();
+        if trimmed.is_empty() {
+            None
+        } else if trimmed.chars().count() > REPORT_REASON_MAX {
+            Some(trimmed.chars().take(REPORT_REASON_MAX).collect::<String>())
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    tracing::info!(reporter = %sender, kind = kind.as_str(), value, "abuse report filed");
+    audit(ctx, sender, "report", serde_json::json!({
+        "kind": kind.as_str(), "value": value, "reason": reason,
+    }));
+    format!(
+        "🚩 Thanks — your report about {} `{value}` has been recorded for an operator to review. \
+         Bridges are not removed automatically; an operator will decide.",
+        kind.as_str()
+    )
+}
+
+/// The `reports` command (#78 Need 1): render the recent `report` events from
+/// the audit trail so an operator can spot patterns and act — each line carries
+/// the exact `ban` to run, wiring the report path straight into the deny-list
+/// tooling. Operator-only (excluded from [`allowed_for_self_serve`]).
+async fn handle_reports(ctx: &BotCtx, room: &Room, count: usize) {
+    reply(room, &format_reports(&ctx.audit_path, count)).await;
+}
+
+/// One `report` event recovered from the audit trail.
+struct ReportView {
+    ts: u64,
+    actor: String,
+    kind: String,
+    value: String,
+    reason: Option<String>,
+}
+
+/// Parse `<data_dir>/audit.jsonl` and return the last `count` `report` events,
+/// oldest→newest. Best-effort: a missing/short/garbled trail (or a non-report
+/// line) is simply skipped, never an error — the audit log is forensic, and a
+/// query over it must not fail loudly.
+fn recent_reports(audit_path: &str, count: usize) -> Vec<ReportView> {
+    let Ok(body) = std::fs::read_to_string(audit_path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ReportView> = body
+        .lines()
+        .filter_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            if v.get("event").and_then(|e| e.as_str()) != Some("report") {
+                return None;
+            }
+            let detail = v.get("detail")?;
+            Some(ReportView {
+                ts: v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0),
+                actor: v.get("actor").and_then(|a| a.as_str()).unwrap_or("<unknown>").to_string(),
+                kind: detail.get("kind").and_then(|k| k.as_str())?.to_string(),
+                value: detail.get("value").and_then(|x| x.as_str())?.to_string(),
+                reason: detail
+                    .get("reason")
+                    .and_then(|r| r.as_str())
+                    .map(str::to_string),
+            })
+        })
+        .collect();
+    // Keep the tail (most recent); the file is append-ordered.
+    if out.len() > count {
+        out.drain(0..out.len() - count);
+    }
+    out
+}
+
+/// Render `recent_reports` for an operator: one bullet per report with the
+/// reporter, target, reason, and a copy-paste `ban` command.
+fn format_reports(audit_path: &str, count: usize) -> String {
+    let reports = recent_reports(audit_path, count);
+    if reports.is_empty() {
+        return "No reports on file.".to_string();
+    }
+    let mut lines = vec![format!("Last {} report(s), oldest first:", reports.len())];
+    for r in &reports {
+        let reason = r.reason.as_deref().map(|s| format!(" — \"{s}\"")).unwrap_or_default();
+        lines.push(format!(
+            "• [t={}] {} reported {} `{}`{}  → `ban {} {}`",
+            r.ts, r.actor, r.kind, r.value, reason, r.kind, r.value
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Cheap shape check for a ban value, mirroring `link`'s checks: catches a
 /// swapped kind/value before it lands in the deny-list.
 fn ban_value_shape_ok(kind: BanKind, value: &str) -> bool {
@@ -2085,6 +2286,171 @@ mod tests {
         assert!(matches!(parse_command("ban owner"), Parsed::Usage(_)));
         assert!(matches!(parse_command("ban a b c"), Parsed::Usage(_)));
         assert!(matches!(parse_command("bans now"), Parsed::Usage(_)));
+    }
+
+    #[test]
+    fn parses_report_and_reports() {
+        // kind + value, no reason.
+        assert_eq!(
+            parse_command("report guild 123456"),
+            Parsed::Cmd(Command::Report {
+                kind: "guild".into(),
+                value: "123456".into(),
+                reason: None,
+            })
+        );
+        // Trailing tokens collapse into a single free-text reason.
+        assert_eq!(
+            parse_command("report owner @evil:x harassing people in voice"),
+            Parsed::Cmd(Command::Report {
+                kind: "owner".into(),
+                value: "@evil:x".into(),
+                reason: Some("harassing people in voice".into()),
+            })
+        );
+        // A quoted reason is one token but still a reason.
+        assert_eq!(
+            parse_command("report room !r:x \"spam and slurs\""),
+            Parsed::Cmd(Command::Report {
+                kind: "room".into(),
+                value: "!r:x".into(),
+                reason: Some("spam and slurs".into()),
+            })
+        );
+        // Too few args → usage (our verb).
+        assert!(matches!(parse_command("report guild"), Parsed::Usage(_)));
+        assert!(matches!(parse_command("report"), Parsed::Usage(_)));
+
+        // `reports` defaults, clamps, and rejects junk.
+        assert_eq!(parse_command("reports"), Parsed::Cmd(Command::Reports { count: DEFAULT_REPORTS }));
+        assert_eq!(parse_command("reports 5"), Parsed::Cmd(Command::Reports { count: 5 }));
+        assert_eq!(
+            parse_command("reports 9999"),
+            Parsed::Cmd(Command::Reports { count: MAX_REPORTS })
+        );
+        assert!(matches!(parse_command("reports 0"), Parsed::Usage(_)));
+        assert!(matches!(parse_command("reports abc"), Parsed::Usage(_)));
+        assert!(matches!(parse_command("reports 1 2"), Parsed::Usage(_)));
+    }
+
+    #[test]
+    fn report_is_self_serve_but_reports_is_operator_only() {
+        assert!(allowed_for_self_serve(&Command::Report {
+            kind: "guild".into(),
+            value: "1".into(),
+            reason: None,
+        }));
+        assert!(!allowed_for_self_serve(&Command::Reports { count: 10 }));
+    }
+
+    #[test]
+    fn recent_reports_filters_orders_and_caps() {
+        let dir = test_data_dir();
+        let path = format!("{}/audit.jsonl", dir.to_str().unwrap());
+        // A trail mixing non-report events with three reports, plus a garbage
+        // line that must be skipped, not error.
+        let lines = [
+            r#"{"ts":1,"actor":"@op:x","event":"link_ok","detail":{"name":"a"}}"#,
+            r#"{"ts":2,"actor":"@a:x","event":"report","detail":{"kind":"guild","value":"111","reason":"spam"}}"#,
+            "not json at all",
+            r#"{"ts":3,"actor":"@b:x","event":"report","detail":{"kind":"owner","value":"@e:x","reason":null}}"#,
+            r#"{"ts":4,"actor":"@op:x","event":"ban","detail":{"kind":"guild","value":"111"}}"#,
+            r#"{"ts":5,"actor":"@c:x","event":"report","detail":{"kind":"room","value":"!r:x","reason":"slurs"}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        // All three reports, oldest→newest, non-report events dropped.
+        let all = recent_reports(&path, 10);
+        assert_eq!(all.iter().map(|r| r.ts).collect::<Vec<_>>(), vec![2, 3, 5]);
+        assert_eq!(all[0].value, "111");
+        assert_eq!(all[1].reason, None);
+        assert_eq!(all[2].kind, "room");
+
+        // The cap keeps the most-recent tail.
+        let last_two = recent_reports(&path, 2);
+        assert_eq!(last_two.iter().map(|r| r.ts).collect::<Vec<_>>(), vec![3, 5]);
+
+        // Rendered output carries a copy-paste ban for each.
+        let rendered = format_reports(&path, 10);
+        assert!(rendered.contains("`ban guild 111`"), "{rendered}");
+        assert!(rendered.contains("`ban room !r:x`"), "{rendered}");
+        assert!(rendered.contains("\"spam\""), "reason shown: {rendered}");
+
+        // A missing / empty trail is a friendly no-op, not an error.
+        assert_eq!(format_reports(&format!("{}/nope.jsonl", dir.to_str().unwrap()), 10), "No reports on file.");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Read the single audit line `report_core` appended (tests file exactly one
+    /// report), as `(event, detail)`.
+    fn read_one_audit(dir: &std::path::Path) -> (String, serde_json::Value) {
+        let body = std::fs::read_to_string(format!("{}/audit.jsonl", dir.to_str().unwrap()))
+            .expect("audit file written");
+        let v: serde_json::Value =
+            serde_json::from_str(body.lines().next().expect("one line")).expect("valid json");
+        (v["event"].as_str().unwrap().to_string(), v["detail"].clone())
+    }
+
+    #[test]
+    fn report_core_records_audit_event_and_acks() {
+        let dir = test_data_dir();
+        let (ctx, _rx) = approval_ctx(&dir, Duration::from_secs(600));
+        let ack = report_core(&ctx, "@victim:x", "guild", "123456", Some("  harassment  "));
+        assert!(ack.contains("has been recorded"), "ack: {ack}");
+        let (event, detail) = read_one_audit(&dir);
+        assert_eq!(event, "report");
+        assert_eq!(detail["kind"], "guild");
+        assert_eq!(detail["value"], "123456");
+        // Reason is trimmed.
+        assert_eq!(detail["reason"], "harassment");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn report_core_rejects_bad_kind_and_shape_without_auditing() {
+        let dir = test_data_dir();
+        let (ctx, _rx) = approval_ctx(&dir, Duration::from_secs(600));
+        // Unknown kind → usage, nothing written.
+        assert!(report_core(&ctx, "@u:x", "nonsense", "x", None).contains("Usage:"));
+        // Right kind, wrong-shaped value → shape refusal.
+        let bad = report_core(&ctx, "@u:x", "owner", "not-an-mxid", None);
+        assert!(bad.contains("does not look like a owner"), "{bad}");
+        // No audit file materialized from either rejection.
+        assert!(
+            std::fs::read_to_string(format!("{}/audit.jsonl", dir.to_str().unwrap()))
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true),
+            "rejected reports must not touch the trail"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn report_core_truncates_overlong_reason() {
+        let dir = test_data_dir();
+        let (ctx, _rx) = approval_ctx(&dir, Duration::from_secs(600));
+        let long = "é".repeat(REPORT_REASON_MAX + 50); // multibyte, to prove char-safe cut
+        report_core(&ctx, "@u:x", "room", "!r:x", Some(&long));
+        let (_event, detail) = read_one_audit(&dir);
+        let stored = detail["reason"].as_str().unwrap();
+        assert_eq!(stored.chars().count(), REPORT_REASON_MAX);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn report_core_rate_limits_non_operators() {
+        let dir = test_data_dir();
+        let (mut ctx, _rx) = approval_ctx(&dir, Duration::from_secs(600));
+        ctx.cooldown = Some(Duration::from_secs(30));
+        // First self-serve report goes through…
+        assert!(report_core(&ctx, "@spammer:x", "guild", "1", None).contains("recorded"));
+        // …the immediate second is velocity-gated (nothing new written).
+        let gated = report_core(&ctx, "@spammer:x", "guild", "2", None);
+        assert!(gated.contains("Rate limited"), "{gated}");
+        let body =
+            std::fs::read_to_string(format!("{}/audit.jsonl", dir.to_str().unwrap())).unwrap();
+        assert_eq!(body.lines().count(), 1, "only the first report is audited");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
