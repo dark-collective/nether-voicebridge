@@ -160,8 +160,9 @@ struct BotCtx {
     /// `<data_dir>/audit.jsonl` (#47) — append-only record of every
     /// state-changing command and its outcome.
     audit_path: String,
-    /// Two-sided link auth, Matrix side (#47): require the `link` sender to be
-    /// a joined member of the target room with PL ≥ its `state_default`.
+    /// Two-sided link auth, Matrix side (#47/#86): require the `link` sender to
+    /// be a joined member of the target room with an explicit individual
+    /// moderator grant (see [`evaluate_sender_authority`]).
     require_room_authority: bool,
     /// Two-sided link auth, Discord side (#47): `Some(ttl)` when a `link` is
     /// held pending until `/bridge approve <code>`; `None` = commit directly.
@@ -1348,27 +1349,41 @@ fn evaluate_call_member_power(content: Option<&serde_json::Value>) -> CallPowerC
 
 const CALL_MEMBER_EVENT: &str = "org.matrix.msc3401.call.member";
 
-/// Verdict of the Matrix-side link-authority check (#47): may `sender` bridge
-/// this room? The bar is "could configure the room themselves": joined, with
-/// power level ≥ the room's `state_default`.
+/// The Element "Moderator" power level — the floor an explicit grant must reach
+/// to count as room authority (#86).
+const MODERATOR_FLOOR: i64 = 50;
+
+/// Verdict of the Matrix-side link-authority check (#47/#86): may `sender`
+/// bridge this room? The bar is an INDIVIDUAL moderator grant — the sender must
+/// be a joined member with an EXPLICIT `users[sender]` power-level entry that is
+/// both above the room's `users_default` and at least [`MODERATOR_FLOOR`]. Keying
+/// on an explicit, above-default grant (rather than `state_default`) is immune to
+/// a room lowering `state_default` OR raising `users_default` to make every
+/// member look authorized — the vector from the #79 review (finding 6).
 #[derive(Debug, PartialEq, Eq)]
 struct SenderAuthority {
     joined: bool,
+    /// The sender's effective PL (explicit `users[]` entry, else `users_default`).
     sender_pl: i64,
-    required: i64,
+    /// Whether the sender has an EXPLICIT `users[]` entry (not just the default).
+    explicit: bool,
+    /// The room's `users_default` — the bar the explicit grant must exceed.
+    users_default: i64,
 }
 
 impl SenderAuthority {
     fn ok(&self) -> bool {
-        self.joined && self.sender_pl >= self.required
+        self.joined
+            && self.explicit
+            && self.sender_pl > self.users_default
+            && self.sender_pl >= MODERATOR_FLOOR
     }
 }
 
 /// Pure evaluation of a sender's authority over a room (unit-tested below).
-/// `pl_content` is the raw `m.room.power_levels` content (`None` = absent →
-/// fail-safe required=50, same posture as the call-member check);
-/// `member_content` is the sender's `m.room.member` content (`None` = no
-/// membership event → not joined).
+/// `pl_content` is the raw `m.room.power_levels` content (`None` = absent → no
+/// explicit grants, so fail-safe reject); `member_content` is the sender's
+/// `m.room.member` content (`None` = no membership event → not joined).
 fn evaluate_sender_authority(
     pl_content: Option<&serde_json::Value>,
     member_content: Option<&serde_json::Value>,
@@ -1378,20 +1393,49 @@ fn evaluate_sender_authority(
         .and_then(|m| m.get("membership"))
         .and_then(|v| v.as_str())
         == Some("join");
-    let (sender_pl, required) = match pl_content {
+    let (sender_pl, explicit, users_default) = match pl_content {
         Some(c) => {
             let users_default = c.get("users_default").and_then(pl_int).unwrap_or(0);
-            let sender_pl = c
-                .get("users")
-                .and_then(|u| u.get(sender))
-                .and_then(pl_int)
-                .unwrap_or(users_default);
-            let required = c.get("state_default").and_then(pl_int).unwrap_or(50);
-            (sender_pl, required)
+            let explicit_pl = c.get("users").and_then(|u| u.get(sender)).and_then(pl_int);
+            (explicit_pl.unwrap_or(users_default), explicit_pl.is_some(), users_default)
         }
-        None => (0, 50),
+        None => (0, false, 0),
     };
-    SenderAuthority { joined, sender_pl, required }
+    SenderAuthority { joined, sender_pl, explicit, users_default }
+}
+
+/// Read the room's power levels + `sender`'s membership over the CS API and
+/// evaluate their authority (#86). `Err` is a short reason on a read failure —
+/// fail-closed: an unreadable room must never authorize. Used to re-check
+/// authority at approval time (the probe was only a snapshot at `link` time).
+async fn read_sender_authority(
+    ctx: &BotCtx,
+    room_id: &str,
+    sender: &str,
+) -> Result<SenderAuthority, String> {
+    let pl = crate::matrix::get_room_state(
+        &ctx.http,
+        &ctx.homeserver_url,
+        &ctx.appservice_token,
+        room_id,
+        "m.room.power_levels",
+        "",
+        ctx.own_user.as_str(),
+    )
+    .await
+    .map_err(|e| format!("could not read power levels: {e}"))?;
+    let member = crate::matrix::get_room_state(
+        &ctx.http,
+        &ctx.homeserver_url,
+        &ctx.appservice_token,
+        room_id,
+        "m.room.member",
+        sender,
+        ctx.own_user.as_str(),
+    )
+    .await
+    .map_err(|e| format!("could not read membership: {e}"))?;
+    Ok(evaluate_sender_authority(pl.as_ref(), member.as_ref(), sender))
 }
 
 /// Power-level values are canonically integers, but legacy rooms (and some
@@ -1426,10 +1470,10 @@ struct ProbeReport {
 /// bridge keeps it in its room — all bridges share one MXID) and, on any
 /// post-join failure, leaves the room ONLY if the probe itself created the
 /// membership. A fully-successful probe retains the join the bridge needs.
-/// `authority_sender`: when set (two-sided link auth, #47), the probe also
-/// verifies that this MXID is a joined member of the room with power level ≥
-/// the room's `state_default` — an operator allowlist entry alone no longer
-/// authorizes bridging an arbitrary room.
+/// `authority_sender`: when set (two-sided link auth, #47/#86), the probe also
+/// verifies that this MXID is a joined member of the room with an explicit
+/// individual moderator grant (see [`evaluate_sender_authority`]) — an operator
+/// allowlist entry alone no longer authorizes bridging an arbitrary room.
 async fn probe_room_prereqs(
     ctx: &BotCtx,
     room_id: &str,
@@ -1581,18 +1625,22 @@ async fn probe_after_join(
         if !authority.ok() {
             let reason = if !authority.joined {
                 "you are not a joined member of it".to_string()
+            } else if !authority.explicit || authority.sender_pl <= authority.users_default {
+                "you have no individual moderator role there (your power comes from the \
+                 room's default, which everyone shares)"
+                    .to_string()
             } else {
                 format!(
-                    "your power level there is {} but linking needs ≥ {} (the room's \
-                     `state_default`)",
-                    authority.sender_pl, authority.required
+                    "your power level there is {} but linking needs ≥ {}",
+                    authority.sender_pl, MODERATOR_FLOOR
                 )
             };
             return Err(format!(
-                "❌ Two-sided link auth is on: only someone with moderator power in {room_id} \
+                "❌ Two-sided link auth is on: only an individual moderator of {room_id} \
+                 (someone explicitly granted power ≥ {MODERATOR_FLOOR}, above the room default) \
                  may bridge it, and {reason}.\n\
-                 Join the room and have an admin raise your power level, or ask a room \
-                 moderator to run `link`.\n\
+                 Ask a room admin to grant you a moderator role, or have an existing \
+                 moderator run `link`.\n\
                  Nothing was written."
             ));
         }
@@ -2120,6 +2168,31 @@ async fn handle_discord_approval(ctx: &BotCtx, client: &Client, approval: Discor
                 "The ban list is unreadable — approval refused until an operator fixes it.",
             ));
             return;
+        }
+    }
+
+    // Room-authority re-check (#86 TOCTOU): the probe was a snapshot at `link`
+    // time; a requester demoted or gone from the room between then and approval
+    // must not slip a bridge through. Only when two-sided room authority is on.
+    if ctx.require_room_authority {
+        match read_sender_authority(ctx, &pending.tenant.room_id, &pending.requester).await {
+            Ok(auth) if auth.ok() => {}
+            Ok(_) => {
+                audit(ctx, &approval.invoker, "approve_rejected", serde_json::json!({
+                    "code": code, "reason": "authority lost",
+                }));
+                let _ = approval.reply.send(ApprovalOutcome::text_only(
+                    "🚫 The Matrix requester no longer holds a moderator role in the room — approval refused.",
+                ));
+                return;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "room authority unreadable at approval — refusing (fail-closed)");
+                let _ = approval.reply.send(ApprovalOutcome::text_only(
+                    "Could not re-verify the requester's room authority — approval refused; run `link` again.",
+                ));
+                return;
+            }
         }
     }
 
@@ -3031,24 +3104,57 @@ mod tests {
     }
 
     #[test]
-    fn sender_authority_users_map_override() {
+    fn sender_authority_needs_explicit_grant_above_default_and_floor() {
         let pl = serde_json::json!({
-            "state_default": 50,
             "users_default": 0,
             "users": { "@mod:x": 50, "@admin:x": 100 },
         });
+        // Explicit entries above the default and ≥ 50 → authorized.
         assert!(evaluate_sender_authority(Some(&pl), Some(&joined()), "@mod:x").ok());
         assert!(evaluate_sender_authority(Some(&pl), Some(&joined()), "@admin:x").ok());
-        // Not in the users map → users_default 0 < 50.
+        // Not in the users map → only the default (0), no explicit grant → refused.
         let plain = evaluate_sender_authority(Some(&pl), Some(&joined()), "@user:x");
-        assert_eq!(plain, SenderAuthority { joined: true, sender_pl: 0, required: 50 });
         assert!(!plain.ok());
+        assert!(!plain.explicit);
+    }
+
+    #[test]
+    fn sender_authority_rejects_lowered_state_default_trick() {
+        // #86: a room that lowered state_default to 0 used to make any member
+        // "authorized" (sender_pl 0 ≥ state_default 0). Now state_default is
+        // irrelevant — no explicit grant means no authority.
+        let pl = serde_json::json!({ "state_default": 0, "users_default": 0 });
+        assert!(!evaluate_sender_authority(Some(&pl), Some(&joined()), "@member:x").ok());
+    }
+
+    #[test]
+    fn sender_authority_rejects_raised_users_default() {
+        // #86: a room that raised users_default to 50 gives every member PL 50.
+        // Without an EXPLICIT above-default grant that is not authority.
+        let pl = serde_json::json!({ "users_default": 50 });
+        let a = evaluate_sender_authority(Some(&pl), Some(&joined()), "@member:x");
+        assert_eq!(a.sender_pl, 50);
+        assert!(!a.explicit);
+        assert!(!a.ok(), "PL 50 from the default alone is not authority");
+        // Even an explicit entry EQUAL to the default (not above it) is not enough.
+        let pl2 = serde_json::json!({ "users_default": 50, "users": { "@x:x": 50 } });
+        assert!(!evaluate_sender_authority(Some(&pl2), Some(&joined()), "@x:x").ok());
+        // An explicit entry ABOVE the raised default is authority.
+        let pl3 = serde_json::json!({ "users_default": 50, "users": { "@x:x": 51 } });
+        assert!(evaluate_sender_authority(Some(&pl3), Some(&joined()), "@x:x").ok());
+    }
+
+    #[test]
+    fn sender_authority_explicit_grant_must_reach_the_floor() {
+        // Explicit and above default, but below the 50 moderator floor → refused.
+        let pl = serde_json::json!({ "users_default": 0, "users": { "@helper:x": 25 } });
+        assert!(!evaluate_sender_authority(Some(&pl), Some(&joined()), "@helper:x").ok());
     }
 
     #[test]
     fn sender_authority_requires_joined_membership() {
-        let pl = serde_json::json!({ "state_default": 0 });
-        // Power is sufficient (0 ≥ 0) but the sender must actually be joined.
+        let pl = serde_json::json!({ "users": { "@u:x": 50 } });
+        // Power is sufficient but the sender must actually be joined.
         assert!(!evaluate_sender_authority(Some(&pl), None, "@u:x").ok());
         let invited = serde_json::json!({ "membership": "invite" });
         assert!(!evaluate_sender_authority(Some(&pl), Some(&invited), "@u:x").ok());
@@ -3057,15 +3163,16 @@ mod tests {
 
     #[test]
     fn sender_authority_absent_pl_fails_safe() {
+        // No power_levels event → no explicit grants → refused.
         let a = evaluate_sender_authority(None, Some(&joined()), "@u:x");
-        assert_eq!(a, SenderAuthority { joined: true, sender_pl: 0, required: 50 });
+        assert!(!a.explicit);
         assert!(!a.ok());
     }
 
     #[test]
     fn sender_authority_accepts_string_encoded_levels() {
         let pl = serde_json::json!({
-            "state_default": "50",
+            "users_default": "0",
             "users": { "@mod:x": "50" },
         });
         assert!(evaluate_sender_authority(Some(&pl), Some(&joined()), "@mod:x").ok());

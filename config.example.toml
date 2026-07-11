@@ -76,8 +76,9 @@
 #
 # # Two-sided link auth (#47) — both optional, both default false:
 # # require_room_authority = true    # `link` sender must be a joined member of the target
-# #                                  # room with power level ≥ its state_default (i.e. a
-# #                                  # room moderator), not just an allowlisted operator
+# #                                  # room with an EXPLICIT moderator grant (a users[] PL
+# #                                  # entry above users_default and >= 50), re-checked at
+# #                                  # approval time, not just an allowlisted operator (#86)
 # # require_discord_approval = true  # `link` is held PENDING (nothing written) until someone
 # #                                  # with Manage Server in the target guild runs
 # #                                  # `/bridge approve code:<code>`; the command is

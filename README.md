@@ -326,8 +326,12 @@ the puppet bots can reach. For a hosted/multi-tenant deployment, two optional
 `[management]` knobs make a link require consent from **both** sides:
 
 - `require_room_authority = true` — the person running `link` must be a joined
-  member of the target Matrix room with power level ≥ the room's
-  `state_default` (i.e. a room moderator), not just an allowlisted operator.
+  member of the target Matrix room with an **explicit individual moderator
+  grant**: a `users[them]` power-level entry above the room's `users_default`
+  and at least 50 (the Element "Moderator" level), not just an allowlisted
+  operator. Keying on an explicit above-default grant (rather than
+  `state_default`) means a room can't authorize every member by lowering
+  `state_default` or raising `users_default` (#86).
 - `require_discord_approval = true` — a `link` that passes every probe is held
   **pending** (nothing written) and answered with a one-time code. Someone with
   the **Manage Server** permission in the target Discord guild must run

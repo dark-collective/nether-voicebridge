@@ -166,7 +166,7 @@ async fn drive(cfg: &E2eConfig, bridge: &BridgeUnderTest) -> Result<()> {
         .send(&dm2, &format!("link NoAuth {} {} {}", cfg.room_a, cfg.guild_id, cfg.channel_a))
         .await?;
     let refusal = mgr2.wait_for_reply(&dm2, &ev, reply_to).await?;
-    if !refusal.contains("moderator power") {
+    if !refusal.contains("individual moderator") {
         bail!("expected a room-authority refusal for a non-moderator; got: {refusal:?}");
     }
 
@@ -188,7 +188,7 @@ async fn drive(cfg: &E2eConfig, bridge: &BridgeUnderTest) -> Result<()> {
             .await?;
         let reply = mgr3.wait_for_reply(&dm3, &ev, reply_to).await?;
         // Within budget → reaches the probe, which refuses for lack of authority.
-        if reply.contains("Too many link attempts") || !reply.contains("moderator power") {
+        if reply.contains("Too many link attempts") || !reply.contains("individual moderator") {
             bail!("attempt {attempt} should have reached the probe (not the rate gate); got: {reply:?}");
         }
     }
@@ -209,8 +209,9 @@ async fn drive(cfg: &E2eConfig, bridge: &BridgeUnderTest) -> Result<()> {
     let pending = mgr.wait_for_reply(&dm, &ev, Duration::from_secs(60)).await?;
     if !pending.contains("Discord-side approval required") || !pending.contains("/bridge approve code:NVB-") {
         bail!(
-            "expected a pending approval code (all probes passed). Is @nvbtest_mgr a \
-             moderator (PL ≥ state_default) in {}? Got: {pending:?}",
+            "expected a pending approval code (all probes passed). Does @nvbtest_mgr have \
+             an explicit moderator grant (users[] PL ≥ 50, above users_default) in {}? \
+             Got: {pending:?}",
             cfg.room_a
         );
     }
@@ -241,7 +242,7 @@ async fn drive(cfg: &E2eConfig, bridge: &BridgeUnderTest) -> Result<()> {
     if refusal.contains("per guild") {
         bail!("per-guild cap counted another owner's pending — regression of #79 finding 4; got: {refusal:?}");
     }
-    if !refusal.contains("moderator power") && !refusal.contains("not a joined member") {
+    if !refusal.contains("individual moderator") {
         bail!("expected mgr2 to fall through to a room-authority refusal (#79 finding 4 fix); got: {refusal:?}");
     }
 
