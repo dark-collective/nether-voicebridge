@@ -2,6 +2,7 @@
 //! grows this toward the full 16-entry catalogue in the design doc.
 
 pub mod audio;
+pub mod lifecycle;
 pub mod mgmt_self_serve;
 pub mod moderation;
 pub mod smoke;
@@ -23,6 +24,8 @@ pub fn all() -> Vec<&'static ScenarioDef> {
         &audio::GHOST_SESSION_ROTATION,
         &moderation::EXTERNAL_DISCONNECT_RECOVERY,
         &moderation::FORCE_MOVE_RECOVERY,
+        &lifecycle::REAP_RELEASE,
+        &lifecycle::LEAVE_GRACE_DEBOUNCE,
     ]
 }
 
