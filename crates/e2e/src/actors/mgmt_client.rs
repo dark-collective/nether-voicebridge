@@ -187,6 +187,27 @@ impl MatrixManagementClient {
         }
     }
 
+    /// Wait until the bot has posted at least one message in `room` — its join
+    /// greeting ("👋 Voice bridge management …"). Consume it BEFORE issuing any
+    /// command so later reply/silence markers are unambiguous: the greeting is
+    /// a bot message not tied to any command, and `greet_when_joined` delays it
+    /// up to ~10 s (it could otherwise land after a command marker and be
+    /// mistaken for the reply, or trip `expect_silence`).
+    pub async fn await_greeting(&self, room: &str, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // A sentinel that never equals a real event id → collect every bot
+            // message in the page.
+            if !self.bot_replies_after(room, "\u{0}").await?.is_empty() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("bot never greeted {room} (SDK never reached Joined?)");
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
     /// The MXIDs currently joined to `room`.
     pub async fn joined_members(&self, room: &str) -> Result<Vec<String>> {
         let url =

@@ -26,6 +26,12 @@ sender_localpart = "nether-voicebridge"
 
 guild_id = "1523348036040790087"
 # Auto Test 01 (unencrypted; m.call.member at PL 0).
+#
+# One-time setup for the self-serve GATE scenario (mgmt_self_serve_link, #76):
+# grant @nvbtest_mgr:<domain> power level 50 (≥ the room's state_default) and
+# ensure it is joined here, so the require_room_authority positive-link path
+# passes. Element → devtools → m.room.power_levels → users. Without it that
+# scenario's positive-link assertion fails with a message that says so.
 channel_a = "1523349282416103454"
 room_a = "!iICkB3Qu8tQemzFqDl:nether.im"
 

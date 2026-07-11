@@ -111,6 +111,9 @@ async fn drive(cfg: &E2eConfig, bridge: &BridgeUnderTest) -> Result<()> {
     let mgr = MatrixManagementClient::register(cfg, "nvbtest_mgr", "NVB Test Manager").await?;
     let dm = mgr.create_dm().await.context("open primary DM")?;
     mgr.await_bot_joined(&dm, Duration::from_secs(60)).await?;
+    // Consume the one-time join greeting so it never masquerades as a command
+    // reply below (see `await_greeting`).
+    mgr.await_greeting(&dm, Duration::from_secs(30)).await?;
 
     // 1. Self-serve reachability: `help` → the SELF-SERVE tier (not operator).
     let ev = mgr.send(&dm, "help").await?;
@@ -135,6 +138,7 @@ async fn drive(cfg: &E2eConfig, bridge: &BridgeUnderTest) -> Result<()> {
     //    command tests below).
     let shared = mgr.create_dm().await.context("open gate-test DM")?;
     mgr.await_bot_joined(&shared, Duration::from_secs(60)).await?;
+    mgr.await_greeting(&shared, Duration::from_secs(30)).await?;
     mgr.invite(&shared, &format!("@nvbtest_mgrx:{}", cfg.server_domain())).await?;
     register_and_join(cfg, "nvbtest_mgrx", &shared).await.context("third member join")?;
     // Now shared has 3 joined members (mgr + bot + mgrx) → commands ignored.
@@ -149,6 +153,7 @@ async fn drive(cfg: &E2eConfig, bridge: &BridgeUnderTest) -> Result<()> {
     let mgr2 = MatrixManagementClient::register(cfg, "nvbtest_mgr2", "NVB Test Manager 2").await?;
     let dm2 = mgr2.create_dm().await.context("open mgr2 DM")?;
     mgr2.await_bot_joined(&dm2, Duration::from_secs(60)).await?;
+    mgr2.await_greeting(&dm2, Duration::from_secs(30)).await?;
     let ev = mgr2
         .send(&dm2, &format!("link NoAuth {} {} {}", cfg.room_a, cfg.guild_id, cfg.channel_a))
         .await?;
