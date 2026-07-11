@@ -3,6 +3,26 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.19] - 2026-07-11
+
+### Security
+- **Open-registration hardening residuals (#87/#88/#89).** Follow-ups to the #79
+  review's medium findings, around a new periodic management-bot maintenance task.
+  - **#87** — a `link` probe that succeeds but is never approved no longer leaves
+    the shared bot joined to that room forever. `PendingLink` records whether the
+    probe created the join; a 5-minute maintenance sweep leaves rooms from expired,
+    unapproved, probe-created pending links — never a room a bridge holds (the
+    "safe set" is the running bridges via `ControlMsg::Status`, unioned with the
+    configured tenant rooms; the sweep is skipped entirely if that set can't be
+    read).
+  - **#88** — a per-foreign-domain cap on pending links bounds how much of the
+    shared 16-slot pending table one homeserver's users can hold, so a
+    federated-MXID Sybil set sharing a homeserver can't starve honest onboarding.
+    The home server is exempt (invite-gated, not a Sybil vector).
+  - **#89** — a per-sender cooldown on invite auto-joins (reusing
+    `mgmt_cooldown_secs`), and the same maintenance sweep leaves DM rooms that
+    have gone empty (only the bot remains).
+
 ## [0.3.0-alpha.18] - 2026-07-11
 
 ### Security
