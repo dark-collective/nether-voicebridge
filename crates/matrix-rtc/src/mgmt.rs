@@ -1160,18 +1160,17 @@ struct ProbeReport {
 /// `Err` carries the complete user-facing reply text — probe failures are
 /// operator errors, not bugs, so they go to the DM rather than the log.
 ///
+/// Side effect: the join probe (deliberately idempotent with the later bridge
+/// spawn) leaves the bot joined to the room even when a later probe fails.
+/// NOTE (#79): on the untrusted open-registration surface this lets a hostile
+/// `link` pin the shared bot into arbitrary rooms it names — the reap-on-failure
+/// fix was backed out (it also tore the bot out of rooms with an active bridge,
+/// since all bridges share one MXID); a correct fix must leave ONLY a membership
+/// the probe itself created. Tracked as a follow-up issue.
 /// `authority_sender`: when set (two-sided link auth, #47), the probe also
 /// verifies that this MXID is a joined member of the room with power level ≥
 /// the room's `state_default` — an operator allowlist entry alone no longer
 /// authorizes bridging an arbitrary room.
-///
-/// The probe must JOIN the room to read its state, but on the untrusted
-/// open-registration surface that join must not be permanent for a link that
-/// never proceeds (#79): a hostile `link` naming a room the sender has no power
-/// in would otherwise pin the shared bridge bot into arbitrary rooms across the
-/// federation. So any failure AFTER the join reaps the membership via
-/// [`appservice_leave_room`] (best-effort) before returning; only a probe that
-/// fully succeeds (→ pending mint or commit) retains the join the bridge needs.
 async fn probe_room_prereqs(
     ctx: &BotCtx,
     room_id: &str,
@@ -1208,34 +1207,6 @@ async fn probe_room_prereqs(
         }
     }
 
-    // The bot is now joined. Run the remaining prerequisite checks; if any
-    // fails, leave the room so an unauthorized/abandoned `link` cannot pin the
-    // shared bot there (#79). A fully-successful probe keeps the join.
-    let result = probe_after_join(ctx, room_id, guild_id, authority_sender).await;
-    if result.is_err() {
-        match crate::matrix::appservice_leave_room(
-            &ctx.homeserver_url,
-            &ctx.appservice_token,
-            room_id,
-            ctx.own_user.as_str(),
-        )
-        .await
-        {
-            Ok(()) => tracing::info!(room_id, "left room after a failed link probe (#79 — no membership retained)"),
-            Err(e) => tracing::warn!(room_id, error = %e, "failed to leave room after a failed link probe (#79)"),
-        }
-    }
-    result
-}
-
-/// The post-join prerequisite checks, split out so [`probe_room_prereqs`] can
-/// reap the probe membership on any failure here (#79).
-async fn probe_after_join(
-    ctx: &BotCtx,
-    room_id: &str,
-    guild_id: &str,
-    authority_sender: Option<&str>,
-) -> Result<ProbeReport, String> {
     // 2. Power levels (hard): a room that blocks ghosts from posting
     // `org.matrix.msc3401.call.member` silently breaks the Discord→Matrix
     // direction, so refuse to link it. Must run after the join (a non-member

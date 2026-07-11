@@ -807,35 +807,6 @@ pub(crate) async fn appservice_join_room(
     Ok(())
 }
 
-/// Leave a room via an appservice-asserted `POST /rooms/{id}/leave` — the mirror
-/// of [`appservice_join_room`]. Used to undo a `link` preflight join when the
-/// link does not proceed (#79): the probe must join to read a room's state, so
-/// an unauthorized or abandoned `link` would otherwise pin the shared bridge
-/// bot into an arbitrary room permanently. Best-effort at the call site.
-pub(crate) async fn appservice_leave_room(
-    homeserver_url: &str,
-    appservice_token: &str,
-    room_id: &str,
-    user_id: &str,
-) -> Result<()> {
-    let http = reqwest::Client::builder().use_rustls_tls().build()?;
-    let url =
-        crate::rtc::ghost::cs_url(homeserver_url, &["rooms", room_id, "leave"], Some(user_id))?;
-    let resp = http
-        .post(url)
-        .bearer_auth(appservice_token)
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .context("appservice leave request")?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("{status}: {body}"));
-    }
-    Ok(())
-}
-
 /// GET a room state event via the CS API, authenticated with the appservice
 /// `as_token` and masqueraded as `user_id` (must be appservice-controlled and
 /// joined to the room). `state_key` is `""` for keyless events.
