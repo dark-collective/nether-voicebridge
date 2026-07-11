@@ -20,10 +20,15 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Process-wide transaction-id counter for `PUT .../send/...` — a send only
-/// needs a value unique per (access token, txn), and a monotonic counter is
-/// that within a run (`Date`/`rand` are avoided so the actor stays trivially
-/// deterministic).
+/// Process-wide transaction-id counter for `PUT .../send/...`. The homeserver
+/// deduplicates a txn per (access token, txn id) — and every masqueraded send
+/// here rides the SAME shared appservice `as_token`, so a bare monotonic counter
+/// (which resets to 1 each process) collides ACROSS runs: a later run replaying
+/// `nvb1` gets the first run's event id back and NO new event, so the command
+/// never lands and `wait_for_reply` can't find its marker. The txn is therefore
+/// scoped with the process id (`nvb{pid}-{n}`) — a per-run nonce, matching the
+/// harness's other uniqueness idiom (`process::id()` in the test data dirs) —
+/// while staying `Date`/`rand`-free.
 static TXN: AtomicU64 = AtomicU64::new(1);
 
 /// A self-serve Matrix user driving the management bot over DM.
@@ -232,9 +237,10 @@ impl MatrixManagementClient {
     pub async fn send(&self, room: &str, body: &str) -> Result<String> {
         let txn = TXN.fetch_add(1, Ordering::Relaxed);
         let url = format!(
-            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/nvb{txn}",
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/nvb{}-{txn}",
             self.base,
-            enc(room)
+            enc(room),
+            std::process::id(),
         );
         let resp = self
             .http
