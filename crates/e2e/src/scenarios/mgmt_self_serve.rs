@@ -262,6 +262,45 @@ async fn drive(cfg: &E2eConfig, bridge: &BridgeUnderTest) -> Result<()> {
         bail!("expected an ownership refusal unlinking a foreign tenant; got: {unlink:?}");
     }
 
+    // 9. Abuse report path (#78): a self-serve user may `report` an abusive
+    //    bridge. It is advisory — recorded to the audit trail, never acted on —
+    //    so the ack promises operator review, not removal. `guild <id>` passes
+    //    the ban-shape check (numeric snowflake). Not rate-gated here:
+    //    mgmt_cooldown_secs is unset in the harness config.
+    let ev = mgr.send(&dm, &format!("report guild {} spamming voice", cfg.guild_id)).await?;
+    let filed = mgr.wait_for_reply(&dm, &ev, reply_to).await?;
+    if !filed.contains("has been recorded for an operator to review") {
+        bail!("expected a report-filed ack; got: {filed:?}");
+    }
+    // The report reaches the audit trail (info-level marker on the write path).
+    bridge
+        .scraper
+        .await_event(Duration::from_secs(30), |e| e.message.contains("abuse report filed"))
+        .await
+        .context("the report did not reach the audit trail (#78)")?;
+
+    // 9b. `reports` is operator-only — a self-serve user is refused, not shown
+    //     the trail.
+    let ev = mgr.send(&dm, "reports").await?;
+    let refused = mgr.wait_for_reply(&dm, &ev, reply_to).await?;
+    if !refused.contains("operator-only") {
+        bail!("expected `reports` to be operator-only for a self-serve user; got: {refused:?}");
+    }
+
+    // 10. Operator review (#78): an allowlisted operator DMs `reports` and sees
+    //     the report mgr just filed, rendered with the exact `ban` to run —
+    //     end-to-end proof the report landed in the trail and feeds the
+    //     deny-list tooling. `nvbtest_operator` matches the harness allowlist.
+    let op = MatrixManagementClient::register(cfg, "nvbtest_operator", "NVB Test Operator").await?;
+    let opdm = op.create_dm().await.context("open operator DM")?;
+    op.await_bot_joined(&opdm, Duration::from_secs(60)).await?;
+    op.await_greeting(&opdm, Duration::from_secs(30)).await?;
+    let ev = op.send(&opdm, "reports").await?;
+    let reports = op.wait_for_reply(&opdm, &ev, reply_to).await?;
+    if !reports.contains("oldest first") || !reports.contains(&format!("ban guild {}", cfg.guild_id)) {
+        bail!("operator `reports` did not show the filed report with its ban suggestion; got: {reports:?}");
+    }
+
     // ── No unexpected ERROR events over the whole scenario ───────────────────
     // The `/bridge` slash-command registration depends on the puppet
     // application's `applications.commands` OAuth scope — orthogonal to the
