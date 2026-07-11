@@ -182,6 +182,13 @@ struct BotCtx {
     /// Per-owner `link`-attempt timestamps within the current window, for the
     /// [`link_attempt_gate`](Self::link_attempt_gate).
     link_attempts: StdMutex<HashMap<String, Vec<Instant>>>,
+    /// `[limits]` GLOBAL (all-senders) `link`+invite attempt budget
+    /// `(attempts, window)` (#84), enforced for non-operators. `None` ⇒ unlimited.
+    global_link_budget: Option<(usize, Duration)>,
+    /// Global attempt timestamps within the current window, for the
+    /// [`global_link_gate`](Self::global_link_gate) — one shared sliding window
+    /// across every sender, so throwaway-MXID churn can't reset it.
+    global_link_attempts: StdMutex<Vec<Instant>>,
     /// Public privacy-policy URL (#43 ToS follow-ups): appended to the `link`
     /// disclosure texts when configured.
     privacy_policy_url: Option<String>,
@@ -328,7 +335,25 @@ impl BotCtx {
             .mutate_stamps
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        cooldown_check(&mut stamps, sender, Instant::now(), cooldown)
+        let now = Instant::now();
+        // Lazy sweep (#84): drop stamps older than the cooldown so the map can't
+        // grow unbounded keyed by throwaway MXIDs on the open surface.
+        prune_stale_stamps(&mut stamps, now, cooldown);
+        cooldown_check(&mut stamps, sender, now, cooldown)
+    }
+
+    /// The GLOBAL (all-senders) `link`+invite velocity gate (#84):
+    /// `Some(retry_secs)` ⇒ the shared budget for the current window is spent
+    /// (nothing recorded); `None` ⇒ allowed, and this attempt is recorded. Not
+    /// keyed on the sender, so federated-MXID churn can't reset it; self-serve
+    /// only — the caller applies it to non-operators.
+    fn global_link_gate(&self) -> Option<u64> {
+        let (budget, window) = self.global_link_budget?;
+        let mut attempts = self
+            .global_link_attempts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        window_check(&mut attempts, Instant::now(), window, budget)
     }
 
     /// The `link`-attempt rate gate (#77): `Some(retry_secs)` ⇒ `sender` has
@@ -344,8 +369,42 @@ impl BotCtx {
             .link_attempts
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
         let entry = attempts.entry(sender.to_owned()).or_default();
-        window_check(entry, Instant::now(), window, budget)
+        let result = window_check(entry, now, window, budget);
+        // Lazy sweep (#84): a sender whose window has fully aged out leaves an
+        // empty Vec behind — drop the key so the outer map can't grow unbounded
+        // one-per-MXID on the open surface.
+        if entry.is_empty() {
+            attempts.remove(sender);
+        }
+        result
+    }
+}
+
+/// Drop timestamp entries older than `ttl` from a per-sender stamp map (#84).
+/// Bounds unbounded growth keyed by throwaway MXIDs. Split out for unit testing.
+fn prune_stale_stamps(stamps: &mut HashMap<String, Instant>, now: Instant, ttl: Duration) {
+    stamps.retain(|_, &mut t| now.saturating_duration_since(t) < ttl);
+}
+
+/// Roll `<data_dir>/audit.jsonl` past which the append-only trail is rotated to
+/// `audit.jsonl.1` (one generation kept) so open-surface report/link/invite spam
+/// can't fill the data-dir disk (#85). 64 MiB × 2 bounded footprint.
+const AUDIT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// If `path` is at/over `max` bytes, rotate it to `<path>.1` (overwriting the
+/// previous generation), so the next append starts a fresh file. Best-effort:
+/// returns quietly if the file is absent/small or the rename fails. Split out
+/// for unit testing (#85).
+fn rotate_if_large(path: &str, max: u64) {
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() >= max => {
+            if let Err(e) = std::fs::rename(path, format!("{path}.1")) {
+                tracing::warn!(error = %e, path, "audit log rotation failed");
+            }
+        }
+        _ => {}
     }
 }
 
@@ -358,6 +417,7 @@ fn audit(ctx: &BotCtx, actor: &str, event: &str, detail: serde_json::Value) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let line = serde_json::json!({ "ts": ts, "actor": actor, "event": event, "detail": detail });
+    rotate_if_large(&ctx.audit_path, AUDIT_MAX_BYTES);
     let write = || -> std::io::Result<()> {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -520,6 +580,8 @@ pub async fn run(
         max_tenants_per_guild: limits.max_tenants_per_guild,
         link_attempt_budget: limits.link_attempt_budget(),
         link_attempts: StdMutex::new(HashMap::new()),
+        global_link_budget: limits.global_link_budget(),
+        global_link_attempts: StdMutex::new(Vec::new()),
         privacy_policy_url: cfg.privacy_policy_url.clone(),
         notice_tx: pool_io.notice_tx,
     });
@@ -724,6 +786,15 @@ async fn handle_invite(ctx: &BotCtx, invite: Option<&InviteDetails>, room: &Room
                     "room_id": room_id.as_str(), "reason": "not_direct",
                 }));
                 false
+            } else if let Some(retry) = ctx.global_link_gate() {
+                // Global velocity gate (#84): shed self-serve invite auto-joins
+                // under load so a federated-MXID swarm can't grow the bot's
+                // joined-room set without bound. The inviter can retry later.
+                tracing::warn!(room_id = %room_id, inviter = %i.sender, retry, "shedding self-serve invite under global load (#84)");
+                audit(ctx, &i.sender, "invite_rejected", serde_json::json!({
+                    "room_id": room_id.as_str(), "reason": "global_budget",
+                }));
+                false
             } else {
                 tracing::info!(room_id = %room_id, inviter = %i.sender, "accepting DM invite from self-serve user (open registration)");
                 audit(ctx, &i.sender, "invite_accepted", serde_json::json!({
@@ -780,6 +851,17 @@ fn greet_when_joined(room: Room) {
             let current = room.client().get_room(room.room_id());
             if let Some(r) = current {
                 if r.state() == RoomState::Joined {
+                    // Defeat a spoofed `is_direct` (#85): a real DM has ≤2 joined
+                    // members (inviter + bot). If the invite pulled the bot into a
+                    // group room, leave instead of greeting — the command gate
+                    // already ignores >2-member rooms, so it'd just be dead weight.
+                    if !is_command_room(r.joined_members_count()) {
+                        tracing::warn!(room_id = %r.room_id(), members = r.joined_members_count(), "invited room is not a DM (spoofed is_direct?) — leaving (#85)");
+                        if let Err(e) = r.leave().await {
+                            tracing::warn!(room_id = %r.room_id(), error = %e, "failed to leave non-DM invited room");
+                        }
+                        return;
+                    }
                     reply(&r, "👋 Voice bridge management — send `help` for commands.").await;
                     return;
                 }
@@ -1160,13 +1242,13 @@ struct ProbeReport {
 /// `Err` carries the complete user-facing reply text — probe failures are
 /// operator errors, not bugs, so they go to the DM rather than the log.
 ///
-/// Side effect: the join probe (deliberately idempotent with the later bridge
-/// spawn) leaves the bot joined to the room even when a later probe fails.
-/// NOTE (#79): on the untrusted open-registration surface this lets a hostile
-/// `link` pin the shared bot into arbitrary rooms it names — the reap-on-failure
-/// fix was backed out (it also tore the bot out of rooms with an active bridge,
-/// since all bridges share one MXID); a correct fix must leave ONLY a membership
-/// the probe itself created. Tracked as a follow-up issue.
+/// The probe must JOIN the room to read its state. On the untrusted
+/// open-registration surface a hostile `link` naming a room the sender has no
+/// power in would otherwise pin the shared bot there permanently (#83). So the
+/// probe records whether the bot was ALREADY a member before joining (a running
+/// bridge keeps it in its room — all bridges share one MXID) and, on any
+/// post-join failure, leaves the room ONLY if the probe itself created the
+/// membership. A fully-successful probe retains the join the bridge needs.
 /// `authority_sender`: when set (two-sided link auth, #47), the probe also
 /// verifies that this MXID is a joined member of the room with power level ≥
 /// the room's `state_default` — an operator allowlist entry alone no longer
@@ -1177,6 +1259,19 @@ async fn probe_room_prereqs(
     guild_id: &str,
     authority_sender: Option<&str>,
 ) -> Result<ProbeReport, String> {
+    // Was the bot already a member before this probe? (A running bridge keeps it
+    // joined.) If the read fails, assume YES — never risk leaving a bridged room
+    // (#83, fail-safe). Only a membership the probe CREATES may be reaped.
+    let already_member = crate::matrix::appservice_is_room_joined(
+        &ctx.http,
+        &ctx.homeserver_url,
+        &ctx.appservice_token,
+        room_id,
+        ctx.own_user.as_str(),
+    )
+    .await
+    .unwrap_or(true);
+
     // 1. Join (hard): covers restricted/invite-only rooms and typo'd room ids.
     match tokio::time::timeout(
         Duration::from_secs(15),
@@ -1207,6 +1302,33 @@ async fn probe_room_prereqs(
         }
     }
 
+    // Run the post-join checks; on failure, reap the membership only if the
+    // probe created it (#83) — a room with an active bridge stays joined.
+    let result = probe_after_join(ctx, room_id, guild_id, authority_sender).await;
+    if result.is_err() && !already_member {
+        match crate::matrix::appservice_leave_room(
+            &ctx.homeserver_url,
+            &ctx.appservice_token,
+            room_id,
+            ctx.own_user.as_str(),
+        )
+        .await
+        {
+            Ok(()) => tracing::info!(room_id, "left room after a failed link probe (#83 — probe-created join reaped)"),
+            Err(e) => tracing::warn!(room_id, error = %e, "failed to leave room after a failed link probe (#83)"),
+        }
+    }
+    result
+}
+
+/// The post-join prerequisite checks, split out so [`probe_room_prereqs`] can
+/// reap a probe-created membership on failure (#83).
+async fn probe_after_join(
+    ctx: &BotCtx,
+    room_id: &str,
+    guild_id: &str,
+    authority_sender: Option<&str>,
+) -> Result<ProbeReport, String> {
     // 2. Power levels (hard): a room that blocks ghosts from posting
     // `org.matrix.msc3401.call.member` silently breaks the Discord→Matrix
     // direction, so refuse to link it. Must run after the join (a non-member
@@ -1557,6 +1679,22 @@ async fn handle_link(
             }));
             reply(room, &format!(
                 "⏳ Too many link attempts — try again in {retry}s."
+            ))
+            .await;
+            return;
+        }
+    }
+
+    // Global velocity gate (#84): a single shared window across ALL self-serve
+    // senders, so a federated-MXID Sybil swarm can't dodge the per-owner budgets
+    // above by rotating throwaway identities. Non-operators only.
+    if !ctx.is_operator(sender) {
+        if let Some(retry) = ctx.global_link_gate() {
+            audit(ctx, sender, "link_rejected", serde_json::json!({
+                "name": name, "reason": "global attempt budget", "retry_secs": retry,
+            }));
+            reply(room, &format!(
+                "⏳ The bridge is handling a lot of link requests right now — try again in {retry}s."
             ))
             .await;
             return;
@@ -2271,6 +2409,40 @@ mod tests {
     }
 
     #[test]
+    fn prune_stale_stamps_drops_aged_keys_only() {
+        let ttl = Duration::from_secs(30);
+        let now = Instant::now();
+        let mut m = HashMap::new();
+        m.insert("@fresh:x".to_string(), now);
+        m.insert("@old:x".to_string(), now - Duration::from_secs(31));
+        m.insert("@edge:x".to_string(), now - Duration::from_secs(29));
+        prune_stale_stamps(&mut m, now, ttl);
+        assert!(m.contains_key("@fresh:x"));
+        assert!(m.contains_key("@edge:x"), "29s < 30s ttl survives");
+        assert!(!m.contains_key("@old:x"), "31s ≥ 30s ttl pruned");
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn audit_rotates_only_past_the_size_cap() {
+        let dir = test_data_dir();
+        let path = format!("{}/audit.jsonl", dir.to_str().unwrap());
+        // Below the cap: no rotation.
+        std::fs::write(&path, "x".repeat(100)).unwrap();
+        rotate_if_large(&path, 1000);
+        assert!(std::fs::metadata(&path).is_ok());
+        assert!(std::fs::metadata(format!("{path}.1")).is_err(), "no rotation below cap");
+        // At/over the cap: rotate to .1, original path is now free for a fresh append.
+        std::fs::write(&path, "y".repeat(1000)).unwrap();
+        rotate_if_large(&path, 1000);
+        assert!(std::fs::metadata(&path).is_err(), "current file moved aside");
+        assert_eq!(std::fs::read_to_string(format!("{path}.1")).unwrap().len(), 1000);
+        // A missing file is a quiet no-op.
+        rotate_if_large(&format!("{}/nope.jsonl", dir.to_str().unwrap()), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn window_budget_of_zero_refuses_everything() {
         let window = Duration::from_secs(60);
         let t0 = Instant::now();
@@ -2802,6 +2974,8 @@ mod tests {
             max_tenants_per_guild: None,
             link_attempt_budget: None,
             link_attempts: StdMutex::new(HashMap::new()),
+            global_link_budget: None,
+            global_link_attempts: StdMutex::new(Vec::new()),
             privacy_policy_url: None,
             notice_tx: None,
         };

@@ -807,6 +807,69 @@ pub(crate) async fn appservice_join_room(
     Ok(())
 }
 
+/// Leave a room via an appservice-asserted `POST /rooms/{id}/leave` — the mirror
+/// of [`appservice_join_room`]. Used to undo a `link` preflight join when the
+/// link does not proceed AND the probe was what created the membership (#83):
+/// the probe must join to read a room's state, so an unauthorized/abandoned
+/// `link` naming a room the bot was not already in would otherwise pin the
+/// shared bridge bot there permanently. Best-effort at the call site; the caller
+/// must NOT call this for a room a running bridge already keeps the bot in (all
+/// bridges share one appservice MXID).
+pub(crate) async fn appservice_leave_room(
+    homeserver_url: &str,
+    appservice_token: &str,
+    room_id: &str,
+    user_id: &str,
+) -> Result<()> {
+    let http = reqwest::Client::builder().use_rustls_tls().build()?;
+    let url =
+        crate::rtc::ghost::cs_url(homeserver_url, &["rooms", room_id, "leave"], Some(user_id))?;
+    let resp = http
+        .post(url)
+        .bearer_auth(appservice_token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .context("appservice leave request")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("{status}: {body}"));
+    }
+    Ok(())
+}
+
+/// Is `user_id` currently joined to `room_id`? Reads the caller's OWN
+/// `/joined_rooms` list (always readable, unlike a state GET which 403s for a
+/// non-member), masqueraded via the appservice `as_token`. Used by the `link`
+/// probe to decide whether a join it is about to make is new — so a failed probe
+/// only reaps a membership it created, never one a running bridge holds (#83).
+pub(crate) async fn appservice_is_room_joined(
+    http: &reqwest::Client,
+    homeserver_url: &str,
+    appservice_token: &str,
+    room_id: &str,
+    user_id: &str,
+) -> Result<bool> {
+    let url = crate::rtc::ghost::cs_url(homeserver_url, &["joined_rooms"], Some(user_id))?;
+    let resp = http
+        .get(url)
+        .bearer_auth(appservice_token)
+        .send()
+        .await
+        .context("GET joined_rooms")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("{status}: {body}"));
+    }
+    let body: serde_json::Value = resp.json().await.context("parse joined_rooms")?;
+    Ok(body
+        .get("joined_rooms")
+        .and_then(|a| a.as_array())
+        .is_some_and(|rooms| rooms.iter().any(|r| r.as_str() == Some(room_id))))
+}
+
 /// GET a room state event via the CS API, authenticated with the appservice
 /// `as_token` and masqueraded as `user_id` (must be appservice-controlled and
 /// joined to the room). `state_key` is `""` for keyless events.

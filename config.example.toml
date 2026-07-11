@@ -115,6 +115,12 @@
 # max_link_attempts = 5         # self-serve `link` attempts per window (#77 velocity limit,
 #                               # atop mgmt_cooldown_secs; operators exempt)
 # link_attempt_window_secs = 3600  # window for max_link_attempts (default 1 h if omitted)
+# max_global_link_attempts = 30 # GLOBAL (all-senders) cap on `link`-probe + invite auto-join
+#                               # attempts per window (#84). NOT keyed on the MXID, so a
+#                               # federated Sybil swarm can't dodge the per-owner budgets by
+#                               # rotating throwaway accounts. Operators exempt. REQUIRED when
+#                               # open_registration is on.
+# global_link_window_secs = 60  # window for max_global_link_attempts (default 60 s if omitted)
 
 # ── Timing (test harness only — leave unset in production) ──────────────────
 # Grace-timer profile (#38). Defaults are the production values; the automated

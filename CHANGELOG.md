@@ -3,6 +3,30 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+- **Open-registration hardening from the #79 adversarial review (#83/#84/#85).**
+  The review confirmed the consent model is structurally sound; these close the
+  highest-severity DoS/abuse gaps on the untrusted public DM surface.
+  - **#83 — the `link` probe no longer pins the shared bot into attacker-named
+    rooms.** The probe must join a room to read its state; it now records whether
+    the bot was *already* a member (a running bridge keeps it joined — all bridges
+    share one appservice MXID) and, on any post-join failure, leaves the room
+    **only if the probe itself created the membership**. A room with an active
+    bridge is never torn out (the correct form of a fix reverted in alpha.16).
+  - **#84 — a global (cross-MXID) velocity limiter.** New `[limits]
+    max_global_link_attempts` (+ optional `global_link_window_secs`, default 60 s)
+    bounds total `link`-probe + invite auto-join volume across *all* self-serve
+    senders, so a federated-MXID Sybil swarm can't get fresh budget per throwaway
+    identity. **Required when `open_registration` is on.** The per-owner cooldown
+    and link-attempt maps are now swept so they can't grow unbounded keyed by
+    throwaway MXIDs.
+  - **#85 — the audit trail rotates and invite auto-joins are member-checked.**
+    `audit.jsonl` rotates to `.1` at 64 MiB (bounded disk against report/link
+    spam), and an accepted DM invite that turns out to have >2 members (a spoofed
+    `is_direct`) is left instead of greeted.
+
 ## [0.3.0-alpha.16] - 2026-07-11
 
 ### Added

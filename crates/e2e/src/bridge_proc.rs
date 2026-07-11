@@ -100,6 +100,11 @@ fn management_and_limits_block(cfg: &E2eConfig) -> String {
     // in-memory so it resets with the fresh bridge process each run).
     out.push_str("max_tenants_per_guild = 2\n");
     out.push_str("max_link_attempts = 3\n");
+    // #84 global (cross-MXID) budget — mandatory under open_registration. Set
+    // generously so the scenario's handful of link attempts never trip it (it
+    // exists to bound a Sybil swarm, not the normal flow); the gate state is
+    // in-memory so it resets with the fresh bridge process each run.
+    out.push_str("max_global_link_attempts = 100\n");
     out.push_str("\n[management]\n");
     out.push_str("server = \"test\"\n");
     out.push_str(&format!(

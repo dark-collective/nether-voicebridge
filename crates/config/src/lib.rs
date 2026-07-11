@@ -142,6 +142,18 @@ pub struct LimitsConfig {
     /// `max_link_attempts` is set; defaults to 3600 (one hour) when omitted.
     #[serde(default)]
     pub link_attempt_window_secs: Option<u64>,
+    /// Global (all-senders) cap on `link`-probe + invite-auto-join attempts per
+    /// window (#84). Unlike `max_link_attempts` this is NOT keyed on the sender
+    /// MXID, so a federated-MXID Sybil swarm cannot get fresh budget per throwaway
+    /// identity — it bounds total untrusted expensive-action volume. Checked for
+    /// non-operators. `None` ⇒ unlimited; REQUIRED when
+    /// `[management] open_registration` is on.
+    #[serde(default)]
+    pub max_global_link_attempts: Option<usize>,
+    /// Window (seconds) for `max_global_link_attempts` (#84). Ignored unless that
+    /// knob is set; defaults to 60 s when omitted.
+    #[serde(default)]
+    pub global_link_window_secs: Option<u64>,
 }
 
 impl LimitsConfig {
@@ -153,6 +165,18 @@ impl LimitsConfig {
             (
                 attempts,
                 Duration::from_secs(self.link_attempt_window_secs.unwrap_or(3600)),
+            )
+        })
+    }
+
+    /// The resolved GLOBAL link-attempt budget `(attempts, window)` (#84) —
+    /// `Some` only when `max_global_link_attempts` is set (window defaulting to
+    /// 60 s). A cross-sender velocity cap on the expensive probe/join flow.
+    pub fn global_link_budget(&self) -> Option<(usize, Duration)> {
+        self.max_global_link_attempts.map(|attempts| {
+            (
+                attempts,
+                Duration::from_secs(self.global_link_window_secs.unwrap_or(60)),
             )
         })
     }
@@ -1488,6 +1512,7 @@ impl Config {
                 ("max_tenants_per_owner", l.max_tenants_per_owner.is_none()),
                 ("max_tenants_per_guild", l.max_tenants_per_guild.is_none()),
                 ("max_link_attempts", l.max_link_attempts.is_none()),
+                ("max_global_link_attempts", l.max_global_link_attempts.is_none()),
             ]
             .into_iter()
             .filter_map(|(field, unset)| unset.then_some(field))
@@ -1497,7 +1522,8 @@ impl Config {
                     "[management]: open_registration exposes an untrusted public DM surface, \
                      so [limits] must set anti-abuse budgets — missing: {}. Recommended: \
                      max_tenants_per_owner = 2, max_tenants_per_guild = 3, \
-                     max_link_attempts = 5, and mgmt_cooldown_secs = 30.",
+                     max_link_attempts = 5, max_global_link_attempts = 30, \
+                     and mgmt_cooldown_secs = 30.",
                     missing.join(", ")
                 )));
             }
@@ -2469,9 +2495,9 @@ appservice_token = "hs_tok"
                 && err.to_string().contains("max_tenants_per_owner"),
             "unexpected: {err}"
         );
-        // Adding the three required caps makes it validate.
+        // Adding the required caps makes it validate.
         let ok = format!(
-            "{}[limits]\nmax_tenants_per_owner = 2\nmax_tenants_per_guild = 3\nmax_link_attempts = 5\n\n",
+            "{}[limits]\nmax_tenants_per_owner = 2\nmax_tenants_per_guild = 3\nmax_link_attempts = 5\nmax_global_link_attempts = 30\n\n",
             base
         );
         loaded(&ok).validate_allowing_no_bridges().expect("should validate with caps set");
