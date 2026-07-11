@@ -361,7 +361,9 @@ and approval disclosure texts, and the `/bridge approve` outcome is posted
 publicly in the channel where it was run, so every bridged server has a
 visible record of the link and its approver. A hostable policy template lives
 at `docs/privacy-policy.md`, and `docs/nether-voicebridge-verification-runbook.md`
-covers the 100-server App Verification gate.
+covers the 100-server App Verification gate. Point end users at
+`docs/self-serve-bridging.md` — the step-by-step walkthrough of the DM `link`
+flow and the approval code, written for the people doing the linking.
 
 ### Abuse controls
 

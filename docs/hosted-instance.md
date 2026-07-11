@@ -6,11 +6,13 @@ Discord voice channel to a Matrix room, without installing or configuring
 anything yourself.
 
 > [!NOTE]
-> The hosted instance is **not open for public self-service yet** — bridges
-> are currently set up by hand, on request, in the community room. See
-> [How to request a bridge](#how-to-request-a-bridge) below. This page will
-> gain a self-serve DM flow once [open registration](../README.md#open-registration)
-> is turned on for the hosted deployment; until then, ask.
+> The hosted instance supports **self-serve bridging**: DM the bridge bot
+> (`@nether-voicebridge_bot:nether.im`) and link your own room — see the
+> **[self-serve walkthrough](self-serve-bridging.md)**. Consent is required
+> from both sides: you must be a moderator of the Matrix room, and someone
+> with Manage Server must approve the link inside Discord. Prefer a human?
+> Bridges can still be requested by hand in the community room — see
+> [How to request a bridge](#how-to-request-a-bridge) below.
 
 ## What it is
 
@@ -76,9 +78,8 @@ presence).
 1. **Invite the bridge bot** if your room is restricted or invite-only. The
    bot joins as a full appservice member — it doesn't need `guest_access` on
    the room — but a restricted/invite-only room still needs it **invited**
-   first (or added to the room's allow-space). Ask in
-   [#nether-voicebridge:nether.im](https://matrix.to/#/%23nether-voicebridge:nether.im)
-   for the bridge bot's Matrix ID to invite.
+   first (or added to the room's allow-space). The hosted instance's bridge
+   bot is `@nether-voicebridge_bot:nether.im`.
 2. **Make sure your room allows power level 0 for `org.matrix.msc3401.call.member`.**
    This is the standard Element Call setup — without it, ghosts (and, in an
    encrypted room, the E2EE subscriber) can't post their call membership, and
@@ -101,7 +102,10 @@ presence).
 
 ## How to request a bridge
 
-Ask in
+The fastest path is the **[self-serve DM flow](self-serve-bridging.md)** — DM
+`@nether-voicebridge_bot:nether.im`, run `link`, and have a Discord server
+manager approve the code. If you'd rather have a human do it (or self-serve is
+temporarily disabled), ask in
 [#nether-voicebridge:nether.im](https://matrix.to/#/%23nether-voicebridge:nether.im)
 (bridged 1:1 with the project's [Discord server](https://discord.gg/BQYxEdu7s2),
 so either side works). Please have ready:
