@@ -6,9 +6,10 @@
 //! * `audio_d2m_unenc` — DiscordSpeaker probe → ghost → MatrixListener WAV → oracle
 //! * `audio_m2d_enc`   — same as m2d in the ENCRYPTED room (the bridge must
 //!   receive the speaker's Olm-delivered media key to decrypt)
-//! * `audio_d2m_enc`   — encrypted Discord→Matrix: ghost key delivery is
-//!   asserted from logs and the audio is oracled at Tap B (the exact PCM the
-//!   ghost hands LiveKit) — a *decrypting* Matrix listener is deferred (D2.5/D3).
+//! * `audio_d2m_enc`   — encrypted Discord→Matrix, full end-to-end: a
+//!   *decrypting* Matrix listener (full synced crypto Client) records the
+//!   ghost's LiveKit track DECRYPTED and oracles it, with Tap B (the exact PCM
+//!   the ghost hands LiveKit) kept as a pre-Opus cross-check.
 //! * `audio_m2d_enc_freshjoin` — the #73 regression: the speaker streams into
 //!   the encrypted call BEFORE the bridge boots (frames beat the media key),
 //!   the one-shot heal re-subscribe must fire, and audio must cross after it.
@@ -772,7 +773,9 @@ async fn run_d2m_enc(ctx: Arc<Ctx>) -> Result<()> {
         return Err(e);
     }
 
-    let result = drive_d2m_enc(&ctx, &bridge, bridge_name, &room_b, &channel_b, seed).await;
+    // decrypting=true: this scenario's whole point is the end-to-end decrypted
+    // oracle (Tap B is kept as a pre-Opus cross-check).
+    let result = drive_d2m_enc(&ctx, &bridge, bridge_name, &room_b, &channel_b, seed, true).await;
     match result {
         Ok(()) => {
             let _ = await_quiescent(&poller, &room_b).await;
@@ -792,15 +795,22 @@ async fn drive_d2m_enc(
     room_b: &str,
     channel_b: &str,
     seed: u64,
+    decrypting: bool,
 ) -> Result<()> {
     let cfg = &ctx.cfg;
 
     // The listener carries a REAL crypto device (media_e2ee=true), so the
     // ghost's Olm key delivery targets a device that can answer /keys/claim.
-    // Its LiveKit recordings stay encrypted (decrypting listener = D2.5/D3)
-    // and are deliberately discarded — Tap B is the audio assertion here.
-    let listener =
-        MatrixListener::join(cfg, room_b, true, "nvbtest_listener", "NVB Test Listener").await?;
+    // A DECRYPTING listener additionally runs a full synced Client that decrypts
+    // the delivered key into a LiveKit KeyProvider → its recordings are
+    // cleartext PCM the oracle scores (the true end-to-end proof). A plain
+    // listener's encrypted recordings stay noise and are discarded — Tap B is
+    // then the sole audio assertion.
+    let listener = if decrypting {
+        MatrixListener::join_decrypting(cfg, room_b, "nvbtest_listener", "NVB Test Listener").await?
+    } else {
+        MatrixListener::join(cfg, room_b, true, "nvbtest_listener", "NVB Test Listener").await?
+    };
 
     let speaker_token = cfg.speaker_tokens.first().context("speaker token")?;
     let speaker_uid = decode_bot_user_id(speaker_token)
@@ -837,7 +847,9 @@ async fn drive_d2m_enc(
 
     // Leaving voice retires the ghost, whose audio pump finalizes Tap B.
     let left = speaker.leave().await;
-    let _ = listener.stop().await;
+    // Stop the listener AFTER the probe+drain completed in `outcome` — its
+    // recordings are then complete (cleartext when `decrypting`).
+    let recordings = listener.stop().await;
     let tap_b_final = bridge
         .scraper
         .await_event(Duration::from_secs(60), |e| {
@@ -849,6 +861,7 @@ async fn drive_d2m_enc(
     outcome?;
     left?;
     tap_b_final?;
+    let recordings = recordings.context("listener recordings")?;
 
     // Key-delivery health over the whole run: a cold-start "reached NO
     // recipient devices" retry or two is expected while the ghost's crypto
@@ -873,6 +886,34 @@ async fn drive_d2m_enc(
     .with_context(|| format!("reading Tap B WAV at {}", tap_b.display()))?;
     eprintln!("   Tap B: {} samples from {}", captured.len(), tap_b.display());
     oracle_assert(&ctx.artifacts, "d2m_enc_tap_b", seed, PROBE_MS, &captured)?;
+
+    // The true end-to-end proof: the DECRYPTING listener's own recording of the
+    // ghost's LiveKit track, decrypted through the full receive path (Olm key →
+    // KeyProvider → libwebrtc frame decrypt). Oracled INDEPENDENTLY of Tap B —
+    // together they prove the audio crossed AND decrypted intact.
+    if decrypting {
+        let ghost_marker = format!("@{}", cfg.ghost_prefix());
+        let decrypted = recordings
+            .iter()
+            .filter(|r| r.identity.starts_with(&ghost_marker) && !r.samples.is_empty())
+            .max_by(|a, b| {
+                nvb_audio::rms_dbfs(&a.samples)
+                    .partial_cmp(&nvb_audio::rms_dbfs(&b.samples))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .with_context(|| {
+                format!(
+                    "the decrypting listener recorded no ghost track (got: {:?})",
+                    recordings.iter().map(|r| (&r.identity, r.samples.len())).collect::<Vec<_>>()
+                )
+            })?;
+        eprintln!(
+            "   decrypted {} samples from ghost {}",
+            decrypted.samples.len(),
+            decrypted.identity
+        );
+        oracle_assert(&ctx.artifacts, "d2m_enc_decrypted", seed, PROBE_MS, &decrypted.samples)?;
+    }
 
     let errors = bridge.scraper.error_events();
     if !errors.is_empty() {
@@ -1074,7 +1115,10 @@ async fn fresh_store_pass(
         bridge.kill().await;
         return Err(e);
     }
-    let result = drive_d2m_enc(ctx, &bridge, bridge_name, room_b, channel_b, seed).await;
+    // decrypting=false: #11's concern is the re-minted device delivering keys
+    // (proven by Tap B + key logs), not the decrypt receive path — keep it on
+    // the lighter listener so it doesn't inherit Phase D's live fragility.
+    let result = drive_d2m_enc(ctx, &bridge, bridge_name, room_b, channel_b, seed, false).await;
     match result {
         Ok(()) => {
             let _ = await_quiescent(poller, room_b).await;

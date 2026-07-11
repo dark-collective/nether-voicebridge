@@ -19,10 +19,13 @@
 //!   [`TestCallHandle::kill`], which dies WITHOUT retracting).
 //! * [`join_and_subscribe`] — a **listener**: joins the call and records every
 //!   subscribed audio track to memory ([`TrackRecording`]) for the audio
-//!   oracle. In an encrypted room it bootstraps a real crypto device (so ghost
-//!   key delivery to it succeeds); *decrypting* the frames is deliberately
-//!   deferred (D2.5/D3) — encrypted recordings are undecodable noise and must
-//!   not be fed to the oracle.
+//!   oracle. In an encrypted room it bootstraps a real (send-only) crypto
+//!   device so ghost key delivery to it succeeds, but does NOT decrypt the
+//!   frames — its encrypted recordings are noise and must not be oracled.
+//! * [`join_and_subscribe_decrypting`] — the same, but runs a **full synced
+//!   matrix-sdk `Client`** whose OlmMachine decrypts the ghost's media key into
+//!   a LiveKit `KeyProvider`, so with E2EE enabled the recorded frames are
+//!   **cleartext** — the true end-to-end oracle for the encrypted D→M path.
 //!
 //! Identity notes:
 //! * The **call** device id goes into `m.call.member`, the lk-jwt request, and
@@ -50,13 +53,18 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use livekit::e2ee::key_provider::{KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions};
+use livekit::e2ee::{E2eeOptions, EncryptionType};
 use livekit::track::RemoteTrack;
 use livekit::webrtc::audio_frame::AudioFrame;
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
 use livekit::{Room, RoomEvent, RoomOptions};
+use matrix_sdk::authentication::{matrix::MatrixSession, SessionTokens};
+use matrix_sdk::config::SyncSettings;
 use matrix_sdk::ruma::events::call::member::CallMemberEventContent;
 use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedUserId, UInt};
-use tokio::sync::{mpsc, watch};
+use matrix_sdk::{Client, SessionMeta};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -663,16 +671,15 @@ pub async fn join_and_subscribe(
         let (identity, _room) = decode_jwt_claims(&jwt_resp.jwt)?;
         tracing::info!(identity = %identity, "test listener LiveKit JWT obtained");
 
-        // Default RoomOptions = auto-subscribe on; no E2eeOptions (decrypting
-        // listener is deferred — see the module doc).
-        let (room, mut events) = Room::connect(&jwt_resp.url, &jwt_resp.jwt, RoomOptions::default())
+        // Default RoomOptions = auto-subscribe on; no E2eeOptions (this plain
+        // listener does not decrypt — see [`join_and_subscribe_decrypting`]).
+        let (room, events) = Room::connect(&jwt_resp.url, &jwt_resp.jwt, RoomOptions::default())
             .await
             .context("test listener LiveKit Room::connect")?;
 
         let cancel = CancellationToken::new();
         let retract = Arc::new(AtomicBool::new(true));
         let recordings: Arc<StdMutex<Vec<TrackRecording>>> = Arc::new(StdMutex::new(Vec::new()));
-
         let task = tokio::spawn(
             {
                 let cancel = cancel.clone();
@@ -682,64 +689,7 @@ pub async fn join_and_subscribe(
                 let mxid = mxid.clone();
                 let device_id = device_id.clone();
                 async move {
-                    let mut collectors: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-                    loop {
-                        tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => break,
-                            ev = events.recv() => match ev {
-                                Some(RoomEvent::TrackSubscribed { track, participant, .. }) => {
-                                    let RemoteTrack::Audio(audio) = track else { continue };
-                                    let identity = participant.identity().to_string();
-                                    tracing::info!(identity = %identity, "test listener subscribed to track — recording");
-                                    let recordings = recordings.clone();
-                                    let ct = cancel.child_token();
-                                    collectors.push(tokio::spawn(
-                                        async move {
-                                            let mut stream = NativeAudioStream::new(
-                                                audio.rtc_track(),
-                                                SAMPLE_RATE as i32,
-                                                1,
-                                            );
-                                            let mut samples: Vec<i16> = Vec::new();
-                                            loop {
-                                                tokio::select! {
-                                                    biased;
-                                                    _ = ct.cancelled() => break,
-                                                    frame = stream.next() => match frame {
-                                                        Some(f) => samples.extend_from_slice(&f.data),
-                                                        None => break,
-                                                    },
-                                                }
-                                            }
-                                            tracing::info!(
-                                                identity = %identity,
-                                                samples = samples.len(),
-                                                "test listener track recording finished"
-                                            );
-                                            recordings
-                                                .lock()
-                                                .unwrap_or_else(PoisonError::into_inner)
-                                                .push(TrackRecording { identity, samples });
-                                        }
-                                        .in_current_span(),
-                                    ));
-                                }
-                                Some(RoomEvent::Disconnected { reason }) => {
-                                    tracing::warn!(reason = ?reason, "test listener LiveKit room disconnected");
-                                    break;
-                                }
-                                Some(other) => tracing::trace!(event = ?other, "test listener room event"),
-                                None => break,
-                            },
-                        }
-                    }
-                    // Flush every per-track collector before reading the shared vec.
-                    cancel.cancel();
-                    for c in collectors {
-                        let _ = c.await;
-                    }
-                    let _ = room.close().await;
+                    run_record_loop(room, events, cancel.clone(), recordings.clone()).await;
                     if retract.load(Ordering::SeqCst) {
                         retract_membership(&gcfg, &mxid, &device_id, &focus).await;
                     }
@@ -752,6 +702,332 @@ pub async fn join_and_subscribe(
         );
 
         tracing::info!(device_id, "test listener live (membership + auto-subscribe)");
+        Ok(TestListenerHandle {
+            mxid: mxid.clone(),
+            device_id,
+            cancel,
+            retract,
+            task,
+        })
+    }
+    .instrument(span)
+    .await
+}
+
+/// The full crypto `Client` + its sync task + sqlite store dir backing a
+/// DECRYPTING listener. Owned by the record task and torn down when it ends, so
+/// the receive-side OlmMachine keeps delivering (rotated) media keys for the
+/// whole recording.
+struct ListenerCrypto {
+    client: Client,
+    sync_task: tokio::task::JoinHandle<()>,
+    store_path: std::path::PathBuf,
+}
+
+impl ListenerCrypto {
+    async fn teardown(self) {
+        self.sync_task.abort();
+        let _ = self.sync_task.await;
+        drop(self.client);
+        if let Err(e) = std::fs::remove_dir_all(&self.store_path) {
+            tracing::debug!(error = %e, path = %self.store_path.display(), "listener crypto store cleanup failed");
+        }
+    }
+}
+
+/// The shared record loop: subscribe every remote audio track, pump each into a
+/// per-track `Vec<i16>` on the 48 kHz clock until `cancel`, then flush the
+/// collectors and close the room. The frames are cleartext whenever the caller
+/// connected `room` with E2EE enabled + the peer's key installed; identical for
+/// both listener flavours. Fills `recordings`; membership retraction + crypto
+/// teardown are the caller's (they differ per flavour).
+async fn run_record_loop(
+    room: Room,
+    mut events: mpsc::UnboundedReceiver<RoomEvent>,
+    cancel: CancellationToken,
+    recordings: Arc<StdMutex<Vec<TrackRecording>>>,
+) {
+    let mut collectors: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            ev = events.recv() => match ev {
+                Some(RoomEvent::TrackSubscribed { track, participant, .. }) => {
+                    let RemoteTrack::Audio(audio) = track else { continue };
+                    let identity = participant.identity().to_string();
+                    tracing::info!(identity = %identity, "test listener subscribed to track — recording");
+                    let recordings = recordings.clone();
+                    let ct = cancel.child_token();
+                    collectors.push(tokio::spawn(
+                        async move {
+                            let mut stream = NativeAudioStream::new(
+                                audio.rtc_track(),
+                                SAMPLE_RATE as i32,
+                                1,
+                            );
+                            let mut samples: Vec<i16> = Vec::new();
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    _ = ct.cancelled() => break,
+                                    frame = stream.next() => match frame {
+                                        Some(f) => samples.extend_from_slice(&f.data),
+                                        None => break,
+                                    },
+                                }
+                            }
+                            tracing::info!(
+                                identity = %identity,
+                                samples = samples.len(),
+                                "test listener track recording finished"
+                            );
+                            recordings
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .push(TrackRecording { identity, samples });
+                        }
+                        .in_current_span(),
+                    ));
+                }
+                Some(RoomEvent::Disconnected { reason }) => {
+                    tracing::warn!(reason = ?reason, "test listener LiveKit room disconnected");
+                    break;
+                }
+                Some(other) => tracing::trace!(event = ?other, "test listener room event"),
+                None => break,
+            },
+        }
+    }
+    // Flush every per-track collector before the caller reads the shared vec.
+    cancel.cancel();
+    for c in collectors {
+        let _ = c.await;
+    }
+    let _ = room.close().await;
+}
+
+/// Fetch this listener's OpenID token + lk-jwt and connect to LiveKit with E2EE
+/// enabled, handing `key_provider` (which must already hold the peer's media
+/// key — #73 keys-before-connect) to the frame decryptor.
+async fn connect_listener_room_e2ee(
+    gcfg: &GhostConfig,
+    focus: &LivekitFocusInfo,
+    mxid: &str,
+    device_id: &str,
+    key_provider: KeyProvider,
+) -> Result<(Room, mpsc::UnboundedReceiver<RoomEvent>)> {
+    let openid = fetch_openid_token(gcfg, mxid).await?;
+    let jwt_resp = lk_jwt::fetch_livekit_token(
+        &gcfg.http,
+        &focus.service_url,
+        &gcfg.room_id,
+        device_id,
+        &openid,
+    )
+    .await?;
+    let (identity, _room) = decode_jwt_claims(&jwt_resp.jwt)?;
+    tracing::info!(identity = %identity, "decrypting listener LiveKit JWT obtained");
+
+    let mut room_opts = RoomOptions::default();
+    room_opts.encryption = Some(E2eeOptions {
+        encryption_type: EncryptionType::Gcm,
+        key_provider,
+    });
+    let (room, events) = Room::connect(&jwt_resp.url, &jwt_resp.jwt, room_opts)
+        .await
+        .context("decrypting listener LiveKit Room::connect")?;
+    room.e2ee_manager().set_enabled(true);
+    tracing::info!("decrypting listener E2EE enabled on LiveKit room");
+    Ok((room, events))
+}
+
+/// Join the room + call as a **decrypting listener** — the true end-to-end
+/// oracle for the encrypted Discord→Matrix direction.
+///
+/// The plain [`join_and_subscribe`] bootstraps only a send-only [`GhostCrypto`]
+/// (it can answer `/keys/claim` so a ghost's Olm key send succeeds, but it runs
+/// no receive-side OlmMachine), so its encrypted frames stay ciphertext. This
+/// variant instead runs a **full synced matrix-sdk [`Client`]** as the test
+/// user: the SDK's OlmMachine decrypts the ghost's Olm-delivered
+/// `io.element.call.encryption_keys` to-device event, whose raw media key we
+/// feed into a LiveKit [`KeyProvider`] (mirroring the bridge's own subscribe
+/// path). With E2EE enabled on the room, libwebrtc then decrypts the ghost's
+/// frames before they reach the recorder → cleartext PCM the oracle can score.
+///
+/// Encrypted rooms only. Costs one full Client + sqlite crypto store + sync
+/// loop; fine for the single test listener (the #44 FD concern was N ghosts).
+pub async fn join_and_subscribe_decrypting(
+    cfg: &TestCallConfig,
+    user: &TestUser,
+) -> Result<TestListenerHandle> {
+    if !cfg.media_e2ee {
+        bail!("join_and_subscribe_decrypting is for encrypted rooms — use join_and_subscribe");
+    }
+    let mxid = user.mxid(&cfg.server_name);
+    let gcfg = build_ghost_config(cfg, &mxid)?;
+    let span = tracing::info_span!("testkit.listener.decrypting", mxid = %mxid);
+
+    async {
+        admit(&gcfg, user, &mxid).await?;
+        let focus =
+            well_known::discover_livekit_focus(&gcfg.http, &gcfg.well_known_base_url, &gcfg.room_id)
+                .await
+                .context("discovering LiveKit focus")?;
+
+        // A fresh per-run call device that is BOTH this Client's crypto device
+        // AND the membership device AND the ghost's key recipient — a single
+        // claimable identity that can also decrypt (the split GhostCrypto can't).
+        let device_id = mint_call_device_id();
+
+        // ── Full synced Client (receive-side crypto) as the test user ──
+        let store_path = std::env::temp_dir().join(format!("nvb-testkit-listener-{device_id}"));
+        let client = Client::builder()
+            .homeserver_url(&gcfg.homeserver_url)
+            .sqlite_store(&store_path, None)
+            .build()
+            .await
+            .context("building decrypting listener Client")?;
+        let access_token = crate::matrix::appservice_login_as(
+            &gcfg.homeserver_url,
+            &gcfg.as_token,
+            &user.localpart,
+            &device_id,
+        )
+        .await
+        .context("decrypting listener appservice login")?;
+        let user_id: OwnedUserId = mxid.parse().context("parsing listener mxid")?;
+        client
+            .restore_session(MatrixSession {
+                meta: SessionMeta { user_id, device_id: device_id.as_str().into() },
+                tokens: SessionTokens { access_token, refresh_token: None },
+            })
+            .await
+            .context("restoring decrypting listener session")?;
+        // First sync uploads device keys + one-time keys, so the ghost can claim
+        // an OTK and Olm-encrypt to this device the moment it sees our membership.
+        client
+            .sync_once(SyncSettings::default())
+            .await
+            .context("decrypting listener initial sync")?;
+
+        // ── KeyProvider (EC-matching HKDF/GCM) + the to-device key handler ──
+        // Options MUST match the bridge/EC exactly (salt `LKFrameEncryptionKey`,
+        // HKDF) or the derived GCM key differs → frames decrypt to noise.
+        let key_provider = KeyProvider::new(KeyProviderOptions {
+            ratchet_window_size: 16,
+            ratchet_salt: b"LKFrameEncryptionKey".to_vec(),
+            failure_tolerance: -1,
+            key_ring_size: 256,
+            key_derivation_algorithm: KeyDerivationAlgorithm::HKDF,
+        });
+        // Signalled once the first peer key is installed — we connect only after
+        // it lands so libwebrtc's inbound decryptor never sees a keyless frame
+        // (the #73 wedge). `notify_one` before the wait stores a permit, so a key
+        // that arrives early is not lost.
+        let first_key = Arc::new(Notify::new());
+        {
+            let provider = key_provider.clone();
+            let first_key = first_key.clone();
+            client.add_event_handler(
+                move |ev: matrix_sdk::ruma::events::ToDeviceEvent<keys::CallEncryptionKeysEventContent>| {
+                    let provider = provider.clone();
+                    let first_key = first_key.clone();
+                    let span = tracing::info_span!(parent: None, "testkit.listener.decrypting");
+                    async move {
+                        let sender = ev.sender.as_str().to_owned();
+                        let content = ev.content;
+                        let claimed_device_id = content.member.claimed_device_id.clone();
+                        let key_index = content.keys.index;
+                        let key_b64 = content.keys.key.clone();
+                        tracing::info!(
+                            sender = %sender,
+                            claimed_device_id = %claimed_device_id,
+                            key_index,
+                            "decrypting listener received io.element.call.encryption_keys"
+                        );
+                        if keys::install_peer_key(&sender, &claimed_device_id, key_index, &key_b64, &provider) {
+                            first_key.notify_one();
+                        }
+                    }
+                    .instrument(span)
+                },
+            );
+        }
+
+        // ── Perpetual sync drives the receive OlmMachine (delivers the key) ──
+        let sync_task = tokio::spawn(
+            {
+                let sync_client = client.clone();
+                async move {
+                    if let Err(e) = sync_client.sync(SyncSettings::default()).await {
+                        tracing::warn!(error = %e, "decrypting listener sync loop ended");
+                    }
+                }
+            }
+            .instrument(tracing::Span::current()),
+        );
+
+        // ── Membership (our Client device) makes the ghost target us ──
+        // Recipient enumeration reads room state, so posting the state membership
+        // is what makes the ghost enumerate + key this device. But in the D→M
+        // direction the ghost only PUBLISHES + sends its key once a Discord
+        // speaker is live — which happens AFTER this function returns (the
+        // scenario joins the listener, then the speaker). So the key wait +
+        // LiveKit connect are DEFERRED into the record task below; this call must
+        // return promptly (like the plain listener) or the scenario deadlocks.
+        post_membership_join(&gcfg, &mxid, &device_id, &focus).await?;
+
+        let cancel = CancellationToken::new();
+        let retract = Arc::new(AtomicBool::new(true));
+        let recordings: Arc<StdMutex<Vec<TrackRecording>>> = Arc::new(StdMutex::new(Vec::new()));
+        let crypto = ListenerCrypto { client, sync_task, store_path };
+        let task = tokio::spawn(
+            {
+                let cancel = cancel.clone();
+                let retract = retract.clone();
+                let recordings = recordings.clone();
+                let gcfg = gcfg.clone();
+                let mxid = mxid.clone();
+                let device_id = device_id.clone();
+                async move {
+                    // Wait for the ghost's first media key (delivered once a
+                    // Discord speaker goes live), THEN connect E2EE with the
+                    // provider pre-loaded — keys-before-connect (#73), so
+                    // libwebrtc's inbound decryptor never sees a keyless frame.
+                    let got_key = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => false,
+                        r = tokio::time::timeout(Duration::from_secs(120), first_key.notified()) => {
+                            if r.is_err() {
+                                tracing::error!("decrypting listener: no media key within 120s — the ghost's Olm delivery to this device failed (check /keys/claim + to-device sync)");
+                            }
+                            r.is_ok()
+                        }
+                    };
+                    if got_key {
+                        tracing::info!("decrypting listener installed first peer media key — connecting E2EE");
+                        match connect_listener_room_e2ee(&gcfg, &focus, &mxid, &device_id, key_provider).await {
+                            Ok((room, events)) => {
+                                run_record_loop(room, events, cancel.clone(), recordings.clone()).await;
+                            }
+                            Err(e) => tracing::error!(error = %e, "decrypting listener connect failed"),
+                        }
+                    }
+                    // Teardown: retract membership, stop the crypto Client + sync.
+                    if retract.load(Ordering::SeqCst) {
+                        retract_membership(&gcfg, &mxid, &device_id, &focus).await;
+                    }
+                    crypto.teardown().await;
+                    tracing::info!("decrypting test listener retired");
+                    let mut out = recordings.lock().unwrap_or_else(PoisonError::into_inner);
+                    std::mem::take(&mut *out)
+                }
+            }
+            .instrument(tracing::Span::current()),
+        );
+
+        tracing::info!(device_id, "decrypting test listener live (membership posted; E2EE connect deferred to first key)");
         Ok(TestListenerHandle {
             mxid: mxid.clone(),
             device_id,

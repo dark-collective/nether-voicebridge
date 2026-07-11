@@ -204,6 +204,24 @@ impl MatrixListener {
         Ok(Self { handle })
     }
 
+    /// Join an ENCRYPTED `room_id` as a DECRYPTING listener: runs a full synced
+    /// crypto Client so the ghost's Olm-delivered media key is decrypted and fed
+    /// to a LiveKit KeyProvider, making the recorded frames cleartext. Unlike
+    /// [`Self::join`] in an encrypted room, its recordings ARE oracle-able.
+    pub async fn join_decrypting(
+        cfg: &E2eConfig,
+        room_id: &str,
+        localpart: &str,
+        display_name: &str,
+    ) -> Result<Self> {
+        let tcfg = call_config(cfg, room_id, true)?;
+        let user = TestUser::new(localpart, display_name)?;
+        let handle = testkit::join_and_subscribe_decrypting(&tcfg, &user)
+            .await
+            .context("matrix listener join_and_subscribe_decrypting")?;
+        Ok(Self { handle })
+    }
+
     /// Stop, leave cleanly, and return everything recorded.
     pub async fn stop(self) -> Result<Vec<TrackRecording>> {
         self.handle.stop().await
