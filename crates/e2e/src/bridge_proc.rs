@@ -478,7 +478,12 @@ mod tests {
         // bot_user_id derives from the profile's sender_localpart.
         assert_eq!(m.bot_user_id, "@nether-voicebridge_bot:nether.im");
         assert_eq!(loaded.limits.max_tenants_per_owner, Some(1));
-        loaded.validate().expect("generated management/limits config validates");
+        // The harness config is a tenants-only hosting deployment (no static
+        // `[[bridge]]`), so it uses the no-bridges validation path — which still
+        // runs `validate_management` (the #76 knobs) but skips the ≥1-bridge rule.
+        loaded
+            .validate_allowing_no_bridges()
+            .expect("generated management/limits config validates");
 
         std::fs::remove_dir_all(&dir).ok();
     }
