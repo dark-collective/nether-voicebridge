@@ -3199,58 +3199,88 @@ async fn puppet_join(
         return None;
     };
 
-    // Register handlers and start playback on the Call *before* connecting: two
-    // events fire *during* `manager.join().await` and are missed if a handler is
-    // attached after the await — `DriverConnect` (our own SSRC, echo-exclusion)
-    // and `SpeakingStateUpdate` (others' SSRC→user; emitted around connect).
-    let call_lock = manager.get_or_insert(channel.guild_id);
-    let handle: Option<TrackHandle>;
-    {
-        let mut call = call_lock.lock().await;
-        call.add_global_event(
-            CoreEvent::DriverConnect.into(),
-            PuppetSsrcRegistrar {
-                bridge: channel.bridge.clone(),
-                idx,
-                exclude: channel.exclude.clone(),
-                current_ssrc: current_ssrc.clone(),
-            },
-        );
-        call.add_global_event(
-            CoreEvent::SpeakingStateUpdate.into(),
-            SpeakingLogger::new(channel.bridge.clone(), channel.ssrc_map.clone()),
-        );
-        // An unexpected DriverDisconnect drives voice recovery (rejoin), tagged
-        // with this join's `epoch` so a stale disconnect from a replaced
-        // connection is ignored. DriverReconnect/ClientDisconnect stay log-only.
-        call.add_global_event(
-            CoreEvent::DriverDisconnect.into(),
-            DriverFaultHandler {
-                bridge: channel.bridge.clone(),
-                idx,
-                guild: channel.guild_id,
-                epoch,
-                cmd_tx: cmd_tx.clone(),
-            },
-        );
-        for ev in [CoreEvent::DriverReconnect, CoreEvent::ClientDisconnect] {
+    // `manager.join()` can come back `JoinError::Dropped` ("request was
+    // cancelled/dropped") when a just-issued gateway leave's confirmation echo
+    // races the join — even a mod-KICKED connection's `remove()` sends a leave
+    // op (songbird's `remove` = `leave` + drop), so the rejoin path hits this,
+    // not only the #62 live-force-move case. `Dropped` is transient, so retry a
+    // couple times (each retry drops the half-open Call and re-registers, since
+    // `remove` takes the handlers + playback track with it) before giving up to
+    // quarantine → failover. A fresh join never races a preceding leave, so it
+    // takes the first attempt and this is behavior-identical for it.
+    const MAX_JOIN_ATTEMPTS: u32 = 3;
+    let mut attempt = 0;
+    let handle: Option<TrackHandle> = loop {
+        attempt += 1;
+        // Register handlers and start playback on the Call *before* connecting:
+        // two events fire *during* `manager.join().await` and are missed if a
+        // handler is attached after the await — `DriverConnect` (our own SSRC,
+        // echo-exclusion) and `SpeakingStateUpdate` (others' SSRC→user; emitted
+        // around connect).
+        let call_lock = manager.get_or_insert(channel.guild_id);
+        let track = {
+            let mut call = call_lock.lock().await;
             call.add_global_event(
-                ev.into(),
-                ConnectionLogger::new(channel.bridge.clone(), channel.ssrc_map.clone()),
+                CoreEvent::DriverConnect.into(),
+                PuppetSsrcRegistrar {
+                    bridge: channel.bridge.clone(),
+                    idx,
+                    exclude: channel.exclude.clone(),
+                    current_ssrc: current_ssrc.clone(),
+                },
             );
-        }
-        let source = PlaybackSource::new(mixer.clone());
-        let input = Input::from(RawAdapter::new(source, PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS));
-        handle = Some(call.play_input(input));
-    }
+            call.add_global_event(
+                CoreEvent::SpeakingStateUpdate.into(),
+                SpeakingLogger::new(channel.bridge.clone(), channel.ssrc_map.clone()),
+            );
+            // An unexpected DriverDisconnect drives voice recovery (rejoin),
+            // tagged with this join's `epoch` so a stale disconnect from a
+            // replaced connection is ignored. DriverReconnect/ClientDisconnect
+            // stay log-only.
+            call.add_global_event(
+                CoreEvent::DriverDisconnect.into(),
+                DriverFaultHandler {
+                    bridge: channel.bridge.clone(),
+                    idx,
+                    guild: channel.guild_id,
+                    epoch,
+                    cmd_tx: cmd_tx.clone(),
+                },
+            );
+            for ev in [CoreEvent::DriverReconnect, CoreEvent::ClientDisconnect] {
+                call.add_global_event(
+                    ev.into(),
+                    ConnectionLogger::new(channel.bridge.clone(), channel.ssrc_map.clone()),
+                );
+            }
+            let source = PlaybackSource::new(mixer.clone());
+            let input =
+                Input::from(RawAdapter::new(source, PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS));
+            call.play_input(input)
+        };
 
-    if let Err(e) = manager.join(channel.guild_id, channel.channel_id).await {
-        tracing::error!(idx, error = %e, "puppet failed to join voice channel");
-        // Reset the (possibly half-open) Call so a later reuse of this bot starts
-        // clean once it recovers from quarantine.
-        let _ = manager.remove(channel.guild_id).await;
-        return None;
-    }
+        match manager.join(channel.guild_id, channel.channel_id).await {
+            Ok(_) => break Some(track),
+            Err(songbird::error::JoinError::Dropped) if attempt < MAX_JOIN_ATTEMPTS => {
+                tracing::warn!(
+                    idx,
+                    attempt,
+                    "puppet join request dropped (gateway leave echo race) — retrying"
+                );
+                // Clear the half-open Call (drops the handlers + this attempt's
+                // `track`) and let the racing leave settle before retrying.
+                let _ = manager.remove(channel.guild_id).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => {
+                tracing::error!(idx, error = %e, "puppet failed to join voice channel");
+                // Reset the (possibly half-open) Call so a later reuse of this
+                // bot starts clean once it recovers from quarantine.
+                let _ = manager.remove(channel.guild_id).await;
+                return None;
+            }
+        }
+    };
 
     let nick = build_nickname(nickname_prefix, display_name);
     if let Err(e) = channel.guild_id.edit_nickname(&ctx.http, Some(nick.as_str())).await {
