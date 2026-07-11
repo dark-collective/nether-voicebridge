@@ -360,6 +360,14 @@ allowlist-only, deny-listed users are refused at the door, and
 without both `require_room_authority` and `require_discord_approval` — without
 those, any Matrix user could bridge rooms and guilds they don't control.
 
+**Invite-only middle tier (#82).** To run a closed beta rather than a fully
+public instance, set `[management] self_serve_allow` — then only those MXIDs
+(plus operators) get the self-serve tier; everyone else is ignored. The config
+value seeds `<data_dir>/self_serve_allow.toml` once; thereafter operators edit
+it live over DM with `serve-allow <@mxid>` / `serve-remove <@mxid>` (and
+`serve-open` to reopen to everyone, `serve-list` to show it). Unset ⇒ open to
+every Matrix user.
+
 For a hosted instance, set `privacy_policy_url` — it is appended to the link
 and approval disclosure texts, and the `/bridge approve` outcome is posted
 publicly in the channel where it was run, so every bridged server has a

@@ -87,6 +87,9 @@
 # #                                  # the `applications.commands` OAuth scope
 # # approval_timeout_secs = 600      # pending-link TTL
 # # approval_bot_index = 0           # which [puppets] token serves /bridge approve
+# # approval_bot_name = "Voice Bridge"  # (#80) display name of that bot, shown in the
+# #                                  # pending-code reply so a self-serve user knows which
+# #                                  # Discord bot to run /bridge approve on
 #
 # # Open registration (#43) — default false. When true, Matrix users NOT on
 # # `allow` may DM the bot (direct rooms only) and self-serve: `link` (with
@@ -94,6 +97,13 @@
 # # plus `unlink`/`list` scoped to bridges they created. ban/unban/bans stay
 # # operator-only. Pair with [limits] max_tenants_per_owner.
 # # open_registration = true
+# # self_serve_allow = ["@friend:nether.im"]  # (#82) invite-only middle tier: when set,
+# #                                  # only these MXIDs (plus operators) get the self-serve
+# #                                  # tier; everyone else is ignored. This SEEDS
+# #                                  # <data_dir>/self_serve_allow.toml once (if absent);
+# #                                  # thereafter edit it live over DM with
+# #                                  # serve-allow/serve-remove/serve-open. Absent ⇒ open to
+# #                                  # every Matrix user (the default).
 # # privacy_policy_url = "https://example.org/privacy"  # appended to link/approve
 # #                                  # disclosure texts (also link it in each Discord
 # #                                  # app's Developer-Portal privacy-policy field)

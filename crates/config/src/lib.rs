@@ -6,9 +6,14 @@ use thiserror::Error;
 
 mod banlist;
 mod optout;
+mod self_serve;
 mod tenants;
 mod tenants_edit;
 pub use banlist::{BanKind, BanList, add_ban, banlist_path, load_banlist, remove_ban};
+pub use self_serve::{
+    add_self_serve, load_self_serve_allow, open_self_serve, remove_self_serve,
+    save_self_serve_allow, self_serve_allow_path,
+};
 pub use optout::{
     ApprovalOutcome, DiscordNotice, OptoutList, add_optout, load_optout, optout_path,
     remove_optout,
@@ -406,6 +411,13 @@ pub struct ManagementConfig {
     /// scope or the command will not appear in guilds.
     #[serde(default)]
     pub approval_bot_index: usize,
+    /// Human name of the approval bot (#80), surfaced in the pending-code reply
+    /// so a self-serve user knows which Discord bot to run `/bridge approve` on.
+    /// The mgmt bot cannot learn the approval bot's live Discord username, so the
+    /// operator supplies it. Unset ⇒ the reply omits the name. Set it to the
+    /// display name of the `[puppets]` app at `approval_bot_index`.
+    #[serde(default)]
+    pub approval_bot_name: Option<String>,
     /// Open registration (#43): when `true`, Matrix users NOT on `allow` may
     /// also DM the bot (direct rooms only) and use the self-serve command
     /// subset — `link` (two-sided auth mandatory: `validate()` requires both
@@ -415,6 +427,17 @@ pub struct ManagementConfig {
     /// non-allowlisted users entirely, the pre-#43 behavior.
     #[serde(default)]
     pub open_registration: bool,
+    /// Self-serve allowlist (#82): an invite-only middle tier between operators
+    /// and fully-open registration. When present, only these MXIDs (plus
+    /// operators) get the self-serve tier under `open_registration`; everyone
+    /// else is ignored. This is a one-time SEED — at startup it is written to
+    /// `<data_dir>/self_serve_allow.toml` if that file is absent, and the file
+    /// (editable live via the `serve-allow`/`serve-remove`/`serve-open` DM
+    /// commands) is the source of truth thereafter. Absent ⇒ unrestricted (the
+    /// pre-#82 behavior: every Matrix user may self-serve when open registration
+    /// is on).
+    #[serde(default)]
+    pub self_serve_allow: Option<Vec<String>>,
     /// Public URL of the instance's privacy policy (#43 ToS follow-ups,
     /// Developer Terms §5a). When set it is appended to the `link` disclosure
     /// texts (pending-approval reply, `/bridge approve` outcome, link
@@ -1432,6 +1455,15 @@ impl Config {
             if !mxid.starts_with('@') || !mxid.contains(':') {
                 return Err(ConfigError::Validation(format!(
                     "[management]: allow entry '{mxid}' is not a full MXID \
+                     (expected @localpart:domain)"
+                )));
+            }
+        }
+        // Self-serve allowlist seed (#82): same MXID shape as `allow`.
+        for mxid in m.self_serve_allow.iter().flatten() {
+            if !mxid.starts_with('@') || !mxid.contains(':') {
+                return Err(ConfigError::Validation(format!(
+                    "[management]: self_serve_allow entry '{mxid}' is not a full MXID \
                      (expected @localpart:domain)"
                 )));
             }
@@ -2524,6 +2556,18 @@ appservice_token = "hs_tok"
         );
         let err = loaded(&raw).validate().unwrap_err();
         assert!(err.to_string().contains("not a full MXID"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn management_rejects_malformed_self_serve_allow() {
+        let mgmt = "[management]\nserver = \"nether\"\nallow = [\"@dark:nether.im\"]\nself_serve_allow = [\"notanmxid\"]\n\n";
+        let raw = format!(
+            "{}{}{mgmt}[[bridge]]\nname = \"a\"\nserver = \"nether\"\nroom_id = \"!a:nether.im\"\n[bridge.discord]\nguild_id = \"111\"\nchannel_id = \"222\"\n",
+            puppets_block(&["Bot a"]),
+            server_block("nether"),
+        );
+        let err = loaded(&raw).validate().unwrap_err();
+        assert!(err.to_string().contains("self_serve_allow entry"), "unexpected: {err}");
     }
 
     #[test]

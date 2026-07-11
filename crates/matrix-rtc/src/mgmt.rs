@@ -173,6 +173,18 @@ struct BotCtx {
     /// Open registration (#43): non-allowlisted users get the self-serve
     /// command subset (DM-only). `false` ⇒ they are ignored entirely.
     open_registration: bool,
+    /// Self-serve allowlist (#82), invite-only middle tier. `None` ⇒ unrestricted
+    /// (every Matrix user may self-serve under `open_registration`); `Some(set)`
+    /// ⇒ only these MXIDs (plus operators). Live source of truth, persisted to
+    /// `self_serve_allow_path`, edited by the `serve-*` commands. See
+    /// [`may_self_serve`](Self::may_self_serve).
+    self_serve_allow: StdMutex<Option<HashSet<String>>>,
+    /// `<data_dir>/self_serve_allow.toml` (#82) — persistence for the above.
+    self_serve_allow_path: String,
+    /// Display name of the approval bot (#80), interpolated into the pending-code
+    /// reply so the user knows which Discord bot to run `/bridge approve` on.
+    /// `None` ⇒ the reply omits the name.
+    approval_bot_name: Option<String>,
     /// `[limits] max_tenants_per_owner` — per-owner tenant cap, enforced at
     /// `link` for non-operators only. `None` ⇒ unlimited.
     max_tenants_per_owner: Option<usize>,
@@ -227,6 +239,20 @@ impl BotCtx {
     /// (when `open_registration` is on) or ignored (when off).
     fn is_operator(&self, sender: &str) -> bool {
         self.allow.contains(sender)
+    }
+
+    /// May `sender` (a NON-operator) use the self-serve tier? (#43/#82) Requires
+    /// `open_registration`, AND — when a self-serve allowlist is configured —
+    /// membership in it. `None` allowlist ⇒ unrestricted (every user). Operators
+    /// bypass this entirely (they are checked first at each call site).
+    fn may_self_serve(&self, sender: &str) -> bool {
+        self.open_registration
+            && self
+                .self_serve_allow
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .is_none_or(|set| set.contains(sender))
     }
 }
 
@@ -688,6 +714,27 @@ pub async fn run(
         }
     }
 
+    // Self-serve allowlist (#82): seed the file from the config list once (only
+    // when the file is absent — the file is the live source of truth thereafter,
+    // edited by the `serve-*` commands), then load it. `None` ⇒ unrestricted.
+    let self_serve_allow_path = nvb_config::self_serve_allow_path(&data_dir);
+    if let Some(seed) = &cfg.self_serve_allow {
+        if nvb_config::load_self_serve_allow(&self_serve_allow_path)
+            .map_err(|e| anyhow::anyhow!("reading self-serve allowlist: {e}"))?
+            .is_none()
+        {
+            nvb_config::save_self_serve_allow(&self_serve_allow_path, seed)
+                .map_err(|e| anyhow::anyhow!("seeding self-serve allowlist: {e}"))?;
+            tracing::info!(count = seed.len(), "seeded self-serve allowlist from config (#82)");
+        }
+    }
+    let self_serve_allow = nvb_config::load_self_serve_allow(&self_serve_allow_path)
+        .map_err(|e| anyhow::anyhow!("reading self-serve allowlist: {e}"))?
+        .map(|v| v.into_iter().collect::<HashSet<String>>());
+    if let Some(set) = &self_serve_allow {
+        tracing::info!(count = set.len(), "self-serve allowlist active — invite-only tier (#82)");
+    }
+
     let ctx = Arc::new(BotCtx {
         own_user: bot_user_id.clone(),
         allow: cfg.allow.iter().cloned().collect(),
@@ -713,6 +760,9 @@ pub async fn run(
             .then(|| Duration::from_secs(cfg.approval_timeout_secs)),
         pending: StdMutex::new(HashMap::new()),
         open_registration: cfg.open_registration,
+        self_serve_allow: StdMutex::new(self_serve_allow),
+        self_serve_allow_path,
+        approval_bot_name: cfg.approval_bot_name.clone(),
         max_tenants_per_owner: limits.max_tenants_per_owner,
         max_tenants_per_guild: limits.max_tenants_per_guild,
         link_attempt_budget: limits.link_attempt_budget(),
@@ -806,8 +856,8 @@ pub async fn run(
             }
             let MessageType::Text(text) = &ev.content.msgtype else { return };
             let sender = ev.sender.as_str();
-            if !ctx.is_operator(sender) && !ctx.open_registration {
-                tracing::debug!(sender = %ev.sender, "ignoring message from non-allowlisted user");
+            if !ctx.is_operator(sender) && !ctx.may_self_serve(sender) {
+                tracing::debug!(sender = %ev.sender, "ignoring message from non-self-serve user");
                 return;
             }
             match parse_command(&text.body) {
@@ -922,7 +972,7 @@ async fn handle_invite(ctx: &BotCtx, invite: Option<&InviteDetails>, room: &Room
             }));
             true
         }
-        Some(i) if ctx.open_registration => {
+        Some(i) if ctx.may_self_serve(&i.sender) => {
             let banned = match nvb_config::load_banlist(&ctx.banlist_path) {
                 Ok(bans) => bans.contains(BanKind::Owner, &i.sender),
                 // Fail closed, same posture as `link`.
@@ -1102,6 +1152,16 @@ enum Command {
     Reports {
         count: usize,
     },
+    /// Self-serve allowlist edits (#82) — operator-only. `SelfServe` carries the
+    /// verb (`allow`/`remove`/`open`/`list`) + optional MXID arg.
+    ServeAllow {
+        mxid: String,
+    },
+    ServeRemove {
+        mxid: String,
+    },
+    ServeOpen,
+    ServeList,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1117,6 +1177,8 @@ const LINK_USAGE: &str = "Usage: `link <name> <matrix-room-id> <discord-guild-id
 const UNLINK_USAGE: &str = "Usage: `unlink <name>`";
 const BAN_USAGE: &str =
     "Usage: `ban <owner|guild|room> <value>` — e.g. `ban owner @evil:example.org`, `ban guild 123456`, `ban room !abc:example.org`. Banning also unlinks every matching tenant.";
+const SERVE_USAGE: &str =
+    "Usage: `serve-allow <@mxid:server>` / `serve-remove <@mxid:server>` — restrict self-serve to an allowlist (#82). `serve-open` reverts to open (everyone). `serve-list` shows the current list.";
 const UNBAN_USAGE: &str = "Usage: `unban <owner|guild|room> <value>`";
 const REPORT_USAGE: &str = "Usage: `report <owner|guild|room> <value> [reason]` — flag an abusive bridge for an operator to review, e.g. `report guild 123456 harassing users`. This does not remove the bridge; an operator decides.";
 const REPORTS_USAGE: &str = "Usage: `reports [count]` — show the most recent abuse reports (default 10).";
@@ -1128,7 +1190,7 @@ const REPORT_REASON_MAX: usize = 280;
 const DEFAULT_REPORTS: usize = 10;
 const MAX_REPORTS: usize = 50;
 
-const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridges (static + tenants) and whether they are running\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server] — bridge a Discord voice channel to a Matrix room\n  unlink <name> — remove a bridge created with link\n  ban <owner|guild|room> <value> — deny-list an owner MXID / Discord guild / Matrix room AND unlink every matching tenant\n  unban <owner|guild|room> <value> — remove a ban\n  bans — show the deny-lists\n  report <owner|guild|room> <value> [reason] — file an abuse report (recorded, not acted on)\n  reports [count] — show recent abuse reports, each with the `ban` to run\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridges (static + tenants) and whether they are running\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server] — bridge a Discord voice channel to a Matrix room\n  unlink <name> — remove a bridge created with link\n  ban <owner|guild|room> <value> — deny-list an owner MXID / Discord guild / Matrix room AND unlink every matching tenant\n  unban <owner|guild|room> <value> — remove a ban\n  bans — show the deny-lists\n  report <owner|guild|room> <value> [reason] — file an abuse report (recorded, not acted on)\n  reports [count] — show recent abuse reports, each with the `ban` to run\n  serve-allow <@mxid> / serve-remove <@mxid> — restrict the self-serve tier to an allowlist; serve-open reopens to everyone; serve-list shows it\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
 
 /// Help for self-serve users (#43): only the verbs they may run, plus the
 /// consent flow they will hit.
@@ -1213,6 +1275,22 @@ fn parse_command(body: &str) -> Parsed {
             },
             _ => Parsed::Usage(REPORTS_USAGE.to_string()),
         },
+        "serve-allow" => match args {
+            [mxid] => Parsed::Cmd(Command::ServeAllow { mxid: mxid.clone() }),
+            _ => Parsed::Usage(SERVE_USAGE.to_string()),
+        },
+        "serve-remove" => match args {
+            [mxid] => Parsed::Cmd(Command::ServeRemove { mxid: mxid.clone() }),
+            _ => Parsed::Usage(SERVE_USAGE.to_string()),
+        },
+        "serve-open" => match args {
+            [] => Parsed::Cmd(Command::ServeOpen),
+            _ => Parsed::Usage("Usage: `serve-open`".to_string()),
+        },
+        "serve-list" => match args {
+            [] => Parsed::Cmd(Command::ServeList),
+            _ => Parsed::Usage("Usage: `serve-list`".to_string()),
+        },
         _ => Parsed::Unknown,
     }
 }
@@ -1276,6 +1354,10 @@ async fn handle_command(ctx: &BotCtx, room: &Room, sender: &str, cmd: Command) {
             handle_report(ctx, room, sender, &kind, &value, reason.as_deref()).await
         }
         Command::Reports { count } => handle_reports(ctx, room, count).await,
+        Command::ServeAllow { mxid } => handle_serve_allow(ctx, room, sender, &mxid).await,
+        Command::ServeRemove { mxid } => handle_serve_remove(ctx, room, sender, &mxid).await,
+        Command::ServeOpen => handle_serve_open(ctx, room, sender).await,
+        Command::ServeList => handle_serve_list(ctx, room).await,
     }
 }
 
@@ -2019,10 +2101,19 @@ async fn handle_link(
                     "name": name, "room_id": room_id, "guild_id": guild_id,
                     "channel_id": channel_id, "code": code,
                 }));
+                // Name the approval bot when the operator configured it (#80) —
+                // the mgmt bot can't learn its live Discord username.
+                let bot_clause = match &ctx.approval_bot_name {
+                    Some(n) => format!("on the **{n}** bot"),
+                    None => "on this instance's bridge bot".to_string(),
+                };
                 reply(room, &format!(
                     "⏳ All room checks passed — Discord-side approval required.\n\
-                     Have someone with **Manage Server** permission in Discord guild {guild_id} run:\n\
+                     Have someone with **Manage Server** in Discord guild {guild_id} run:\n\
                      `/bridge approve code:{code}`\n\
+                     Run it {bot_clause}. If the `/bridge` command doesn't appear there, that \
+                     bot's application must be invited to the guild with the \
+                     `applications.commands` scope.\n\
                      The code expires in {} minutes; nothing is written until it is approved.{}",
                     ttl.as_secs().div_ceil(60),
                     ctx.policy_line()
@@ -2470,6 +2561,102 @@ async fn handle_bans(ctx: &BotCtx, room: &Room) {
     }
 }
 
+// ---- self-serve allowlist commands (#82, operator-only) ----
+
+/// Reload the in-memory self-serve allowlist from the file after an edit (#82),
+/// so [`BotCtx::may_self_serve`] reflects the change immediately.
+fn refresh_self_serve(ctx: &BotCtx) {
+    match nvb_config::load_self_serve_allow(&ctx.self_serve_allow_path) {
+        Ok(loaded) => {
+            *ctx.self_serve_allow.lock().unwrap_or_else(PoisonError::into_inner) =
+                loaded.map(|v| v.into_iter().collect());
+        }
+        Err(e) => tracing::error!(error = %e, "failed to reload self-serve allowlist after edit"),
+    }
+}
+
+fn self_serve_count(ctx: &BotCtx) -> Option<usize> {
+    ctx.self_serve_allow
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map(|s| s.len())
+}
+
+async fn handle_serve_allow(ctx: &BotCtx, room: &Room, sender: &str, mxid: &str) {
+    if !mxid.starts_with('@') || !mxid.contains(':') {
+        reply(room, &format!("'{mxid}' is not a full MXID (expected @localpart:server).")).await;
+        return;
+    }
+    let _guard = ctx.mutate_lock.lock().await;
+    match nvb_config::add_self_serve(&ctx.self_serve_allow_path, mxid) {
+        Ok(changed) => {
+            refresh_self_serve(ctx);
+            audit(ctx, sender, "serve_allow", serde_json::json!({ "mxid": mxid, "added": changed }));
+            let n = self_serve_count(ctx).unwrap_or(0);
+            reply(room, &format!(
+                "✅ `{mxid}` may now use self-serve. The self-serve tier is restricted to {n} user(s) (plus operators) — `serve-open` reopens it to everyone."
+            ))
+            .await;
+        }
+        Err(e) => reply(room, &format!("Cannot write the self-serve allowlist: {e}")).await,
+    }
+}
+
+async fn handle_serve_remove(ctx: &BotCtx, room: &Room, sender: &str, mxid: &str) {
+    let _guard = ctx.mutate_lock.lock().await;
+    match nvb_config::remove_self_serve(&ctx.self_serve_allow_path, mxid) {
+        Ok(true) => {
+            refresh_self_serve(ctx);
+            audit(ctx, sender, "serve_remove", serde_json::json!({ "mxid": mxid }));
+            reply(room, &format!(
+                "✅ `{mxid}` removed from the self-serve allowlist. (The list stays in force — `serve-open` to reopen to everyone.)"
+            ))
+            .await;
+        }
+        Ok(false) => {
+            reply(room, &format!(
+                "`{mxid}` was not on the allowlist (or self-serve is already open to everyone)."
+            ))
+            .await;
+        }
+        Err(e) => reply(room, &format!("Cannot write the self-serve allowlist: {e}")).await,
+    }
+}
+
+async fn handle_serve_open(ctx: &BotCtx, room: &Room, sender: &str) {
+    let _guard = ctx.mutate_lock.lock().await;
+    match nvb_config::open_self_serve(&ctx.self_serve_allow_path) {
+        Ok(was_restricted) => {
+            refresh_self_serve(ctx);
+            audit(ctx, sender, "serve_open", serde_json::json!({ "was_restricted": was_restricted }));
+            if was_restricted {
+                reply(room, "🔓 Self-serve is now OPEN to every Matrix user (allowlist removed).").await;
+            } else {
+                reply(room, "Self-serve was already open to everyone.").await;
+            }
+        }
+        Err(e) => reply(room, &format!("Cannot remove the self-serve allowlist: {e}")).await,
+    }
+}
+
+async fn handle_serve_list(ctx: &BotCtx, room: &Room) {
+    match nvb_config::load_self_serve_allow(&ctx.self_serve_allow_path) {
+        Ok(None) => {
+            reply(room, "Self-serve is OPEN — every Matrix user may self-serve (when open_registration is on).").await
+        }
+        Ok(Some(list)) if list.is_empty() => {
+            reply(room, "Self-serve is RESTRICTED but the allowlist is empty — only operators may self-serve. Add users with `serve-allow`.").await
+        }
+        Ok(Some(mut list)) => {
+            list.sort();
+            let lines: Vec<String> = list.iter().map(|m| format!("• {m}")).collect();
+            reply(room, &format!("Self-serve allowlist ({}):\n{}", list.len(), lines.join("\n"))).await;
+        }
+        Err(e) => reply(room, &format!("Cannot read the self-serve allowlist: {e}")).await,
+    }
+}
+
 /// The `report` command (#78 Need 2): let anyone who can reach the bot flag an
 /// abusive bridge. A report is *reactive tooling* — it never acts on its own
 /// (auto-banning on untrusted input would itself be an abuse vector). It is
@@ -2795,6 +2982,47 @@ mod tests {
         assert!(matches!(parse_command("ban owner"), Parsed::Usage(_)));
         assert!(matches!(parse_command("ban a b c"), Parsed::Usage(_)));
         assert!(matches!(parse_command("bans now"), Parsed::Usage(_)));
+    }
+
+    #[test]
+    fn parses_serve_commands() {
+        assert_eq!(
+            parse_command("serve-allow @a:x"),
+            Parsed::Cmd(Command::ServeAllow { mxid: "@a:x".into() })
+        );
+        assert_eq!(
+            parse_command("serve-remove @a:x"),
+            Parsed::Cmd(Command::ServeRemove { mxid: "@a:x".into() })
+        );
+        assert_eq!(parse_command("serve-open"), Parsed::Cmd(Command::ServeOpen));
+        assert_eq!(parse_command("serve-list"), Parsed::Cmd(Command::ServeList));
+        assert!(matches!(parse_command("serve-allow"), Parsed::Usage(_)));
+        assert!(matches!(parse_command("serve-open now"), Parsed::Usage(_)));
+        // The serve-* commands are operator-only (not in the self-serve tier).
+        assert!(!allowed_for_self_serve(&Command::ServeOpen));
+        assert!(!allowed_for_self_serve(&Command::ServeList));
+        assert!(!allowed_for_self_serve(&Command::ServeAllow { mxid: "@a:x".into() }));
+    }
+
+    #[test]
+    fn may_self_serve_respects_open_reg_and_allowlist() {
+        let dir = test_data_dir();
+        let (mut ctx, _rx) = approval_ctx(&dir, Duration::from_secs(600));
+        // open_registration = true, allowlist None ⇒ unrestricted.
+        assert!(ctx.may_self_serve("@anyone:x"));
+        // Restrict to a set.
+        *ctx.self_serve_allow.lock().unwrap() =
+            Some(["@a:x".to_string()].into_iter().collect());
+        assert!(ctx.may_self_serve("@a:x"));
+        assert!(!ctx.may_self_serve("@b:x"));
+        // A present-but-empty list ⇒ only operators self-serve (nobody here).
+        *ctx.self_serve_allow.lock().unwrap() = Some(HashSet::new());
+        assert!(!ctx.may_self_serve("@a:x"));
+        // open_registration off ⇒ never, regardless of the list.
+        ctx.open_registration = false;
+        *ctx.self_serve_allow.lock().unwrap() = None;
+        assert!(!ctx.may_self_serve("@a:x"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3337,6 +3565,9 @@ mod tests {
             approval_ttl: Some(ttl),
             pending: StdMutex::new(HashMap::new()),
             open_registration: true,
+            self_serve_allow: StdMutex::new(None),
+            self_serve_allow_path: format!("{d}/self_serve_allow.toml"),
+            approval_bot_name: None,
             max_tenants_per_owner: Some(1),
             max_tenants_per_guild: None,
             link_attempt_budget: None,
