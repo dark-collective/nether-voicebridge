@@ -11,8 +11,13 @@
 //!   notices and rejoins the assigned channel. Guards the #62 fix
 //!   (v0.3.0-alpha.11); the original catalogue listed this as the #62
 //!   KnownFail, filed before that fix landed.
+//! * `recovery_no_spare` — the same voice-kick as `external_disconnect_recovery`
+//!   but with a **1-bot pool**, so there is no spare to fail over to: recovery
+//!   MUST be a same-bot rejoin or the channel goes dead. Guards the severe case
+//!   of the #81 `JoinError::Dropped` rejoin-race fix (retry-on-Dropped), which
+//!   the 3-bot variant can mask by failing over to another bot.
 //!
-//! Both run with prod up (dedicated harness bots + the nvbtest appservice).
+//! All run with prod up (dedicated harness bots + the nvbtest appservice).
 
 use super::audio::{
     DRAIN, PROBE_MS, SETTLE, await_quiescent, loudest, oracle_assert, puppet_ids,
@@ -40,6 +45,14 @@ pub static FORCE_MOVE_RECOVERY: ScenarioDef = ScenarioDef {
     expectation: Expectation::Pass,
     run: |ctx| Box::pin(run_force_move_recovery(ctx)),
 };
+/// A mod voice-kick in a NO-SPARE guild (1-bot pool) — recovery MUST be a
+/// same-bot rejoin (no other bot to fail over to). Guards the #81
+/// `JoinError::Dropped` rejoin-race fix's severe case.
+pub static RECOVERY_NO_SPARE: ScenarioDef = ScenarioDef {
+    name: "recovery_no_spare",
+    expectation: Expectation::Pass,
+    run: |ctx| Box::pin(run_recovery_no_spare(ctx)),
+};
 
 /// The recovery-claim log (`puppet.rs`, shared by the `DriverDropped` and
 /// `VerifyConnected` paths) — the bridge NOTICED the adversarial event.
@@ -66,7 +79,54 @@ async fn run_external_disconnect_recovery(ctx: Arc<Ctx>) -> Result<()> {
         return Err(e);
     }
 
-    let result = drive_disconnect_recovery(&ctx, &bridge, bridge_name, seed, targets).await;
+    let result =
+        drive_disconnect_recovery(&ctx, &bridge, bridge_name, seed, targets, "disconnect_recovery")
+            .await;
+    match result {
+        Ok(()) => {
+            let _ = await_quiescent(&poller, &cfg.room_a).await;
+            bridge.sigterm_and_wait(Duration::from_secs(20)).await.context("SIGTERM drain")
+        }
+        Err(e) => {
+            bridge.kill().await;
+            Err(e)
+        }
+    }
+}
+
+// ─── recovery_no_spare (guards the #81 rejoin-race fix's severe case) ─────────────
+
+async fn run_recovery_no_spare(ctx: Arc<Ctx>) -> Result<()> {
+    let cfg = &ctx.cfg;
+    let bridge_name = "Auto Test 01";
+    let seed = 0xD35A;
+    let poller = RoomStatePoller::new(cfg)?;
+    let targets = puppet_ids(cfg)?;
+    sweep_test_memberships(cfg, &poller, &cfg.room_a).await?;
+
+    let tenants = tenant_entry(bridge_name, &cfg.room_a, &cfg.guild_id, &cfg.channel_a);
+    // A 1-bot pool: there is NO spare to fail over to, so a failed rejoin leaves
+    // the speaker with no puppet at all (dead channel). The only way to pass is
+    // a working same-bot rejoin — the exact severe case the #81 JoinError::Dropped
+    // retry fix addresses, and which the 3-bot external_disconnect_recovery can
+    // mask by failing over.
+    let bridge = BridgeUnderTest::start_with_pool_size(
+        cfg,
+        ctx.profile,
+        &tenants,
+        &ctx.artifacts.join("bridge"),
+        1,
+    )
+    .await
+    .context("starting bridge-under-test")?;
+    if let Err(e) = bridge.await_ready(&[bridge_name], Duration::from_secs(120)).await {
+        bridge.kill().await;
+        return Err(e);
+    }
+
+    let result =
+        drive_disconnect_recovery(&ctx, &bridge, bridge_name, seed, targets, "recovery_no_spare")
+            .await;
     match result {
         Ok(()) => {
             let _ = await_quiescent(&poller, &cfg.room_a).await;
@@ -85,6 +145,7 @@ async fn drive_disconnect_recovery(
     bridge_name: &str,
     seed: u64,
     targets: HashSet<u64>,
+    label: &str,
 ) -> Result<()> {
     let cfg = &ctx.cfg;
     let moderator = DiscordMod::connect(cfg.mod_token()?, &cfg.guild_id).await?;
@@ -97,7 +158,10 @@ async fn drive_disconnect_recovery(
         targets,
     )
     .await?;
-    let outcome = async {
+    // The driven block returns the pre-kick puppet id so the audio oracle below
+    // can assert the recovery was a SAME-bot rejoin (the recorded bot == the
+    // kicked bot), not a failover to a different bot.
+    let outcome: Result<u64> = async {
         listener.join().await?;
 
         let speaker =
@@ -146,21 +210,26 @@ async fn drive_disconnect_recovery(
             speaker.speak_probe(seed, PROBE_MS).await?;
             tokio::time::sleep(Duration::from_millis(PROBE_MS as u64)).await;
             tokio::time::sleep(DRAIN).await;
-            Ok::<(), anyhow::Error>(())
+            Ok::<u64, anyhow::Error>(puppet)
         }
         .await;
         speaker.leave().await;
-        driven?;
-        Ok::<(), anyhow::Error>(())
+        driven
     }
     .await;
     let recordings = listener.stop().await;
-    outcome?;
+    let puppet = outcome?;
 
     let (uid, captured) = loudest(recordings)
         .context("the Discord listener recorded nothing from any puppet")?;
     eprintln!("   recorded {} samples from puppet {uid}", captured.len());
-    oracle_assert(&ctx.artifacts, "disconnect_recovery", seed, PROBE_MS, &captured)?;
+    if uid != puppet {
+        bail!(
+            "post-recovery audio came from bot {uid}, not the kicked puppet {puppet} — \
+             recovery used a different bot, not a same-bot rejoin"
+        );
+    }
+    oracle_assert(&ctx.artifacts, label, seed, PROBE_MS, &captured)?;
 
     let errors = bridge.scraper.error_events();
     if !errors.is_empty() {

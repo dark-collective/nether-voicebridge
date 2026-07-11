@@ -28,6 +28,7 @@ pub fn all() -> Vec<&'static ScenarioDef> {
         &audio::GHOST_SESSION_ROTATION,
         &moderation::EXTERNAL_DISCONNECT_RECOVERY,
         &moderation::FORCE_MOVE_RECOVERY,
+        &moderation::RECOVERY_NO_SPARE,
         &lifecycle::REAP_RELEASE,
         &lifecycle::LEAVE_GRACE_DEBOUNCE,
         &overflow_fcfs::OVERFLOW_FCFS_PROMOTION,
