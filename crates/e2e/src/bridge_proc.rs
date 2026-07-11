@@ -237,7 +237,12 @@ impl BridgeUnderTest {
         let secrets_dir = secrets_dir_for(workdir);
         tokio::fs::create_dir_all(&secrets_dir).await.context("creating bridge secrets dir")?;
         let config_path = secrets_dir.join("config.toml");
-        tokio::fs::write(&config_path, render_config(cfg, management)).await?;
+        let real_config = if management {
+            generate_config_with_management(cfg)
+        } else {
+            generate_config(cfg)
+        };
+        tokio::fs::write(&config_path, real_config).await?;
         tokio::fs::write(
             workdir.join("config.redacted.toml"),
             generate_config_redacted(cfg, management),

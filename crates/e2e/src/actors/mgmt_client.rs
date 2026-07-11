@@ -62,10 +62,6 @@ impl MatrixManagementClient {
         Ok(me)
     }
 
-    pub fn mxid(&self) -> &str {
-        &self.mxid
-    }
-
     /// Idempotent appservice register (`M_USER_IN_USE` is success — the
     /// standing `nvbtest_*` users persist across runs).
     async fn register_user(&self, localpart: &str) -> Result<()> {
@@ -287,7 +283,7 @@ impl MatrixManagementClient {
             if ev["event_id"].as_str() == Some(after_event) {
                 break; // reached our command — everything after is the reply set
             }
-            if ev["type"] == "m.room.message" && ev["sender"].as_str() == Some(&self.bot_mxid) {
+            if ev["type"] == "m.room.message" && ev["sender"].as_str() == Some(self.bot_mxid.as_str()) {
                 if let Some(body) = ev["content"]["body"].as_str() {
                     replies.push(body.to_owned());
                 }
