@@ -251,6 +251,40 @@ pub(super) fn oracle_assert(
     Ok(())
 }
 
+/// The inverse of [`oracle_assert`]: assert `captured` does NOT contain the
+/// probe for `seed` — the #15 `multi_bridge_isolation` cross-talk guard ("bridge
+/// A's channel never carries bridge C's probe"). A single global alignment is
+/// enough here: a matching stream locks near-perfectly (ncc → ~0.9+), while an
+/// unrelated/silent stream sits far below, so `max_ncc` (~0.35) separates them
+/// with wide margin. Writes the same `_absent.wav` for triage.
+pub(super) fn oracle_absent(
+    artifacts: &Path,
+    label: &str,
+    seed: u64,
+    probe_ms: u32,
+    captured: &[i16],
+    max_ncc: f32,
+) -> Result<()> {
+    let probe = synth_probe_mono_48k(seed, probe_ms);
+    if let Some(p) = artifacts.join(format!("{label}_absent.wav")).to_str() {
+        let _ = nvb_audio::wav::write_wav_mono_48k(p, captured);
+    }
+    let rep = compare_mono_48k(&probe, captured, &oracle_cfg());
+    eprintln!(
+        "   oracle-absent[{label}]: ncc={:.3} (ceiling {max_ncc:.2}) → {}",
+        rep.ncc,
+        if rep.ncc < max_ncc { "ABSENT (ok)" } else { "PRESENT (cross-talk!)" },
+    );
+    if rep.ncc >= max_ncc {
+        bail!(
+            "cross-talk detected for {label}: probe seed {seed:#x} correlated at \
+             ncc={:.3} (ceiling {max_ncc:.2}) — audio leaked across bridges (WAV in artifacts)",
+            rep.ncc,
+        );
+    }
+    Ok(())
+}
+
 /// Retract any `m.call.member` a prior crashed run's `@nvbtest_*` participant
 /// left behind (the bridge's own startup sweep only clears ITS ghosts). A
 /// stale test membership would flip the bridge call-active at boot and skew

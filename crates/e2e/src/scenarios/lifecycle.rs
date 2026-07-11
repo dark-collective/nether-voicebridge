@@ -295,7 +295,7 @@ fn skip_unless_real(ctx: &Ctx, name: &str, why: &str) -> bool {
 
 /// Poll until one of `ids` is in ANY voice channel of the test guild, returning
 /// its user id (`None`-returning cache misses keep polling, #72 F6-3).
-async fn await_puppet_present(
+pub(super) async fn await_puppet_present(
     probe: &ConnCountProbe,
     ids: &HashSet<u64>,
     timeout: Duration,
