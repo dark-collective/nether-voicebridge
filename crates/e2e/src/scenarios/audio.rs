@@ -1036,18 +1036,16 @@ async fn run_shutdown_drain(ctx: Arc<Ctx>) -> Result<()> {
     }
 
     // ── Baseline: no puppet lingers in Discord voice after the drain ─────────
-    // Generous window: SIGTERM tears the process down milliseconds after the
-    // puppet's songbird leave, so the ACTIVE capture anchor's voice-leave may
-    // not flush to Discord's gateway before exit — Discord then clears its voice
-    // state via the RTC keepalive timeout (~90 s) rather than promptly. The
-    // bridge's own "puppet left voice and released" + "all bridges drained
-    // cleanly" (asserted above) prove the drain issued the leave; this only
-    // confirms Discord eventually reflects baseline. (Prompter flush-on-shutdown
-    // is a bridge follow-up, tracked separately.)
+    // The drain now keeps the puppet clients polled a bounded moment after
+    // queuing each voice-leave so the gateway frame flushes before exit (#74),
+    // so Discord reflects baseline promptly instead of clearing the active
+    // anchor via its ~90 s RTC keepalive. A 30 s window keeps generous margin
+    // for gateway/cache propagation without masking a regression back to the
+    // keepalive-timeout behaviour.
     let probe =
         ConnCountProbe::connect(cfg.speaker_tokens.last().context("probe token")?, &cfg.guild_id)
             .await?;
-    let baseline = probe.await_baseline(&targets, Duration::from_secs(150)).await;
+    let baseline = probe.await_baseline(&targets, Duration::from_secs(30)).await;
     probe.shutdown().await;
     baseline?;
 

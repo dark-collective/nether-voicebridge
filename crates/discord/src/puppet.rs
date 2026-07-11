@@ -94,6 +94,14 @@ const GATE_HANGOVER: Duration = Duration::from_millis(250);
 /// it is carrying more than one Matrix speaker (members beyond the puppet count).
 const OVERFLOW_LABEL: &str = "Overflow";
 
+/// On graceful shutdown the drain queues each puppet's voice-leave (an Op4
+/// voice-state-update) to its gateway shard, but dropping the clients on return
+/// kills the websocket before the frame flushes — Discord then clears the bot
+/// via its ~90 s RTC keepalive instead of promptly (#74). Keep the clients
+/// polled this long after the leaves are queued so the frames go out. Bounded
+/// well under the supervisor's teardown timeout.
+const VOICE_LEAVE_FLUSH_GRACE: Duration = Duration::from_millis(1000);
+
 /// Discord's hard cap on guild nicknames (Unicode characters).
 const NICKNAME_MAX_CHARS: usize = 32;
 
@@ -723,6 +731,16 @@ impl SharedPool {
                     tracing::warn!(error = %e, "a puppet client exited during drain");
                 }
             }
+        }
+        // The voice-leaves are queued to each shard's gateway sender but not yet
+        // flushed over the websocket; returning now drops the clients and kills
+        // the sockets before Discord sees them (#74 — an active anchor lingers
+        // ~90 s on the RTC keepalive). Keep the clients POLLED a bounded moment
+        // so the frames flush. A client exiting on its own during the grace is
+        // fine (nothing left to drain).
+        tokio::select! {
+            _ = tokio::time::sleep(VOICE_LEAVE_FLUSH_GRACE) => {}
+            _ = &mut clients => {}
         }
         sweeper.abort();
         Ok(())
