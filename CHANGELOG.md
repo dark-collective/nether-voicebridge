@@ -3,7 +3,7 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0-alpha.16] - 2026-07-11
 
 ### Added
 - **Abuse observability + report path for open registration (#78).** Reactive
