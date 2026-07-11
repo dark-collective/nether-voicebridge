@@ -385,7 +385,10 @@ visible record of the link and its approver. A hostable policy template lives
 at `docs/privacy-policy.md`, and `docs/nether-voicebridge-verification-runbook.md`
 covers the 100-server App Verification gate. Point end users at
 `docs/self-serve-bridging.md` — the step-by-step walkthrough of the DM `link`
-flow and the approval code, written for the people doing the linking.
+flow and the approval code, written for the people doing the linking — and set
+`docs_url` to wherever you host that walkthrough: it is appended to the bot's
+DM greeting, `help`, and the errors the guide explains, so someone who
+discovers the bot cold can find their way to the instructions (#92).
 
 ### Abuse controls
 

@@ -445,6 +445,13 @@ pub struct ManagementConfig {
     /// privacy-policy field — that part can't be automated.
     #[serde(default)]
     pub privacy_policy_url: Option<String>,
+    /// Public URL of the instance's user guide (#92). When set it is appended
+    /// to the DM greeting, `help`, the pending-approval reply, and the
+    /// probe/shape errors whose fixes the guide walks through — so a user who
+    /// discovers the bot cold can find the walkthrough (how to get IDs, the
+    /// puppet invite links, the power-level setup).
+    #[serde(default)]
+    pub docs_url: Option<String>,
     // --- resolved from the referenced [server.<name>] profile ---
     #[serde(default)]
     pub homeserver_url: String,

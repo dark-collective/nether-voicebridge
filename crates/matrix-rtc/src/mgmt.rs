@@ -208,6 +208,9 @@ struct BotCtx {
     /// Public privacy-policy URL (#43 ToS follow-ups): appended to the `link`
     /// disclosure texts when configured.
     privacy_policy_url: Option<String>,
+    /// Public user-guide URL (#92): appended to the greeting, `help`, and the
+    /// replies whose fix lives in the guide.
+    docs_url: Option<String>,
     /// Disclosure notices to the Discord pool (#64): posted into a bridged
     /// voice channel's text chat by the command bot. Best-effort.
     notice_tx: Option<mpsc::UnboundedSender<DiscordNotice>>,
@@ -221,6 +224,12 @@ impl BotCtx {
             .as_deref()
             .map(|u| format!("\nPrivacy policy: {u}"))
             .unwrap_or_default()
+    }
+
+    /// `"\nGuide: <url>"` when configured, else empty — appended to the
+    /// greeting, `help`, and the replies whose fix the guide explains (#92).
+    fn docs_line(&self) -> String {
+        docs_line(self.docs_url.as_deref())
     }
 
     /// Post a disclosure notice into a Discord channel via the pool's command
@@ -770,6 +779,7 @@ pub async fn run(
         global_link_budget: limits.global_link_budget(),
         global_link_attempts: StdMutex::new(Vec::new()),
         privacy_policy_url: cfg.privacy_policy_url.clone(),
+        docs_url: cfg.docs_url.clone(),
         notice_tx: pool_io.notice_tx,
     });
 
@@ -1056,7 +1066,7 @@ async fn handle_invite(ctx: &BotCtx, invite: Option<&InviteDetails>, room: &Room
     )
     .await
     {
-        Ok(Ok(())) => greet_when_joined(room.clone()),
+        Ok(Ok(())) => greet_when_joined(room.clone(), ctx.docs_url.clone()),
         Ok(Err(e)) => {
             tracing::error!(room_id = %room_id, error = %e, "failed to join invited room")
         }
@@ -1068,7 +1078,7 @@ async fn handle_invite(ctx: &BotCtx, invite: Option<&InviteDetails>, room: &Room
 /// (the appservice-asserted join is a raw HTTP call, so the `Room` stays in
 /// Invited state until the next sync — sending immediately would fail).
 /// Detached + best-effort: the greeting is a nicety, `help` always works.
-fn greet_when_joined(room: Room) {
+fn greet_when_joined(room: Room, docs_url: Option<String>) {
     tokio::spawn(async move {
         for delay in [1u64, 3, 10] {
             tokio::time::sleep(Duration::from_secs(delay)).await;
@@ -1086,13 +1096,23 @@ fn greet_when_joined(room: Room) {
                         }
                         return;
                     }
-                    reply(&r, "👋 Voice bridge management — send `help` for commands.").await;
+                    reply(&r, &format!(
+                        "👋 I link Discord voice channels to Matrix rooms so both sides can talk. Send `help` for commands.{}",
+                        docs_line(docs_url.as_deref())
+                    ))
+                    .await;
                     return;
                 }
             }
         }
         tracing::warn!(room_id = %room.room_id(), "room never reached joined state — skipping greeting");
     });
+}
+
+/// `"\nGuide: <url>"` when a docs url is configured, else empty (#92). Free
+/// function so the ctx-less greeting task can use it too.
+fn docs_line(url: Option<&str>) -> String {
+    url.map(|u| format!("\nGuide: {u}")).unwrap_or_default()
 }
 
 /// Best-effort reply into `room` (the SDK encrypts automatically in an
@@ -1336,7 +1356,7 @@ async fn handle_command(ctx: &BotCtx, room: &Room, sender: &str, cmd: Command) {
         Command::Help => {
             let text =
                 if ctx.is_operator(sender) { HELP_TEXT } else { SELF_SERVE_HELP_TEXT };
-            reply(room, text).await
+            reply(room, &format!("{text}{}", ctx.docs_line())).await
         }
         Command::List => handle_list(ctx, room, sender).await,
         Command::Unlink { name } => handle_unlink(ctx, room, sender, &name).await,
@@ -1672,8 +1692,8 @@ async fn probe_after_join(
         return Err(format!(
             "❌ The room's power levels block the bridge: posting `{CALL_MEMBER_EVENT}` needs power level {}, but the bridge's ghost users join at level {} — Matrix would never see the Discord side of the call.\n\
              Fix: start an Element Call in the room once (that sets the level), or via /devtools set `events[\"{CALL_MEMBER_EVENT}\"] = 0` in `m.room.power_levels`. Element's \"Roles & Permissions\" UI shows \"Default\" either way, so check the raw event.\n\
-             Nothing was written.",
-            check.required, check.ghost_pl
+             Nothing was written.{}",
+            check.required, check.ghost_pl, ctx.docs_line()
         ));
     }
 
@@ -1849,11 +1869,11 @@ async fn handle_link(
         return;
     }
     if !room_id.starts_with('!') || !room_id.contains(':') {
-        reply(room, &format!("'{room_id}' does not look like a Matrix room id (expected `!localpart:domain`). Use the room's internal id, not an alias.")).await;
+        reply(room, &format!("'{room_id}' does not look like a Matrix room id (expected `!localpart:domain`). Use the room's internal id, not an alias (Element: room Settings → Advanced → \"Internal room ID\").{}", ctx.docs_line())).await;
         return;
     }
     if !is_numeric_id(&guild_id) || !is_numeric_id(&channel_id) {
-        reply(room, "Discord guild and channel ids must be numeric snowflakes (Server Settings → enable Developer Mode → right-click → Copy ID).").await;
+        reply(room, &format!("Discord guild and channel ids must be numeric snowflakes (in Discord, enable User Settings → Advanced → Developer Mode, then right-click the server / channel → Copy ID).{}", ctx.docs_line())).await;
         return;
     }
     let server = match server {
@@ -2114,8 +2134,9 @@ async fn handle_link(
                      Run it {bot_clause}. If the `/bridge` command doesn't appear there, that \
                      bot's application must be invited to the guild with the \
                      `applications.commands` scope.\n\
-                     The code expires in {} minutes; nothing is written until it is approved.{}",
+                     The code expires in {} minutes; nothing is written until it is approved.{}{}",
                     ttl.as_secs().div_ceil(60),
+                    ctx.docs_line(),
                     ctx.policy_line()
                 ))
                 .await;
@@ -2811,6 +2832,18 @@ fn is_numeric_id(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docs_line_present_and_absent() {
+        // Unset ⇒ empty, so every reply that appends it is byte-identical to
+        // the pre-#92 text.
+        assert_eq!(docs_line(None), "");
+        // Set ⇒ a leading-newline suffix, safe to append mid-reply.
+        assert_eq!(
+            docs_line(Some("https://example.test/guide")),
+            "\nGuide: https://example.test/guide"
+        );
+    }
 
     #[test]
     fn command_room_is_dm_only() {

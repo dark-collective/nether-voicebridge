@@ -107,6 +107,10 @@
 # # privacy_policy_url = "https://example.org/privacy"  # appended to link/approve
 # #                                  # disclosure texts (also link it in each Discord
 # #                                  # app's Developer-Portal privacy-policy field)
+# # docs_url = "https://example.org/bridge-guide"  # (#92) user-guide URL appended to
+# #                                  # the DM greeting, `help`, the pending-approval
+# #                                  # reply, and the errors the guide explains (IDs,
+# #                                  # power levels) — gives cold DMers a way in
 
 # ── Admission limits (optional) ──────────────────────────────────────────────
 # Hard caps for a hosted deployment (#47). Every field is optional; an absent

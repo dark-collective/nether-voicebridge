@@ -116,6 +116,10 @@ fn management_and_limits_block(cfg: &E2eConfig) -> String {
     out.push_str("open_registration = true\n");
     out.push_str("approval_timeout_secs = 300\n");
     out.push_str("approval_bot_index = 0\n");
+    // #92 docs_url: exercised live (appended to greeting/help/pending replies);
+    // the scenario's substring asserts all match mid-string, so appending is
+    // invisible to them.
+    out.push_str("docs_url = \"https://nether.wiki/matrix/voice-bridge/\"\n");
     out
 }
 
