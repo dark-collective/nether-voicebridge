@@ -54,13 +54,13 @@ speak in a guild it has actually joined). Invite **every** bot below if you
 want the full pool available to your server; inviting only some partitions
 your server to a smaller slice of it.
 
-- Puppet bot 1: <!-- TODO(operator): insert OAuth2 invite URL for bot 1 -->
-- Puppet bot 2: <!-- TODO(operator): insert OAuth2 invite URL for bot 2 -->
-<!-- TODO(operator): add one bullet + placeholder per bot in the live hosted
-     pool (matching config.toml's [puppets].tokens count), and replace each
-     placeholder with that application's real client id via the URL template
-     in docs/discord-bot-setup.md#3-generate-the-oauth2-invite-url. Do not
-     invent client ids. -->
+- [Voice Bridge 01](https://discord.com/oauth2/authorize?client_id=1515386525653930055&permissions=103809024&integration_type=0&scope=bot)
+- [Voice Bridge 02](https://discord.com/oauth2/authorize?client_id=1515387208046088364&permissions=103809024&integration_type=0&scope=bot)
+- [Voice Bridge 03](https://discord.com/oauth2/authorize?client_id=1515738552007135282&permissions=103809024&integration_type=0&scope=bot)
+- [Voice Bridge 04](https://discord.com/oauth2/authorize?client_id=1523341447959543910&permissions=103809024&integration_type=0&scope=bot)
+- [Voice Bridge 05](https://discord.com/oauth2/authorize?client_id=1522762904233967716&permissions=103809024&integration_type=0&scope=bot)
+- [Voice Bridge 06](https://discord.com/oauth2/authorize?client_id=1522762505842065549&permissions=103809024&integration_type=0&scope=bot)
+- [Voice Bridge 07](https://discord.com/oauth2/authorize?client_id=1522763042654257173&permissions=103809024&integration_type=0&scope=bot)
 
 Each link is a standard Discord OAuth2 `bot`-scope invite pre-scoped to:
 
