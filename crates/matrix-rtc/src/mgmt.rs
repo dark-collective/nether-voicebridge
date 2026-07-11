@@ -1160,14 +1160,18 @@ struct ProbeReport {
 /// `Err` carries the complete user-facing reply text — probe failures are
 /// operator errors, not bugs, so they go to the DM rather than the log.
 ///
-/// Side effect: the join probe (deliberately idempotent with the later bridge
-/// spawn) leaves the bot joined to the room even when a later probe fails.
-/// That is harmless — a retried `link` reuses the membership, and the bridge
-/// needs it anyway. (`unlink` never leaves rooms either; out of scope here.)
 /// `authority_sender`: when set (two-sided link auth, #47), the probe also
 /// verifies that this MXID is a joined member of the room with power level ≥
 /// the room's `state_default` — an operator allowlist entry alone no longer
 /// authorizes bridging an arbitrary room.
+///
+/// The probe must JOIN the room to read its state, but on the untrusted
+/// open-registration surface that join must not be permanent for a link that
+/// never proceeds (#79): a hostile `link` naming a room the sender has no power
+/// in would otherwise pin the shared bridge bot into arbitrary rooms across the
+/// federation. So any failure AFTER the join reaps the membership via
+/// [`appservice_leave_room`] (best-effort) before returning; only a probe that
+/// fully succeeds (→ pending mint or commit) retains the join the bridge needs.
 async fn probe_room_prereqs(
     ctx: &BotCtx,
     room_id: &str,
@@ -1188,6 +1192,7 @@ async fn probe_room_prereqs(
     {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
+            // The join itself failed → nothing to leave.
             return Err(format!(
                 "❌ The bridge bot could not join {room_id}: {e}\n\
                  If the room is invite-only or restricted, invite {} to it first, then run `link` again.\n\
@@ -1203,6 +1208,34 @@ async fn probe_room_prereqs(
         }
     }
 
+    // The bot is now joined. Run the remaining prerequisite checks; if any
+    // fails, leave the room so an unauthorized/abandoned `link` cannot pin the
+    // shared bot there (#79). A fully-successful probe keeps the join.
+    let result = probe_after_join(ctx, room_id, guild_id, authority_sender).await;
+    if result.is_err() {
+        match crate::matrix::appservice_leave_room(
+            &ctx.homeserver_url,
+            &ctx.appservice_token,
+            room_id,
+            ctx.own_user.as_str(),
+        )
+        .await
+        {
+            Ok(()) => tracing::info!(room_id, "left room after a failed link probe (#79 — no membership retained)"),
+            Err(e) => tracing::warn!(room_id, error = %e, "failed to leave room after a failed link probe (#79)"),
+        }
+    }
+    result
+}
+
+/// The post-join prerequisite checks, split out so [`probe_room_prereqs`] can
+/// reap the probe membership on any failure here (#79).
+async fn probe_after_join(
+    ctx: &BotCtx,
+    room_id: &str,
+    guild_id: &str,
+    authority_sender: Option<&str>,
+) -> Result<ProbeReport, String> {
     // 2. Power levels (hard): a room that blocks ghosts from posting
     // `org.matrix.msc3401.call.member` silently breaks the Discord→Matrix
     // direction, so refuse to link it. Must run after the join (a non-member
@@ -1499,8 +1532,11 @@ async fn handle_link(
     // Per-guild tenant cap (#77 anti-Sybil): self-serve users only. The Discord
     // Manage-Server gate is the strongest anti-Sybil anchor, so cap by the guild
     // being targeted — a federation-reachable owner MXID is throwaway, a real
-    // guild is not. Pending links to the guild count too (a Sybil could park
-    // cap-dodging approvals otherwise), matching the per-owner rule.
+    // guild is not. Committed tenants for the guild count regardless of owner;
+    // pending links count only for THIS requester (#79): a pending guild_id is
+    // attacker-supplied and unproven until Discord approval, so counting a third
+    // party's pendings would let anyone park links on a victim guild's public
+    // snowflake and block its legitimate admin from onboarding.
     if let (false, Some(cap)) = (ctx.is_operator(sender), ctx.max_tenants_per_guild) {
         let existing = match nvb_config::tenant_guilds(&ctx.tenants_path) {
             Ok(entries) => entries
@@ -1514,7 +1550,9 @@ async fn handle_link(
         };
         let pending = {
             let map = ctx.pending.lock().unwrap_or_else(PoisonError::into_inner);
-            map.values().filter(|p| p.tenant.guild_id == guild_id).count()
+            map.values()
+                .filter(|p| p.tenant.guild_id == guild_id && p.requester == sender)
+                .count()
         };
         if existing + pending >= cap {
             audit(ctx, sender, "link_rejected", serde_json::json!({

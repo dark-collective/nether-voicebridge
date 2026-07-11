@@ -1477,6 +1477,31 @@ impl Config {
                     .to_string(),
             ));
         }
+        // Anti-abuse budgets are mandatory on the untrusted public surface (#79):
+        // open_registration exposes a DM command path to any (federated) Matrix
+        // user, so shipping it without admission caps leaves zero velocity
+        // limiting against a Sybil swarm. Require the caps that bound per-owner
+        // and per-guild growth and the link-attempt velocity budget.
+        if m.open_registration {
+            let l = &self.limits;
+            let missing: Vec<&str> = [
+                ("max_tenants_per_owner", l.max_tenants_per_owner.is_none()),
+                ("max_tenants_per_guild", l.max_tenants_per_guild.is_none()),
+                ("max_link_attempts", l.max_link_attempts.is_none()),
+            ]
+            .into_iter()
+            .filter_map(|(field, unset)| unset.then_some(field))
+            .collect();
+            if !missing.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "[management]: open_registration exposes an untrusted public DM surface, \
+                     so [limits] must set anti-abuse budgets — missing: {}. Recommended: \
+                     max_tenants_per_owner = 2, max_tenants_per_guild = 3, \
+                     max_link_attempts = 5, and mgmt_cooldown_secs = 30.",
+                    missing.join(", ")
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -2427,6 +2452,29 @@ appservice_token = "hs_tok"
         let m = cfg.management.as_ref().unwrap();
         assert_eq!(m.bot_user_id, "@voicebridge_bot:nether.im");
         cfg.validate().expect("should validate");
+    }
+
+    #[test]
+    fn open_registration_requires_anti_abuse_limits() {
+        // open_registration with two-sided auth but NO [limits] caps is refused
+        // (#79): the public DM surface must ship with admission budgets.
+        let base = format!(
+            "{}{}[management]\nallow = [\"@dark:nether.im\"]\nrequire_room_authority = true\nrequire_discord_approval = true\nopen_registration = true\n\n",
+            puppets_block(&["Bot a"]),
+            server_block("nether"),
+        );
+        let err = loaded(&base).validate_allowing_no_bridges().unwrap_err();
+        assert!(
+            err.to_string().contains("anti-abuse budgets")
+                && err.to_string().contains("max_tenants_per_owner"),
+            "unexpected: {err}"
+        );
+        // Adding the three required caps makes it validate.
+        let ok = format!(
+            "{}[limits]\nmax_tenants_per_owner = 2\nmax_tenants_per_guild = 3\nmax_link_attempts = 5\n\n",
+            base
+        );
+        loaded(&ok).validate_allowing_no_bridges().expect("should validate with caps set");
     }
 
     #[test]
