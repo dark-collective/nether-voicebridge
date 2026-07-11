@@ -151,6 +151,9 @@ struct BotCtx {
     cooldown: Option<Duration>,
     /// Last state-change attempt per operator MXID, for the cooldown gate.
     mutate_stamps: StdMutex<HashMap<String, Instant>>,
+    /// Last accepted-invite time per inviter MXID, for the per-sender invite
+    /// cooldown (#89a) — reuses the `cooldown` duration (`mgmt_cooldown_secs`).
+    invite_stamps: StdMutex<HashMap<String, Instant>>,
     /// `<data_dir>/banlist.toml` (#47 abuse controls) — deny-lists enforced by
     /// `link` and edited by `ban`/`unban`.
     banlist_path: String,
@@ -236,12 +239,27 @@ struct PendingLink {
     /// Probe warnings, carried into the eventual success reply.
     warnings: Vec<String>,
     created: Instant,
+    /// Whether the `link` probe CREATED the bot's membership of `tenant.room_id`
+    /// (#87). When this pending expires unapproved, the maintenance sweep may
+    /// leave that room — but only if `probe_joined` (a bridge's room, which the
+    /// bot was already in, is never reaped).
+    probe_joined: bool,
 }
 
 /// Cap on simultaneously pending links: bounds memory against a `link` spammer
 /// (each entry is tiny, so this is generous) while leaving room for honest
 /// concurrent onboarding.
 const PENDING_LINK_CAP: usize = 16;
+
+/// How often the management bot runs its maintenance sweep (#87/#89b): reap
+/// rooms left behind by abandoned pending links and empty DM rooms. Not urgent —
+/// pending links are already bounded by [`PENDING_LINK_CAP`] — so a slow tick.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Most pending links one homeserver's users may hold at once (#88). Bounds
+/// concentration of the shared [`PENDING_LINK_CAP`] table by a federated Sybil
+/// set sharing one homeserver; the home server (invite-gated) is exempt.
+const PER_DOMAIN_PENDING_CAP: usize = 3;
 
 /// Code alphabet: uppercase alphanumerics minus the ambiguous 0/O/1/I — codes
 /// are relayed human-to-human across two chat systems.
@@ -323,6 +341,107 @@ fn take_pending(
     Ok(p)
 }
 
+/// Decide which rooms a maintenance sweep should reap (#87): for each EXPIRED
+/// pending link the probe joined, the room may be left — unless a running bridge
+/// still holds it (`safe_rooms`) or another LIVE (non-expired) pending still
+/// targets it. Returns `(codes_to_prune, rooms_to_leave)`; all expired codes are
+/// pruned, only probe-created & unused rooms are left. Pure, for unit testing —
+/// the caller performs the map mutation and the best-effort leaves.
+fn abandoned_probe_rooms(
+    pending: &HashMap<String, PendingLink>,
+    safe_rooms: &HashSet<String>,
+    now: Instant,
+    ttl: Duration,
+) -> (Vec<String>, Vec<String>) {
+    let expired = |p: &PendingLink| now.saturating_duration_since(p.created) >= ttl;
+    let live_rooms: HashSet<&str> = pending
+        .values()
+        .filter(|p| !expired(p))
+        .map(|p| p.tenant.room_id.as_str())
+        .collect();
+    let mut prune = Vec::new();
+    let mut leave = Vec::new();
+    for (code, p) in pending {
+        if !expired(p) {
+            continue;
+        }
+        prune.push(code.clone());
+        let room = &p.tenant.room_id;
+        if p.probe_joined
+            && !safe_rooms.contains(room)
+            && !live_rooms.contains(room.as_str())
+            && !leave.contains(room)
+        {
+            leave.push(room.clone());
+        }
+    }
+    (prune, leave)
+}
+
+/// The homeserver domain of a full MXID (`@user:example.org` → `example.org`),
+/// or `None` if it isn't `@localpart:domain`-shaped (#88).
+fn mxid_domain(mxid: &str) -> Option<&str> {
+    mxid.strip_prefix('@')?.split_once(':').map(|(_, d)| d)
+}
+
+/// One management-bot maintenance sweep (#87/#89b): leave rooms left behind by
+/// abandoned pending links and empty DM rooms — never a room a bridge holds.
+/// Best-effort; the whole sweep is skipped if the running-bridge set can't be
+/// read (fail-safe, the lesson from the alpha.16 revert).
+async fn run_maintenance(ctx: &BotCtx, client: &Client) {
+    let Some(statuses) = query_status(ctx).await else {
+        tracing::debug!("maintenance: supervisor did not answer — skipping sweep");
+        return;
+    };
+    // Never leave a room with a bridge: the running set (static + tenant) unioned
+    // with the configured tenant rooms (covers a tenant momentarily not running).
+    let mut safe_rooms: HashSet<String> = statuses.into_iter().map(|s| s.room_id).collect();
+    if let Ok(rooms) = nvb_config::tenant_rooms(&ctx.tenants_path) {
+        safe_rooms.extend(rooms);
+    }
+
+    // #87: reap rooms from expired, unapproved, probe-created pending links.
+    if let Some(ttl) = ctx.approval_ttl {
+        let leave = {
+            let mut map = ctx.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            let (prune, leave) = abandoned_probe_rooms(&map, &safe_rooms, Instant::now(), ttl);
+            for code in prune {
+                map.remove(&code);
+            }
+            leave
+        };
+        for room in leave {
+            leave_room_best_effort(ctx, &room, "abandoned pending link (#87)").await;
+        }
+    }
+
+    // #89b: leave DM rooms that are now empty (only the bot remains), unless a
+    // bridge holds them.
+    for room in client.joined_rooms() {
+        if room.joined_members_count() <= 1 {
+            let id = room.room_id().as_str();
+            if !safe_rooms.contains(id) {
+                leave_room_best_effort(ctx, id, "empty DM room (#89b)").await;
+            }
+        }
+    }
+}
+
+/// Best-effort appservice leave with a uniform log line (#87/#89b).
+async fn leave_room_best_effort(ctx: &BotCtx, room_id: &str, reason: &str) {
+    match crate::matrix::appservice_leave_room(
+        &ctx.homeserver_url,
+        &ctx.appservice_token,
+        room_id,
+        ctx.own_user.as_str(),
+    )
+    .await
+    {
+        Ok(()) => tracing::info!(room_id, reason, "maintenance: left room"),
+        Err(e) => tracing::warn!(room_id, reason, error = %e, "maintenance: failed to leave room"),
+    }
+}
+
 impl BotCtx {
     /// The `link`/`unlink` rate gate (#47): `Some(remaining_secs)` ⇒ `sender`
     /// is still cooling down (nothing stamped); `None` ⇒ allowed, and this
@@ -338,6 +457,22 @@ impl BotCtx {
         let now = Instant::now();
         // Lazy sweep (#84): drop stamps older than the cooldown so the map can't
         // grow unbounded keyed by throwaway MXIDs on the open surface.
+        prune_stale_stamps(&mut stamps, now, cooldown);
+        cooldown_check(&mut stamps, sender, now, cooldown)
+    }
+
+    /// Per-sender invite cooldown (#89a): `Some(remaining_secs)` ⇒ `sender` sent
+    /// an accepted invite too recently (nothing stamped); `None` ⇒ allowed and
+    /// stamped. Reuses the `mgmt_cooldown_secs` duration and the same lazy sweep
+    /// as [`mutate_cooldown`]; a separate map so invites and commands don't share
+    /// one budget. `None` when the cooldown is unset (unlimited).
+    fn invite_cooldown(&self, sender: &str) -> Option<u64> {
+        let cooldown = self.cooldown?;
+        let mut stamps = self
+            .invite_stamps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
         prune_stale_stamps(&mut stamps, now, cooldown);
         cooldown_check(&mut stamps, sender, now, cooldown)
     }
@@ -568,6 +703,7 @@ pub async fn run(
         mutate_lock: tokio::sync::Mutex::new(()),
         cooldown: limits.mgmt_cooldown_secs.map(Duration::from_secs),
         mutate_stamps: StdMutex::new(HashMap::new()),
+        invite_stamps: StdMutex::new(HashMap::new()),
         banlist_path: nvb_config::banlist_path(&data_dir),
         audit_path: format!("{}/audit.jsonl", data_dir.trim_end_matches('/')),
         require_room_authority: cfg.require_room_authority,
@@ -601,6 +737,26 @@ pub async fn run(
                         Some(approval) => handle_discord_approval(&ctx, &client, approval).await,
                         None => break,
                     }
+                }
+            }
+        });
+    }
+
+    // Periodic maintenance (#87/#89b): reap rooms left behind by abandoned pending
+    // links and empty DM rooms. Only the open-registration surface accumulates
+    // these (strangers probing / abandoning), so it's scoped there.
+    if ctx.open_registration {
+        let ctx = ctx.clone();
+        let client = client.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(MAINTENANCE_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    _ = tick.tick() => run_maintenance(&ctx, &client).await,
                 }
             }
         });
@@ -820,6 +976,23 @@ async fn handle_invite(ctx: &BotCtx, invite: Option<&InviteDetails>, room: &Room
             tracing::warn!(room_id = %room_id, error = %e, "failed to reject invite");
         }
         return;
+    }
+    // Per-sender invite cooldown (#89a): a self-serve user can't churn invite
+    // auto-joins (each grows the bot's joined-room set). Operators exempt; inert
+    // when `mgmt_cooldown_secs` is unset.
+    if let Some(i) = invite {
+        if !ctx.is_operator(&i.sender) {
+            if let Some(remaining) = ctx.invite_cooldown(&i.sender) {
+                tracing::info!(room_id = %room_id, inviter = %i.sender, remaining, "invite cooldown — declining self-serve invite (#89a)");
+                audit(ctx, &i.sender, "invite_rejected", serde_json::json!({
+                    "room_id": room_id.as_str(), "reason": "cooldown",
+                }));
+                if let Err(e) = room.leave().await {
+                    tracing::warn!(room_id = %room_id, error = %e, "failed to decline cooled-down invite");
+                }
+                return;
+            }
+        }
     }
     match tokio::time::timeout(
         Duration::from_secs(30),
@@ -1236,6 +1409,10 @@ fn pl_int(v: &serde_json::Value) -> Option<i64> {
 /// startup a legitimately-invited guild may not be known yet).
 struct ProbeReport {
     warnings: Vec<String>,
+    /// Whether the bot was ALREADY a member before the probe joined the room
+    /// (#87). `false` ⇒ the probe created the membership, so an abandoned pending
+    /// link may later reap it; `true` ⇒ a running bridge holds it, never reap.
+    already_member: bool,
 }
 
 /// Run every room/guild prerequisite probe BEFORE tenants.toml is touched.
@@ -1304,21 +1481,30 @@ async fn probe_room_prereqs(
 
     // Run the post-join checks; on failure, reap the membership only if the
     // probe created it (#83) — a room with an active bridge stays joined.
-    let result = probe_after_join(ctx, room_id, guild_id, authority_sender).await;
-    if result.is_err() && !already_member {
-        match crate::matrix::appservice_leave_room(
-            &ctx.homeserver_url,
-            &ctx.appservice_token,
-            room_id,
-            ctx.own_user.as_str(),
-        )
-        .await
-        {
-            Ok(()) => tracing::info!(room_id, "left room after a failed link probe (#83 — probe-created join reaped)"),
-            Err(e) => tracing::warn!(room_id, error = %e, "failed to leave room after a failed link probe (#83)"),
+    match probe_after_join(ctx, room_id, guild_id, authority_sender).await {
+        Ok(mut report) => {
+            // Carry whether the probe created the join, so an abandoned pending
+            // link can later reap the room but never a bridge's room (#87).
+            report.already_member = already_member;
+            Ok(report)
+        }
+        Err(msg) => {
+            if !already_member {
+                match crate::matrix::appservice_leave_room(
+                    &ctx.homeserver_url,
+                    &ctx.appservice_token,
+                    room_id,
+                    ctx.own_user.as_str(),
+                )
+                .await
+                {
+                    Ok(()) => tracing::info!(room_id, "left room after a failed link probe (#83 — probe-created join reaped)"),
+                    Err(e) => tracing::warn!(room_id, error = %e, "failed to leave room after a failed link probe (#83)"),
+                }
+            }
+            Err(msg)
         }
     }
-    result
 }
 
 /// The post-join prerequisite checks, split out so [`probe_room_prereqs`] can
@@ -1459,7 +1645,8 @@ async fn probe_after_join(
         )),
     }
 
-    Ok(ProbeReport { warnings })
+    // `already_member` is filled in by `probe_room_prereqs` (which knows it).
+    Ok(ProbeReport { warnings, already_member: false })
 }
 
 async fn handle_list(ctx: &BotCtx, room: &Room, sender: &str) {
@@ -1661,6 +1848,35 @@ async fn handle_link(
         }
     }
 
+    // Per-foreign-domain pending cap (#88): bound how much of the shared pending
+    // table one homeserver's users can hold, so a federated-MXID Sybil set can't
+    // concentrate it and starve honest onboarding. The home server is exempt —
+    // it is invite-gated (not a Sybil vector) and capping it would throttle
+    // legitimate concurrent onboarding.
+    if !ctx.is_operator(sender) {
+        if let Some(domain) = mxid_domain(sender) {
+            if domain != ctx.own_user.server_name().as_str() {
+                let pending = {
+                    let map = ctx.pending.lock().unwrap_or_else(PoisonError::into_inner);
+                    map.values()
+                        .filter(|p| mxid_domain(&p.requester) == Some(domain))
+                        .count()
+                };
+                if pending >= PER_DOMAIN_PENDING_CAP {
+                    audit(ctx, sender, "link_rejected", serde_json::json!({
+                        "name": name, "reason": "domain pending cap",
+                        "domain": domain, "pending": pending, "cap": PER_DOMAIN_PENDING_CAP,
+                    }));
+                    reply(room, &format!(
+                        "⏳ Too many links from your homeserver are awaiting approval ({pending}) — try again once some are approved or expire."
+                    ))
+                    .await;
+                    return;
+                }
+            }
+        }
+    }
+
     // Rate gate (#47): past the cheap shape checks (a typo doesn't burn the
     // budget), before the expensive probes and the state change they precede.
     if let Some(remaining) = ctx.mutate_cooldown(sender) {
@@ -1741,6 +1957,7 @@ async fn handle_link(
             tenant,
             requester: sender.to_owned(),
             origin_room: room.room_id().to_owned(),
+            probe_joined: !report.already_member,
             warnings: report.warnings,
             created: Instant::now(),
         };
@@ -2424,6 +2641,44 @@ mod tests {
     }
 
     #[test]
+    fn mxid_domain_extraction() {
+        assert_eq!(mxid_domain("@user:example.org"), Some("example.org"));
+        assert_eq!(mxid_domain("@bot:nether.im"), Some("nether.im"));
+        // split_once on the first ':' keeps a port/path in the domain part.
+        assert_eq!(mxid_domain("@a:b:c"), Some("b:c"));
+        assert_eq!(mxid_domain("nocolon"), None);
+        assert_eq!(mxid_domain("user:example.org"), None); // no leading '@'
+        assert_eq!(mxid_domain("@nodomain"), None);
+    }
+
+    #[test]
+    fn abandoned_probe_rooms_reaps_only_expired_probe_created_unbridged() {
+        let ttl = Duration::from_secs(600);
+        // Build with additive offsets so we never subtract from `Instant::now()`.
+        let base = Instant::now();
+        let now = base + Duration::from_secs(700); // 700 ≥ ttl ⇒ `base` entries are expired
+        let live = base + Duration::from_secs(695); // age 5 s ⇒ not expired
+        let mk = |room: &str, probe_joined: bool, created: Instant| {
+            let mut p = test_pending("111", created);
+            p.tenant.room_id = room.to_string();
+            p.probe_joined = probe_joined;
+            p
+        };
+        let mut map = HashMap::new();
+        map.insert("EXP_PROBE".to_string(), mk("!reap:x", true, base)); // → leave
+        map.insert("EXP_NOTPROBE".to_string(), mk("!wasthere:x", false, base)); // prune only (bot already there)
+        map.insert("EXP_SAFE".to_string(), mk("!bridged:x", true, base)); // prune only (bridged)
+        map.insert("LIVE".to_string(), mk("!livermtwin:x", true, live)); // kept (not expired)
+        map.insert("EXP_LIVE_TWIN".to_string(), mk("!livermtwin:x", true, base)); // prune only (room still live-pending)
+
+        let safe: HashSet<String> = ["!bridged:x".to_string()].into_iter().collect();
+        let (mut prune, leave) = abandoned_probe_rooms(&map, &safe, now, ttl);
+        prune.sort();
+        assert_eq!(prune, vec!["EXP_LIVE_TWIN", "EXP_NOTPROBE", "EXP_PROBE", "EXP_SAFE"]);
+        assert_eq!(leave, vec!["!reap:x".to_string()]);
+    }
+
+    #[test]
     fn audit_rotates_only_past_the_size_cap() {
         let dir = test_data_dir();
         let path = format!("{}/audit.jsonl", dir.to_str().unwrap());
@@ -2843,6 +3098,7 @@ mod tests {
             origin_room: "!dm:x".try_into().unwrap(),
             warnings: Vec::new(),
             created,
+            probe_joined: true,
         }
     }
 
@@ -2964,6 +3220,7 @@ mod tests {
             mutate_lock: tokio::sync::Mutex::new(()),
             cooldown: None,
             mutate_stamps: StdMutex::new(HashMap::new()),
+        invite_stamps: StdMutex::new(HashMap::new()),
             banlist_path: nvb_config::banlist_path(d),
             audit_path: format!("{d}/audit.jsonl"),
             require_room_authority: true,

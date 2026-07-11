@@ -17,7 +17,7 @@ pub use tenants::{TenantsFile, list_tenant_names, load_tenants, tenants_path};
 pub use tenants_edit::{
     NewTenant, PriorContent, add_tenant_entry, remove_tenant_entries_matching,
     remove_tenant_entry, restore_tenants_file, tenant_discord_channel, tenant_guilds,
-    tenant_owners,
+    tenant_owners, tenant_rooms,
 };
 
 #[derive(Debug, Error)]

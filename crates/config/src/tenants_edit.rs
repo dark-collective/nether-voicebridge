@@ -198,6 +198,24 @@ pub fn tenant_guilds(path: &str) -> Result<Vec<(String, Option<String>)>, Config
     Ok(out)
 }
 
+/// The Matrix `room_id` of every `[[bridge]]` tenant entry, in file order (#87).
+/// Read-only; a missing file is an empty list. The management-bot maintenance
+/// sweep unions this with the running-bridge set so it never leaves a configured
+/// tenant's room even when that bridge is momentarily not running.
+pub fn tenant_rooms(path: &str) -> Result<Vec<String>, ConfigError> {
+    let prior = read_prior(path)?;
+    let doc = parse_doc(prior.as_deref())?;
+    let mut out = Vec::new();
+    if let Some(arr) = doc.get("bridge").and_then(|b| b.as_array_of_tables()) {
+        for t in arr {
+            if let Some(room) = t.get("room_id").and_then(|v| v.as_str()) {
+                out.push(room.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The Discord channel id recorded on the `[[bridge]]` entry named `name`
 /// (`None` = no such entry, or a hand-written entry without one). Read-only;
 /// the unlink disclosure notice (#64) targets this channel.
