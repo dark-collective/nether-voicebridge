@@ -2421,6 +2421,15 @@ impl EventHandler for PuppetHandler {
 /// for interactions) — with `optout`/`optin` open to everyone, the command has
 /// no `default_member_permissions`, so this check is the ONLY gate. The
 /// code↔guild match happens at the pending-link table on the Matrix side.
+/// May this `/bridge approve` invoker approve a link? The Discord-side half of
+/// the #47 two-sided auth gate: **Manage Server** (Administrator implies it).
+/// `None` (permissions absent from the interaction payload — e.g. a DM) is a
+/// refusal. Pure so it is unit-testable without a live interaction (the rest of
+/// the slash-command path is not bot-automatable — #76 part 3).
+fn can_approve(perms: Option<Permissions>) -> bool {
+    perms.is_some_and(|p| p.manage_guild() || p.administrator())
+}
+
 async fn handle_approve_command(
     ctx: &Context,
     cmd: &CommandInteraction,
@@ -2429,7 +2438,7 @@ async fn handle_approve_command(
     pool: &Arc<SharedPool>,
 ) {
     let perms = cmd.member.as_ref().and_then(|m| m.permissions);
-    if !perms.is_some_and(|p| p.manage_guild() || p.administrator()) {
+    if !can_approve(perms) {
         respond_ephemeral(
             ctx,
             cmd,
@@ -3560,6 +3569,21 @@ mod tests {
         fn set_muted(&self, _k: &str, _muted: bool) {}
         fn release(&self, _k: &str) {}
         fn release_all(&self) {}
+    }
+
+    /// The Discord-side `/bridge approve` permission gate (#47/#76 part 3):
+    /// Manage Server or Administrator approves; anything less — or missing
+    /// permissions (a DM) — is refused.
+    #[test]
+    fn approve_requires_manage_server_or_admin() {
+        assert!(can_approve(Some(Permissions::MANAGE_GUILD)));
+        assert!(can_approve(Some(Permissions::ADMINISTRATOR)));
+        assert!(can_approve(Some(Permissions::MANAGE_GUILD | Permissions::SEND_MESSAGES)));
+        // A member without Manage Server / Administrator.
+        assert!(!can_approve(Some(Permissions::SEND_MESSAGES)));
+        assert!(!can_approve(Some(Permissions::empty())));
+        // Permissions absent from the payload (e.g. a DM) → refused.
+        assert!(!can_approve(None));
     }
 
     /// Build a pool of `n` bots with no channels registered yet.

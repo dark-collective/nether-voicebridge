@@ -2,6 +2,7 @@
 //! grows this toward the full 16-entry catalogue in the design doc.
 
 pub mod audio;
+pub mod mgmt_self_serve;
 pub mod moderation;
 pub mod smoke;
 
@@ -10,6 +11,7 @@ use crate::scenario::ScenarioDef;
 pub fn all() -> Vec<&'static ScenarioDef> {
     vec![
         &smoke::SMOKE_OPEN_CLOSE,
+        &mgmt_self_serve::MGMT_SELF_SERVE_LINK,
         &audio::AUDIO_M2D_UNENC,
         &audio::AUDIO_D2M_UNENC,
         &audio::AUDIO_M2D_ENC,

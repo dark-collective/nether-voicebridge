@@ -7,6 +7,7 @@
 
 pub mod discord;
 pub mod matrix;
+pub mod mgmt_client;
 
 use anyhow::Result;
 use async_trait::async_trait;

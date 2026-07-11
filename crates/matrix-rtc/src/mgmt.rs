@@ -2222,4 +2222,197 @@ mod tests {
         assert!(insert_pending(&mut map, test_pending("111", later), later, ttl).is_ok());
         assert_eq!(map.len(), 1);
     }
+
+    // ── Discord-side approval redemption (#76 part 2) ────────────────────────
+    //
+    // The live e2e scenario drives the Matrix half (link → pending code) against
+    // the real bridge, but a bot cannot invoke the `/bridge approve` slash
+    // command, so the redemption half is exercised here by injecting a
+    // `DiscordApproval` straight into `handle_discord_approval` — the same code
+    // path the pool's approval task runs (`run`, mgmt.rs:486). No homeserver:
+    // the origin-room notification uses an OFFLINE client (`get_room` → None,
+    // the best-effort skip), and the supervisor is a mock answering `Reconcile`.
+
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A private, unique-per-test data dir (tenants/banlist/audit live here).
+    fn test_data_dir() -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "nvb-mgmt-approval-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create test data dir");
+        // add_tenant_entry appends to an existing file — start from empty.
+        std::fs::write(nvb_config::tenants_path(dir.to_str().unwrap()), "").expect("seed tenants");
+        dir
+    }
+
+    /// Build a `BotCtx` wired to `dir` with Discord approval enabled (`ttl`),
+    /// returning it plus the supervisor receiver the caller drives.
+    fn approval_ctx(
+        dir: &std::path::Path,
+        ttl: Duration,
+    ) -> (BotCtx, mpsc::UnboundedReceiver<ControlMsg>) {
+        let d = dir.to_str().unwrap();
+        let (control, control_rx) = mpsc::unbounded_channel();
+        let ctx = BotCtx {
+            own_user: "@bot:example.org".try_into().unwrap(),
+            allow: HashSet::new(),
+            control,
+            tenants_path: nvb_config::tenants_path(d),
+            server_names: vec!["test".to_string()],
+            homeserver_url: "https://example.invalid".to_string(),
+            appservice_token: "t".to_string(),
+            http: reqwest::Client::new(),
+            well_known_base: "https://example.invalid".to_string(),
+            mutate_lock: tokio::sync::Mutex::new(()),
+            cooldown: None,
+            mutate_stamps: StdMutex::new(HashMap::new()),
+            banlist_path: nvb_config::banlist_path(d),
+            audit_path: format!("{d}/audit.jsonl"),
+            require_room_authority: true,
+            approval_ttl: Some(ttl),
+            pending: StdMutex::new(HashMap::new()),
+            open_registration: true,
+            max_tenants_per_owner: Some(1),
+            privacy_policy_url: None,
+            notice_tx: None,
+        };
+        (ctx, control_rx)
+    }
+
+    /// A pending link on guild 111, room `!r:x`, channel 222, owner `@u:x`.
+    fn seed_one_pending(ctx: &BotCtx, ttl: Duration) -> String {
+        let mut map = ctx.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        insert_pending(&mut map, test_pending("111", Instant::now()), Instant::now(), ttl)
+            .expect("insert pending")
+    }
+
+    /// An offline client: constructed without contacting any server, so
+    /// `get_room` returns `None` and the origin-room notification is skipped.
+    async fn offline_client() -> Client {
+        Client::builder()
+            .homeserver_url("https://example.invalid")
+            .build()
+            .await
+            .expect("offline client builds")
+    }
+
+    fn approval(code: &str, guild_id: u64) -> (DiscordApproval, oneshot::Receiver<ApprovalOutcome>) {
+        let (reply, rx) = oneshot::channel();
+        (
+            DiscordApproval {
+                code: code.to_string(),
+                guild_id,
+                invoker: "Alice (12345)".to_string(),
+                reply,
+            },
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn approval_commits_tenant_and_returns_success_notice() {
+        let dir = test_data_dir();
+        let ttl = Duration::from_secs(600);
+        let (ctx, mut control_rx) = approval_ctx(&dir, ttl);
+        let code = seed_one_pending(&ctx, ttl);
+
+        // Mock supervisor: accept the reconcile, reporting the tenant as added.
+        let sup = tokio::spawn(async move {
+            if let Some(ControlMsg::Reconcile { reply }) = control_rx.recv().await {
+                let _ = reply.send(Ok(ReconcileSummary {
+                    added: vec!["t".to_string()],
+                    ..Default::default()
+                }));
+            }
+        });
+
+        let client = offline_client().await;
+        let (ap, rx) = approval(&code, 111);
+        handle_discord_approval(&ctx, &client, ap).await;
+        let outcome = rx.await.expect("approval replied");
+
+        assert!(outcome.text.contains("is up"), "expected success text, got: {}", outcome.text);
+        assert!(outcome.notice.is_some(), "a committed link posts the #64 disclosure notice");
+        // test_pending's channel id is "2" → the notice targets that channel.
+        assert_eq!(outcome.notice_channel_id, Some(2), "notice targets the bridged channel");
+        // The tenant was written to tenants.toml, and the pending entry consumed.
+        let body = std::fs::read_to_string(&ctx.tenants_path).unwrap();
+        assert!(body.contains("!r:x"), "tenant persisted: {body}");
+        assert!(ctx.pending.lock().unwrap().is_empty(), "code consumed");
+        sup.await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn approval_wrong_guild_keeps_code_and_writes_nothing() {
+        let dir = test_data_dir();
+        let ttl = Duration::from_secs(600);
+        let (ctx, _control_rx) = approval_ctx(&dir, ttl);
+        let code = seed_one_pending(&ctx, ttl);
+
+        let client = offline_client().await;
+        let (ap, rx) = approval(&code, 999); // pending is guild 111
+        handle_discord_approval(&ctx, &client, ap).await;
+        let outcome = rx.await.expect("approval replied");
+
+        assert!(
+            outcome.text.contains("different Discord server"),
+            "guild mismatch message, got: {}",
+            outcome.text
+        );
+        // Code survives for the correct server; tenants.toml untouched.
+        assert!(ctx.pending.lock().unwrap().contains_key(&code), "code not burned on mismatch");
+        assert!(std::fs::read_to_string(&ctx.tenants_path).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn approval_expired_code_is_refused() {
+        let dir = test_data_dir();
+        let ttl = Duration::from_millis(1);
+        let (ctx, _control_rx) = approval_ctx(&dir, ttl);
+        let code = seed_one_pending(&ctx, ttl);
+        tokio::time::sleep(Duration::from_millis(10)).await; // age past the TTL
+
+        let client = offline_client().await;
+        let (ap, rx) = approval(&code, 111);
+        handle_discord_approval(&ctx, &client, ap).await;
+        let outcome = rx.await.expect("approval replied");
+
+        assert!(
+            outcome.text.contains("Unknown or expired"),
+            "expired message, got: {}",
+            outcome.text
+        );
+        assert!(std::fs::read_to_string(&ctx.tenants_path).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn approval_refused_if_banned_while_pending() {
+        let dir = test_data_dir();
+        let ttl = Duration::from_secs(600);
+        let (ctx, _control_rx) = approval_ctx(&dir, ttl);
+        let code = seed_one_pending(&ctx, ttl);
+        // A ban lands on the pending link's room while it waits for approval.
+        nvb_config::add_ban(&ctx.banlist_path, BanKind::Room, "!r:x").unwrap();
+
+        let client = offline_client().await;
+        let (ap, rx) = approval(&code, 111);
+        handle_discord_approval(&ctx, &client, ap).await;
+        let outcome = rx.await.expect("approval replied");
+
+        assert!(
+            outcome.text.contains("banned while awaiting approval"),
+            "ban re-check message, got: {}",
+            outcome.text
+        );
+        assert!(std::fs::read_to_string(&ctx.tenants_path).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
