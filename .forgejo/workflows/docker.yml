@@ -33,10 +33,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # arm64 is disabled for now (emulated build is very slow). To restore
-      # multi-arch: uncomment this step and add linux/arm64 to `platforms` below.
-      # - name: Set up QEMU (for arm64 cross-build)
-      #   uses: docker/setup-qemu-action@v3
+      # arm64 is built natively by the image-arm64 job below (on the
+      # linux-arm64 host-mode runner) instead of QEMU-emulating it here; the
+      # manifest job then merges both single-arch pushes into one multi-arch
+      # tag so `docker pull .../nether-voicebridge:latest` resolves on either
+      # architecture.
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -89,8 +90,8 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          # amd64-only for now (see the commented QEMU step above to restore
-          # multi-arch: `platforms: linux/amd64,linux/arm64`).
+          # amd64 only in this job; linux/arm64 is built natively by
+          # image-arm64 below and merged into this tag by the manifest job.
           platforms: linux/amd64
           push: true
           tags: ${{ steps.vars.outputs.tags }}
@@ -99,6 +100,111 @@ jobs:
           # and cache-from never resolved it anyway. Cold builds are ~12 min amd64.
           # If incremental caching is wanted later, use a non-Cloudflare backend
           # (e.g. type=gha — the runner's actions cache is enabled).
+
+  # Native arm64 build on the new host-mode runner (label linux-arm64, also
+  # registered as ubuntu-latest — either works). Docker Engine is already
+  # provisioned on this host. No act_runner-managed container per job (host/
+  # exec mode), so the JS actions below (checkout, docker/*) rely on Node.js
+  # being present on the host too — there's no per-job container to provide
+  # it in host mode.
+  image-arm64:
+    runs-on: linux-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # Same reasoning as the amd64 job: buildkit runs in its own
+          # container and won't inherit the host daemon's
+          # insecure-registries, so tell it the tailnet registry is HTTP
+          # directly.
+          buildkitd-config-inline: |
+            [registry."100.64.0.13:3000"]
+              http = true
+
+      - name: Log in to the Forgejo container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: dark
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      # Same tag rule as the amd64 image job, arch-suffixed: this push must
+      # not clobber the canonical tag before the manifest job below merges
+      # both single-arch images into it.
+      - name: Determine image tags
+        id: vars
+        run: |
+          repo="${REGISTRY}/${{ github.repository }}"
+          {
+            echo "tags<<__EOF__"
+            if [ "${{ github.ref_type }}" = "tag" ]; then
+              ref="${{ github.ref_name }}"
+              echo "${repo}:${ref}-arm64"
+              case "$ref" in
+                *-*) : ;;                           # prerelease: version tag only
+                *)   echo "${repo}:latest-arm64" ;;  # stable: also move :latest-arm64
+              esac
+            else
+              echo "${repo}:edge-arm64"              # manual dispatch
+            fi
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.vars.outputs.tags }}
+
+  # Merges the amd64 (`image`) and arm64 (`image-arm64`) single-arch pushes
+  # into one multi-arch manifest under the canonical tag(s), so a plain
+  # `docker pull .../nether-voicebridge:latest` resolves correctly regardless
+  # of the pulling host's architecture. Doesn't rebuild anything — needs only
+  # registry auth and both single-arch images to already exist.
+  manifest:
+    runs-on: docker
+    needs: [image, image-arm64]
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."100.64.0.13:3000"]
+              http = true
+
+      - name: Log in to the Forgejo container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: dark
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      # Mirrors the tag-selection logic from the image job's "Determine image
+      # tags" step — kept in sync manually (same pattern e2e.yml already uses
+      # for its duplicated env blocks).
+      - name: Create multi-arch manifest
+        run: |
+          set -eu
+          repo="${REGISTRY}/${{ github.repository }}"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            ref="${{ github.ref_name }}"
+            docker buildx imagetools create -t "${repo}:${ref}" \
+              "${repo}:${ref}" "${repo}:${ref}-arm64"
+            case "$ref" in
+              *-*) : ;;
+              *) docker buildx imagetools create -t "${repo}:latest" \
+                   "${repo}:latest" "${repo}:latest-arm64" ;;
+            esac
+          else
+            docker buildx imagetools create -t "${repo}:edge" \
+              "${repo}:edge" "${repo}:edge-arm64"
+          fi
 
   # Builds the .deb and .rpm and attaches them to the Forgejo Release for the tag.
   # Tag-only, and runs AFTER `image` so it can reuse that build's binary instead
