@@ -3,6 +3,19 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.20] - 2026-07-11
+
+### Security
+- **Stronger room-authority bar for self-serve linking (#86).** `require_room_authority`
+  no longer passes anyone whose power merely meets `state_default`. The sender must
+  now hold an **explicit individual moderator grant**: a `users[sender]` power-level
+  entry that is both above the room's `users_default` and at least 50 (the Element
+  "Moderator" level). Keying on an explicit, above-default grant closes the #79
+  finding-6 vectors — a room can no longer authorize *every* member by lowering
+  `state_default` or raising `users_default`. Authority is also **re-checked at
+  Discord-approval time**, not just at the `link` probe, so a requester demoted or
+  gone between `link` and approval can't slip a bridge through.
+
 ## [0.3.0-alpha.19] - 2026-07-11
 
 ### Security

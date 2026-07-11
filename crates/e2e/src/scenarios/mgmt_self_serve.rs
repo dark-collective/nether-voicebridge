@@ -33,9 +33,11 @@
 //! staging `/bridge approve`.
 //!
 //! ONE-TIME SETUP (positive-authority path): `@nvbtest_mgr:<domain>` must be a
-//! joined member of Auto Test 01 (`room_a`) with power level ≥ its
-//! `state_default` (grant PL 50 via Element devtools → `m.room.power_levels`).
-//! Without it the positive-link assertion fails with a message that says so.
+//! joined member of Auto Test 01 (`room_a`) with an EXPLICIT moderator grant —
+//! a `users[]` power-level entry above `users_default` and ≥ 50 (grant PL 50 via
+//! Element devtools → `m.room.power_levels`; #86). Verified 2026-07-11:
+//! users_default 0, `@nvbtest_mgr` = 50 → passes. Without it the positive-link
+//! assertion fails with a message that says so.
 //! The other harness users (`nvbtest_mgr2`/`mgrx`/the #77 `nvbtest_mgr3`) need
 //! NO setup — they only drive negative/pre-probe paths that never require power.
 
