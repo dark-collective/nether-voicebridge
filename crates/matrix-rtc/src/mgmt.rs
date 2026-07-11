@@ -3608,6 +3608,7 @@ mod tests {
             global_link_budget: None,
             global_link_attempts: StdMutex::new(Vec::new()),
             privacy_policy_url: None,
+            docs_url: None,
             notice_tx: None,
         };
         (ctx, control_rx)
