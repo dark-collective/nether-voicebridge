@@ -3,6 +3,24 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.21] - 2026-07-11
+
+### Added
+- **Self-serve allowlist — an invite-only middle tier (#82).** Between operators
+  and fully-open registration: set `[management] self_serve_allow` and only those
+  MXIDs (plus operators) get the self-serve tier; everyone else is ignored. The
+  config value seeds `<data_dir>/self_serve_allow.toml` once; thereafter operators
+  edit it live over DM with `serve-allow` / `serve-remove` / `serve-open` /
+  `serve-list`. Unset ⇒ open to every Matrix user (the pre-#82 behavior). The
+  file's existence is what enables restriction, so removing the last entry does
+  not silently re-open the surface.
+
+### Changed
+- **The `link` pending-code reply names the approval bot (#80).** New optional
+  `[management] approval_bot_name` is surfaced in the reply so a self-serve user
+  knows which Discord bot to run `/bridge approve` on, and the reply now points at
+  the `applications.commands` scope when the command doesn't appear in the guild.
+
 ## [0.3.0-alpha.20] - 2026-07-11
 
 ### Security
