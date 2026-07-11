@@ -5,6 +5,14 @@ shared instance on the `nether.im` homeserver that you can ask to bridge your
 Discord voice channel to a Matrix room, without installing or configuring
 anything yourself.
 
+> [!IMPORTANT]
+> **The hosted instance is in open beta.** It works in daily use, but the
+> bridge is young and under heavy development — expect the occasional rough
+> edge rather than perfection. Thank you for testing it with us! Report
+> anything odd in
+> [`#nether-voicebridge-help:nether.im`](https://matrix.to/#/%23nether-voicebridge-help%3Anether.im)
+> (or with the bot's `report` command for abuse).
+
 > [!NOTE]
 > The hosted instance supports **self-serve bridging**: DM the bridge bot
 > (`@nether-voicebridge_bot:nether.im`) and link your own room — see the

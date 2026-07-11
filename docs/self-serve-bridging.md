@@ -13,7 +13,10 @@ code.
 > operator setting up your own, see the [README](../README.md) and
 > [hosted-instance notes](hosted-instance.md). Whether self-serve is enabled —
 > and which bot to DM — is up to each instance's operator; for the `nether.im`
-> instance, see [Use the hosted instance](hosted-instance.md).
+> instance, see [Use the hosted instance](hosted-instance.md). The `nether.im`
+> instance is in **open beta**: rough edges happen, and we appreciate every
+> tester — if something misbehaves, say so in
+> [`#nether-voicebridge-help:nether.im`](https://matrix.to/#/%23nether-voicebridge-help%3Anether.im).
 
 ## What you'll need
 

@@ -17,6 +17,25 @@ channel↔room pairs at once.
 > space [`#nether-voicebridge:nether.im`](https://matrix.to/#/%23nether-voicebridge:nether.im)
 > or on the [Discord server](https://discord.gg/BQYxEdu7s2).
 
+## Two ways to get a bridge
+
+**Use the hosted instance (recommended).** We run a public instance on
+`nether.im`, currently in **open beta** — free, self-serve, nothing to install:
+DM `@nether-voicebridge_bot:nether.im` and link your own room in a few minutes.
+Start with the wiki guide at
+**[nether.wiki/matrix/voice-bridge](https://nether.wiki/matrix/voice-bridge/)**,
+or the in-repo [hosted-instance notes](docs/hosted-instance.md) and
+[self-serve walkthrough](docs/self-serve-bridging.md). It *is* a beta —
+you may hit rough edges, and we're grateful to everyone testing it with us;
+tell us what breaks in
+[`#nether-voicebridge-help:nether.im`](https://matrix.to/#/%23nether-voicebridge-help%3Anether.im).
+
+**Or self-host it.** Everything below — requirements,
+[quickstart](#quickstart-from-source), [Docker](#docker),
+[packages](#install-debianubuntu--fedorarhel), configuration — is for running
+your own instance on your own homeserver. The same self-serve DM flow works on
+your instance too, once you enable [open registration](#open-registration).
+
 ## Community
 
 Development happens in the open on both platforms — fittingly, kept in sync by a
