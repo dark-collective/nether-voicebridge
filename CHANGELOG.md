@@ -3,6 +3,21 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Anti-Sybil admission controls for open registration (#77).** Two new
+  `[limits]` knobs harden the self-serve `link` flow beyond the per-owner tenant
+  cap, which keys on the federation-reachable (thus throwaway) owner MXID:
+  - `max_tenants_per_guild` caps how many tenant bridges may target one Discord
+    guild — the Manage-Server requirement is a stronger anti-Sybil anchor than a
+    federated account. Pending (unapproved) links count toward it; operators are
+    exempt.
+  - `max_link_attempts` (+ optional `link_attempt_window_secs`, default one hour)
+    adds a per-owner sliding-window velocity budget on `link` attempts that reach
+    the probe stage, on top of the single-shot `mgmt_cooldown_secs`. Operators
+    are exempt. Rejections are recorded in the audit trail.
+
 ## [0.3.0-alpha.15] - 2026-07-10
 
 ### Fixed

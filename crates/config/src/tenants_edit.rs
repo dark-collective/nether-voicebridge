@@ -174,6 +174,30 @@ pub fn tenant_owners(path: &str) -> Result<Vec<(String, Option<String>)>, Config
     Ok(out)
 }
 
+/// The Discord guild id recorded on every `[[bridge]]` entry, `(name, guild)`
+/// in file order. `guild` is `None` on a hand-written entry lacking a
+/// `[bridge.discord]` guild_id. Read-only; a missing file is an empty list. The
+/// per-guild tenant cap (#77) counts off this.
+pub fn tenant_guilds(path: &str) -> Result<Vec<(String, Option<String>)>, ConfigError> {
+    let prior = read_prior(path)?;
+    let doc = parse_doc(prior.as_deref())?;
+    let mut out = Vec::new();
+    if let Some(arr) = doc.get("bridge").and_then(|b| b.as_array_of_tables()) {
+        for t in arr {
+            let name =
+                t.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>").to_string();
+            let guild = t
+                .get("discord")
+                .and_then(|d| d.as_table_like())
+                .and_then(|d| d.get("guild_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            out.push((name, guild));
+        }
+    }
+    Ok(out)
+}
+
 /// The Discord channel id recorded on the `[[bridge]]` entry named `name`
 /// (`None` = no such entry, or a hand-written entry without one). Read-only;
 /// the unlink disclosure notice (#64) targets this channel.
@@ -483,5 +507,30 @@ mod tests {
         // The unlink-notice lookup (#64): channel id by name, None for unknown.
         assert_eq!(tenant_discord_channel(&path, "mine").unwrap(), Some("222".to_string()));
         assert_eq!(tenant_discord_channel(&path, "nope").unwrap(), None);
+    }
+
+    #[test]
+    fn tenant_guilds_reads_guild_ids_for_the_per_guild_cap() {
+        let dir = TmpDir::new();
+        let path = dir.file();
+
+        // Missing file ⇒ empty list, not an error (#77).
+        assert_eq!(tenant_guilds(&path).unwrap(), vec![]);
+
+        add_tenant_entry(&path, &tenant("a")).unwrap(); // guild 111
+        let mut other = tenant("b");
+        other.guild_id = "999".to_string();
+        add_tenant_entry(&path, &other).unwrap();
+
+        let got = tenant_guilds(&path).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("a".to_string(), Some("111".to_string())),
+                ("b".to_string(), Some("999".to_string())),
+            ]
+        );
+        // The cap counts entries matching one guild.
+        assert_eq!(got.iter().filter(|(_, g)| g.as_deref() == Some("111")).count(), 1);
     }
 }

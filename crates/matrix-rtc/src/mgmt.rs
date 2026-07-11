@@ -172,6 +172,16 @@ struct BotCtx {
     /// `[limits] max_tenants_per_owner` — per-owner tenant cap, enforced at
     /// `link` for non-operators only. `None` ⇒ unlimited.
     max_tenants_per_owner: Option<usize>,
+    /// `[limits] max_tenants_per_guild` — per-guild tenant cap, enforced at
+    /// `link` for non-operators only (#77 anti-Sybil). `None` ⇒ unlimited.
+    max_tenants_per_guild: Option<usize>,
+    /// `[limits]` per-owner `link`-attempt sliding-window budget
+    /// `(attempts, window)` (#77), enforced at `link` for non-operators only.
+    /// `None` ⇒ unlimited.
+    link_attempt_budget: Option<(usize, Duration)>,
+    /// Per-owner `link`-attempt timestamps within the current window, for the
+    /// [`link_attempt_gate`](Self::link_attempt_gate).
+    link_attempts: StdMutex<HashMap<String, Vec<Instant>>>,
     /// Public privacy-policy URL (#43 ToS follow-ups): appended to the `link`
     /// disclosure texts when configured.
     privacy_policy_url: Option<String>,
@@ -320,6 +330,23 @@ impl BotCtx {
             .unwrap_or_else(PoisonError::into_inner);
         cooldown_check(&mut stamps, sender, Instant::now(), cooldown)
     }
+
+    /// The `link`-attempt rate gate (#77): `Some(retry_secs)` ⇒ `sender` has
+    /// spent their attempt budget for the current window (nothing recorded);
+    /// `None` ⇒ allowed, and this attempt is recorded. A velocity limit on the
+    /// probe/approval flow beyond the single-shot [`mutate_cooldown`]; self-serve
+    /// only — the caller applies it to non-operators.
+    ///
+    /// [`mutate_cooldown`]: Self::mutate_cooldown
+    fn link_attempt_gate(&self, sender: &str) -> Option<u64> {
+        let (budget, window) = self.link_attempt_budget?;
+        let mut attempts = self
+            .link_attempts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let entry = attempts.entry(sender.to_owned()).or_default();
+        window_check(entry, Instant::now(), window, budget)
+    }
 }
 
 /// Append one audit event (#47): `{"ts":<epoch secs>,"actor":…,"event":…,…}`
@@ -360,6 +387,29 @@ fn cooldown_check(
         }
     }
     stamps.insert(sender.to_owned(), now);
+    None
+}
+
+/// Pure core of the link-attempt gate (#77), split out for unit testing. Prunes
+/// stamps older than `window`; if fewer than `budget` remain it records `now`
+/// and returns `None`, otherwise returns the whole seconds (≥ 1) until the
+/// oldest surviving stamp ages out of the window — nothing is recorded.
+fn window_check(
+    attempts: &mut Vec<Instant>,
+    now: Instant,
+    window: Duration,
+    budget: usize,
+) -> Option<u64> {
+    attempts.retain(|&t| now.saturating_duration_since(t) < window);
+    if attempts.len() >= budget {
+        // The oldest surviving stamp is the first to leave the window, freeing
+        // the next slot. (Empty only when budget == 0 — then fall back to a
+        // full window.)
+        let oldest = attempts.iter().min().copied().unwrap_or(now);
+        let wait = window.saturating_sub(now.saturating_duration_since(oldest));
+        return Some(wait.as_secs().max(1));
+    }
+    attempts.push(now);
     None
 }
 
@@ -467,6 +517,9 @@ pub async fn run(
         pending: StdMutex::new(HashMap::new()),
         open_registration: cfg.open_registration,
         max_tenants_per_owner: limits.max_tenants_per_owner,
+        max_tenants_per_guild: limits.max_tenants_per_guild,
+        link_attempt_budget: limits.link_attempt_budget(),
+        link_attempts: StdMutex::new(HashMap::new()),
         privacy_policy_url: cfg.privacy_policy_url.clone(),
         notice_tx: pool_io.notice_tx,
     });
@@ -1378,11 +1431,62 @@ async fn handle_link(
         }
     }
 
+    // Per-guild tenant cap (#77 anti-Sybil): self-serve users only. The Discord
+    // Manage-Server gate is the strongest anti-Sybil anchor, so cap by the guild
+    // being targeted — a federation-reachable owner MXID is throwaway, a real
+    // guild is not. Pending links to the guild count too (a Sybil could park
+    // cap-dodging approvals otherwise), matching the per-owner rule.
+    if let (false, Some(cap)) = (ctx.is_operator(sender), ctx.max_tenants_per_guild) {
+        let existing = match nvb_config::tenant_guilds(&ctx.tenants_path) {
+            Ok(entries) => entries
+                .iter()
+                .filter(|(_, g)| g.as_deref() == Some(guild_id.as_str()))
+                .count(),
+            Err(e) => {
+                reply(room, &format!("Cannot read tenants.toml: {e}")).await;
+                return;
+            }
+        };
+        let pending = {
+            let map = ctx.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            map.values().filter(|p| p.tenant.guild_id == guild_id).count()
+        };
+        if existing + pending >= cap {
+            audit(ctx, sender, "link_rejected", serde_json::json!({
+                "name": name, "reason": "guild cap", "guild_id": guild_id,
+                "existing": existing, "pending": pending, "cap": cap,
+            }));
+            reply(room, &format!(
+                "This Discord guild already has {existing} bridge(s){} — the limit is {cap} per guild.",
+                if pending > 0 { format!(" and {pending} awaiting approval") } else { String::new() }
+            ))
+            .await;
+            return;
+        }
+    }
+
     // Rate gate (#47): past the cheap shape checks (a typo doesn't burn the
     // budget), before the expensive probes and the state change they precede.
     if let Some(remaining) = ctx.mutate_cooldown(sender) {
         reply(room, &format!("⏳ Rate limited — try again in {remaining}s.")).await;
         return;
+    }
+
+    // Link-attempt velocity budget (#77): self-serve users only. The cooldown
+    // above is a single-shot spacing; this bounds sustained hammering of the
+    // probe/approval flow over a longer window. Checked after the cooldown
+    // stamps, so one honest retry-after-cooldown spends one attempt.
+    if !ctx.is_operator(sender) {
+        if let Some(retry) = ctx.link_attempt_gate(sender) {
+            audit(ctx, sender, "link_rejected", serde_json::json!({
+                "name": name, "reason": "attempt budget", "retry_secs": retry,
+            }));
+            reply(room, &format!(
+                "⏳ Too many link attempts — try again in {retry}s."
+            ))
+            .await;
+            return;
+        }
     }
 
     // Preflight probes (#47): verify the room/guild prerequisites BEFORE
@@ -1925,6 +2029,48 @@ mod tests {
     }
 
     #[test]
+    fn window_budget_gates_and_recovers_as_stamps_age_out() {
+        let window = Duration::from_secs(3600);
+        let budget = 3usize;
+        let t0 = Instant::now();
+        let mut a = Vec::new();
+
+        // First `budget` attempts inside the window are all allowed + recorded.
+        assert_eq!(window_check(&mut a, t0, window, budget), None);
+        assert_eq!(window_check(&mut a, t0 + Duration::from_secs(1), window, budget), None);
+        assert_eq!(window_check(&mut a, t0 + Duration::from_secs(2), window, budget), None);
+        // The 4th within the window is gated — retry when the OLDEST (t0) ages
+        // out, i.e. the full window minus the 2 s already elapsed.
+        assert_eq!(
+            window_check(&mut a, t0 + Duration::from_secs(2), window, budget),
+            Some(3598)
+        );
+        // A gated attempt is NOT recorded: the count stays at budget, so the
+        // retry estimate is stable rather than ratcheting the window forward.
+        assert_eq!(
+            window_check(&mut a, t0 + Duration::from_secs(3), window, budget),
+            Some(3597)
+        );
+        // Once the oldest stamps leave the window, a slot frees again. At
+        // t0+3601 both t0 (elapsed 3601) and t0+1 (elapsed exactly 3600, and the
+        // window is a strict `<`) have aged out; only t0+2 survives.
+        let later = t0 + Duration::from_secs(3601);
+        assert_eq!(window_check(&mut a, later, window, budget), None);
+        // t0 and t0+1 pruned, t0+2 still live, plus `later` → 2 stamps.
+        assert_eq!(a.len(), 2);
+    }
+
+    #[test]
+    fn window_budget_of_zero_refuses_everything() {
+        let window = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let mut a = Vec::new();
+        // A zero budget admits nothing (odd but valid) and records nothing.
+        assert_eq!(window_check(&mut a, t0, window, 0), Some(60));
+        assert!(a.is_empty());
+    }
+
+    #[test]
     fn parses_ban_unban_and_bans() {
         assert_eq!(
             parse_command("ban owner @evil:x"),
@@ -2278,6 +2424,9 @@ mod tests {
             pending: StdMutex::new(HashMap::new()),
             open_registration: true,
             max_tenants_per_owner: Some(1),
+            max_tenants_per_guild: None,
+            link_attempt_budget: None,
+            link_attempts: StdMutex::new(HashMap::new()),
             privacy_policy_url: None,
             notice_tx: None,
         };

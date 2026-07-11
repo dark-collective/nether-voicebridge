@@ -16,7 +16,8 @@ pub use optout::{
 pub use tenants::{TenantsFile, list_tenant_names, load_tenants, tenants_path};
 pub use tenants_edit::{
     NewTenant, PriorContent, add_tenant_entry, remove_tenant_entries_matching,
-    remove_tenant_entry, restore_tenants_file, tenant_discord_channel, tenant_owners,
+    remove_tenant_entry, restore_tenants_file, tenant_discord_channel, tenant_guilds,
+    tenant_owners,
 };
 
 #[derive(Debug, Error)]
@@ -121,6 +122,40 @@ pub struct LimitsConfig {
     /// only — operators are bounded by `max_tenants` alone. `None` ⇒ unlimited.
     #[serde(default)]
     pub max_tenants_per_owner: Option<usize>,
+    /// Maximum tenant bridges that may target one Discord guild (#77 anti-Sybil).
+    /// `max_tenants_per_owner` keys on the — federation-reachable, thus
+    /// throwaway-able — owner MXID; the Discord Manage-Server requirement is the
+    /// stronger anti-Sybil anchor (a real guild is hard to forge at scale), so
+    /// this caps by the guild being bridged. Checked at `link` for
+    /// non-operators; pending links count. `None` ⇒ unlimited.
+    #[serde(default)]
+    pub max_tenants_per_guild: Option<usize>,
+    /// Per-owner (MXID) `link`-attempt budget within a sliding window (#77): at
+    /// most this many attempts that reach the probe stage per
+    /// `link_attempt_window_secs`. A velocity limit beyond the single-shot
+    /// `mgmt_cooldown_secs` spacing — it bounds hammering of the expensive
+    /// probe/approval flow. Checked at `link` for non-operators. `None` ⇒
+    /// unlimited.
+    #[serde(default)]
+    pub max_link_attempts: Option<usize>,
+    /// Window (seconds) for `max_link_attempts` (#77). Ignored unless
+    /// `max_link_attempts` is set; defaults to 3600 (one hour) when omitted.
+    #[serde(default)]
+    pub link_attempt_window_secs: Option<u64>,
+}
+
+impl LimitsConfig {
+    /// The resolved link-attempt rate budget: `(attempts, window)` when
+    /// `max_link_attempts` is set (window defaulting to one hour), else `None`
+    /// (#77). Single-knob activation — the window is an optional override.
+    pub fn link_attempt_budget(&self) -> Option<(usize, Duration)> {
+        self.max_link_attempts.map(|attempts| {
+            (
+                attempts,
+                Duration::from_secs(self.link_attempt_window_secs.unwrap_or(3600)),
+            )
+        })
+    }
 }
 
 /// The resolved grace-timer profile (#38). Every lifecycle timer the bridge
@@ -1686,6 +1721,51 @@ media_e2ee = false
         assert_eq!(cfg.limits.max_ghosts_per_bridge, None);
         assert_eq!(cfg.limits.mgmt_cooldown_secs, Some(30));
         cfg.validate().expect("limits never invalidate a config");
+    }
+
+    #[test]
+    fn anti_sybil_limits_parse_and_resolve_the_link_window() {
+        // #77 knobs absent ⇒ unlimited, and no attempt budget resolves.
+        let l = LimitsConfig::default();
+        assert_eq!(l.max_tenants_per_guild, None);
+        assert_eq!(l.max_link_attempts, None);
+        assert_eq!(l.link_attempt_budget(), None);
+
+        // Present: per-guild cap parses; the attempt budget activates on the
+        // single `max_link_attempts` knob, defaulting the window to one hour.
+        let raw = format!(
+            "[limits]\nmax_tenants_per_guild = 2\nmax_link_attempts = 5\n{}{}",
+            puppets_block(&["Bot a"]),
+            bridge_block(Some("a"), "!a:nether.im", "./sa", "222"),
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse failed");
+        assert_eq!(cfg.limits.max_tenants_per_guild, Some(2));
+        assert_eq!(
+            cfg.limits.link_attempt_budget(),
+            Some((5, std::time::Duration::from_secs(3600)))
+        );
+        cfg.validate().expect("anti-sybil limits never invalidate a config");
+
+        // An explicit window overrides the default.
+        let raw = format!(
+            "[limits]\nmax_link_attempts = 3\nlink_attempt_window_secs = 120\n{}{}",
+            puppets_block(&["Bot a"]),
+            bridge_block(Some("a"), "!a:nether.im", "./sa", "222"),
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse failed");
+        assert_eq!(
+            cfg.limits.link_attempt_budget(),
+            Some((3, std::time::Duration::from_secs(120)))
+        );
+
+        // The window alone (no budget) does NOT activate the gate.
+        let raw = format!(
+            "[limits]\nlink_attempt_window_secs = 120\n{}{}",
+            puppets_block(&["Bot a"]),
+            bridge_block(Some("a"), "!a:nether.im", "./sa", "222"),
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse failed");
+        assert_eq!(cfg.limits.link_attempt_budget(), None);
     }
 
     #[test]
