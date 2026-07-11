@@ -225,17 +225,24 @@ async fn drive(cfg: &E2eConfig, bridge: &BridgeUnderTest) -> Result<()> {
         bail!("expected a per-owner cap refusal; got: {cap:?}");
     }
 
-    // 6b. max_tenants_per_guild (#77): the guild now holds the seeded tenant (1)
-    //     plus mgr's pending GoodLink (1) = the cap (2). A DIFFERENT owner (mgr2,
-    //     under its own per-owner cap) linking to it is refused by the per-guild
-    //     cap. This check precedes the room-authority probe, so mgr2's lack of
-    //     power in room_a is irrelevant — the guild-cap message fires first.
+    // 6b. Per-guild cap pending-scoping (#79 finding 4). The guild holds the
+    //     seeded committed tenant (1) plus mgr's pending GoodLink (1). Before the
+    //     fix, the per-guild cap summed BOTH — so a DIFFERENT owner's pending
+    //     tipped the guild to the cap and blocked mgr2, letting anyone park
+    //     pendings on a victim guild's public snowflake to freeze its onboarding.
+    //     Now the pending count is scoped to the requester: for mgr2 only the
+    //     seeded committed tenant counts (1 < 2), so the guild cap does NOT fire —
+    //     mgr2 falls through to the room-authority probe and is refused THERE
+    //     instead. A guild-cap refusal here would be a regression of the fix.
     let ev = mgr2
         .send(&dm2, &format!("link GuildFull {} {} {}", cfg.room_a, cfg.guild_id, cfg.channel_a))
         .await?;
-    let guild_cap = mgr2.wait_for_reply(&dm2, &ev, reply_to).await?;
-    if !guild_cap.contains("the limit is 2 per guild") {
-        bail!("expected a per-guild cap refusal; got: {guild_cap:?}");
+    let refusal = mgr2.wait_for_reply(&dm2, &ev, reply_to).await?;
+    if refusal.contains("per guild") {
+        bail!("per-guild cap counted another owner's pending — regression of #79 finding 4; got: {refusal:?}");
+    }
+    if !refusal.contains("moderator power") && !refusal.contains("not a joined member") {
+        bail!("expected mgr2 to fall through to a room-authority refusal (#79 finding 4 fix); got: {refusal:?}");
     }
 
     // 7. Deny-list: a link to the banned room is refused (checked before the
