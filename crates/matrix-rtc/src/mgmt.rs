@@ -3327,10 +3327,13 @@ mod tests {
             mutate_lock: tokio::sync::Mutex::new(()),
             cooldown: None,
             mutate_stamps: StdMutex::new(HashMap::new()),
-        invite_stamps: StdMutex::new(HashMap::new()),
+            invite_stamps: StdMutex::new(HashMap::new()),
             banlist_path: nvb_config::banlist_path(d),
             audit_path: format!("{d}/audit.jsonl"),
-            require_room_authority: true,
+            // The #86 commit-time authority re-check does a live room read; these
+            // offline approval tests exercise the commit/ban/expiry logic, not
+            // authority, so keep it off (a live room can't be reached here).
+            require_room_authority: false,
             approval_ttl: Some(ttl),
             pending: StdMutex::new(HashMap::new()),
             open_registration: true,
