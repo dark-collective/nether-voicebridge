@@ -3,6 +3,21 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.22] - 2026-07-11
+
+### Added
+- **The bot's replies link the user guide (#92).** New optional `[management]
+  docs_url`: when set, a `Guide: <url>` line is appended to the DM greeting,
+  `help` (both tiers), the pending-approval reply, and the errors whose fix the
+  guide walks through (room-id / snowflake shape, the `call.member` power-level
+  probe) — so someone who discovers the bot cold can find the walkthrough. The
+  greeting now also says what the bot does instead of just "management".
+
+### Fixed
+- The snowflake shape error sent users to "Server Settings" for Developer Mode —
+  it lives under **User** Settings → Advanced. The room-id shape error now says
+  where Element shows the internal room ID.
+
 ## [0.3.0-alpha.21] - 2026-07-11
 
 ### Added
