@@ -20,15 +20,20 @@
 //!   and the target merely invited, so `joined_members_count() == 1`: the
 //!   #89b empty-room sweep reaps it before the target can accept, killing
 //!   the outreach. Pre-fix this reproduced ~100 ms after creation (the
-//!   operator's message 403'd mid-send). **alpha.25's exemption
-//!   (`invited_members_count() == 0`) did NOT close it** (live 2026-07-12,
-//!   2/2 deterministic): that count reads the SDK store, and it was still 0
-//!   a full 3 s after `create_dm` — the sweep reaped the room with the
-//!   invite pending server-side the whole time. The exemption needs a
-//!   source of truth that doesn't lag/omit (state-store members or a
-//!   bot-created-DM set), which lives in `crates/matrix-rtc` — the other
-//!   instance's file; evidence posted on #100. Flip to `Pass` when that
-//!   lands.
+//!   operator's message 403'd mid-send). **alpha.25 did NOT fully close
+//!   it** — three live post-fix runs, two failure modes, one root (the SDK
+//!   store lags `create_dm`):
+//!   1. *reap race* (2×): the exemption's `invited_members_count()` still
+//!      read 0 a full 3 s after creation → the sweep reaped the room with
+//!      the invite pending server-side the whole time;
+//!   2. *first-message UTD* (1×): the sweep spared the room, but the 📣
+//!      sent immediately after `create_dm` was never decryptable by the
+//!      invited target (megolm recipients computed before the invite
+//!      reached the bot's local store — no key ever shared).
+//!   Both fixes live in `crates/matrix-rtc` (the other instance's file): a
+//!   non-lagging membership source for the exemption, and deferring the
+//!   outreach send until the room state has caught up. Evidence on #100.
+//!   Flip to `Pass` when that lands.
 //!
 //!   The target is a CRYPTO client, not the raw-CS one: live testing showed
 //!   the SDK's `create_dm` mints the operator-msg DM **encrypted** (initial
