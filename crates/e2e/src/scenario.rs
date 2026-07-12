@@ -15,10 +15,13 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expectation {
     Pass,
-    /// No live scenario constructs this yet: the force-move gap it was
-    /// designed for (#62) was fixed in v0.3.0-alpha.11, so that scenario
-    /// ships as `Pass`. Kept (with runner tests) for the next filed gap.
-    #[allow(dead_code)]
+    /// A filed, not-yet-fixed gap. Live user: `mgmt_dm_pending_reap` (#99),
+    /// tracking the #97 pending-invite reap — alpha.25's exemption reads the
+    /// SDK store's `invited_members_count()`, which lags/omits the fresh
+    /// invite, so the reap still fires (live 2026-07-12, post-fix). Flip to
+    /// `Pass` when the exemption is rebuilt on a non-lagging source. (First
+    /// design target, the #62 force-move gap, was fixed before ever shipping
+    /// a KnownFail.)
     KnownFail { issue: &'static str },
 }
 
