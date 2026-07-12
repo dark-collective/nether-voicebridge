@@ -226,15 +226,42 @@ impl MatrixCryptoDmClient {
         self.client.invited_rooms().iter().map(|r| r.room_id().to_string()).collect()
     }
 
-    /// Accept a pending invite (SDK join, so the crypto client's state moves
-    /// to Joined and decryption of the room's history can proceed).
+    /// Accept a pending invite. NOT the SDK's `Room::join()`: Tuwunel
+    /// guest-classifies `m.login.application_service` login sessions, so that
+    /// path 403s ("Guests are not allowed to join this room") on any room
+    /// without `guest_access=can_join` — the same trap the bridge itself hit
+    /// (see `matrix.rs::appservice_join_room` / CLAUDE.md). Live-confirmed on
+    /// the #109 fixture: a fixture-side user's SDK join of the bot's federated
+    /// DM was guest-refused. Join via an appservice-ASSERTED raw `/join`
+    /// instead (a full, non-guest member), with the bot's domain as the via
+    /// hint for the federated case; then wait for the SDK to observe Joined so
+    /// decryption of the room's history can proceed.
     pub async fn join(&self, room: &str) -> Result<()> {
-        let room_id: matrix_sdk::ruma::OwnedRoomId = room.parse().context("parsing room id")?;
-        let r = self
-            .client
-            .get_room(&room_id)
-            .with_context(|| format!("crypto-dm client does not know room {room}"))?;
-        r.join().await.context("crypto-dm join")?;
+        let enc: String = room
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        let via = self.bot_mxid.rsplit(':').next().unwrap_or_default().to_owned();
+        let resp = self
+            .http
+            .post(format!("{}/_matrix/client/v3/join/{}", self.base, enc))
+            .query(&[("user_id", self.mxid.as_str()), ("server_name", via.as_str())])
+            .bearer_auth(&self.as_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .context("crypto-dm asserted join request")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("crypto-dm asserted join failed: {status}: {body}");
+        }
+        self.sdk_room(room, Duration::from_secs(30)).await?;
         Ok(())
     }
 

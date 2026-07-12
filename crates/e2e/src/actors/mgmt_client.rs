@@ -164,16 +164,19 @@ impl MatrixManagementClient {
             .context("createRoom response missing room_id")
     }
 
-    /// Create a **v12 (domainless-id) room** inviting `invite` — the #103
-    /// shape: the room id carries no `:server` tail, and creator authority is
-    /// implicit (v12 forbids a `users[]` entry for creators, so an authority
-    /// check must recognize creatorship rather than look up a power level).
-    /// `private_chat` (NOT `trusted_private_chat`: that preset grants
-    /// invitees creator-level PL via `users[]`, which v12 rejects for the
-    /// creator shape being exercised). The `m.call.member` PL-0 override is
-    /// the standard Element Call setup the link probes expect of any
+    /// Create a **PUBLIC v12 (domainless-id) room** — the #103 shape: the
+    /// room id carries no `:server` tail, and creator authority is implicit
+    /// (v12 forbids a `users[]` entry for creators, so an authority check
+    /// must recognize creatorship rather than look up a power level). Public
+    /// join rule on purpose: inviting the bot instead would trip its own
+    /// non-direct invite gate (a self-serve user's invite is auto-rejected →
+    /// membership `leave` → the probe join is then refused; live-confirmed on
+    /// the #109 fixture), and a public room still exercises the whole #103
+    /// surface — id parsing, the via-hinted first-contact probe join, and
+    /// v12 creator authority. The `m.call.member` PL-0 override is the
+    /// standard Element Call setup the link probes expect of any
     /// to-be-bridged room.
-    pub async fn create_room_v12(&self, invite: &str) -> Result<String> {
+    pub async fn create_room_v12(&self) -> Result<String> {
         let resp = self
             .http
             .post(format!("{}/_matrix/client/v3/createRoom", self.base))
@@ -181,8 +184,7 @@ impl MatrixManagementClient {
             .bearer_auth(&self.as_token)
             .json(&serde_json::json!({
                 "room_version": "12",
-                "preset": "private_chat",
-                "invite": [invite],
+                "preset": "public_chat",
                 "power_level_content_override": {
                     "events": { "org.matrix.msc3401.call.member": 0 },
                 },

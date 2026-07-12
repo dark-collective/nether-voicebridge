@@ -22,12 +22,15 @@
 //!   → first message UTD) is expected to reproduce harder over federation
 //!   than the same-server `mgmt_dm_pending_reap` twin.
 //! * [`FED_LINK_V12`] (`Pass`) — the #103 acceptance test: a remote user
-//!   mints a **v12 (domainless-id) room on the fixture**, then self-serve
-//!   `link`s it. Exercises the v12 room-id handling in `link` and the
-//!   via-hinted first-contact probe join that #103 shipped (v0.3.0-beta.1).
-//!   Deliberately invites the bot at creation — the federated invite is what
-//!   teaches nether.im the room; an UNINVITED variant (pure via-discovery
-//!   join) is follow-up hardening.
+//!   mints a **public v12 (domainless-id) room on the fixture**, then
+//!   self-serve `link`s it. Exercises the v12 room-id handling in `link`,
+//!   the via-hinted first-contact probe join, and v12 implicit creator
+//!   authority (all shipped in v0.3.0-beta.1). Public on purpose: a
+//!   self-serve user's invite of the bot trips its own non-direct invite
+//!   gate (auto-reject → `leave` membership → probe join refused;
+//!   live-confirmed here), which also means the bot's "invite me first, then
+//!   link again" guidance is currently unsatisfiable for self-serve users on
+//!   invite-only rooms — filed as a product gap.
 //! * `fed_slow_join_greeting` — DEFERRED: [`FED_DM_INVITE_LIFECYCLE`]
 //!   already proves the greeting lands after a real federated join; a
 //!   dedicated scenario only adds value with injected federation latency
@@ -440,12 +443,15 @@ async fn drive_link(
     bridge: &BridgeUnderTest,
     rooms: &mut Vec<String>,
 ) -> Result<()> {
-    // A v12 room minted on the FIXTURE: its room id is domainless (`!<hash>`,
-    // no `:server` tail) and nether.im has never seen it — the #103 shape.
-    // The bot is invited at creation so the federated invite carries the via
-    // hint the probe join needs.
+    // A PUBLIC v12 room minted on the FIXTURE: its room id is domainless
+    // (`!<hash>`, no `:server` tail) and nether.im has never seen it — the
+    // #103 first-contact shape. Public, not invite-gated: a self-serve
+    // user's invite of the bot is auto-rejected by its non-direct invite
+    // gate (live-confirmed), leaving a `leave` membership that then blocks
+    // the probe join; the probe's via hint (the linker's domain) is what
+    // routes the domainless join instead.
     let v12_room = linker
-        .create_room_v12(&cfg.bot_user_id())
+        .create_room_v12()
         .await
         .context("creating v12 room on the fixture")?;
     rooms.push(v12_room.clone());
