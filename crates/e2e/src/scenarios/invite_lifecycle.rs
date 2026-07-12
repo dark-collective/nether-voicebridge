@@ -15,15 +15,20 @@
 //!   declines). Same-server = the only thing the harness can mint (see the
 //!   testing-design doc's federation-limitation note), so here it guards the
 //!   post-fix contract as a regression test rather than reproducing the bug.
-//! * [`MGMT_DM_PENDING_REAP`] (`Pass`) — a DM the BOT initiated (operator
-//!   `msg` → `create_dm`) has the bot joined and the target merely invited,
-//!   so `joined_members_count() == 1`: the pre-#97-fix #89b empty-room sweep
-//!   reaped it before the target could accept, killing the pending invite.
-//!   Reproduced deterministically as `KnownFail{#97}` (live 2026-07-12,
-//!   pre-fix: the compressed sweep reaped the fresh DM ~100 ms after
-//!   creation — before even the operator's message could be sent into it,
-//!   403 "sender's membership `leave` is not `join`"); flipped to `Pass`
-//!   with alpha.25's reap exemption for pending-invite rooms.
+//! * [`MGMT_DM_PENDING_REAP`] (`KnownFail{#97}` — STILL, post-alpha.25) — a
+//!   DM the BOT initiated (operator `msg` → `create_dm`) has the bot joined
+//!   and the target merely invited, so `joined_members_count() == 1`: the
+//!   #89b empty-room sweep reaps it before the target can accept, killing
+//!   the outreach. Pre-fix this reproduced ~100 ms after creation (the
+//!   operator's message 403'd mid-send). **alpha.25's exemption
+//!   (`invited_members_count() == 0`) did NOT close it** (live 2026-07-12,
+//!   2/2 deterministic): that count reads the SDK store, and it was still 0
+//!   a full 3 s after `create_dm` — the sweep reaped the room with the
+//!   invite pending server-side the whole time. The exemption needs a
+//!   source of truth that doesn't lag/omit (state-store members or a
+//!   bot-created-DM set), which lives in `crates/matrix-rtc` — the other
+//!   instance's file; evidence posted on #100. Flip to `Pass` when that
+//!   lands.
 //!
 //!   The target is a CRYPTO client, not the raw-CS one: live testing showed
 //!   the SDK's `create_dm` mints the operator-msg DM **encrypted** (initial
@@ -50,7 +55,7 @@ pub static MGMT_INVITE_OFFLINE: ScenarioDef = ScenarioDef {
 
 pub static MGMT_DM_PENDING_REAP: ScenarioDef = ScenarioDef {
     name: "mgmt_dm_pending_reap",
-    expectation: Expectation::Pass,
+    expectation: Expectation::KnownFail { issue: "#97" },
     run: boxed_reap,
 };
 
