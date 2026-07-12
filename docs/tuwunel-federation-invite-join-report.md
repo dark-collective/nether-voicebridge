@@ -78,8 +78,14 @@ So B answers unauthenticated probes correctly; only the authenticated
 event-exchange endpoints (`make_join`/`send_join`/`invite`) return bodies A
 cannot parse — consistently, in both directions of the relationship.
 
-**Control experiments (added later the same day, ~19:30–20:30 UTC).** These
-narrow the fault surface considerably:
+**Root-cause update (live capture).** `missing field \`event\` at line 1,
+column 2` means the parser exhausted the object right after `{` — **B is
+returning HTTP 200 with a literal empty body `{}`** on authenticated
+federation writes, alongside intermittent transport-level failures
+(`Request error: error sending request`), while GETs stay healthy.
+
+**Control experiments (same day, ~19:30–20:30 UTC).** These narrow the fault
+surface further:
 
 1. **B federates fine with Synapse.** A user on `4d2.org` (Synapse 1.153.0)
    established a DM with the same B user while A↔B stayed broken — B is not
@@ -100,37 +106,43 @@ narrow the fault surface considerably:
    `Tuwunel/1.8.1`, `Synapse/1.153.0`, and browser user-agents alike (no UA
    discrimination); the same request with a **forged** `X-Matrix` header
    claiming `origin="nether.im"` returns a proper
-   `403 M_FORBIDDEN: Failed to verify X-Matrix signatures`. So B receives
-   these requests, resolves A's keys, and runs signature verification
-   correctly — only requests that PASS verification get the empty-`200`
-   treatment.
+   `403 M_FORBIDDEN: Failed to verify X-Matrix signatures`. So requests on
+   the failing endpoints demonstrably REACH B's Tuwunel, which resolves A's
+   keys and runs signature verification correctly — only requests that PASS
+   verification get the empty-`200` treatment. A middleware cannot
+   discriminate valid from invalid signatures, which weakens the
+   pure-middleware theory: the empty `200` is produced by (or triggered
+   inside) Tuwunel after verification — e.g. a server ACL / ignore-list
+   path — or by per-pair state.
 4. **It is every authenticated endpoint, reads included.** A same-day
    capture of A querying B's public rooms directory over federation fails
    identically: `Server returned bad 200 response: Deserialization(Json(
    Error("missing field `chunk`", line: 1, column: 2)))` — the same
    empty-object `200`, on a read-only endpoint unrelated to invite-join.
 
-Synthesis: after signature verification **succeeds**, B answers
-nether.im-origin requests — reads and writes alike — with `200` and a
-near-empty JSON body. That shape looks like an "ignore this origin" code
-path (server ACL / blocklist?) or poisoned per-pair state, rather than an
-event-format bug.
+We're pursuing the B-side half with B's operator (config/ACL check + B-side
+logs). Filing anyway because two requester-side improvements would have saved
+hours, plus one behavioral question:
 
-**Questions.**
-1. Which response struct produces `missing field \`event\`` at line 1 col 1–2
-   here — `make_join`, `send_join` (v1/v2), or the `v2/invite` response? The
-   error string doesn't name the endpoint; that would help a lot.
-2. Is there any code path where Tuwunel commits a `200` for these endpoints
-   but writes an empty/partial JSON body (error after status committed,
-   response body dropped by a streaming layer, etc.)?
+**Asks.**
+1. **Name the endpoint in the error.** `Server returned bad 200 response:
+   Deserialization(…)` doesn't say whether `make_join`, `send_join`, or
+   `v2/invite` failed — with a fleet of identical errors we couldn't tell
+   which exchange was breaking without packet-level work.
+2. **`createRoom` should surface a failed federated invite, not WARN and
+   continue.** When the `v2/invite` send fails, the room is created and the
+   response is a clean 200 — the invitee's membership event simply never
+   exists. From the client's perspective the invite silently vanished
+   (`WARN tuwunel_api::client::room::create: Failed to send invite`). At
+   minimum the createRoom response could carry a warning; ideally a
+   per-invite failure surface.
 3. **Does `forbidden_remote_server_names` (or any other server ACL /
    ignore-list) answer a blocked origin's authenticated requests with
-   `200 {}`?** If so, this may be B-side configuration — and the upstream
-   ask becomes "make that an explicit `M_FORBIDDEN`, an empty 200 is
-   undiagnosable for the remote operator".
-4. Known 1.8.1 regression in this area? (Both ends are 1.8.1.)
-5. What `RUST_LOG`/tracing filter on the *requesting* side would log the raw
-   response body so we can capture exactly what B returns?
+   `200 {}`?** If so, an explicit `M_FORBIDDEN` would make this class
+   diagnosable from the remote side — an empty 200 is not.
+4. What `RUST_LOG`/tracing filter on the requesting side logs the raw
+   response body for federation exchanges, for the next time someone needs
+   to see the `{}` with their own eyes?
 
 Happy to provide precise timestamps/room ids privately and to coordinate with
 B's operator (who is reachable to us). The visible user impact is that DMs
