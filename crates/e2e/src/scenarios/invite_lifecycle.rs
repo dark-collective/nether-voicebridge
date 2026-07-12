@@ -15,7 +15,8 @@
 //!   declines). Same-server = the only thing the harness can mint (see the
 //!   testing-design doc's federation-limitation note), so here it guards the
 //!   post-fix contract as a regression test rather than reproducing the bug.
-//! * [`MGMT_DM_PENDING_REAP`] (`KnownFail{#97}` — STILL, post-alpha.25) — a
+//! * [`MGMT_DM_PENDING_REAP`] (`KnownFail{#104}` — mode 1, the reap race,
+//!   is FIXED; the residual is the cold-outreach first-message UTD) — a
 //!   DM the BOT initiated (operator `msg` → `create_dm`) has the bot joined
 //!   and the target merely invited, so `joined_members_count() == 1`: the
 //!   #89b empty-room sweep reaps it before the target can accept, killing
@@ -61,7 +62,7 @@ pub static MGMT_INVITE_OFFLINE: ScenarioDef = ScenarioDef {
 
 pub static MGMT_DM_PENDING_REAP: ScenarioDef = ScenarioDef {
     name: "mgmt_dm_pending_reap",
-    expectation: Expectation::KnownFail { issue: "#97" },
+    expectation: Expectation::KnownFail { issue: "#104" },
     run: boxed_reap,
 };
 
