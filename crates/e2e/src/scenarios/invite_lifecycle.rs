@@ -30,6 +30,7 @@
 //!      sent immediately after `create_dm` was never decryptable by the
 //!      invited target (megolm recipients computed before the invite
 //!      reached the bot's local store — no key ever shared).
+//!
 //!   Both fixes live in `crates/matrix-rtc` (the other instance's file): a
 //!   non-lagging membership source for the exemption, and deferring the
 //!   outreach send until the room state has caught up. Evidence on #100.
