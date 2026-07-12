@@ -5,6 +5,7 @@
 //! [`matrix::MatrixSpeaker`] / [`matrix::MatrixPhantom`] /
 //! [`matrix::MatrixListener`].
 
+pub mod crypto_dm;
 pub mod discord;
 pub mod matrix;
 pub mod mgmt_client;

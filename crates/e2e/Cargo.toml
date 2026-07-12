@@ -23,6 +23,10 @@ nvb-audio = { workspace = true }
 # feature unification: a full-workspace build compiles nvb-matrix-rtc WITH the
 # feature — the shipped binary is built `-p nether-voicebridge`, which doesn't.
 nvb-matrix-rtc = { workspace = true, features = ["testkit"] }
+# The #99 E2EE DM actor is a full crypto client. Same already-in-workspace
+# rule as everything here — feature unification means a full-workspace build
+# compiled matrix-sdk with `e2e-encryption` all along (via nvb-matrix-rtc).
+matrix-sdk = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs", "signal"] }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }

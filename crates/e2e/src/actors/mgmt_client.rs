@@ -199,6 +199,51 @@ impl MatrixManagementClient {
         Ok(())
     }
 
+    /// The rooms this user currently holds a PENDING invite to (one-shot
+    /// `/sync?timeout=0`). #99's reap-race scenario finds the DM the BOT
+    /// initiated (operator `msg` → `create_dm`) this way — the target has no
+    /// other channel to learn the room id from.
+    pub async fn invited_rooms(&self) -> Result<Vec<String>> {
+        let url = format!("{}/_matrix/client/v3/sync", self.base);
+        let resp = self
+            .http
+            .get(url)
+            .query(&[("user_id", self.mxid.as_str()), ("timeout", "0")])
+            .bearer_auth(&self.as_token)
+            .send()
+            .await
+            .context("sync request")?;
+        if !resp.status().is_success() {
+            bail!("sync failed: {}", resp.status());
+        }
+        let json: Value = resp.json().await.context("sync JSON")?;
+        Ok(json["rooms"]["invite"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    /// Accept a pending invite: appservice-asserted `POST /join` (full member,
+    /// no `guest_access` needed — the same leg [`register_and_join`] uses).
+    pub async fn join(&self, room: &str) -> Result<()> {
+        let url = format!("{}/_matrix/client/v3/join/{}", self.base, enc(room));
+        let resp = self
+            .http
+            .post(url)
+            .query(&[("user_id", &self.mxid)])
+            .bearer_auth(&self.as_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .context("join request")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("join failed: {status}: {body}");
+        }
+        Ok(())
+    }
+
     /// Poll `joined_members` until the bot is a joined member (its DM auto-join
     /// is a raw appservice `POST /join`, so it lands server-side within a beat
     /// of the invite). Errors at `timeout`.

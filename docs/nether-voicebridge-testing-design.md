@@ -422,6 +422,27 @@ the DiscordListener records the puppet).
 
 The baseline pre/postcondition wraps **every** live scenario for free.
 
+## What the harness cannot test: federation
+
+Every harness actor is an `nvbtest_*` appservice user on the **same
+homeserver** as the bridge. The harness cannot mint remote users or stand up a
+second server, so anything that only exists across a federation boundary is
+out of reach:
+
+- **remote-join latency** — local joins complete in milliseconds; federated
+  joins take seconds, which is the window that made #97's duplicate-invite
+  processing bite (`@dau:tinier.town`, 2026-07-12);
+- **federated invite redelivery/ordering quirks**, and remote-server sync
+  behavior generally;
+- **cross-server E2EE device fan-out** (key requests/claims over federation).
+
+The #99 scenarios (`mgmt_dm_e2ee`, `mgmt_invite_offline`,
+`mgmt_dm_pending_reap`) cover the *mechanisms* behind the 2026-07-12 incident
+class locally — cooldown stamping, sweep reaping, encrypted DM round-trips —
+but a federation-timing regression can still first surface in prod. That class
+is watched operationally (nvb-watch alerts + the audit trail), not by this
+harness.
+
 # Provisioning runbook (operator-manual, one-time, needed from Phase D)
 
 1. **Discord apps** (create deliberately, never scripted):
