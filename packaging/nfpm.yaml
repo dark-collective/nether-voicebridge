@@ -2,11 +2,14 @@
 #   https://nfpm.goreleaser.com/
 #
 # Run from the REPOSITORY ROOT (all `src` / script paths are root-relative):
-#   NVB_VERSION=0.2.0 nfpm package -f packaging/nfpm.yaml -p deb -t dist/
-#   NVB_VERSION=0.2.0 nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+#   NVB_VERSION=0.2.0 NVB_ARCH=amd64 nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+#   NVB_VERSION=0.2.0 NVB_ARCH=amd64 nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
 # or just run packaging/build-packages.sh, which builds the binary first.
+# NVB_ARCH is the Debian-style arch of the binary at target/release/
+# (amd64 | arm64) — CI sets it per architecture; build-packages.sh derives it
+# from the host. nfpm maps it to the rpm name (x86_64 / aarch64) itself.
 name: nether-voicebridge
-arch: amd64
+arch: ${NVB_ARCH}
 platform: linux
 version: ${NVB_VERSION}
 section: net

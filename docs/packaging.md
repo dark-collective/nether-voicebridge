@@ -29,7 +29,8 @@ retract ghost `m.call.member` before systemd escalates.
 ## Install & run
 
 ```bash
-sudo apt install ./nether-voicebridge_<version>_amd64.deb     # Debian/Ubuntu
+# pick your architecture: amd64/x86_64 or arm64/aarch64
+sudo apt install ./nether-voicebridge_<version>_amd64.deb      # Debian/Ubuntu
 sudo dnf install ./nether-voicebridge-<version>-1.x86_64.rpm   # Fedora/RHEL
 
 sudo cp /etc/nether-voicebridge/config.example.toml /etc/nether-voicebridge/config.toml
@@ -58,31 +59,34 @@ NVB_VERSION=0.2.0 packaging/build-packages.sh   # or pin it explicitly
 ```
 
 The script builds the release binary, then runs `nfpm` from the repo root (all
-paths in `packaging/nfpm.yaml` are root-relative). amd64 only for now, mirroring the
-Docker image.
+paths in `packaging/nfpm.yaml` are root-relative). It packages for the host's
+architecture (override with `NVB_ARCH=amd64|arm64`); CI builds both arches per
+release, each natively, mirroring the multi-arch Docker image.
 
 ## Standalone binary tarball
 
-For distros without `.deb`/`.rpm`, each release also carries a self-contained
-`nether-voicebridge-<version>-x86_64-linux.tar.gz` — the same glibc/amd64 binary the
-Docker image and packages use, bundled with `config.example.toml`, the systemd unit,
-`LICENSE`, and the README. A `SHA256SUMS` file covering every release asset (deb, rpm,
-tarball) is attached too; verify with `sha256sum -c SHA256SUMS --ignore-missing`.
+For distros without `.deb`/`.rpm`, each release also carries self-contained
+`nether-voicebridge-<version>-x86_64-linux.tar.gz` and `…-aarch64-linux.tar.gz`
+tarballs — the same glibc binaries the Docker images and packages use, bundled
+with `config.example.toml`, the systemd unit, `LICENSE`, and the README. A
+`SHA256SUMS` file covering every release asset (debs, rpms, tarballs) is attached
+too; verify with `sha256sum -c SHA256SUMS --ignore-missing`.
 
-Like the binary itself, the tarball is **amd64-only** and dynamically linked against
-**glibc 2.36 + libopus** — it is not a static/musl build, so it needs those runtime
-libraries and a glibc host. The end-user install steps are in the README's
-"Standalone binary" section.
+The tarballs are dynamically linked against **glibc 2.36 + libopus** — not
+static/musl builds, so they need those runtime libraries and a glibc host. The
+end-user install steps are in the README's "Standalone binary" section.
 
 ## CI
 
-`.forgejo/workflows/docker.yml` handles both the image and the packages, so the
-binary is compiled **once** per tag. On a `v*` tag push the `image` job builds and
-pushes the Docker image (the sole compile), then the `packages` job — which
-`needs: image` and is tag-gated — pulls that image, copies the binary out of it
-(`/app/nether-voicebridge` → `target/release/`), runs `nfpm`, builds the standalone
-tarball, generates `SHA256SUMS`, and uploads all four assets (`.deb`, `.rpm`,
-`.tar.gz`, `SHA256SUMS`) to the Forgejo Release. It needs a repo Actions secret **`RELEASE_TOKEN`**
+`.forgejo/workflows/docker.yml` handles both the images and the packages, so the
+binary is compiled **once per (tag, arch)**, each natively (no QEMU). On a `v*`
+tag push the `image` (amd64) and `image-arm64` jobs build and push the per-arch
+Docker images (the sole compiles) and `manifest` merges them into the multi-arch
+tag; then the `packages` job — which `needs: manifest` and is tag-gated — pulls
+each arch image, copies the binary out of it (`/app/nether-voicebridge` →
+`target/release/`), runs `nfpm`, builds the standalone tarball, and after both
+arches generates `SHA256SUMS` and uploads all seven assets (2× `.deb`, 2× `.rpm`,
+2× `.tar.gz`, `SHA256SUMS`) to the Forgejo Release. It needs a repo Actions secret **`RELEASE_TOKEN`**
 — a Forgejo token with `write:repository` scope (the Docker job's package-scoped
 `REGISTRY_TOKEN` can't create releases). Cutting a release is then just: bump the
 version in `[workspace.package]`, commit, and push a `v<version>` tag.

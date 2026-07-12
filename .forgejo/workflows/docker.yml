@@ -206,13 +206,14 @@ jobs:
               "${repo}:edge" "${repo}:edge-arm64"
           fi
 
-  # Builds the .deb and .rpm and attaches them to the Forgejo Release for the tag.
-  # Tag-only, and runs AFTER `image` so it can reuse that build's binary instead
-  # of compiling a second time (#29). The binary it packages is byte-identical to
-  # the one shipped in the Docker image.
+  # Builds the .deb/.rpm/tarball for BOTH architectures and attaches them to the
+  # Forgejo Release for the tag (#49). Tag-only, and runs AFTER `manifest` so a
+  # release is never cut with a half-published image and both arch images exist
+  # to extract from. The binaries it packages are byte-identical to the ones
+  # shipped in the Docker images (#29) — no second `cargo build` anywhere.
   packages:
     runs-on: docker
-    needs: [image]
+    needs: [manifest]
     if: github.ref_type == 'tag'
     steps:
       - name: Checkout
@@ -221,7 +222,7 @@ jobs:
       - name: Install packaging dependencies (nfpm)
         run: |
           # nfpm (pinned), installed as a static binary. No Rust toolchain needed
-          # here — the binary comes from the image, not a local compile.
+          # here — the binaries come from the images, not a local compile.
           NFPM_VERSION=2.46.3
           curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
             | tar -xz -C /usr/local/bin nfpm
@@ -248,50 +249,56 @@ jobs:
           v="${GITHUB_REF_NAME#v}"
           echo "version=${v/-/\~}" >> "$GITHUB_OUTPUT"
 
-      # Reuse the binary the `image` job already compiled: pull the pushed image
-      # and copy /app/nether-voicebridge out to the path nfpm.yaml expects
-      # (target/release/nether-voicebridge). This is what eliminates the second
-      # `cargo build` that used to run here.
-      - name: Extract release binary from the pushed image
-        run: |
-          set -eu
-          img="${REGISTRY}/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}"
-          docker pull "$img"
-          cid=$(docker create "$img")
-          mkdir -p target/release
-          docker cp "$cid:/app/nether-voicebridge" target/release/nether-voicebridge
-          docker rm "$cid"
-          ls -l target/release/nether-voicebridge
-
-      - name: Build .deb and .rpm
-        env:
-          NVB_VERSION: ${{ steps.vars.outputs.version }}
-        run: |
-          mkdir -p dist
-          nfpm package -f packaging/nfpm.yaml -p deb -t dist/
-          nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
-          ls -l dist/
-
-      # Standalone tarball for non-deb/rpm distros: the same glibc/amd64 binary
-      # the image carries, bundled with the example config, systemd unit, license,
-      # and README so it's a self-contained drop-in. No recompile — reuses the
-      # binary extracted above.
-      - name: Build the standalone x86_64 tarball
+      # Per arch: pull the image the build jobs just pushed, copy its
+      # /app/nether-voicebridge out (this is what eliminates the second
+      # `cargo build` that used to run here), then package it. `docker create`
+      # never RUNS the container, so extracting from the arm64 image on this
+      # amd64 runner needs no QEMU. amd64 lives under the canonical tag (pinned
+      # by --platform, since `manifest` has already made it multi-arch); arm64
+      # under the single-arch -arm64 tag `image-arm64` pushed. nfpm names the
+      # outputs by arch (…_amd64.deb / …_arm64.deb, ….x86_64.rpm /
+      # ….aarch64.rpm) so the loop iterations never collide; the tarball gets
+      # the uname-style arch.
+      - name: Build .deb/.rpm/tarball for each architecture
         env:
           NVB_VERSION: ${{ steps.vars.outputs.version }}
         run: |
           set -eu
-          stage="nether-voicebridge-${NVB_VERSION}-x86_64-linux"
-          mkdir -p "dist/${stage}"
-          cp target/release/nether-voicebridge "dist/${stage}/"
-          cp config.example.toml packaging/nether-voicebridge.service LICENSE README.md "dist/${stage}/"
-          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
-          rm -rf "dist/${stage}"
+          mkdir -p dist target/release
+          for arch in amd64 arm64; do
+            case "$arch" in
+              amd64) img="${REGISTRY}/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}" ;;
+              arm64) img="${REGISTRY}/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}-arm64" ;;
+            esac
+            docker pull --platform "linux/${arch}" "$img"
+            cid=$(docker create --platform "linux/${arch}" "$img")
+            docker cp "$cid:/app/nether-voicebridge" target/release/nether-voicebridge
+            docker rm "$cid"
+            ls -l target/release/nether-voicebridge
+
+            NVB_ARCH="$arch" nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+            NVB_ARCH="$arch" nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+
+            # Standalone tarball for non-deb/rpm distros: the same glibc binary
+            # the image carries, bundled with the example config, systemd unit,
+            # license, and README so it's a self-contained drop-in.
+            case "$arch" in
+              amd64) uarch=x86_64 ;;
+              arm64) uarch=aarch64 ;;
+            esac
+            stage="nether-voicebridge-${NVB_VERSION}-${uarch}-linux"
+            mkdir -p "dist/${stage}"
+            cp target/release/nether-voicebridge "dist/${stage}/"
+            cp config.example.toml packaging/nether-voicebridge.service LICENSE README.md "dist/${stage}/"
+            tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+            rm -rf "dist/${stage}"
+          done
+          rm -f target/release/nether-voicebridge
           ls -l dist/
 
-      # Checksums over every release asset. Run last (after deb/rpm + tarball
-      # exist); `cd dist` so the file lists bare names → `sha256sum -c SHA256SUMS`
-      # works from inside the extracted/downloaded dir.
+      # Checksums over every release asset. Run last (after all debs/rpms +
+      # tarballs exist); `cd dist` so the file lists bare names →
+      # `sha256sum -c SHA256SUMS` works from inside the extracted/downloaded dir.
       - name: Generate SHA256SUMS
         run: |
           set -eu

@@ -268,17 +268,18 @@ self-contained tarball — the binary plus `config.example.toml`, the systemd un
 
 ```bash
 ver=<version>   # e.g. 0.2.0
+arch=x86_64     # or aarch64
 base=https://nether.codes/dark/nether-voicebridge/releases/download/v$ver
-curl -LO $base/nether-voicebridge-$ver-x86_64-linux.tar.gz
+curl -LO $base/nether-voicebridge-$ver-$arch-linux.tar.gz
 curl -LO $base/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing   # verify
-tar xzf nether-voicebridge-$ver-x86_64-linux.tar.gz
+tar xzf nether-voicebridge-$ver-$arch-linux.tar.gz
 ```
 
-> The binary is **amd64-only** and built against **glibc 2.36** (dynamically linked
-> to **libopus**), so it needs your distro's `libopus` + `ca-certificates` and a
-> glibc host — it won't run on Alpine/musl or much older glibc. There, prefer the
-> Docker image, which carries its own runtime.
+> The binary is built against **glibc 2.36** (dynamically linked to **libopus**),
+> so it needs your distro's `libopus` + `ca-certificates` and a glibc host — it
+> won't run on Alpine/musl or much older glibc. There, prefer the Docker image,
+> which carries its own runtime.
 
 ## Configuration notes
 

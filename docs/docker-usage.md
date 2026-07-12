@@ -107,9 +107,10 @@ environment:
 
 ### Multi-architecture builds
 
-The published images and release artifacts are **amd64-only**. If you need arm64,
-build it yourself — to build for both `linux/amd64` and `linux/arm64` and push to a
-registry:
+The published images and release artifacts cover **amd64 and arm64**: each release
+tag is a multi-arch manifest (`docker pull` resolves your architecture
+automatically), and the `.deb`/`.rpm`/tarball assets ship in both arches. To build
+your own multi-arch image and push it to a registry:
 
 ```bash
 docker buildx build \
@@ -124,12 +125,12 @@ A plain `docker compose build` builds only for the host architecture.
 ## CI image builds (Forgejo Actions)
 
 `.forgejo/workflows/docker.yml` builds and pushes the image to the
-`nether.codes` container registry on every push to `master` and on `v*` tags. It
-needs a Forgejo runner with a `docker` label and a reachable Docker daemon
-(socket-mounted into the job container). The first build is heavy — the WebRTC
-download plus a full release compile. CI is **amd64-only** (the emulated arm64 leg
-is disabled — see the commented QEMU step in `docker.yml`), so a cold build is
-~12 min.
+`nether.codes` container registry on `v*` tags (and on-demand `:edge` builds via
+workflow dispatch). It needs a Forgejo runner with a `docker` label and a
+reachable Docker daemon (socket-mounted into the job container), plus a second
+runner labeled `linux-arm64` that builds the arm64 image **natively** (no QEMU);
+a `manifest` job merges both into the multi-arch tag. The first build is heavy —
+the WebRTC download plus a full release compile — a cold amd64 build is ~12 min.
 
 ### Limiting runner resources
 
