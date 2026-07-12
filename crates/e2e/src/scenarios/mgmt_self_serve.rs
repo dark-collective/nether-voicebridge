@@ -311,6 +311,29 @@ async fn drive(cfg: &E2eConfig, bridge: &BridgeUnderTest) -> Result<()> {
         bail!("operator `reports` did not show the filed report with its ban suggestion; got: {reports:?}");
     }
 
+    // 11. Operator observability (#94): `status` renders the pool's guild
+    //     footprint (the harness pool has ≥1 bot, all in the test guild) and
+    //     `stats` renders per-bridge uptime + process RSS. Both are
+    //     operator-only (default-deny — not in `allowed_for_self_serve`).
+    let ev = op.send(&opdm, "status").await?;
+    let status = op.wait_for_reply(&opdm, &ev, reply_to).await?;
+    if !status.contains("Puppet-pool guild footprint")
+        || !status.contains("Distinct guilds served")
+    {
+        bail!("operator `status` did not render the pool footprint; got: {status:?}");
+    }
+    let ev = op.send(&opdm, "stats").await?;
+    let stats = op.wait_for_reply(&opdm, &ev, reply_to).await?;
+    if !stats.contains("Running bridges") || !stats.contains("Process RSS") {
+        bail!("operator `stats` did not render bridge stats; got: {stats:?}");
+    }
+    // 11b. The same verbs are refused for the self-serve user.
+    let ev = mgr.send(&dm, "status").await?;
+    let refused = mgr.wait_for_reply(&dm, &ev, reply_to).await?;
+    if !refused.contains("operator-only") {
+        bail!("expected `status` to be operator-only for a self-serve user; got: {refused:?}");
+    }
+
     // ── No unexpected ERROR events over the whole scenario ───────────────────
     // The `/bridge` slash-command registration depends on the puppet
     // application's `applications.commands` OAuth scope — orthogonal to the

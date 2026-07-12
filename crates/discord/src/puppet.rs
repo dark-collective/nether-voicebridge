@@ -925,6 +925,28 @@ impl SharedPool {
             .contains(&guild)
     }
 
+    /// Per-bot guild footprint for the operator `status` command (#94):
+    /// `(bot index, gateway-connected, sorted guild ids)`. Guild knowledge
+    /// comes from `ready`/`guild_create`, so shortly after startup counts can
+    /// under-report (same caveat as [`Self::any_bot_in_guild`]).
+    pub fn guild_footprint(&self) -> Vec<(usize, bool, Vec<u64>)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| {
+                let mut guilds: Vec<u64> = s
+                    .guilds
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .map(|g| g.get())
+                    .collect();
+                guilds.sort_unstable();
+                (idx, s.connected.load(Ordering::SeqCst), guilds)
+            })
+            .collect()
+    }
+
     /// Whether at least one puppet bot has learned (via `ready`/`guild_create`)
     /// that it is a member of `guild_id`. Used by the management bot's `link`
     /// preflight. Guild membership is only known after each bot's gateway

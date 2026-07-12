@@ -120,6 +120,9 @@ fn management_and_limits_block(cfg: &E2eConfig) -> String {
     // the scenario's substring asserts all match mid-string, so appending is
     // invisible to them.
     out.push_str("docs_url = \"https://nether.wiki/matrix/voice-bridge/\"\n");
+    // #94 instance_notice: appended to greeting/help after the guide line —
+    // same append-only safety argument as docs_url.
+    out.push_str("instance_notice = \"Open beta — test notice.\"\n");
     out
 }
 

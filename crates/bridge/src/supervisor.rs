@@ -32,7 +32,7 @@ use nvb_config::{
 };
 use nvb_discord::{CaptureSink, SharedPool};
 use nvb_matrix_rtc::GhostPool;
-use nvb_matrix_rtc::mgmt::{BridgeStatus, ControlMsg, ControlTx, ReconcileSummary};
+use nvb_matrix_rtc::mgmt::{BotFootprint, BridgeStatus, ControlMsg, ControlTx, ReconcileSummary};
 
 /// How long a cancelled bridge gets to unwind (leave voice, retract ghost
 /// memberships, close LiveKit) before its future is force-dropped. The
@@ -128,6 +128,9 @@ struct RunningBridge {
     /// from the completion handler once the old future has fully dropped (store
     /// handles closed, pool channel key freed). Never spawn a replacement inline.
     pending_respawn: Option<BridgeConfig>,
+    /// When this bridge future was spawned — feeds `uptime_secs` in the
+    /// operator `stats` command (#94).
+    spawned_at: std::time::Instant,
 }
 
 impl RunningBridge {
@@ -233,6 +236,7 @@ impl Supervisor {
                 capture_sink,
                 origin,
                 pending_respawn: None,
+                spawned_at: std::time::Instant::now(),
             },
         );
 
@@ -458,6 +462,8 @@ impl Supervisor {
                             guild_id: cfg.discord.guild_id.clone(),
                             channel_id: cfg.discord.channel_id.clone(),
                             owner: cfg.owner.clone(),
+                            created: cfg.created,
+                            uptime_secs: rb.spawned_at.elapsed().as_secs(),
                         }
                     })
                     .collect();
@@ -466,6 +472,15 @@ impl Supervisor {
             }
             ControlMsg::GuildCoverage { guild_id, reply } => {
                 let _ = reply.send(self.pool.any_bot_in_guild(guild_id));
+            }
+            ControlMsg::PoolFootprint { reply } => {
+                let out = self
+                    .pool
+                    .guild_footprint()
+                    .into_iter()
+                    .map(|(bot, connected, guilds)| BotFootprint { bot, connected, guilds })
+                    .collect();
+                let _ = reply.send(out);
             }
         }
     }
@@ -1013,6 +1028,7 @@ mod tests {
                 capture_sink: None,
                 origin: Origin::Static,
                 pending_respawn: None,
+                spawned_at: std::time::Instant::now(),
             },
         );
 

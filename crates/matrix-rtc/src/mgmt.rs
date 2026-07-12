@@ -33,6 +33,22 @@ pub enum ControlMsg {
         guild_id: u64,
         reply: oneshot::Sender<bool>,
     },
+    /// Per-puppet-bot guild footprint for the operator `status` command (#94).
+    PoolFootprint {
+        reply: oneshot::Sender<Vec<BotFootprint>>,
+    },
+}
+
+/// One puppet bot's guild footprint, as reported by
+/// [`ControlMsg::PoolFootprint`]. Guild knowledge comes from the gateway
+/// (`ready`/`guild_create`), so shortly after startup it can under-report.
+#[derive(Debug, Clone)]
+pub struct BotFootprint {
+    /// Index into the `[puppets]` token list (bot 0 is the approval/command bot).
+    pub bot: usize,
+    /// Gateway `ready` fired and the bot's command loop is live.
+    pub connected: bool,
+    pub guilds: Vec<u64>,
 }
 
 /// What an accepted reconcile did. `failed` lists entries whose plan was
@@ -59,6 +75,10 @@ pub struct BridgeStatus {
     pub channel_id: String,
     /// Owner record (#47): the MXID that `link`ed this tenant, when known.
     pub owner: Option<String>,
+    /// `created` epoch seconds from the tenant entry, when recorded.
+    pub created: Option<i64>,
+    /// Seconds since the supervisor spawned this bridge future (#94).
+    pub uptime_secs: u64,
 }
 
 /// Convenience alias for the supervisor-facing sender handle.
@@ -211,6 +231,12 @@ struct BotCtx {
     /// Public user-guide URL (#92): appended to the greeting, `help`, and the
     /// replies whose fix lives in the guide.
     docs_url: Option<String>,
+    /// Free-text instance notice (#94, e.g. the open-beta disclaimer + help
+    /// room): appended to the greeting and `help`.
+    instance_notice: Option<String>,
+    /// Pending `announce` awaiting `announce confirm` (#94): the text and its
+    /// confirmation deadline. One at a time, operator-tier only.
+    pending_announce: StdMutex<Option<(String, Instant)>>,
     /// Disclosure notices to the Discord pool (#64): posted into a bridged
     /// voice channel's text chat by the command bot. Best-effort.
     notice_tx: Option<mpsc::UnboundedSender<DiscordNotice>>,
@@ -230,6 +256,12 @@ impl BotCtx {
     /// greeting, `help`, and the replies whose fix the guide explains (#92).
     fn docs_line(&self) -> String {
         docs_line(self.docs_url.as_deref())
+    }
+
+    /// `"\n<notice>"` when configured, else empty — the instance notice (#94),
+    /// appended to the greeting and `help` after the guide line.
+    fn notice_line(&self) -> String {
+        notice_line(self.instance_notice.as_deref())
     }
 
     /// Post a disclosure notice into a Discord channel via the pool's command
@@ -780,6 +812,8 @@ pub async fn run(
         global_link_attempts: StdMutex::new(Vec::new()),
         privacy_policy_url: cfg.privacy_policy_url.clone(),
         docs_url: cfg.docs_url.clone(),
+        instance_notice: cfg.instance_notice.clone(),
+        pending_announce: StdMutex::new(None),
         notice_tx: pool_io.notice_tx,
     });
 
@@ -1066,7 +1100,7 @@ async fn handle_invite(ctx: &BotCtx, invite: Option<&InviteDetails>, room: &Room
     )
     .await
     {
-        Ok(Ok(())) => greet_when_joined(room.clone(), ctx.docs_url.clone()),
+        Ok(Ok(())) => greet_when_joined(room.clone(), ctx.docs_url.clone(), ctx.instance_notice.clone()),
         Ok(Err(e)) => {
             tracing::error!(room_id = %room_id, error = %e, "failed to join invited room")
         }
@@ -1078,7 +1112,7 @@ async fn handle_invite(ctx: &BotCtx, invite: Option<&InviteDetails>, room: &Room
 /// (the appservice-asserted join is a raw HTTP call, so the `Room` stays in
 /// Invited state until the next sync — sending immediately would fail).
 /// Detached + best-effort: the greeting is a nicety, `help` always works.
-fn greet_when_joined(room: Room, docs_url: Option<String>) {
+fn greet_when_joined(room: Room, docs_url: Option<String>, instance_notice: Option<String>) {
     tokio::spawn(async move {
         for delay in [1u64, 3, 10] {
             tokio::time::sleep(Duration::from_secs(delay)).await;
@@ -1097,8 +1131,9 @@ fn greet_when_joined(room: Room, docs_url: Option<String>) {
                         return;
                     }
                     reply(&r, &format!(
-                        "👋 I link Discord voice channels to Matrix rooms so both sides can talk. Send `help` for commands.{}",
-                        docs_line(docs_url.as_deref())
+                        "👋 I link Discord voice channels to Matrix rooms so both sides can talk. Send `help` for commands.{}{}",
+                        docs_line(docs_url.as_deref()),
+                        notice_line(instance_notice.as_deref())
                     ))
                     .await;
                     return;
@@ -1113,6 +1148,12 @@ fn greet_when_joined(room: Room, docs_url: Option<String>) {
 /// function so the ctx-less greeting task can use it too.
 fn docs_line(url: Option<&str>) -> String {
     url.map(|u| format!("\nGuide: {u}")).unwrap_or_default()
+}
+
+/// `"\n<notice>"` when an instance notice is configured, else empty (#94).
+/// Free function so the ctx-less greeting task can use it too.
+fn notice_line(notice: Option<&str>) -> String {
+    notice.map(|n| format!("\n{n}")).unwrap_or_default()
 }
 
 /// Best-effort reply into `room` (the SDK encrypts automatically in an
@@ -1182,6 +1223,21 @@ enum Command {
     },
     ServeOpen,
     ServeList,
+    /// Operator: puppet-pool guild footprint (#94).
+    Status,
+    /// Operator: per-bridge uptime/owner + process RSS (#94).
+    Stats,
+    /// Operator: DM `text` to `mxid` as the bot (#94).
+    Msg {
+        mxid: String,
+        text: String,
+    },
+    /// Operator: mass-DM every tenant owner (#94). Two-step: `announce <text>`
+    /// stages, `announce confirm` sends.
+    Announce {
+        text: String,
+    },
+    AnnounceConfirm,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1202,6 +1258,8 @@ const SERVE_USAGE: &str =
 const UNBAN_USAGE: &str = "Usage: `unban <owner|guild|room> <value>`";
 const REPORT_USAGE: &str = "Usage: `report <owner|guild|room> <value> [reason]` — flag an abusive bridge for an operator to review, e.g. `report guild 123456 harassing users`. This does not remove the bridge; an operator decides.";
 const REPORTS_USAGE: &str = "Usage: `reports [count]` — show the most recent abuse reports (default 10).";
+const MSG_USAGE: &str = "Usage: `msg <@mxid:server> <text>` — DM a user as the bridge bot, e.g. `msg @user:example.org please trim your bridge usage`.";
+const ANNOUNCE_USAGE: &str = "Usage: `announce <text>` — stage a DM to every bridge owner, then `announce confirm` within 2 minutes to send it. Use sparingly.";
 
 /// Longest free-text `report` reason kept in the audit trail. Reports come from
 /// untrusted self-serve users, so cap the bytes appended per line (#78).
@@ -1210,7 +1268,7 @@ const REPORT_REASON_MAX: usize = 280;
 const DEFAULT_REPORTS: usize = 10;
 const MAX_REPORTS: usize = 50;
 
-const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridges (static + tenants) and whether they are running\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server] — bridge a Discord voice channel to a Matrix room\n  unlink <name> — remove a bridge created with link\n  ban <owner|guild|room> <value> — deny-list an owner MXID / Discord guild / Matrix room AND unlink every matching tenant\n  unban <owner|guild|room> <value> — remove a ban\n  bans — show the deny-lists\n  report <owner|guild|room> <value> [reason] — file an abuse report (recorded, not acted on)\n  reports [count] — show recent abuse reports, each with the `ban` to run\n  serve-allow <@mxid> / serve-remove <@mxid> — restrict the self-serve tier to an allowlist; serve-open reopens to everyone; serve-list shows it\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridges (static + tenants) and whether they are running\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server] — bridge a Discord voice channel to a Matrix room\n  unlink <name> — remove a bridge created with link\n  ban <owner|guild|room> <value> — deny-list an owner MXID / Discord guild / Matrix room AND unlink every matching tenant\n  unban <owner|guild|room> <value> — remove a ban\n  bans — show the deny-lists\n  report <owner|guild|room> <value> [reason] — file an abuse report (recorded, not acted on)\n  reports [count] — show recent abuse reports, each with the `ban` to run\n  serve-allow <@mxid> / serve-remove <@mxid> — restrict the self-serve tier to an allowlist; serve-open reopens to everyone; serve-list shows it\n  status — puppet-pool guild footprint (Discord verification tripwire)\n  stats — per-bridge uptime + owner, and process memory\n  msg <@mxid> <text> — DM a user as the bridge bot\n  announce <text> — stage a DM to every bridge owner; `announce confirm` sends it\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
 
 /// Help for self-serve users (#43): only the verbs they may run, plus the
 /// consent flow they will hit.
@@ -1311,6 +1369,28 @@ fn parse_command(body: &str) -> Parsed {
             [] => Parsed::Cmd(Command::ServeList),
             _ => Parsed::Usage("Usage: `serve-list`".to_string()),
         },
+        "status" => match args {
+            [] => Parsed::Cmd(Command::Status),
+            _ => Parsed::Usage("Usage: `status`".to_string()),
+        },
+        "stats" => match args {
+            [] => Parsed::Cmd(Command::Stats),
+            _ => Parsed::Usage("Usage: `stats`".to_string()),
+        },
+        "msg" => match args {
+            [mxid, text @ ..] if !text.is_empty() => Parsed::Cmd(Command::Msg {
+                mxid: mxid.clone(),
+                text: text.join(" "),
+            }),
+            _ => Parsed::Usage(MSG_USAGE.to_string()),
+        },
+        "announce" => match args {
+            [one] if one == "confirm" => Parsed::Cmd(Command::AnnounceConfirm),
+            text if !text.is_empty() => {
+                Parsed::Cmd(Command::Announce { text: text.join(" ") })
+            }
+            _ => Parsed::Usage(ANNOUNCE_USAGE.to_string()),
+        },
         _ => Parsed::Unknown,
     }
 }
@@ -1356,7 +1436,7 @@ async fn handle_command(ctx: &BotCtx, room: &Room, sender: &str, cmd: Command) {
         Command::Help => {
             let text =
                 if ctx.is_operator(sender) { HELP_TEXT } else { SELF_SERVE_HELP_TEXT };
-            reply(room, &format!("{text}{}", ctx.docs_line())).await
+            reply(room, &format!("{text}{}{}", ctx.docs_line(), ctx.notice_line())).await
         }
         Command::List => handle_list(ctx, room, sender).await,
         Command::Unlink { name } => handle_unlink(ctx, room, sender, &name).await,
@@ -1378,6 +1458,11 @@ async fn handle_command(ctx: &BotCtx, room: &Room, sender: &str, cmd: Command) {
         Command::ServeRemove { mxid } => handle_serve_remove(ctx, room, sender, &mxid).await,
         Command::ServeOpen => handle_serve_open(ctx, room, sender).await,
         Command::ServeList => handle_serve_list(ctx, room).await,
+        Command::Status => handle_status(ctx, room).await,
+        Command::Stats => handle_stats(ctx, room).await,
+        Command::Msg { mxid, text } => handle_msg(ctx, room, sender, &mxid, &text).await,
+        Command::Announce { text } => handle_announce_stage(ctx, room, text).await,
+        Command::AnnounceConfirm => handle_announce_confirm(ctx, room, sender).await,
     }
 }
 
@@ -1386,6 +1471,14 @@ async fn handle_command(ctx: &BotCtx, room: &Room, sender: &str, cmd: Command) {
 async fn query_status(ctx: &BotCtx) -> Option<Vec<BridgeStatus>> {
     let (tx, rx) = oneshot::channel();
     ctx.control.send(ControlMsg::Status { reply: tx }).ok()?;
+    tokio::time::timeout(CONTROL_TIMEOUT, rx).await.ok()?.ok()
+}
+
+/// Ask the supervisor for the per-puppet-bot guild footprint (#94). `None` =
+/// control channel down or timed out (caller reports).
+async fn query_pool_footprint(ctx: &BotCtx) -> Option<Vec<BotFootprint>> {
+    let (tx, rx) = oneshot::channel();
+    ctx.control.send(ControlMsg::PoolFootprint { reply: tx }).ok()?;
     tokio::time::timeout(CONTROL_TIMEOUT, rx).await.ok()?.ok()
 }
 
@@ -2678,6 +2771,237 @@ async fn handle_serve_list(ctx: &BotCtx, room: &Room) {
     }
 }
 
+const SUPERVISOR_SILENT: &str = "The supervisor did not respond — check the bridge logs.";
+
+/// Operator `status` (#94): the puppet pool's guild footprint, rendered
+/// against the Discord 100-server App Verification gate.
+async fn handle_status(ctx: &BotCtx, room: &Room) {
+    let Some(rows) = query_pool_footprint(ctx).await else {
+        reply(room, SUPERVISOR_SILENT).await;
+        return;
+    };
+    let tenants = nvb_config::tenant_guilds(&ctx.tenants_path).unwrap_or_default();
+    reply(room, &render_footprint(&rows, &tenants)).await;
+}
+
+/// Pure renderer for `status`, split out for unit tests (#94).
+fn render_footprint(rows: &[BotFootprint], tenants: &[(String, Option<String>)]) -> String {
+    let mut out = String::from("Puppet-pool guild footprint:\n");
+    let mut union: HashSet<u64> = HashSet::new();
+    for r in rows {
+        union.extend(r.guilds.iter().copied());
+        let state = if r.connected { "connected" } else { "NOT CONNECTED" };
+        let tripwire = if r.guilds.len() >= VERIFICATION_TRIPWIRE {
+            " ⚠ nearing Discord's 100-server App Verification gate — start verification for this app (see docs/nether-voicebridge-verification-runbook.md)"
+        } else {
+            ""
+        };
+        out.push_str(&format!("• bot {}: {} guild(s), {}{}\n", r.bot, r.guilds.len(), state, tripwire));
+    }
+    out.push_str(&format!("Distinct guilds served: {}\n", union.len()));
+    // Tenant bridges per guild (from tenants.toml — static bridges not counted).
+    let mut per_guild: HashMap<String, usize> = HashMap::new();
+    for (_, g) in tenants {
+        if let Some(g) = g {
+            *per_guild.entry(g.clone()).or_default() += 1;
+        }
+    }
+    if per_guild.is_empty() {
+        out.push_str("Tenant bridges: none");
+    } else {
+        let mut entries: Vec<_> = per_guild.into_iter().collect();
+        entries.sort();
+        out.push_str("Tenant bridges per guild: ");
+        out.push_str(
+            &entries.iter().map(|(g, n)| format!("{g}×{n}")).collect::<Vec<_>>().join(", "),
+        );
+    }
+    out
+}
+
+/// Per-bot guild count at which `status` starts warning about the Discord
+/// App Verification gate (100 servers hard; start the paperwork early).
+const VERIFICATION_TRIPWIRE: usize = 60;
+
+/// Operator `stats` (#94, minimal tier): per-bridge uptime/owner/created plus
+/// whole-process RSS. Honest limitation: tenants share one process, so
+/// per-tenant CPU/memory attribution needs per-tenant processes (roadmap).
+async fn handle_stats(ctx: &BotCtx, room: &Room) {
+    let Some(mut list) = query_status(ctx).await else {
+        reply(room, SUPERVISOR_SILENT).await;
+        return;
+    };
+    list.sort_by(|a, b| a.label.cmp(&b.label));
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut out = format!("Running bridges ({}):\n", list.len());
+    for b in &list {
+        let owner = b.owner.as_deref().unwrap_or("(static)");
+        let age = match b.created {
+            Some(c) if now_epoch >= c => format!(", linked {} ago", human_secs((now_epoch - c) as u64)),
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            "• {} — {} — up {}{}\n",
+            b.label,
+            owner,
+            human_secs(b.uptime_secs),
+            age
+        ));
+    }
+    match proc_rss_mib() {
+        Some(mib) => out.push_str(&format!("Process RSS: {mib} MiB")),
+        None => out.push_str("Process RSS: unavailable"),
+    }
+    out.push_str(" — shared across all bridges; per-tenant CPU/memory attribution needs per-tenant processes.");
+    reply(room, &out).await;
+}
+
+/// `VmRSS` of this process in MiB, from `/proc/self/status` (Linux-only,
+/// best-effort — `None` elsewhere).
+fn proc_rss_mib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb: u64 = status
+        .lines()
+        .find(|l| l.starts_with("VmRSS:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some(kb / 1024)
+}
+
+/// `"3d 4h"` / `"2h 5m"` / `"42s"` — coarse human duration for `stats`.
+fn human_secs(s: u64) -> String {
+    let (d, h, m) = (s / 86_400, (s % 86_400) / 3_600, (s % 3_600) / 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// DM `text` to `mxid` as the bot, reusing an existing direct room when the
+/// SDK knows one (#94). Extracted so `msg` and `announce` share the path.
+async fn dm_user(client: &Client, mxid: &str, text: &str) -> Result<(), String> {
+    let uid = UserId::parse(mxid).map_err(|e| e.to_string())?;
+    let dm = client.create_dm(&uid).await.map_err(|e| e.to_string())?;
+    dm.send(RoomMessageEventContent::text_plain(text)).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Operator `msg` (#94): one-off DM to a specific user, audit-logged.
+async fn handle_msg(ctx: &BotCtx, room: &Room, sender: &str, mxid: &str, text: &str) {
+    if !(mxid.starts_with('@') && mxid.contains(':')) {
+        reply(room, &format!("'{mxid}' is not a full MXID (expected @localpart:server).")).await;
+        return;
+    }
+    let body = format!("📣 Message from the bridge operator:\n{text}");
+    match dm_user(&room.client(), mxid, &body).await {
+        Ok(()) => {
+            audit(ctx, sender, "operator_msg", serde_json::json!({ "to": mxid }));
+            reply(room, &format!("✅ Sent to {mxid}.")).await;
+        }
+        Err(e) => reply(room, &format!("❌ Could not DM {mxid}: {e}")).await,
+    }
+}
+
+/// How long a staged `announce` stays confirmable (#94).
+const ANNOUNCE_CONFIRM_WINDOW: Duration = Duration::from_secs(120);
+
+/// Distinct owners an `announce` reaches (#94): every tenant owner, deduped,
+/// minus ownerless legacy entries and the operators themselves. Pure for
+/// unit tests.
+fn announce_recipients(
+    owners: &[(String, Option<String>)],
+    operators: &HashSet<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = owners
+        .iter()
+        .filter_map(|(_, o)| o.clone())
+        .filter(|o| !operators.contains(o))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Operator `announce <text>` (#94): stage the mass DM and report who it
+/// would reach; nothing sends until `announce confirm`.
+async fn handle_announce_stage(ctx: &BotCtx, room: &Room, text: String) {
+    let owners = match nvb_config::tenant_owners(&ctx.tenants_path) {
+        Ok(o) => o,
+        Err(e) => {
+            reply(room, &format!("Cannot read tenants.toml: {e}")).await;
+            return;
+        }
+    };
+    let recipients = announce_recipients(&owners, &ctx.allow);
+    if recipients.is_empty() {
+        reply(room, "No tenant owners to announce to (operators and ownerless entries are skipped).").await;
+        return;
+    }
+    *ctx.pending_announce.lock().unwrap_or_else(PoisonError::into_inner) =
+        Some((text.clone(), Instant::now()));
+    reply(room, &format!(
+        "Staged announcement to {} owner(s):\n—\n{text}\n—\nSend `announce confirm` within {} minutes to deliver it. Use sparingly.",
+        recipients.len(),
+        ANNOUNCE_CONFIRM_WINDOW.as_secs() / 60
+    ))
+    .await;
+}
+
+/// Operator `announce confirm` (#94): deliver the staged announcement to
+/// every recipient, tally the result, audit it.
+async fn handle_announce_confirm(ctx: &BotCtx, room: &Room, sender: &str) {
+    let staged = ctx
+        .pending_announce
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    let Some((text, staged_at)) = staged else {
+        reply(room, "Nothing staged — `announce <text>` first.").await;
+        return;
+    };
+    if staged_at.elapsed() > ANNOUNCE_CONFIRM_WINDOW {
+        reply(room, "The staged announcement expired — `announce <text>` again.").await;
+        return;
+    }
+    let owners = match nvb_config::tenant_owners(&ctx.tenants_path) {
+        Ok(o) => o,
+        Err(e) => {
+            reply(room, &format!("Cannot read tenants.toml: {e}")).await;
+            return;
+        }
+    };
+    let recipients = announce_recipients(&owners, &ctx.allow);
+    let body = format!("📣 Announcement from the bridge operator:\n{text}");
+    let client = room.client();
+    let (mut sent, mut failed) = (0usize, Vec::new());
+    for r in &recipients {
+        match dm_user(&client, r, &body).await {
+            Ok(()) => sent += 1,
+            Err(e) => failed.push(format!("{r} ({e})")),
+        }
+    }
+    audit(ctx, sender, "announce", serde_json::json!({
+        "recipients": recipients.len(),
+        "sent": sent,
+        "failed": failed.len(),
+    }));
+    let mut out = format!("📣 Announcement delivered to {sent}/{} owner(s).", recipients.len());
+    if !failed.is_empty() {
+        out.push_str(&format!("\nFailed: {}", failed.join(", ")));
+    }
+    reply(room, &out).await;
+}
+
 /// The `report` command (#78 Need 2): let anyone who can reach the bot flag an
 /// abusive bridge. A report is *reactive tooling* — it never acts on its own
 /// (auto-banning on untrusted input would itself be an abuse vector). It is
@@ -2832,6 +3156,77 @@ fn is_numeric_id(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_operator_tooling_verbs() {
+        // #94: status/stats take no args; msg needs mxid + text; announce
+        // distinguishes the confirm word from announcement text.
+        assert_eq!(parse_command("status"), Parsed::Cmd(Command::Status));
+        assert_eq!(parse_command("stats"), Parsed::Cmd(Command::Stats));
+        assert!(matches!(parse_command("status now"), Parsed::Usage(_)));
+        assert_eq!(
+            parse_command("msg @u:x.org please trim usage"),
+            Parsed::Cmd(Command::Msg { mxid: "@u:x.org".into(), text: "please trim usage".into() })
+        );
+        assert!(matches!(parse_command("msg @u:x.org"), Parsed::Usage(_)));
+        assert_eq!(
+            parse_command("announce maintenance at noon"),
+            Parsed::Cmd(Command::Announce { text: "maintenance at noon".into() })
+        );
+        assert_eq!(parse_command("announce confirm"), Parsed::Cmd(Command::AnnounceConfirm));
+        assert!(matches!(parse_command("announce"), Parsed::Usage(_)));
+        // None of the new verbs are self-serve reachable.
+        for cmd in [
+            Command::Status,
+            Command::Stats,
+            Command::Msg { mxid: String::new(), text: String::new() },
+            Command::Announce { text: String::new() },
+            Command::AnnounceConfirm,
+        ] {
+            assert!(!allowed_for_self_serve(&cmd));
+        }
+    }
+
+    #[test]
+    fn announce_recipients_dedup_and_skip() {
+        let owners = vec![
+            ("a".to_string(), Some("@one:x".to_string())),
+            ("b".to_string(), Some("@one:x".to_string())), // dup owner
+            ("c".to_string(), Some("@op:x".to_string())),  // operator
+            ("d".to_string(), None),                       // legacy, ownerless
+            ("e".to_string(), Some("@two:y".to_string())),
+        ];
+        let ops: HashSet<String> = ["@op:x".to_string()].into();
+        assert_eq!(announce_recipients(&owners, &ops), vec!["@one:x", "@two:y"]);
+        assert!(announce_recipients(&[], &ops).is_empty());
+    }
+
+    #[test]
+    fn footprint_render_marks_tripwire() {
+        let rows = vec![
+            BotFootprint { bot: 0, connected: true, guilds: vec![1, 2] },
+            BotFootprint { bot: 1, connected: false, guilds: (0..65).collect() },
+        ];
+        let tenants = vec![
+            ("t1".to_string(), Some("1".to_string())),
+            ("t2".to_string(), Some("1".to_string())),
+        ];
+        let s = render_footprint(&rows, &tenants);
+        assert!(s.contains("bot 0: 2 guild(s), connected"));
+        assert!(s.contains("bot 1: 65 guild(s), NOT CONNECTED ⚠"));
+        assert!(s.contains("Distinct guilds served: 65"));
+        assert!(s.contains("1×2"));
+        // Under the tripwire → no warning marker on bot 0's line.
+        assert!(!s.lines().next().unwrap_or("").contains('⚠'));
+    }
+
+    #[test]
+    fn human_secs_buckets() {
+        assert_eq!(human_secs(42), "42s");
+        assert_eq!(human_secs(300), "5m");
+        assert_eq!(human_secs(7500), "2h 5m");
+        assert_eq!(human_secs(273_600), "3d 4h");
+    }
 
     #[test]
     fn docs_line_present_and_absent() {
@@ -3609,6 +4004,8 @@ mod tests {
             global_link_attempts: StdMutex::new(Vec::new()),
             privacy_policy_url: None,
             docs_url: None,
+            instance_notice: None,
+            pending_announce: StdMutex::new(None),
             notice_tx: None,
         };
         (ctx, control_rx)

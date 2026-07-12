@@ -388,7 +388,17 @@ covers the 100-server App Verification gate. Point end users at
 flow and the approval code, written for the people doing the linking — and set
 `docs_url` to wherever you host that walkthrough: it is appended to the bot's
 DM greeting, `help`, and the errors the guide explains, so someone who
-discovers the bot cold can find their way to the instructions (#92).
+discovers the bot cold can find their way to the instructions (#92). An
+optional `instance_notice` string is likewise appended to the greeting and
+`help` — the place for an open-beta disclaimer and your help-room address
+(#94).
+
+Operator-only observability and outreach commands (#94, see the
+[operations runbook](docs/operations-runbook.md)): `status` renders the puppet
+pool's per-bot guild footprint against Discord's 100-server verification gate;
+`stats` shows per-bridge uptime/owner and process memory; `msg <@mxid> <text>`
+DMs one user as the bot; `announce <text>` + `announce confirm` mass-DMs every
+bridge owner (sparingly — it's for service notices).
 
 ### Abuse controls
 

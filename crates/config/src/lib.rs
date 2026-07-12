@@ -452,6 +452,10 @@ pub struct ManagementConfig {
     /// puppet invite links, the power-level setup).
     #[serde(default)]
     pub docs_url: Option<String>,
+    /// Free-text notice appended to the DM greeting and `help` (#94) — e.g. an
+    /// open-beta disclaimer with the instance's help-room address.
+    #[serde(default)]
+    pub instance_notice: Option<String>,
     // --- resolved from the referenced [server.<name>] profile ---
     #[serde(default)]
     pub homeserver_url: String,

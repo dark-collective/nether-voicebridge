@@ -111,6 +111,9 @@
 # #                                  # the DM greeting, `help`, the pending-approval
 # #                                  # reply, and the errors the guide explains (IDs,
 # #                                  # power levels) — gives cold DMers a way in
+# # instance_notice = "Open beta — best-effort uptime. Help: #help:example.org"
+# #                                  # (#94) free-text notice appended to the DM
+# #                                  # greeting and `help` — beta disclaimer etc.
 
 # ── Admission limits (optional) ──────────────────────────────────────────────
 # Hard caps for a hosted deployment (#47). Every field is optional; an absent
