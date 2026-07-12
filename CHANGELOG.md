@@ -3,6 +3,20 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.25] - 2026-07-12
+
+### Fixed
+- **Federated DM invites no longer self-destruct (#97).** Sync redelivers a
+  still-pending invite while a slow federated join is in flight; the duplicate
+  used to hit the per-sender invite cooldown stamped by its own first pass and
+  *decline* the just-joined room (join-then-leave, hit by the first real beta
+  user). Invite handling now dedupes per room, and the cooldown arms only
+  after a join actually succeeds.
+- **Bot-initiated DMs survive until the invitee answers (#97).** The
+  empty-room reaper no longer collects rooms that still have a pending
+  invited member — previously it retracted `msg`/`announce`/outreach invites
+  if the human took more than one sweep interval to accept.
+
 ## [0.3.0-alpha.24] - 2026-07-12
 
 ### Added
