@@ -556,15 +556,18 @@ async fn check_room_call_power(ctx: &BotCtx, client: &Client, statuses: &[Bridge
         if check.ok() {
             continue;
         }
-        // Deliver only once the SDK client can see the room — right after a
-        // restart the sweep can beat the initial sync, and notifying (or
-        // stamping the cooldown) with no room view would silence the in-room
-        // notice for a whole cooldown window. Defer to the next sweep instead.
+        // Deliver only once the SDK client sees the room AS JOINED — right
+        // after a restart the sweep can beat the initial sync, and the bot's
+        // appservice-asserted raw join leaves the LOCAL state Invited until a
+        // sync lands (the same race `greet_when_joined` retries around), so
+        // `room.send()` would refuse. Notifying (or stamping the cooldown)
+        // before delivery can succeed would silence the in-room notice for a
+        // whole cooldown window. Defer to the next sweep instead.
         let room = match matrix_sdk::ruma::RoomId::parse(b.room_id.as_str()) {
             Ok(rid) => match client.get_room(&rid) {
-                Some(room) => room,
-                None => {
-                    tracing::debug!(room = %b.room_id, "maintenance: no room view yet — deferring misconfig notification to the next sweep");
+                Some(room) if room.state() == RoomState::Joined => room,
+                _ => {
+                    tracing::debug!(room = %b.room_id, "maintenance: room not (yet) locally joined — deferring misconfig notification to the next sweep");
                     continue;
                 }
             },
