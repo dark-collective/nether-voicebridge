@@ -422,26 +422,43 @@ the DiscordListener records the puppet).
 
 The baseline pre/postcondition wraps **every** live scenario for free.
 
-## What the harness cannot test: federation
+## Federation coverage: the `nether.autos` fixture (#109)
 
-Every harness actor is an `nvbtest_*` appservice user on the **same
-homeserver** as the bridge. The harness cannot mint remote users or stand up a
-second server, so anything that only exists across a federation boundary is
-out of reach:
+Originally every harness actor was an `nvbtest_*` appservice user on the
+**same homeserver** as the bridge, so anything that only exists across a
+federation boundary was out of reach — exactly where the #96/#97/#103
+incident class first bled (`@dau:tinier.town`, 2026-07-12). The #109 fixture
+removes that limit: a second, operator-owned Tuwunel homeserver
+(`nether.autos`, provisioning + wipe procedure in `docs/e2e-homeserver.md`)
+with its own passive `autotest` appservice lets the harness mint genuinely
+REMOTE `@autotest_*:nether.autos` users. The `fed_*` scenarios gate on the
+`fed_*` config group (`fed_homeserver_url`/`fed_as_token`) and report
+`skipped` when it's absent, so the suite still runs anywhere.
 
-- **remote-join latency** — local joins complete in milliseconds; federated
-  joins take seconds, which is the window that made #97's duplicate-invite
-  processing bite (`@dau:tinier.town`, 2026-07-12);
-- **federated invite redelivery/ordering quirks**, and remote-server sync
-  behavior generally;
-- **cross-server E2EE device fan-out** (key requests/claims over federation).
+The formerly-unreachable classes, mapped to their scenarios:
 
-The #99 scenarios (`mgmt_dm_e2ee`, `mgmt_invite_offline`,
-`mgmt_dm_pending_reap`) cover the *mechanisms* behind the 2026-07-12 incident
-class locally — cooldown stamping, sweep reaping, encrypted DM round-trips —
-but a federation-timing regression can still first surface in prod. That class
-is watched operationally (nvb-watch alerts + the audit trail), not by this
-harness.
+- **remote-join latency** (federated joins take seconds — the #97
+  duplicate-invite window) → `fed_dm_invite_lifecycle` (Pass; the same-server
+  mechanism twin is `mgmt_invite_offline`);
+- **cross-server E2EE device fan-out** (device-list queries/OTK claims/megolm
+  shares over federation) → `fed_cold_outreach_utd` (KnownFail #104 until the
+  cold-outreach UTD fix lands; same-server twin `mgmt_dm_pending_reap`);
+- **remotely-minted v12 (domainless-id) rooms** (id parsing, via-hinted
+  first-contact probe joins, v12 implicit creator authority) → `fed_link_v12`
+  (the #103 acceptance test);
+- `fed_slow_join_greeting` — **deferred**: needs injected federation latency
+  beyond `greet_when_joined`'s 1/3/10 s retry ladder, i.e. the chaos-proxy
+  tier below.
+
+Still out of reach (watched operationally via nvb-watch + the audit trail):
+
+- **other server implementations** — the fixture is Tuwunel, like prod;
+  Synapse/conduit-specific federation behavior only surfaces with real
+  third-party peers;
+- **adversarial/partitioned federation** (malformed `make_join`/`invite`
+  responses — the tinier.town corruption class): planned as a later tier, a
+  chaos proxy in front of the fixture mangling responses deterministically
+  (#106/#108).
 
 # Provisioning runbook (operator-manual, one-time, needed from Phase D)
 
