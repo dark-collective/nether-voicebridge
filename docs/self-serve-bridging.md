@@ -124,15 +124,32 @@ each speaker appears on the far side as their own named participant.
 
 ## Limits you may hit
 
-Instances typically cap self-serve usage (all operator-configured, so exact
-numbers vary):
+Instances cap self-serve usage (all operator-configured, so exact numbers
+vary). The `nether.im` instance currently sets:
 
-- a cooldown between commands, and a budget on `link` attempts per hour;
-- a cap on how many bridges one account may own (pending approvals count);
-- a cap on how many bridges may target one Discord server.
+- **2 bridges per account** (pending approvals count toward it) and **3 per
+  Discord server**;
+- a **30-second cooldown** between commands that change something, and **5
+  `link` attempts per hour** (plus a global rate limit shared by everyone);
+- the **approval code expires after 10 minutes** — if the Discord side missed
+  the window, just run `link` again for a fresh code.
 
-If you hit one, the refusal message says so and (for the rate limits) when to
-retry.
+If you hit one of those, the refusal message says exactly which limit and (for
+the rate limits) when to retry.
+
+Two limits are about call size rather than commands, and they **don't produce
+an error message** — worth knowing so they don't look like breakage:
+
+- **Discord speakers per Matrix call:** each bridge relays up to **16**
+  concurrent Discord speakers into the Element Call (each as their own named
+  ghost). A 17th simultaneous speaker is **not relayed at all** until a slot
+  frees (someone leaves or goes quiet long enough to be released) — they're
+  fine on the Discord side, just absent from Matrix.
+- **Named Matrix speakers per Discord channel:** the shared pool of **7**
+  puppet bots means up to 7 Matrix speakers get their own named participant in
+  a Discord channel at once — an 8th simultaneous speaker is still heard, but
+  their audio comes out of the channel's anchor bot instead of a bot with
+  their name (it blends back once someone stops talking).
 
 ## Consent, disclosure, and opting out
 

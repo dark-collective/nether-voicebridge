@@ -414,6 +414,10 @@ path that feeds the deny-list.
   owners lose self-serve access entirely; the deny-list is re-checked at approval
   time so a ban that lands while a link is pending still blocks it.
 
+For the operator's side of the story — proactive monitoring of the audit trail
+and egress, backups, the moderation recipes, and the periodic check-in ritual —
+see the **[operations runbook](docs/operations-runbook.md)**.
+
 ## Community & contributing
 
 - **Hosted-instance help:**
