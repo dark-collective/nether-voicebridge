@@ -14,7 +14,7 @@
 //! The browser UA + rustls mirror [`crate::observers::RoomStatePoller`]: the
 //! standing homeserver sits behind Cloudflare, which 403s default library UAs.
 
-use crate::config::E2eConfig;
+use crate::config::{AsHomeserver, E2eConfig};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,11 +41,24 @@ pub struct MatrixManagementClient {
 }
 
 impl MatrixManagementClient {
-    /// Register `@{localpart}:<domain>` (idempotent) via the test appservice
-    /// and set its display name (best-effort). `localpart` must have a
-    /// non-digit suffix (a digit suffix is echo-classified as a bridge ghost —
-    /// same rule the testkit's `TestUser` enforces).
+    /// Register `@{localpart}:<domain>` (idempotent) via the PRIMARY test
+    /// appservice and set its display name (best-effort). `localpart` must
+    /// have a non-digit suffix (a digit suffix is echo-classified as a bridge
+    /// ghost — same rule the testkit's `TestUser` enforces).
     pub async fn register(cfg: &E2eConfig, localpart: &str, display_name: &str) -> Result<Self> {
+        Self::register_on(&cfg.primary_as()?, &cfg.bot_user_id(), localpart, display_name).await
+    }
+
+    /// [`Self::register`] against an explicit appservice endpoint — the #109
+    /// federation fixture mints REMOTE users this way (`hs` = the fixture,
+    /// `bot_mxid` = the bridge's mgmt bot on ITS homeserver: a fixture-side
+    /// user talking to `@…_bot:nether.im` is a genuinely federated exchange).
+    pub async fn register_on(
+        hs: &AsHomeserver,
+        bot_mxid: &str,
+        localpart: &str,
+        display_name: &str,
+    ) -> Result<Self> {
         let suffix = localpart.rsplit('_').next().unwrap_or(localpart);
         if suffix.is_empty() || suffix.bytes().all(|b| b.is_ascii_digit()) {
             bail!("management-client localpart '{localpart}' needs a non-empty, non-all-digit suffix");
@@ -57,10 +70,10 @@ impl MatrixManagementClient {
             .context("building management-client http")?;
         let me = Self {
             http,
-            base: cfg.homeserver_url.trim_end_matches('/').to_owned(),
-            as_token: cfg.test_as_token()?.to_owned(),
-            mxid: format!("@{localpart}:{}", cfg.server_domain()),
-            bot_mxid: cfg.bot_user_id(),
+            base: hs.base_url.clone(),
+            as_token: hs.as_token.clone(),
+            mxid: format!("@{localpart}:{}", hs.domain),
+            bot_mxid: bot_mxid.to_owned(),
         };
         me.register_user(localpart).await?;
         me.set_display_name(display_name).await;
@@ -149,6 +162,44 @@ impl MatrixManagementClient {
             .as_str()
             .map(str::to_owned)
             .context("createRoom response missing room_id")
+    }
+
+    /// Create a **v12 (domainless-id) room** inviting `invite` — the #103
+    /// shape: the room id carries no `:server` tail, and creator authority is
+    /// implicit (v12 forbids a `users[]` entry for creators, so an authority
+    /// check must recognize creatorship rather than look up a power level).
+    /// `private_chat` (NOT `trusted_private_chat`: that preset grants
+    /// invitees creator-level PL via `users[]`, which v12 rejects for the
+    /// creator shape being exercised). The `m.call.member` PL-0 override is
+    /// the standard Element Call setup the link probes expect of any
+    /// to-be-bridged room.
+    pub async fn create_room_v12(&self, invite: &str) -> Result<String> {
+        let resp = self
+            .http
+            .post(format!("{}/_matrix/client/v3/createRoom", self.base))
+            .query(&[("user_id", &self.mxid)])
+            .bearer_auth(&self.as_token)
+            .json(&serde_json::json!({
+                "room_version": "12",
+                "preset": "private_chat",
+                "invite": [invite],
+                "power_level_content_override": {
+                    "events": { "org.matrix.msc3401.call.member": 0 },
+                },
+            }))
+            .send()
+            .await
+            .context("createRoom(v12) request")?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("createRoom(v12) failed: {status}: {body}");
+        }
+        let json: Value = serde_json::from_str(&body).context("createRoom(v12) response JSON")?;
+        json["room_id"]
+            .as_str()
+            .map(str::to_owned)
+            .context("createRoom(v12) response missing room_id")
     }
 
     /// Invite `mxid` into `room` (as this user). Used to grow a DM past the

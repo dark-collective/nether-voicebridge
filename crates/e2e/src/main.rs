@@ -110,18 +110,19 @@ async fn run(args: &[String]) -> Result<()> {
     };
 
     let report = scenario::run_scenarios(&defs, cfg, profile).await?;
-    let (mut pass, mut fail, mut known, mut unexpected) = (0, 0, 0, 0);
+    let (mut pass, mut fail, mut known, mut unexpected, mut skipped) = (0, 0, 0, 0, 0);
     for s in &report.scenarios {
         match s.outcome.as_str() {
             "pass" => pass += 1,
             "known_fail" => known += 1,
             "unexpected_pass" => unexpected += 1,
+            "skipped" => skipped += 1,
             _ => fail += 1,
         }
     }
     eprintln!(
-        "== {} pass, {} fail, {} known-fail, {} unexpected-pass — report.json in artifacts ==",
-        pass, fail, known, unexpected
+        "== {} pass, {} fail, {} known-fail, {} unexpected-pass, {} skipped — report.json in artifacts ==",
+        pass, fail, known, unexpected, skipped
     );
     if !report.ok() {
         std::process::exit(1);

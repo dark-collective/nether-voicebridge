@@ -27,7 +27,7 @@
 //!   `nvbtest_*` users (stale keyless devices show up as `unreachable` noise
 //!   in every peer's key sends).
 
-use crate::config::E2eConfig;
+use crate::config::{AsHomeserver, E2eConfig};
 use anyhow::{Context, Result, bail};
 use matrix_sdk::{
     Client, RoomState, SessionMeta,
@@ -61,10 +61,24 @@ pub struct MatrixCryptoDmClient {
 }
 
 impl MatrixCryptoDmClient {
-    /// Register `@{localpart}:<domain>` (idempotent) via the test appservice,
-    /// login a fresh crypto device, and start syncing. Same localpart rule as
-    /// the plaintext client: a digit suffix is echo-classified as a ghost.
+    /// Register `@{localpart}:<domain>` (idempotent) via the PRIMARY test
+    /// appservice, login a fresh crypto device, and start syncing. Same
+    /// localpart rule as the plaintext client: a digit suffix is
+    /// echo-classified as a ghost.
     pub async fn register(cfg: &E2eConfig, localpart: &str, display_name: &str) -> Result<Self> {
+        Self::register_on(&cfg.primary_as()?, &cfg.bot_user_id(), localpart, display_name).await
+    }
+
+    /// [`Self::register`] against an explicit appservice endpoint — the #109
+    /// federation fixture mints REMOTE crypto users this way (`hs` = the
+    /// fixture, `bot_mxid` = the mgmt bot on ITS homeserver), so device-key
+    /// queries, OTK claims and megolm shares all cross real federation.
+    pub async fn register_on(
+        hs: &AsHomeserver,
+        bot_mxid: &str,
+        localpart: &str,
+        display_name: &str,
+    ) -> Result<Self> {
         let suffix = localpart.rsplit('_').next().unwrap_or(localpart);
         if suffix.is_empty() || suffix.bytes().all(|b| b.is_ascii_digit()) {
             bail!("crypto-dm localpart '{localpart}' needs a non-empty, non-all-digit suffix");
@@ -74,9 +88,9 @@ impl MatrixCryptoDmClient {
             .user_agent("Mozilla/5.0 (compatible; nvb-e2e)")
             .build()
             .context("building crypto-dm http")?;
-        let base = cfg.homeserver_url.trim_end_matches('/').to_owned();
-        let as_token = cfg.test_as_token()?.to_owned();
-        let mxid = format!("@{localpart}:{}", cfg.server_domain());
+        let base = hs.base_url.clone();
+        let as_token = hs.as_token.clone();
+        let mxid = format!("@{localpart}:{}", hs.domain);
 
         // Idempotent appservice register (M_USER_IN_USE is success).
         let reg = http
@@ -163,7 +177,7 @@ impl MatrixCryptoDmClient {
             base,
             as_token,
             mxid,
-            bot_mxid: cfg.bot_user_id(),
+            bot_mxid: bot_mxid.to_owned(),
             client,
             sync_task,
         })

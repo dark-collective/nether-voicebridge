@@ -42,6 +42,24 @@ impl Profile {
     }
 }
 
+/// One appservice-authenticated homeserver endpoint the harness mints fake
+/// Matrix users on — the primary (`nvbtest` on the bridge's own homeserver)
+/// or the #109 federation fixture (`autotest` on nether.autos). Actors that
+/// take an `AsHomeserver` can impersonate users on either side of a
+/// federated exchange.
+#[derive(Debug, Clone)]
+pub struct AsHomeserver {
+    /// Client-API base URL, no trailing slash.
+    pub base_url: String,
+    /// The appservice registration's `as_token` (secret — never logged).
+    pub as_token: String,
+    /// The server_name minted users live on.
+    pub domain: String,
+    /// Localpart stem of the registration's exclusive namespace, without the
+    /// trailing underscore (`nvbtest` / `autotest`).
+    pub user_prefix: String,
+}
+
 /// The `e2e.toml` shape — every field optional; env wins over file.
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
@@ -62,6 +80,10 @@ struct FileConfig {
     room_c: Option<String>,
     test_as_token: Option<String>,
     mod_token: Option<String>,
+    fed_homeserver_url: Option<String>,
+    fed_as_token: Option<String>,
+    fed_domain: Option<String>,
+    fed_user_prefix: Option<String>,
     artifacts_dir: Option<String>,
 }
 
@@ -105,12 +127,58 @@ pub struct E2eConfig {
     /// application) used by the `DiscordMod` REST actor to force-move /
     /// disconnect a puppet. Optional — only the mod-driven scenarios need it.
     pub mod_token: Option<String>,
+    /// The #109 federation fixture (nether.autos + its `autotest`
+    /// registration). Optional — the `fed_*` scenarios report `skipped` when
+    /// absent, so the suite still runs anywhere. A PARTIAL group fails the
+    /// load loudly (a typo must never demote a run to silently-skipped).
+    pub federation: Option<AsHomeserver>,
     /// Where per-run artifacts (bridge log, report.json, WAVs) land.
     pub artifacts_dir: PathBuf,
 }
 
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// Host component of an http(s) URL (the same rule the bridge applies to
+/// derive `matrix_domain` from `homeserver_url`).
+fn url_host(url: &str) -> String {
+    url.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Resolve the optional `fed_*` group: all keys absent → `None` (the `fed_*`
+/// scenarios skip); url + as_token present → the fixture endpoint (domain
+/// defaults to the url host, prefix to `autotest`); anything partial → a loud
+/// error, so a typo can't demote a federated run to silently-skipped.
+fn resolve_federation(
+    url: Option<String>,
+    as_token: Option<String>,
+    domain: Option<String>,
+    user_prefix: Option<String>,
+) -> Result<Option<AsHomeserver>> {
+    match (url, as_token) {
+        (Some(url), Some(as_token)) => {
+            let base_url = url.trim_end_matches('/').to_owned();
+            let domain = domain.unwrap_or_else(|| url_host(&base_url));
+            Ok(Some(AsHomeserver {
+                base_url,
+                as_token,
+                domain,
+                user_prefix: user_prefix.unwrap_or_else(|| "autotest".into()),
+            }))
+        }
+        (None, None) if domain.is_none() && user_prefix.is_none() => Ok(None),
+        _ => bail!(
+            "federation fixture config is incomplete: NVB_E2E_FED_HOMESERVER_URL and \
+             NVB_E2E_FED_AS_TOKEN (fed_homeserver_url/fed_as_token in e2e.toml) must both \
+             be set when any fed_* key is present"
+        ),
+    }
 }
 
 impl E2eConfig {
@@ -170,6 +238,12 @@ impl E2eConfig {
             room_c: pick("NVB_E2E_ROOM_C", file.room_c),
             test_as_token: pick("NVB_E2E_TEST_AS_TOKEN", file.test_as_token),
             mod_token: pick("NVB_E2E_MOD_TOKEN", file.mod_token),
+            federation: resolve_federation(
+                pick("NVB_E2E_FED_HOMESERVER_URL", file.fed_homeserver_url),
+                pick("NVB_E2E_FED_AS_TOKEN", file.fed_as_token),
+                pick("NVB_E2E_FED_DOMAIN", file.fed_domain),
+                pick("NVB_E2E_FED_USER_PREFIX", file.fed_user_prefix),
+            )?,
             artifacts_dir: pick("NVB_E2E_ARTIFACTS", file.artifacts_dir)
                 .unwrap_or_else(|| "e2e-artifacts".into())
                 .into(),
@@ -237,6 +311,34 @@ impl E2eConfig {
         })
     }
 
+    /// The PRIMARY appservice endpoint (the `nvbtest` registration on the
+    /// bridge's own homeserver) as an [`AsHomeserver`] — what every actor
+    /// used before the #109 fixture existed, now as a value the fixture
+    /// variant can substitute. Fail-loud like [`Self::test_as_token`].
+    pub fn primary_as(&self) -> Result<AsHomeserver> {
+        Ok(AsHomeserver {
+            base_url: self.homeserver_url.trim_end_matches('/').to_owned(),
+            as_token: self.test_as_token()?.to_owned(),
+            domain: self.server_domain(),
+            user_prefix: "nvbtest".into(),
+        })
+    }
+
+    /// The #109 federation fixture endpoint, or a [`crate::scenario::Skip`]
+    /// error — the `fed_*` scenarios' one-line gate:
+    /// `let fed = ctx.cfg.federation_or_skip()?;`
+    pub fn federation_or_skip(&self) -> Result<&AsHomeserver> {
+        self.federation.as_ref().ok_or_else(|| {
+            crate::scenario::Skip(
+                "no federation fixture configured: set NVB_E2E_FED_HOMESERVER_URL + \
+                 NVB_E2E_FED_AS_TOKEN (fed_homeserver_url/fed_as_token in e2e.toml) \
+                 to run the fed_* scenarios (see docs/e2e-homeserver.md)"
+                    .into(),
+            )
+            .into()
+        })
+    }
+
     /// The bridge bot's full MXID, derived the same way the bridge derives it
     /// (`{sender_localpart}_bot` on the server domain — see
     /// `nvb_config::Config::resolve_bot_user_ids`).
@@ -255,13 +357,7 @@ impl E2eConfig {
         if let Some(d) = &self.matrix_domain {
             return d.clone();
         }
-        self.homeserver_url
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .split(['/', ':'])
-            .next()
-            .unwrap_or("")
-            .to_owned()
+        url_host(&self.homeserver_url)
     }
 }
 
@@ -289,6 +385,7 @@ mod tests {
             room_c: None,
             test_as_token: None,
             mod_token: None,
+            federation: None,
             artifacts_dir: "art".into(),
         };
         assert_eq!(cfg.server_domain(), "100.64.0.21");
@@ -296,6 +393,48 @@ mod tests {
         assert_eq!(cfg.server_domain(), "nether.im");
         assert_eq!(cfg.bot_user_id(), "@nether-voicebridge_bot:nether.im");
         assert_eq!(cfg.ghost_prefix(), "nether-voicebridge_");
+
+        // primary_as() is fail-loud without the test appservice, and mirrors
+        // the url/domain resolution once it's present.
+        assert!(cfg.primary_as().is_err());
+        cfg.test_as_token = Some("tok".into());
+        let primary = cfg.primary_as().unwrap();
+        assert_eq!(primary.base_url, "http://100.64.0.21:8008");
+        assert_eq!(primary.domain, "nether.im");
+        assert_eq!(primary.user_prefix, "nvbtest");
+
+        // federation_or_skip() without the fixture is a Skip, not a failure.
+        let err = cfg.federation_or_skip().unwrap_err();
+        assert!(err.is::<crate::scenario::Skip>());
+        cfg.federation = Some(AsHomeserver {
+            base_url: "https://nether.autos".into(),
+            as_token: "t".into(),
+            domain: "nether.autos".into(),
+            user_prefix: "autotest".into(),
+        });
+        assert_eq!(cfg.federation_or_skip().unwrap().domain, "nether.autos");
+    }
+
+    #[test]
+    fn federation_group_resolves_or_fails_loudly() {
+        // Absent → None (scenarios skip).
+        assert!(resolve_federation(None, None, None, None).unwrap().is_none());
+        // Complete → defaults derived from the url.
+        let fed = resolve_federation(
+            Some("https://nether.autos/".into()),
+            Some("tok".into()),
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fed.base_url, "https://nether.autos");
+        assert_eq!(fed.domain, "nether.autos");
+        assert_eq!(fed.user_prefix, "autotest");
+        // Partial → loud error, never a silent skip.
+        assert!(resolve_federation(Some("https://nether.autos".into()), None, None, None).is_err());
+        assert!(resolve_federation(None, Some("tok".into()), None, None).is_err());
+        assert!(resolve_federation(None, None, Some("nether.autos".into()), None).is_err());
     }
 
     #[test]

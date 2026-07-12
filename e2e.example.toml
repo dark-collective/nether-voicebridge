@@ -61,4 +61,14 @@ room_a = "!iICkB3Qu8tQemzFqDl:nether.im"
 # scenarios (D3 workstream B).
 # mod_token = "..."                    # SECRET
 
+# ── Federation fixture (#109): the SECOND homeserver (Tuwunel at
+# nether.autos) with its passive `autotest` appservice, so the fed_*
+# scenarios can drive genuinely REMOTE users. All fed_* keys absent → those
+# scenarios report `skipped` (the suite still runs anywhere); a PARTIAL
+# group fails the config load loudly. Provisioning: docs/e2e-homeserver.md.
+# fed_homeserver_url = "https://nether.autos"
+# fed_as_token = "..."                 # SECRET — the autotest registration's as_token
+# fed_domain = "nether.autos"          # only when the url host isn't the server_name
+# fed_user_prefix = "autotest"         # default; the fixture namespace's stem
+
 # artifacts_dir = "e2e-artifacts"

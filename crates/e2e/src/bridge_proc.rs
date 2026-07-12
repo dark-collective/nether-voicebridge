@@ -518,6 +518,7 @@ mod tests {
             room_c: None,
             test_as_token: None,
             mod_token: None,
+            federation: None,
             artifacts_dir: "art".into(),
         }
     }

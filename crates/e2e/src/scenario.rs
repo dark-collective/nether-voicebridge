@@ -25,6 +25,24 @@ pub enum Expectation {
     KnownFail { issue: &'static str },
 }
 
+/// A scenario that cannot run in THIS environment — an optional fixture's
+/// config group is absent (e.g. the #109 federation fixture's `fed_*` keys).
+/// Returned through `anyhow` and intercepted by the runner as outcome
+/// `skipped`: never fails the suite, never counts as `known_fail` /
+/// `unexpected_pass`. Distinct from the `bail!`-ing accessors
+/// (`encrypted_pair` &c.), which stay fail-loud: on the standing env those
+/// assets are always provisioned, so their absence is a misconfiguration.
+#[derive(Debug)]
+pub struct Skip(pub String);
+
+impl std::fmt::Display for Skip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "skipped: {}", self.0)
+    }
+}
+
+impl std::error::Error for Skip {}
+
 /// Everything a scenario gets to work with.
 pub struct Ctx {
     pub cfg: E2eConfig,
@@ -46,7 +64,7 @@ pub struct ScenarioDef {
 pub struct ScenarioReport {
     pub name: String,
     pub expectation: String,
-    /// `pass` | `fail` | `known_fail` | `unexpected_pass` | `timeout`
+    /// `pass` | `fail` | `known_fail` | `unexpected_pass` | `timeout` | `skipped`
     pub outcome: String,
     pub duration_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,6 +108,9 @@ pub async fn run_scenarios(
         let duration_ms = started.elapsed().as_millis();
 
         let (outcome, error) = match (outcome, def.expectation) {
+            // A Skip is environmental, not behavioral — it wins over the
+            // expectation (a skipping KnownFail is `skipped`, not `known_fail`).
+            (Ok(Err(e)), _) if e.is::<Skip>() => ("skipped", Some(format!("{e}"))),
             (Ok(Ok(())), Expectation::Pass) => ("pass", None),
             (Ok(Ok(())), Expectation::KnownFail { issue }) => (
                 "unexpected_pass",
@@ -156,6 +177,7 @@ mod tests {
             room_c: None,
             test_as_token: None,
             mod_token: None,
+            federation: None,
             artifacts_dir: artifacts,
         }
     }
@@ -165,6 +187,9 @@ mod tests {
     }
     fn failing(_: Arc<Ctx>) -> super::ScenarioFuture {
         Box::pin(async { anyhow::bail!("nope") })
+    }
+    fn skipping(_: Arc<Ctx>) -> super::ScenarioFuture {
+        Box::pin(async { Err(Skip("fixture absent".into()).into()) })
     }
 
     static OK: ScenarioDef =
@@ -178,11 +203,18 @@ mod tests {
         expectation: Expectation::KnownFail { issue: "#62" },
         run: passing,
     };
+    static SKIPPED: ScenarioDef =
+        ScenarioDef { name: "skipped", expectation: Expectation::Pass, run: skipping };
+    static SKIPPED_GAP: ScenarioDef = ScenarioDef {
+        name: "skipped_gap",
+        expectation: Expectation::KnownFail { issue: "#62" },
+        run: skipping,
+    };
 
     #[tokio::test]
     async fn outcomes_and_report_json() {
         let dir = std::env::temp_dir().join(format!("nvb-e2e-report-{}", std::process::id()));
-        let defs = [&OK, &BAD, &GAP, &FIXED_GAP];
+        let defs = [&OK, &BAD, &GAP, &FIXED_GAP, &SKIPPED, &SKIPPED_GAP];
         let report = run_scenarios(&defs, dummy_cfg(dir.clone()), Profile::Compressed)
             .await
             .expect("runner completes");
@@ -192,12 +224,16 @@ mod tests {
         assert_eq!(by_name["bad"], "fail");
         assert_eq!(by_name["gap"], "known_fail");
         assert_eq!(by_name["fixed_gap"], "unexpected_pass");
+        // A Skip is environmental: it wins over the expectation on both kinds.
+        assert_eq!(by_name["skipped"], "skipped");
+        assert_eq!(by_name["skipped_gap"], "skipped");
         assert!(!report.ok(), "a Pass-expected failure fails the suite");
         assert!(dir.join("report.json").exists());
-        // known_fail alone must not fail the suite.
-        let report2 = run_scenarios(&[&GAP], dummy_cfg(dir.clone()), Profile::Compressed)
-            .await
-            .unwrap();
+        // known_fail / skipped alone must not fail the suite.
+        let report2 =
+            run_scenarios(&[&GAP, &SKIPPED, &SKIPPED_GAP], dummy_cfg(dir.clone()), Profile::Compressed)
+                .await
+                .unwrap();
         assert!(report2.ok());
         std::fs::remove_dir_all(&dir).ok();
     }
