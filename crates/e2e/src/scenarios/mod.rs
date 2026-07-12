@@ -1,11 +1,14 @@
-//! Scenario registry (23 scenarios). Each scenario is a static
+//! Scenario registry (26 scenarios). Each scenario is a static
 //! [`ScenarioDef`]; with the #6 live variant (`steal_release_repromotion`,
 //! which also has a hermetic twin in `puppet.rs`'s unit tests) every row of
 //! the design doc's catalogue runs live. The #99 invite-lifecycle additions
 //! (`mgmt_dm_e2ee`, `mgmt_invite_offline`, `mgmt_dm_pending_reap`) cover the
-//! DM surface the `@dau:tinier.town` incident showed the suite was blind to.
+//! DM surface the `@dau:tinier.town` incident showed the suite was blind to;
+//! the #109 `fed_*` additions drive genuinely REMOTE users via the
+//! `nether.autos` fixture (they report `skipped` without its `fed_*` config).
 
 pub mod audio;
+pub mod federation;
 pub mod invite_lifecycle;
 pub mod lifecycle;
 pub mod mgmt_dm_e2ee;
@@ -26,6 +29,9 @@ pub fn all() -> Vec<&'static ScenarioDef> {
         &mgmt_dm_e2ee::MGMT_DM_E2EE,
         &invite_lifecycle::MGMT_INVITE_OFFLINE,
         &invite_lifecycle::MGMT_DM_PENDING_REAP,
+        &federation::FED_DM_INVITE_LIFECYCLE,
+        &federation::FED_COLD_OUTREACH_UTD,
+        &federation::FED_LINK_V12,
         &room_misconfig::ROOM_MISCONFIG_NOTICE,
         &audio::AUDIO_M2D_UNENC,
         &audio::AUDIO_D2M_UNENC,
