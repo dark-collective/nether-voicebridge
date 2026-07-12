@@ -240,6 +240,10 @@ struct BotCtx {
     /// Per-room stamp of the last #95 room-misconfigured notification, gating
     /// re-notification to [`MISCONFIG_NOTIFY_COOLDOWN`].
     notify_stamps: StdMutex<HashMap<String, Instant>>,
+    /// Rooms whose invite is currently being handled (#97): dedupes the
+    /// sync's redelivery of a pending invite while a slow federated join is
+    /// in flight. Entries are removed when handling finishes.
+    invite_inflight: StdMutex<HashSet<String>>,
     /// Disclosure notices to the Discord pool (#64): posted into a bridged
     /// voice channel's text chat by the command bot. Best-effort.
     notice_tx: Option<mpsc::UnboundedSender<DiscordNotice>>,
@@ -514,9 +518,12 @@ async fn run_maintenance(ctx: &BotCtx, client: &Client) {
     }
 
     // #89b: leave DM rooms that are now empty (only the bot remains), unless a
-    // bridge holds them.
+    // bridge holds them. A room with a PENDING invite is not abandoned (#97):
+    // reaping it retracts the invite out from under the human — which is
+    // exactly what happened to the operator's own outreach DM live
+    // (2026-07-12), and would break `msg`/`announce` to cold recipients.
     for room in client.joined_rooms() {
-        if room.joined_members_count() <= 1 {
+        if room.joined_members_count() <= 1 && room.invited_members_count() == 0 {
             let id = room.room_id().as_str();
             if !safe_rooms.contains(id) {
                 leave_room_best_effort(ctx, id, "empty DM room (#89b)").await;
@@ -678,7 +685,22 @@ impl BotCtx {
             .unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         prune_stale_stamps(&mut stamps, now, cooldown);
-        cooldown_check(&mut stamps, sender, now, cooldown)
+        // PEEK only (#97): the window is armed by `stamp_invite_cooldown`
+        // after a successful join, never by the check itself — otherwise a
+        // duplicate delivery of the invite being joined trips its own stamp.
+        cooldown_peek(&stamps, sender, now, cooldown)
+    }
+
+    /// Arm the #89a per-sender invite window (#97): called only after a
+    /// successful invite auto-join.
+    fn stamp_invite_cooldown(&self, sender: &str) {
+        if self.cooldown.is_none() {
+            return;
+        }
+        self.invite_stamps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(sender.to_string(), Instant::now());
     }
 
     /// The GLOBAL (all-senders) `link`+invite velocity gate (#84):
@@ -787,6 +809,23 @@ fn cooldown_check(
     }
     stamps.insert(sender.to_owned(), now);
     None
+}
+
+/// Non-stamping sibling of [`cooldown_check`] (#97): report the remaining
+/// window without arming it. Same rounding semantics (whole seconds, ≥ 1).
+fn cooldown_peek(
+    stamps: &HashMap<String, Instant>,
+    sender: &str,
+    now: Instant,
+    cooldown: Duration,
+) -> Option<u64> {
+    let last = stamps.get(sender)?;
+    let elapsed = now.saturating_duration_since(*last);
+    if elapsed < cooldown {
+        Some((cooldown - elapsed).as_secs().max(1))
+    } else {
+        None
+    }
 }
 
 /// Pure core of the link-attempt gate (#77), split out for unit testing. Prunes
@@ -951,6 +990,7 @@ pub async fn run(
         instance_notice: cfg.instance_notice.clone(),
         pending_announce: StdMutex::new(None),
         notify_stamps: StdMutex::new(HashMap::new()),
+        invite_inflight: StdMutex::new(HashSet::new()),
         notice_tx: pool_io.notice_tx,
     });
 
@@ -1142,6 +1182,36 @@ async fn stripped_invite_details(room: &Room, own: &UserId) -> Option<InviteDeta
 /// (see `matrix::appservice_join_room`).
 async fn handle_invite(ctx: &BotCtx, invite: Option<&InviteDetails>, room: &Room) {
     let room_id = room.room_id().to_owned();
+    // #97: sync redelivers a still-pending invite while a slow (federated)
+    // join is in flight, and can surface it once more after the join lands.
+    // Neither is a NEW invite. Without these guards the duplicate walked into
+    // the #89a cooldown its own first pass had just stamped and DECLINED the
+    // just-joined room — join-then-leave, live against the first real user
+    // (2026-07-12). Guard 1: the room is already joined locally.
+    if room.state() == RoomState::Joined {
+        tracing::debug!(room_id = %room_id, "invite for an already-joined room — ignoring duplicate delivery");
+        return;
+    }
+    // Guard 2: a handler for this room is already running (in-flight set;
+    // the entry is removed when that handler finishes, so a genuinely new
+    // invite after a failed join can retry).
+    {
+        let mut inflight =
+            ctx.invite_inflight.lock().unwrap_or_else(PoisonError::into_inner);
+        if !inflight.insert(room_id.to_string()) {
+            tracing::debug!(room_id = %room_id, "invite already being handled — ignoring duplicate delivery");
+            return;
+        }
+    }
+    handle_invite_gated(ctx, invite, room).await;
+    ctx.invite_inflight
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(room_id.as_str());
+}
+
+async fn handle_invite_gated(ctx: &BotCtx, invite: Option<&InviteDetails>, room: &Room) {
+    let room_id = room.room_id().to_owned();
     // Reachability decisions feed the audit trail (#78): who tried to open a
     // DM with the bot, from which room, and whether it was let in — the signal
     // a public operator watches for probing. `banned` is the fail-closed
@@ -1239,7 +1309,17 @@ async fn handle_invite(ctx: &BotCtx, invite: Option<&InviteDetails>, room: &Room
     )
     .await
     {
-        Ok(Ok(())) => greet_when_joined(room.clone(), ctx.docs_url.clone(), ctx.instance_notice.clone()),
+        Ok(Ok(())) => {
+            // #97: the #89a cooldown is stamped only on a SUCCESSFUL join —
+            // a failed or duplicate attempt must never arm the tripwire that
+            // declines the next delivery of the same invite.
+            if let Some(i) = invite {
+                if !ctx.is_operator(&i.sender) {
+                    ctx.stamp_invite_cooldown(&i.sender);
+                }
+            }
+            greet_when_joined(room.clone(), ctx.docs_url.clone(), ctx.instance_notice.clone())
+        }
         Ok(Err(e)) => {
             tracing::error!(room_id = %room_id, error = %e, "failed to join invited room")
         }
@@ -3297,6 +3377,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cooldown_peek_never_stamps() {
+        // #97: peeking must not arm the window — the arm happens explicitly
+        // after a successful join. A duplicate delivery peeking its own
+        // sender must see a CLEAN window until the join lands.
+        let mut stamps = HashMap::new();
+        let cd = Duration::from_secs(30);
+        let t0 = Instant::now();
+        assert_eq!(cooldown_peek(&stamps, "@u:x", t0, cd), None);
+        // Peeking again (the duplicate) still sees clean — nothing stamped.
+        assert_eq!(cooldown_peek(&stamps, "@u:x", t0 + Duration::from_secs(3), cd), None);
+        // After the explicit stamp (successful join), the window is armed…
+        stamps.insert("@u:x".to_string(), t0 + Duration::from_secs(3));
+        assert_eq!(
+            cooldown_peek(&stamps, "@u:x", t0 + Duration::from_secs(4), cd),
+            Some(29)
+        );
+        // …matching cooldown_check's rounding (whole secs, ≥1)…
+        assert_eq!(
+            cooldown_peek(&stamps, "@u:x", t0 + Duration::from_millis(32_900), cd),
+            Some(1)
+        );
+        // …and expires like it too.
+        assert_eq!(
+            cooldown_peek(&stamps, "@u:x", t0 + Duration::from_secs(34), cd),
+            None
+        );
+    }
+
+    #[test]
     fn misconfig_notice_names_event_fix_and_docs() {
         let n = misconfig_notice("Game Night", 50, 0, "\nGuide: https://x.test/g");
         assert!(n.contains("voice bridge 'Game Night'"));
@@ -4180,6 +4289,7 @@ mod tests {
             instance_notice: None,
             pending_announce: StdMutex::new(None),
             notify_stamps: StdMutex::new(HashMap::new()),
+            invite_inflight: StdMutex::new(HashSet::new()),
             notice_tx: None,
         };
         (ctx, control_rx)
