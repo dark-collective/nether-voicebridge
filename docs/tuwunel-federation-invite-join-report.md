@@ -78,6 +78,44 @@ So B answers unauthenticated probes correctly; only the authenticated
 event-exchange endpoints (`make_join`/`send_join`/`invite`) return bodies A
 cannot parse — consistently, in both directions of the relationship.
 
+**Control experiments (added later the same day, ~19:30–20:30 UTC).** These
+narrow the fault surface considerably:
+
+1. **B federates fine with Synapse.** A user on `4d2.org` (Synapse 1.153.0)
+   established a DM with the same B user while A↔B stayed broken — B is not
+   globally broken; the failure is specific to this pair.
+2. **Tuwunel 1.8.1 ↔ Tuwunel 1.8.1 works in an otherwise-identical
+   topology.** A freshly-provisioned Tuwunel 1.8.1 test server
+   (`nether.autos`), fronted by a Cloudflare tunnel exactly like A, completed
+   scripted invite/join round trips with A **in both directions** — including
+   a cross-server join of a v12 (domainless-id) room — hours after A↔B broke.
+   Same software, same version, same edge topology as the failing pair. This
+   eliminates "Tuwunel↔Tuwunel invite-join is broken in 1.8.1" as the
+   explanation.
+3. **B's edge and auth layers answer correctly to everything except
+   validly-signed A requests.** `matrix.tinier.town` fronts Tuwunel with
+   Caddy (`via: 1.1 Caddy` — no Cloudflare/WAF in the path). From outside:
+   an unauthenticated bodied `PUT /_matrix/federation/v2/invite/…` returns a
+   proper Matrix `M_FORBIDDEN: Missing Authorization header` under
+   `Tuwunel/1.8.1`, `Synapse/1.153.0`, and browser user-agents alike (no UA
+   discrimination); the same request with a **forged** `X-Matrix` header
+   claiming `origin="nether.im"` returns a proper
+   `403 M_FORBIDDEN: Failed to verify X-Matrix signatures`. So B receives
+   these requests, resolves A's keys, and runs signature verification
+   correctly — only requests that PASS verification get the empty-`200`
+   treatment.
+4. **It is every authenticated endpoint, reads included.** A same-day
+   capture of A querying B's public rooms directory over federation fails
+   identically: `Server returned bad 200 response: Deserialization(Json(
+   Error("missing field `chunk`", line: 1, column: 2)))` — the same
+   empty-object `200`, on a read-only endpoint unrelated to invite-join.
+
+Synthesis: after signature verification **succeeds**, B answers
+nether.im-origin requests — reads and writes alike — with `200` and a
+near-empty JSON body. That shape looks like an "ignore this origin" code
+path (server ACL / blocklist?) or poisoned per-pair state, rather than an
+event-format bug.
+
 **Questions.**
 1. Which response struct produces `missing field \`event\`` at line 1 col 1–2
    here — `make_join`, `send_join` (v1/v2), or the `v2/invite` response? The
@@ -85,8 +123,13 @@ cannot parse — consistently, in both directions of the relationship.
 2. Is there any code path where Tuwunel commits a `200` for these endpoints
    but writes an empty/partial JSON body (error after status committed,
    response body dropped by a streaming layer, etc.)?
-3. Known 1.8.1 regression in this area? (Both ends are 1.8.1.)
-4. What `RUST_LOG`/tracing filter on the *requesting* side would log the raw
+3. **Does `forbidden_remote_server_names` (or any other server ACL /
+   ignore-list) answer a blocked origin's authenticated requests with
+   `200 {}`?** If so, this may be B-side configuration — and the upstream
+   ask becomes "make that an explicit `M_FORBIDDEN`, an empty 200 is
+   undiagnosable for the remote operator".
+4. Known 1.8.1 regression in this area? (Both ends are 1.8.1.)
+5. What `RUST_LOG`/tracing filter on the *requesting* side would log the raw
    response body so we can capture exactly what B returns?
 
 Happy to provide precise timestamps/room ids privately and to coordinate with
@@ -101,3 +144,17 @@ joins still succeeded at 04:19/04:30 after the first one. B's operator
 (@dau:tinier.town) should be asked whether anything on their side changed
 ~04:35. Full evidence trail: prod journal 2026-07-12 02:25–14:46, and
 voice-bridge issues #96/#97/#103._
+
+_Internal notes 2 (control-experiment session, same day evening): **do not
+file upstream until B's operator answers two things** — (a) does
+`tinier.town`'s `tuwunel.toml` carry `forbidden_remote_server_names` (or any
+ACL/ignore list) matching `nether.im`, and did anything change there (config
+edit, Caddy config, server update/restart) around 04:35 UTC; (b) what does
+B's own Tuwunel journal log for `nether.im` while A retries a join — i.e.
+does B knowingly serve the `200 {}` (blocklist path → B-side config, file
+only the "empty 200 is undiagnosable" polish issue) or does it error
+internally (→ file the full report with both-side logs). The dau-side
+`help`-silence report is fully explained by the outage: his events never
+reached A at all (A-side journal has no trace of his join/messages in the
+public fallback room). Control-experiment details live in the section above;
+fixture provisioning in `docs/e2e-homeserver.md` (#109)._
