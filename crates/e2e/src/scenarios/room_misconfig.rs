@@ -47,6 +47,10 @@ async fn run(ctx: Arc<Ctx>) -> Result<()> {
         .await
         .context("registering operator")?;
     let room = op.create_room_nondirect().await.context("creating drill room")?;
+    // Marker BEFORE the bridge starts: the first sweep can fire within
+    // seconds of startup, and the notice must land after this event for the
+    // scan below to see it.
+    let marker = op.send(&room, "drill: awaiting misconfig notice").await?;
 
     // 2. Seed it as a tenant and start the bridge with a compressed sweep.
     let tenants = tenant_entry(BRIDGE_NAME, &room, &cfg.guild_id, &cfg.channel_a);
@@ -60,10 +64,12 @@ async fn run(ctx: Arc<Ctx>) -> Result<()> {
     .await
     .context("starting bridge-under-test")?;
 
-    let result = drive(&ctx, &op, &room, &bridge).await;
+    let result = drive(&ctx, &op, &room, &marker, &bridge).await;
 
-    // Teardown either way: drain the bridge, then both test users leave the
-    // drill room so it doesn't accumulate across runs (best-effort).
+    // Teardown either way: drain the bridge, then the operator leaves the
+    // drill room. The bot user is in the PROD appservice namespace (the test
+    // as_token can't masquerade it), so its membership is left for the
+    // bridge's own #89b empty-room reap to collect.
     let teardown = match result {
         Ok(()) => bridge.sigterm_and_wait(Duration::from_secs(20)).await.context("SIGTERM drain"),
         Err(e) => {
@@ -71,10 +77,8 @@ async fn run(ctx: Arc<Ctx>) -> Result<()> {
             Err(e)
         }
     };
-    for mxid in [cfg.bot_user_id(), op.mxid().to_string()] {
-        if let Err(e) = op.leave_as(&room, &mxid).await {
-            eprintln!("drill-room leave for {mxid} failed (non-fatal): {e}");
-        }
+    if let Err(e) = op.leave_as(&room, op.mxid()).await {
+        eprintln!("drill-room operator leave failed (non-fatal): {e}");
     }
     teardown
 }
@@ -83,6 +87,7 @@ async fn drive(
     ctx: &Ctx,
     op: &MatrixManagementClient,
     room: &str,
+    marker: &str,
     bridge: &BridgeUnderTest,
 ) -> Result<()> {
     bridge.await_ready(&[BRIDGE_NAME], Duration::from_secs(120)).await?;
@@ -92,14 +97,11 @@ async fn drive(
         .await
         .context("management bot never became ready")?;
 
-    // Marker event so the notice-wait only scans messages from here on.
-    let marker = op.send(room, "drill: awaiting misconfig notice").await?;
-
     // 3. The sweep must post the fix-it notice into the room itself.
     let notice = op
         .wait_for_bot_message_containing(
             room,
-            &marker,
+            marker,
             "org.matrix.msc3401.call.member",
             Duration::from_secs(60),
         )

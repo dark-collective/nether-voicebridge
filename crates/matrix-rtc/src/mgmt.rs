@@ -556,6 +556,23 @@ async fn check_room_call_power(ctx: &BotCtx, client: &Client, statuses: &[Bridge
         if check.ok() {
             continue;
         }
+        // Deliver only once the SDK client can see the room — right after a
+        // restart the sweep can beat the initial sync, and notifying (or
+        // stamping the cooldown) with no room view would silence the in-room
+        // notice for a whole cooldown window. Defer to the next sweep instead.
+        let room = match matrix_sdk::ruma::RoomId::parse(b.room_id.as_str()) {
+            Ok(rid) => match client.get_room(&rid) {
+                Some(room) => room,
+                None => {
+                    tracing::debug!(room = %b.room_id, "maintenance: no room view yet — deferring misconfig notification to the next sweep");
+                    continue;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(room = %b.room_id, error = %e, "maintenance: unparsable room id");
+                continue;
+            }
+        };
         // Once per room per cooldown window; a gated repeat stays silent.
         {
             let mut stamps =
@@ -567,13 +584,7 @@ async fn check_room_call_power(ctx: &BotCtx, client: &Client, statuses: &[Bridge
             }
         }
         let notice = misconfig_notice(&b.label, check.required, check.ghost_pl, &ctx.docs_line());
-        match matrix_sdk::ruma::RoomId::parse(b.room_id.as_str()) {
-            Ok(rid) => match client.get_room(&rid) {
-                Some(room) => reply(&room, &notice).await,
-                None => tracing::warn!(room = %b.room_id, "maintenance: bot has no view of the misconfigured room — in-room notice skipped"),
-            },
-            Err(e) => tracing::warn!(room = %b.room_id, error = %e, "maintenance: unparsable room id"),
-        }
+        reply(&room, &notice).await;
         if let Some(owner) = &b.owner {
             if let Err(e) = dm_user(
                 client,
