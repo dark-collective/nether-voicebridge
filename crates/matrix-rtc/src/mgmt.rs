@@ -519,14 +519,34 @@ async fn run_maintenance(ctx: &BotCtx, client: &Client) {
 
     // #89b: leave DM rooms that are now empty (only the bot remains), unless a
     // bridge holds them. A room with a PENDING invite is not abandoned (#97):
-    // reaping it retracts the invite out from under the human — which is
-    // exactly what happened to the operator's own outreach DM live
-    // (2026-07-12), and would break `msg`/`announce` to cold recipients.
+    // reaping it retracts the invite out from under the human. The pending
+    // check must ask the SERVER — the SDK's `invited_members_count()` reads
+    // the lagging store summary and read 0 for a 3-second-old room whose
+    // invite was pending the whole time (alpha.25's gate; #100 mode 1,
+    // reproduced 2/2). One extra GET per reap CANDIDATE (rare) is cheap, and
+    // an error fails safe: never reap on uncertainty.
     for room in client.joined_rooms() {
-        if room.joined_members_count() <= 1 && room.invited_members_count() == 0 {
+        if room.joined_members_count() <= 1 {
             let id = room.room_id().as_str();
-            if !safe_rooms.contains(id) {
-                leave_room_best_effort(ctx, id, "empty DM room (#89b)").await;
+            if safe_rooms.contains(id) {
+                continue;
+            }
+            match crate::matrix::appservice_pending_invites(
+                &ctx.http,
+                &ctx.homeserver_url,
+                &ctx.appservice_token,
+                id,
+                ctx.own_user.as_str(),
+            )
+            .await
+            {
+                Ok(0) => leave_room_best_effort(ctx, id, "empty DM room (#89b)").await,
+                Ok(n) => {
+                    tracing::debug!(room_id = %id, pending = n, "maintenance: empty room has pending invites — not reaping")
+                }
+                Err(e) => {
+                    tracing::warn!(room_id = %id, error = %e, "maintenance: pending-invite check failed — not reaping (fail-safe)")
+                }
             }
         }
     }
@@ -3123,6 +3143,26 @@ fn human_secs(s: u64) -> String {
 async fn dm_user(client: &Client, mxid: &str, text: &str) -> Result<(), String> {
     let uid = UserId::parse(mxid).map_err(|e| e.to_string())?;
     let dm = client.create_dm(&uid).await.map_err(|e| e.to_string())?;
+    // #97 residual, #100 mode 2: in an encrypted DM the SDK computes megolm
+    // recipients from its LOCAL member list, which lags a fresh `create_dm` —
+    // sending immediately shares the room key with nobody, and the recipient
+    // gets a PERMANENTLY undecryptable first message (the SDK won't re-share
+    // to other users on key request). `get_member` pulls the membership from
+    // the server into the store; retry briefly (same trick as
+    // `greet_when_joined`) before giving up and sending anyway — a possibly
+    // undecryptable message still beats silently dropping operator outreach.
+    for delay in [0u64, 1, 3, 10] {
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+        }
+        match dm.get_member(&uid).await {
+            Ok(Some(_)) => break,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::debug!(target_user = %mxid, error = %e, "dm_user: member fetch failed — retrying");
+            }
+        }
+    }
     dm.send(RoomMessageEventContent::text_plain(text)).await.map_err(|e| e.to_string())?;
     Ok(())
 }

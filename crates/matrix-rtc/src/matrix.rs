@@ -886,6 +886,36 @@ pub(crate) async fn appservice_is_room_joined(
 /// joined to the room). `state_key` is `""` for keyless events.
 /// `Ok(Some(content))` on 200, `Ok(None)` on 404 (event absent), `Err`
 /// otherwise (auth, not in room, network).
+/// SERVER-side count of pending (`membership=invite`) members in `room_id`
+/// (#97 residual, #100 mode 1): the SDK's `invited_members_count()` reads the
+/// local store summary, which lags a freshly created room by seconds — long
+/// enough for the #89b sweep to reap a DM whose invite was pending
+/// server-side the whole time. `GET /members?membership=invite` cannot lag.
+pub(crate) async fn appservice_pending_invites(
+    http: &reqwest::Client,
+    homeserver_url: &str,
+    appservice_token: &str,
+    room_id: &str,
+    user_id: &str,
+) -> Result<usize> {
+    let mut url =
+        crate::rtc::ghost::cs_url(homeserver_url, &["rooms", room_id, "members"], Some(user_id))?;
+    url.query_pairs_mut().append_pair("membership", "invite");
+    let resp = http
+        .get(url)
+        .bearer_auth(appservice_token)
+        .send()
+        .await
+        .context("GET room members (invite)")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("{status}: {body}"));
+    }
+    let json: serde_json::Value = resp.json().await.context("members response JSON")?;
+    Ok(json["chunk"].as_array().map(|c| c.len()).unwrap_or(0))
+}
+
 pub(crate) async fn get_room_state(
     http: &reqwest::Client,
     homeserver_url: &str,
