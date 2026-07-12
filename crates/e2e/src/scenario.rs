@@ -15,11 +15,10 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expectation {
     Pass,
-    /// A filed, not-yet-fixed gap. Live users: the #99 invite-lifecycle
-    /// scenarios (`mgmt_invite_offline`, `mgmt_dm_pending_reap`), tracking
-    /// the #97 invite races — flip them to `Pass` when the fix (alpha.25)
-    /// merges. (Its first design target, the #62 force-move gap, was fixed in
-    /// v0.3.0-alpha.11 before ever shipping a KnownFail.)
+    /// A filed, not-yet-fixed gap. Live user: `mgmt_dm_pending_reap` (#99),
+    /// tracking the #97 pending-invite reap — flip it to `Pass` when the fix
+    /// (alpha.25) merges. (Its first design target, the #62 force-move gap,
+    /// was fixed in v0.3.0-alpha.11 before ever shipping a KnownFail.)
     KnownFail { issue: &'static str },
 }
 

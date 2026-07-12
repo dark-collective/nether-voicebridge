@@ -2,8 +2,9 @@
 //! [`ScenarioDef`]; with the #6 live variant (`steal_release_repromotion`,
 //! which also has a hermetic twin in `puppet.rs`'s unit tests) every row of
 //! the design doc's catalogue runs live. The #99 invite-lifecycle additions
-//! (`mgmt_dm_e2ee` + the two `KnownFail{#97}` scenarios) cover the DM surface
-//! the `@dau:tinier.town` incident showed the suite was blind to.
+//! (`mgmt_dm_e2ee`, `mgmt_invite_offline`, and the `KnownFail{#97}`
+//! `mgmt_dm_pending_reap`) cover the DM surface the `@dau:tinier.town`
+//! incident showed the suite was blind to.
 
 pub mod audio;
 pub mod invite_lifecycle;

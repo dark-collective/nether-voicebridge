@@ -1,22 +1,29 @@
 //! #99 — the invite/DM lifecycle scenarios the `@dau:tinier.town` incident
-//! (2026-07-12) showed the suite was blind to. Both ship as
-//! `KnownFail { issue: "#97" }`: they assert the POST-fix contract, fail
-//! against the pre-fix bridge for exactly the documented #97 reasons, and are
-//! flipped to `Pass` once the #97 fix (alpha.25) merges.
+//! (2026-07-12) showed the suite was blind to.
 //!
-//! * [`MGMT_INVITE_OFFLINE`] — a DM invite that arrives while the bridge is
-//!   DOWN must produce exactly ONE accept when it starts: the pre-fix
-//!   `handle_invite` stamps the #89a per-sender cooldown BEFORE its join, so a
-//!   redelivery of the still-pending invite (the raw appservice join leaves
-//!   the SDK's local state `Invited` until a sync lands) hits the stamp its
-//!   own first pass set and DECLINES → join-then-leave. Note the arming
-//!   detail: `mgmt_cooldown_secs` must be SET (prod always had it; the
-//!   harness's standing block leaves it unset — which is exactly why 20
-//!   scenarios never reproduced this).
-//! * [`MGMT_DM_PENDING_REAP`] — a DM the BOT initiated (operator `msg` →
-//!   `create_dm`) has the bot joined and the target merely invited, so
-//!   `joined_members_count() == 1`: the pre-fix #89b empty-room sweep reaps
-//!   it before the target can accept, killing the pending invite.
+//! * [`MGMT_INVITE_OFFLINE`] (`Pass`) — a DM invite that arrives while the
+//!   bridge is DOWN must produce exactly ONE accept when it starts: the
+//!   pre-#97-fix `handle_invite` stamps the #89a per-sender cooldown BEFORE
+//!   its join, so a redelivery of the still-pending invite hits the stamp its
+//!   own first pass set and DECLINES → join-then-leave. Arming detail:
+//!   `mgmt_cooldown_secs` must be SET (prod always had it; the harness's
+//!   standing block leaves it unset — which is exactly why 20 scenarios never
+//!   reproduced #97). **Live finding (2026-07-12, pre-fix bridge):** this
+//!   ships as `Pass`, not `KnownFail` — the trigger needs the seconds-long
+//!   federated-join window, and with a same-server inviter Tuwunel does NOT
+//!   redeliver the invite (verified: armed cooldown, exactly one accept, zero
+//!   declines). Same-server = the only thing the harness can mint (see the
+//!   testing-design doc's federation-limitation note), so here it guards the
+//!   post-fix contract as a regression test rather than reproducing the bug.
+//! * [`MGMT_DM_PENDING_REAP`] (`KnownFail{#97}`) — a DM the BOT initiated
+//!   (operator `msg` → `create_dm`) has the bot joined and the target merely
+//!   invited, so `joined_members_count() == 1`: the pre-fix #89b empty-room
+//!   sweep reaps it before the target can accept, killing the pending
+//!   invite. Reproduces deterministically (live 2026-07-12: the compressed
+//!   sweep reaped the fresh DM ~100 ms after creation — before even the
+//!   operator's message could be sent into it, 403 "sender's membership
+//!   `leave` is not `join`"). Flip to `Pass` when the #97 fix (alpha.25)
+//!   merges.
 
 use anyhow::{Context as _, Result, bail};
 use std::sync::Arc;
@@ -28,7 +35,7 @@ use crate::scenario::{Ctx, Expectation, ScenarioDef};
 
 pub static MGMT_INVITE_OFFLINE: ScenarioDef = ScenarioDef {
     name: "mgmt_invite_offline",
-    expectation: Expectation::KnownFail { issue: "#97" },
+    expectation: Expectation::Pass,
     run: boxed_offline,
 };
 
