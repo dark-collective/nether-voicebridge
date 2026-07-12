@@ -3,6 +3,19 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.24] - 2026-07-12
+
+### Added
+- **The bridge detects and announces broken room call-permissions itself
+  (#95 tiers 1–2).** Every maintenance sweep checks each bridged room's
+  `m.room.power_levels` for the `org.matrix.msc3401.call.member = 0`
+  requirement — the most common silent bridge-breaker. On failure: a fix-it
+  chat notice is posted into the room, the bridge owner gets a DM, a
+  `room_misconfigured` audit event is appended, and a WARN feeds the ops
+  tooling; once per room per day. The sweep now runs for every deployment
+  (static bridges included) — the open-registration reap duties stay gated.
+  `NVB_MAINTENANCE_INTERVAL_SECS` overrides the 5-minute tick for drills.
+
 ## [0.3.0-alpha.23] - 2026-07-12
 
 ### Added
