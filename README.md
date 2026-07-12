@@ -21,7 +21,7 @@ channel↔room pairs at once.
 
 **Use the hosted instance (recommended).** We run a public instance on
 `nether.im`, currently in **open beta** — free, self-serve, nothing to install:
-DM `@nether-voicebridge_bot:nether.im` and link your own room in a few minutes.
+DM `@voicebridge_as:nether.im` and link your own room in a few minutes.
 Start with the wiki guide at
 **[nether.wiki/matrix/voice-bridge](https://nether.wiki/matrix/voice-bridge/)**,
 or the in-repo [hosted-instance notes](docs/hosted-instance.md) and

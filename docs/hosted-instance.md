@@ -15,7 +15,7 @@ anything yourself.
 
 > [!NOTE]
 > The hosted instance supports **self-serve bridging**: DM the bridge bot
-> (`@nether-voicebridge_bot:nether.im`) and link your own room — see the
+> (`@voicebridge_as:nether.im`) and link your own room — see the
 > **[self-serve walkthrough](self-serve-bridging.md)**. Consent is required
 > from both sides: you must be a moderator of the Matrix room, and someone
 > with Manage Server must approve the link inside Discord. (Prefer a human?
@@ -88,7 +88,7 @@ presence).
    bot joins as a full appservice member — it doesn't need `guest_access` on
    the room — but a restricted/invite-only room still needs it **invited**
    first (or added to the room's allow-space). The hosted instance's bridge
-   bot is `@nether-voicebridge_bot:nether.im`.
+   bot is `@voicebridge_as:nether.im`.
 2. **Make sure your room allows power level 0 for `org.matrix.msc3401.call.member`.**
    This is the standard Element Call setup — without it, ghosts (and, in an
    encrypted room, the E2EE subscriber) can't post their call membership, and
@@ -112,7 +112,7 @@ presence).
 ## How to request a bridge
 
 The fastest path is the **[self-serve DM flow](self-serve-bridging.md)** — DM
-`@nether-voicebridge_bot:nether.im`, run `link`, and have a Discord server
+`@voicebridge_as:nether.im`, run `link`, and have a Discord server
 manager approve the code — self-serve is **enabled on the hosted instance**
 (open beta). If you'd rather have a human walk you through it, ask in
 [#nether-voicebridge-help:nether.im](https://matrix.to/#/%23nether-voicebridge-help%3Anether.im).
