@@ -3,6 +3,21 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-alpha.23] - 2026-07-12
+
+### Added
+- **Operator observability + outreach commands (#94).** `status` renders the
+  puppet pool's per-bot guild footprint (connected state, guild counts, the
+  distinct-guild total, tenant bridges per guild) with a ⚠ warning as any app
+  nears Discord's 100-server App Verification gate. `stats` shows per-bridge
+  uptime, owner, and link age plus whole-process memory. `msg <@mxid> <text>`
+  DMs a user as the bridge bot, and `announce <text>` + `announce confirm`
+  mass-DMs every bridge owner (two-step, 2-minute confirm window, audit-logged)
+  for rare service notices. All operator-only.
+- **`[management] instance_notice`.** Optional free-text line appended to the
+  DM greeting and `help` — the place for an open-beta disclaimer and the
+  instance's help-room address.
+
 ## [0.3.0-alpha.22] - 2026-07-11
 
 ### Added
