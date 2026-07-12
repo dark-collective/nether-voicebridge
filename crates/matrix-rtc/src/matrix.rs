@@ -570,6 +570,7 @@ pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Cli
             &cfg.appservice_token,
             &cfg.room_id,
             bot_user_id.as_str(),
+            None,
         ),
     )
     .await
@@ -787,11 +788,21 @@ pub(crate) async fn appservice_join_room(
     appservice_token: &str,
     room_id: &str,
     user_id: &str,
+    via: Option<&str>,
 ) -> Result<()> {
     let http = reqwest::Client::builder().use_rustls_tls().build()?;
     // Reuse the ghost path's URL builder (percent-encodes the room_id path segment
     // and appends the `?user_id=` masquerade).
-    let url = crate::rtc::ghost::cs_url(homeserver_url, &["join", room_id], Some(user_id))?;
+    let mut url = crate::rtc::ghost::cs_url(homeserver_url, &["join", room_id], Some(user_id))?;
+    // v12+ room ids carry no domain (#103), so a first-contact federated join
+    // needs an explicit resolution hint. Harmless extra for legacy ids and
+    // already-known rooms. `server_name` is the deprecated spelling, sent too
+    // for older homeservers.
+    if let Some(server) = via {
+        url.query_pairs_mut()
+            .append_pair("via", server)
+            .append_pair("server_name", server);
+    }
     let resp = http
         .post(url)
         .bearer_auth(appservice_token)

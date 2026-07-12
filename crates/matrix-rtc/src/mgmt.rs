@@ -1305,6 +1305,9 @@ async fn handle_invite_gated(ctx: &BotCtx, invite: Option<&InviteDetails>, room:
             &ctx.appservice_token,
             room_id.as_str(),
             ctx.own_user.as_str(),
+            // The inviter's server can always resolve the room (#103) — a
+            // helpful hint for domainless v12 room ids, harmless otherwise.
+            invite.and_then(|i| mxid_domain(&i.sender)),
         ),
     )
     .await
@@ -1893,6 +1896,9 @@ async fn probe_room_prereqs(
     room_id: &str,
     guild_id: &str,
     authority_sender: Option<&str>,
+    // Resolution hint for the first-contact join (#103): the requester's
+    // server domain — required in practice for domainless v12 room ids.
+    via_hint: Option<&str>,
 ) -> Result<ProbeReport, String> {
     // Was the bot already a member before this probe? (A running bridge keeps it
     // joined.) If the read fails, assume YES — never risk leaving a bridged room
@@ -1915,6 +1921,7 @@ async fn probe_room_prereqs(
             &ctx.appservice_token,
             room_id,
             ctx.own_user.as_str(),
+            via_hint,
         ),
     )
     .await
@@ -2180,8 +2187,11 @@ async fn handle_link(
         reply(room, "The bridge name must not be empty.").await;
         return;
     }
-    if !room_id.starts_with('!') || !room_id.contains(':') {
-        reply(room, &format!("'{room_id}' does not look like a Matrix room id (expected `!localpart:domain`). Use the room's internal id, not an alias (Element: room Settings → Advanced → \"Internal room ID\").{}", ctx.docs_line())).await;
+    if !plausible_room_id(&room_id) {
+        // Log it too — these rejections were previously reply-only and
+        // invisible in triage (#103 was diagnosed blind because of that).
+        tracing::info!(sender = %sender, room_id = %room_id, "rejecting link: implausible room id");
+        reply(room, &format!("'{room_id}' does not look like a Matrix room id (expected `!localpart:domain` or the newer domainless `!…` form). Use the room's internal id, not an alias (Element: room Settings → Advanced → \"Internal room ID\").{}", ctx.docs_line())).await;
         return;
     }
     if !is_numeric_id(&guild_id) || !is_numeric_id(&channel_id) {
@@ -2386,7 +2396,9 @@ async fn handle_link(
     // `require_room_authority` the probe also checks the SENDER's power in
     // the room (two-sided link auth, Matrix side).
     let authority_sender = ctx.require_room_authority.then_some(sender);
-    let report = match probe_room_prereqs(ctx, &room_id, &guild_id, authority_sender).await {
+    let report = match probe_room_prereqs(ctx, &room_id, &guild_id, authority_sender, mxid_domain(sender))
+        .await
+    {
         Ok(r) => r,
         Err(msg) => {
             reply(room, &msg).await;
@@ -3363,7 +3375,7 @@ fn ban_value_shape_ok(kind: BanKind, value: &str) -> bool {
     match kind {
         BanKind::Owner => value.starts_with('@') && value.contains(':'),
         BanKind::Guild => is_numeric_id(value),
-        BanKind::Room => value.starts_with('!') && value.contains(':'),
+        BanKind::Room => plausible_room_id(value),
     }
 }
 
@@ -3372,9 +3384,31 @@ fn is_numeric_id(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Both room-id generations (#103): legacy `!localpart:domain` AND the v12+
+/// domainless hash form `!<opaque>`. `!` + non-empty + no whitespace is the
+/// gate — the join/state probes are the real validation (and ruma parses both
+/// forms fine; a real user's homeserver mints the new form today).
+fn plausible_room_id(s: &str) -> bool {
+    s.starts_with('!') && s.len() > 1 && !s.contains(char::is_whitespace)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plausible_room_id_accepts_both_generations() {
+        // Legacy domain form.
+        assert!(plausible_room_id("!abc:example.org"));
+        // v12+ domainless hash form — the exact shape a real user's server
+        // minted (#103); the old `contains(':')` check rejected it.
+        assert!(plausible_room_id("!HZxp_Dy3wHbASuHxk8Th0qhzGHl3Bxuj3t1IvMMH54U"));
+        // Still rejects the obvious non-ids.
+        assert!(!plausible_room_id("#alias:example.org"));
+        assert!(!plausible_room_id("!"));
+        assert!(!plausible_room_id("!has space:example.org"));
+        assert!(!plausible_room_id("room-without-sigil"));
+    }
 
     #[test]
     fn cooldown_peek_never_stamps() {
