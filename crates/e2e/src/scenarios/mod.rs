@@ -1,7 +1,7 @@
-//! Scenario registry. Each scenario is a static [`ScenarioDef`]; with the #7 and
-//! #15 live variants this reaches the full 16-entry catalogue in the design doc
-//! (the remaining unlisted row, #6 `steal_release_repromotion`, is hermetic-only
-//! and lives in `puppet.rs`'s unit tests).
+//! Scenario registry. Each scenario is a static [`ScenarioDef`]; with the #6
+//! live variant (`steal_release_repromotion`, which also has a hermetic twin in
+//! `puppet.rs`'s unit tests) every row of the design doc's catalogue now runs
+//! live.
 
 pub mod audio;
 pub mod lifecycle;
@@ -10,6 +10,7 @@ pub mod moderation;
 pub mod multi_bridge_isolation;
 pub mod overflow_fcfs;
 pub mod smoke;
+pub mod steal_repromotion;
 
 use crate::scenario::ScenarioDef;
 
@@ -33,6 +34,7 @@ pub fn all() -> Vec<&'static ScenarioDef> {
         &lifecycle::LEAVE_GRACE_DEBOUNCE,
         &overflow_fcfs::OVERFLOW_FCFS_PROMOTION,
         &multi_bridge_isolation::MULTI_BRIDGE_ISOLATION,
+        &steal_repromotion::STEAL_RELEASE_REPROMOTION,
     ]
 }
 

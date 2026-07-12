@@ -408,7 +408,7 @@ the DiscordListener records the puppet).
 | 3 | `audio_d2m_unenc` (oracle) | #32/#36 class | live | compressed | unenc |
 | 4 | `audio_m2d_enc` (full oracle) | #30/#51 key path | live | compressed | **enc** |
 | 5 | `audio_d2m_enc` (Tap B + key logs) | #51 | live | compressed | **enc** |
-| 6 | `steal_release_repromotion` | #24 | hermetic (T2) | paused-time | — |
+| 6 | `steal_release_repromotion` | #24 | T2 + live 2-channel steal variant | compressed | unenc ×2 |
 | 7 | `overflow_fcfs_promotion` | allocation | T2 + live 3-speaker variant | compressed | unenc |
 | 8 | `reap_release` (phantom member) | #54 | T2 + live | **real-timing nightly** (45 s grace) | unenc |
 | 9 | `external_disconnect_recovery` | #46 fix — **must PASS** | live | compressed | unenc |
