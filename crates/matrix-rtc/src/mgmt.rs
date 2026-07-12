@@ -1223,7 +1223,30 @@ async fn handle_invite(ctx: &BotCtx, invite: Option<&InviteDetails>, room: &Room
             return;
         }
     }
-    handle_invite_gated(ctx, invite, room).await;
+    // Guard 3 (#110): Guard 1 reads the SDK's LOCAL state, which lags the raw
+    // appservice join by a full sync cycle — and over FEDERATION the invite
+    // redelivery arrives INSIDE that window (~0.5 s live on the #109 fixture),
+    // so it sailed past both guards, hit the #89a cooldown its own first pass
+    // had just stamped, and declined the just-joined room (join-then-leave;
+    // same-server Tuwunel never redelivers, which is why 23 scenarios stayed
+    // green). The server is the ground truth for our membership: if it already
+    // has us joined, this "invite" is a redelivery, never a decline candidate.
+    let already_joined = crate::matrix::appservice_is_room_joined(
+        &ctx.http,
+        &ctx.homeserver_url,
+        &ctx.appservice_token,
+        room_id.as_str(),
+        ctx.own_user.as_str(),
+    )
+    .await
+    // On a failed read, proceed as a new invite: the gate may re-accept (an
+    // idempotent join) but must never mistakenly IGNORE a genuinely new one.
+    .unwrap_or(false);
+    if already_joined {
+        tracing::info!(room_id = %room_id, "invite for a room the server already has us joined to — ignoring federated redelivery (#110)");
+    } else {
+        handle_invite_gated(ctx, invite, room).await;
+    }
     ctx.invite_inflight
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -1806,25 +1829,36 @@ struct SenderAuthority {
     explicit: bool,
     /// The room's `users_default` — the bar the explicit grant must exceed.
     users_default: i64,
+    /// v12+ (MSC4289): the sender is a room CREATOR — implicit infinite power,
+    /// and FORBIDDEN from appearing in `users[]`, so the explicit-grant check
+    /// can never see them (#112: a v12 creator could not link their own room,
+    /// live on the #109 fixture). Creators are a fixed, unforgeable set in the
+    /// create event — recognizing them keeps the #79-finding-6 immunity (no
+    /// defaults manipulation can mint one).
+    creator: bool,
 }
 
 impl SenderAuthority {
     fn ok(&self) -> bool {
         self.joined
-            && self.explicit
-            && self.sender_pl > self.users_default
-            && self.sender_pl >= MODERATOR_FLOOR
+            && (self.creator
+                || (self.explicit
+                    && self.sender_pl > self.users_default
+                    && self.sender_pl >= MODERATOR_FLOOR))
     }
 }
 
 /// Pure evaluation of a sender's authority over a room (unit-tested below).
 /// `pl_content` is the raw `m.room.power_levels` content (`None` = absent → no
 /// explicit grants, so fail-safe reject); `member_content` is the sender's
-/// `m.room.member` content (`None` = no membership event → not joined).
+/// `m.room.member` content (`None` = no membership event → not joined);
+/// `creators` is the room's v12+ creator set ([`read_room_creators`] — empty
+/// for pre-v12 rooms or on any read failure, fail-closed to the grant path).
 fn evaluate_sender_authority(
     pl_content: Option<&serde_json::Value>,
     member_content: Option<&serde_json::Value>,
     sender: &str,
+    creators: &[String],
 ) -> SenderAuthority {
     let joined = member_content
         .and_then(|m| m.get("membership"))
@@ -1838,7 +1872,59 @@ fn evaluate_sender_authority(
         }
         None => (0, false, 0),
     };
-    SenderAuthority { joined, sender_pl, explicit, users_default }
+    let creator = creators.iter().any(|c| c == sender);
+    SenderAuthority { joined, sender_pl, explicit, users_default, creator }
+}
+
+/// The room's v12+ CREATOR set (MSC4289), or empty for pre-v12 rooms / on any
+/// read failure (fail-closed to the explicit-grant path). v12 room ids ARE the
+/// create event id (MSC4291: `!<hash>` ↔ `$<hash>`), so the full create event
+/// — whose `sender` is the first creator — is fetchable directly; any
+/// `additional_creators` ride the create content.
+async fn read_room_creators(ctx: &BotCtx, room_id: &str) -> Vec<String> {
+    let create = crate::matrix::get_room_state(
+        &ctx.http,
+        &ctx.homeserver_url,
+        &ctx.appservice_token,
+        room_id,
+        "m.room.create",
+        "",
+        ctx.own_user.as_str(),
+    )
+    .await
+    .ok()
+    .flatten();
+    let Some(create) = create else { return Vec::new() };
+    let v12plus = create
+        .get("room_version")
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|v| v >= 12);
+    if !v12plus {
+        return Vec::new();
+    }
+    let mut creators = Vec::new();
+    if let Some(hash) = room_id.strip_prefix('!') {
+        let event_id = format!("${hash}");
+        if let Ok(Some(ev)) = crate::matrix::get_room_event(
+            &ctx.http,
+            &ctx.homeserver_url,
+            &ctx.appservice_token,
+            room_id,
+            &event_id,
+            ctx.own_user.as_str(),
+        )
+        .await
+        {
+            if let Some(s) = ev.get("sender").and_then(|v| v.as_str()) {
+                creators.push(s.to_owned());
+            }
+        }
+    }
+    if let Some(extra) = create.get("additional_creators").and_then(|v| v.as_array()) {
+        creators.extend(extra.iter().filter_map(|v| v.as_str().map(str::to_owned)));
+    }
+    creators
 }
 
 /// Read the room's power levels + `sender`'s membership over the CS API and
@@ -1872,7 +1958,8 @@ async fn read_sender_authority(
     )
     .await
     .map_err(|e| format!("could not read membership: {e}"))?;
-    Ok(evaluate_sender_authority(pl.as_ref(), member.as_ref(), sender))
+    let creators = read_room_creators(ctx, room_id).await;
+    Ok(evaluate_sender_authority(pl.as_ref(), member.as_ref(), sender, &creators))
 }
 
 /// Power-level values are canonically integers, but legacy rooms (and some
@@ -2061,8 +2148,13 @@ async fn probe_after_join(
         .map_err(|e| {
             format!("❌ Could not read your room membership: {e}\nNothing was written.")
         })?;
-        let authority =
-            evaluate_sender_authority(pl_content.as_ref(), member_content.as_ref(), sender);
+        let creators = read_room_creators(ctx, room_id).await;
+        let authority = evaluate_sender_authority(
+            pl_content.as_ref(),
+            member_content.as_ref(),
+            sender,
+            &creators,
+        );
         if !authority.ok() {
             let reason = if !authority.joined {
                 "you are not a joined member of it".to_string()
@@ -4122,10 +4214,10 @@ mod tests {
             "users": { "@mod:x": 50, "@admin:x": 100 },
         });
         // Explicit entries above the default and ≥ 50 → authorized.
-        assert!(evaluate_sender_authority(Some(&pl), Some(&joined()), "@mod:x").ok());
-        assert!(evaluate_sender_authority(Some(&pl), Some(&joined()), "@admin:x").ok());
+        assert!(evaluate_sender_authority(Some(&pl), Some(&joined()), "@mod:x", &[]).ok());
+        assert!(evaluate_sender_authority(Some(&pl), Some(&joined()), "@admin:x", &[]).ok());
         // Not in the users map → only the default (0), no explicit grant → refused.
-        let plain = evaluate_sender_authority(Some(&pl), Some(&joined()), "@user:x");
+        let plain = evaluate_sender_authority(Some(&pl), Some(&joined()), "@user:x", &[]);
         assert!(!plain.ok());
         assert!(!plain.explicit);
     }
@@ -4136,7 +4228,7 @@ mod tests {
         // "authorized" (sender_pl 0 ≥ state_default 0). Now state_default is
         // irrelevant — no explicit grant means no authority.
         let pl = serde_json::json!({ "state_default": 0, "users_default": 0 });
-        assert!(!evaluate_sender_authority(Some(&pl), Some(&joined()), "@member:x").ok());
+        assert!(!evaluate_sender_authority(Some(&pl), Some(&joined()), "@member:x", &[]).ok());
     }
 
     #[test]
@@ -4144,39 +4236,39 @@ mod tests {
         // #86: a room that raised users_default to 50 gives every member PL 50.
         // Without an EXPLICIT above-default grant that is not authority.
         let pl = serde_json::json!({ "users_default": 50 });
-        let a = evaluate_sender_authority(Some(&pl), Some(&joined()), "@member:x");
+        let a = evaluate_sender_authority(Some(&pl), Some(&joined()), "@member:x", &[]);
         assert_eq!(a.sender_pl, 50);
         assert!(!a.explicit);
         assert!(!a.ok(), "PL 50 from the default alone is not authority");
         // Even an explicit entry EQUAL to the default (not above it) is not enough.
         let pl2 = serde_json::json!({ "users_default": 50, "users": { "@x:x": 50 } });
-        assert!(!evaluate_sender_authority(Some(&pl2), Some(&joined()), "@x:x").ok());
+        assert!(!evaluate_sender_authority(Some(&pl2), Some(&joined()), "@x:x", &[]).ok());
         // An explicit entry ABOVE the raised default is authority.
         let pl3 = serde_json::json!({ "users_default": 50, "users": { "@x:x": 51 } });
-        assert!(evaluate_sender_authority(Some(&pl3), Some(&joined()), "@x:x").ok());
+        assert!(evaluate_sender_authority(Some(&pl3), Some(&joined()), "@x:x", &[]).ok());
     }
 
     #[test]
     fn sender_authority_explicit_grant_must_reach_the_floor() {
         // Explicit and above default, but below the 50 moderator floor → refused.
         let pl = serde_json::json!({ "users_default": 0, "users": { "@helper:x": 25 } });
-        assert!(!evaluate_sender_authority(Some(&pl), Some(&joined()), "@helper:x").ok());
+        assert!(!evaluate_sender_authority(Some(&pl), Some(&joined()), "@helper:x", &[]).ok());
     }
 
     #[test]
     fn sender_authority_requires_joined_membership() {
         let pl = serde_json::json!({ "users": { "@u:x": 50 } });
         // Power is sufficient but the sender must actually be joined.
-        assert!(!evaluate_sender_authority(Some(&pl), None, "@u:x").ok());
+        assert!(!evaluate_sender_authority(Some(&pl), None, "@u:x", &[]).ok());
         let invited = serde_json::json!({ "membership": "invite" });
-        assert!(!evaluate_sender_authority(Some(&pl), Some(&invited), "@u:x").ok());
-        assert!(evaluate_sender_authority(Some(&pl), Some(&joined()), "@u:x").ok());
+        assert!(!evaluate_sender_authority(Some(&pl), Some(&invited), "@u:x", &[]).ok());
+        assert!(evaluate_sender_authority(Some(&pl), Some(&joined()), "@u:x", &[]).ok());
     }
 
     #[test]
     fn sender_authority_absent_pl_fails_safe() {
         // No power_levels event → no explicit grants → refused.
-        let a = evaluate_sender_authority(None, Some(&joined()), "@u:x");
+        let a = evaluate_sender_authority(None, Some(&joined()), "@u:x", &[]);
         assert!(!a.explicit);
         assert!(!a.ok());
     }
@@ -4187,7 +4279,31 @@ mod tests {
             "users_default": "0",
             "users": { "@mod:x": "50" },
         });
-        assert!(evaluate_sender_authority(Some(&pl), Some(&joined()), "@mod:x").ok());
+        assert!(evaluate_sender_authority(Some(&pl), Some(&joined()), "@mod:x", &[]).ok());
+    }
+
+    #[test]
+    fn sender_authority_recognizes_v12_creators() {
+        // #112: v12 creators hold implicit infinite power and are FORBIDDEN
+        // from users[] — the explicit-grant path can never see them. A room's
+        // creator set (from the create event) must authorize directly.
+        let creators = vec!["@creator:x".to_string(), "@cofounder:y".to_string()];
+        // v12 rooms commonly have NO users[] entry at all for the creator.
+        let pl = serde_json::json!({ "users_default": 0 });
+        let a = evaluate_sender_authority(Some(&pl), Some(&joined()), "@creator:x", &creators);
+        assert!(a.creator);
+        assert!(a.ok(), "a joined v12 creator is room authority");
+        assert!(
+            evaluate_sender_authority(Some(&pl), Some(&joined()), "@cofounder:y", &creators).ok(),
+            "additional_creators count too"
+        );
+        // Still gated on joined membership…
+        assert!(!evaluate_sender_authority(Some(&pl), None, "@creator:x", &creators).ok());
+        // …and a non-creator without a grant stays refused.
+        assert!(!evaluate_sender_authority(Some(&pl), Some(&joined()), "@member:x", &creators).ok());
+        // Absent power_levels does not defeat creatorship (creator power is
+        // implicit, not a PL entry).
+        assert!(evaluate_sender_authority(None, Some(&joined()), "@creator:x", &creators).ok());
     }
 
     #[test]

@@ -916,6 +916,41 @@ pub(crate) async fn appservice_pending_invites(
     Ok(json["chunk"].as_array().map(|c| c.len()).unwrap_or(0))
 }
 
+/// GET one FULL event (incl. `sender`) via the CS API, appservice-asserted.
+/// `Ok(Some(event))` on 200, `Ok(None)` on 404, `Err` otherwise. First use:
+/// resolving a v12 room's creator — the create event's sender — since state
+/// reads return content only and v11+ removed `content.creator` (#112).
+pub(crate) async fn get_room_event(
+    http: &reqwest::Client,
+    homeserver_url: &str,
+    appservice_token: &str,
+    room_id: &str,
+    event_id: &str,
+    user_id: &str,
+) -> Result<Option<serde_json::Value>> {
+    let url = crate::rtc::ghost::cs_url(
+        homeserver_url,
+        &["rooms", room_id, "event", event_id],
+        Some(user_id),
+    )?;
+    let resp = http
+        .get(url)
+        .bearer_auth(appservice_token)
+        .send()
+        .await
+        .context("GET room event")?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("{status}: {body}"));
+    }
+    let event = resp.json().await.context("parsing room event")?;
+    Ok(Some(event))
+}
+
 pub(crate) async fn get_room_state(
     http: &reqwest::Client,
     homeserver_url: &str,
