@@ -11,6 +11,10 @@
 //! guild + rooms); it must never share puppet tokens with a running prod
 //! instance.
 
+// The #99 crypto DM actor tokio::spawns matrix-sdk's deeply-nested sync
+// future; the trait solver needs the same headroom nvb-matrix-rtc grants.
+#![recursion_limit = "256"]
+
 mod actors;
 mod bridge_proc;
 mod config;

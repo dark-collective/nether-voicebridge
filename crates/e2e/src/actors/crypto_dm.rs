@@ -238,7 +238,7 @@ impl MatrixCryptoDmClient {
             .send(RoomMessageEventContent::text_plain(body))
             .await
             .context("crypto-dm encrypted send")?;
-        Ok(resp.event_id.to_string())
+        Ok(resp.response.event_id.to_string())
     }
 
     /// One decryption pass over the recent timeline (newest-first `/messages`
