@@ -12,7 +12,12 @@
 homeserver_url = "https://nether.im"
 # matrix_domain = "nether.im"          # only when homeserver_url isn't the public domain
 appservice_id = "voicebridge"
-sender_localpart = "nether-voicebridge"
+# Use a DISTINCT localpart stem from your production bridge (still inside the
+# appservice namespace): the harness's management bot is `{stem}_bot`, and if
+# that matches an MXID real users might DM, a harness run's startup
+# invite-sweep can consume THEIR pending invites (#96 — this happened; the
+# nether.im harness uses "nether-voicebridge_e2e" → @nether-voicebridge_e2e_bot).
+sender_localpart = "nether-voicebridge_e2e"
 # appservice_token = "..."             # SECRET — the bridge appservice's as_token
 
 # Dedicated harness puppet bots for the bridge-under-test. NEVER prod's
