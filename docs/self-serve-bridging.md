@@ -46,10 +46,28 @@ Two room prerequisites, both verified by the bot before anything is created:
 
 1. **The room must allow power level 0 for `org.matrix.msc3401.call.member`** —
    the standard Element Call setup. Easiest fix: start (or join) a proper
-   Element Call in the room once; Element configures it automatically. Element's
-   "Roles & Permissions → Join Element calls" label is unreliable here — if in
-   doubt, check the raw `m.room.power_levels` event
-   ([details](hosted-instance.md#get-the-bridge-bot-into-your-matrix-room)).
+   Element Call in the room once; Element configures it automatically.
+
+   This is the single most common bridge-breaker, and its failure mode is
+   silent: the link succeeds and Matrix→Discord works, but **Discord speakers
+   never appear in the Matrix call** (the ghosts' membership posts get a 403
+   and retry forever). Two traps:
+
+   - Element's "Roles & Permissions → Join Element calls" label is
+     **unreliable** — it shows "Default" whether or not the room is correctly
+     configured. Don't trust it in either direction.
+   - The ground truth is the raw state: `/devtools` → Explore room state →
+     `m.room.power_levels` → `"org.matrix.msc3401.call.member": 0` must be
+     present under `"events"`; add it there if missing
+     ([details](hosted-instance.md#get-the-bridge-bot-into-your-matrix-room)).
+
+   The `link` probe checks this for you at link time — but power levels can
+   regress later (room upgrades, permission edits), and the check only runs
+   when linking.
+   <!-- TODO(screenshots): same 3 shots as the wiki page — call button,
+        devtools power_levels with the override highlighted, misleading
+        Roles & Permissions dropdown. -->
+
 2. **If the room is restricted/invite-only, invite the bridge bot** to it first.
    The bot joins as a full appservice member (no `guest_access` needed), but a
    restricted room still needs it invited or in the allow-space.
