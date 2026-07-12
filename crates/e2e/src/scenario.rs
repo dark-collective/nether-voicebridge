@@ -15,10 +15,13 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expectation {
     Pass,
-    /// A filed, not-yet-fixed gap. Live user: `mgmt_dm_pending_reap` (#99),
-    /// tracking the #97 pending-invite reap — flip it to `Pass` when the fix
-    /// (alpha.25) merges. (Its first design target, the #62 force-move gap,
-    /// was fixed in v0.3.0-alpha.11 before ever shipping a KnownFail.)
+    /// No live scenario constructs this right now — both gaps it has tracked
+    /// were fixed before (or hours after) their KnownFail shipped: the #62
+    /// force-move gap (fixed v0.3.0-alpha.11) and the #97 pending-invite reap
+    /// (`mgmt_dm_pending_reap` shipped as KnownFail, live-reproduced once,
+    /// and flipped to `Pass` the same night when alpha.25 landed). Kept (with
+    /// runner tests) for the next filed gap.
+    #[allow(dead_code)]
     KnownFail { issue: &'static str },
 }
 

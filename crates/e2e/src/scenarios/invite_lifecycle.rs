@@ -15,15 +15,15 @@
 //!   declines). Same-server = the only thing the harness can mint (see the
 //!   testing-design doc's federation-limitation note), so here it guards the
 //!   post-fix contract as a regression test rather than reproducing the bug.
-//! * [`MGMT_DM_PENDING_REAP`] (`KnownFail{#97}`) — a DM the BOT initiated
-//!   (operator `msg` → `create_dm`) has the bot joined and the target merely
-//!   invited, so `joined_members_count() == 1`: the pre-fix #89b empty-room
-//!   sweep reaps it before the target can accept, killing the pending
-//!   invite. Reproduces deterministically (live 2026-07-12: the compressed
-//!   sweep reaped the fresh DM ~100 ms after creation — before even the
-//!   operator's message could be sent into it, 403 "sender's membership
-//!   `leave` is not `join`"). Flip to `Pass` when the #97 fix (alpha.25)
-//!   merges.
+//! * [`MGMT_DM_PENDING_REAP`] (`Pass`) — a DM the BOT initiated (operator
+//!   `msg` → `create_dm`) has the bot joined and the target merely invited,
+//!   so `joined_members_count() == 1`: the pre-#97-fix #89b empty-room sweep
+//!   reaped it before the target could accept, killing the pending invite.
+//!   Reproduced deterministically as `KnownFail{#97}` (live 2026-07-12,
+//!   pre-fix: the compressed sweep reaped the fresh DM ~100 ms after
+//!   creation — before even the operator's message could be sent into it,
+//!   403 "sender's membership `leave` is not `join`"); flipped to `Pass`
+//!   with alpha.25's reap exemption for pending-invite rooms.
 
 use anyhow::{Context as _, Result, bail};
 use std::sync::Arc;
@@ -41,7 +41,7 @@ pub static MGMT_INVITE_OFFLINE: ScenarioDef = ScenarioDef {
 
 pub static MGMT_DM_PENDING_REAP: ScenarioDef = ScenarioDef {
     name: "mgmt_dm_pending_reap",
-    expectation: Expectation::KnownFail { issue: "#97" },
+    expectation: Expectation::Pass,
     run: boxed_reap,
 };
 
