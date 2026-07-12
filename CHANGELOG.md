@@ -3,6 +3,44 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-beta.2] - 2026-07-12
+
+**The federation fixture pays for itself.** A second, operator-run test
+homeserver (`nether.autos`, issue #109) now lets the live suite mint genuinely
+REMOTE users — and it caught two real bridge bugs within its first hour that
+23 same-server scenarios were structurally blind to. Both are fixed here.
+
+### Fixed
+- **Federated invite redelivery no longer makes the management bot decline
+  the DM it just joined (#110).** Over federation, a still-pending invite is
+  redelivered ~half a second after the bot's accept-join — inside the window
+  where the SDK's local room state lags the raw appservice join. The
+  redelivered invite then hit the per-sender cooldown its own first pass had
+  just stamped and was declined (the #97 join-then-leave, alive over
+  federation; deterministic with `mgmt_cooldown_secs` set). The invite
+  handler now asks the server — the ground truth — whether the bot is
+  already joined before treating a delivery as a new invite.
+- **v12 room creators can link their own rooms (#112).** Room v12 gives
+  creators implicit infinite power and forbids them from `users[]` — so the
+  moderator-grant authority check could structurally never authorize a v12
+  creator. The check now resolves the room's creator set from the create
+  event (v12 room ids ARE the create event id) and accepts joined creators.
+  Fail-closed: any read failure falls back to the explicit-grant path.
+
+### Added
+- **Federated live scenarios (#109).** `fed_dm_invite_lifecycle` and
+  `fed_link_v12` (both passing, guarding the fixes above) plus
+  `fed_cold_outreach_utd` (known-fail pinning #104 with a genuinely remote
+  crypto recipient). The suite grows to 26; the `fed_*` scenarios report a
+  new first-class `skipped` outcome on deployments without the fixture, so
+  the suite still runs anywhere. Fixture runbook: `docs/e2e-homeserver.md`.
+
+### Known issues
+- Self-serve `link` of an invite-only room remains unsatisfiable — the bot's
+  "invite me first" guidance conflicts with its own invite gate (#111).
+- Cold-outreach first messages to remote encrypted recipients can still be
+  undecryptable (#104) — now deterministically reproduced by the fixture.
+
 ## [0.3.0-beta.1] - 2026-07-12
 
 **Alpha → beta.** The self-serve hosted flow has now been exercised end-to-end
