@@ -237,6 +237,9 @@ struct BotCtx {
     /// Pending `announce` awaiting `announce confirm` (#94): the text and its
     /// confirmation deadline. One at a time, operator-tier only.
     pending_announce: StdMutex<Option<(String, Instant)>>,
+    /// Per-room stamp of the last #95 room-misconfigured notification, gating
+    /// re-notification to [`MISCONFIG_NOTIFY_COOLDOWN`].
+    notify_stamps: StdMutex<HashMap<String, Instant>>,
     /// Disclosure notices to the Discord pool (#64): posted into a bridged
     /// voice channel's text chat by the command bot. Best-effort.
     notice_tx: Option<mpsc::UnboundedSender<DiscordNotice>>,
@@ -319,10 +322,26 @@ struct PendingLink {
 /// concurrent onboarding.
 const PENDING_LINK_CAP: usize = 16;
 
-/// How often the management bot runs its maintenance sweep (#87/#89b): reap
-/// rooms left behind by abandoned pending links and empty DM rooms. Not urgent —
-/// pending links are already bounded by [`PENDING_LINK_CAP`] — so a slow tick.
+/// How often the management bot runs its maintenance sweep (#87/#89b reaps +
+/// the #95 room power-level check). Not urgent — pending links are already
+/// bounded by [`PENDING_LINK_CAP`] — so a slow tick.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// [`MAINTENANCE_INTERVAL`] with the `NVB_MAINTENANCE_INTERVAL_SECS` env
+/// override (#95, min-clamped to 5 s) so live drills and tests can compress
+/// the sweep without a config knob.
+fn maintenance_interval() -> Duration {
+    std::env::var("NVB_MAINTENANCE_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|s| Duration::from_secs(s.max(5)))
+        .unwrap_or(MAINTENANCE_INTERVAL)
+}
+
+/// Per-room cooldown on the #95 room-misconfigured notification, so a broken
+/// room nags its members/owner once a day, not every sweep. In-memory: a
+/// restart re-notifies once, which is fine.
+const MISCONFIG_NOTIFY_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
 
 /// Most pending links one homeserver's users may hold at once (#88). Bounds
 /// concentration of the shared [`PENDING_LINK_CAP`] table by a federated Sybil
@@ -461,6 +480,17 @@ async fn run_maintenance(ctx: &BotCtx, client: &Client) {
         tracing::debug!("maintenance: supervisor did not answer — skipping sweep");
         return;
     };
+
+    // #95 tiers 1+2: detect bridged rooms whose power levels block the ghosts
+    // and notify. Runs for every deployment (static bridges break too).
+    check_room_call_power(ctx, client, &statuses).await;
+
+    // The reap duties below serve only the open-registration surface
+    // (strangers probing / abandoning rooms).
+    if !ctx.open_registration {
+        return;
+    }
+
     // Never leave a room with a bridge: the running set (static + tenant) unioned
     // with the configured tenant rooms (covers a tenant momentarily not running).
     let mut safe_rooms: HashSet<String> = statuses.into_iter().map(|s| s.room_id).collect();
@@ -493,6 +523,98 @@ async fn run_maintenance(ctx: &BotCtx, client: &Client) {
             }
         }
     }
+}
+
+/// #95 tiers 1+2: for every bridged room (static AND tenant), read
+/// `m.room.power_levels` and check that the ghosts can post
+/// `m.call.member`. A room that can't silently loses the whole
+/// Discord→Matrix direction, so on detection: post a chat message into the
+/// room itself (the bot is a member, and chat stays writable at PL 0 even
+/// when state events are locked — the exact asymmetry causing the breakage),
+/// DM the tenant owner when known, append a `room_misconfigured` audit
+/// event, and WARN for the ops tooling. Per-room [`MISCONFIG_NOTIFY_COOLDOWN`].
+async fn check_room_call_power(ctx: &BotCtx, client: &Client, statuses: &[BridgeStatus]) {
+    for b in statuses {
+        let pl = match crate::matrix::get_room_state(
+            &ctx.http,
+            &ctx.homeserver_url,
+            &ctx.appservice_token,
+            &b.room_id,
+            "m.room.power_levels",
+            "",
+            ctx.own_user.as_str(),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(room = %b.room_id, error = %e, "maintenance: power-level read failed — skipping check");
+                continue;
+            }
+        };
+        let check = evaluate_call_member_power(pl.as_ref());
+        if check.ok() {
+            continue;
+        }
+        // Once per room per cooldown window; a gated repeat stays silent.
+        {
+            let mut stamps =
+                ctx.notify_stamps.lock().unwrap_or_else(PoisonError::into_inner);
+            if cooldown_check(&mut stamps, &b.room_id, Instant::now(), MISCONFIG_NOTIFY_COOLDOWN)
+                .is_some()
+            {
+                continue;
+            }
+        }
+        let notice = misconfig_notice(&b.label, check.required, check.ghost_pl, &ctx.docs_line());
+        match matrix_sdk::ruma::RoomId::parse(b.room_id.as_str()) {
+            Ok(rid) => match client.get_room(&rid) {
+                Some(room) => reply(&room, &notice).await,
+                None => tracing::warn!(room = %b.room_id, "maintenance: bot has no view of the misconfigured room — in-room notice skipped"),
+            },
+            Err(e) => tracing::warn!(room = %b.room_id, error = %e, "maintenance: unparsable room id"),
+        }
+        if let Some(owner) = &b.owner {
+            if let Err(e) = dm_user(
+                client,
+                owner,
+                &format!("Heads-up about your bridge '{}' ({}):\n{notice}", b.label, b.room_id),
+            )
+            .await
+            {
+                tracing::warn!(owner = %owner, error = %e, "maintenance: owner DM failed");
+            }
+        }
+        audit(ctx, "maintenance", "room_misconfigured", serde_json::json!({
+            "bridge": b.label,
+            "room": b.room_id,
+            "required": check.required,
+            "ghost_pl": check.ghost_pl,
+            "owner": b.owner,
+        }));
+        tracing::warn!(
+            bridge = %b.label,
+            room = %b.room_id,
+            required = check.required,
+            ghost_pl = check.ghost_pl,
+            "bridged room misconfigured: ghosts cannot post m.call.member — Discord→Matrix broken there"
+        );
+    }
+}
+
+/// Pure renderer for the #95 room-misconfigured notice (unit-tested).
+fn misconfig_notice(label: &str, required: i64, ghost_pl: i64, docs: &str) -> String {
+    format!(
+        "⚠️ This room's permissions are blocking the voice bridge '{label}': \
+         Discord speakers cannot appear in this room's call (posting \
+         `{CALL_MEMBER_EVENT}` needs power level {required}, but participants \
+         join at {ghost_pl}).\n\
+         Fix: start an Element Call in this room once — or via /devtools set \
+         `events[\"{CALL_MEMBER_EVENT}\"] = 0` in `m.room.power_levels`. \
+         Element's \"Roles & Permissions\" UI shows \"Default\" either way, so \
+         check the raw event. The bridge re-checks every few minutes and will \
+         recover on its own once fixed.{docs}"
+    )
 }
 
 /// Best-effort appservice leave with a uniform log line (#87/#89b).
@@ -814,6 +936,7 @@ pub async fn run(
         docs_url: cfg.docs_url.clone(),
         instance_notice: cfg.instance_notice.clone(),
         pending_announce: StdMutex::new(None),
+        notify_stamps: StdMutex::new(HashMap::new()),
         notice_tx: pool_io.notice_tx,
     });
 
@@ -837,15 +960,17 @@ pub async fn run(
         });
     }
 
-    // Periodic maintenance (#87/#89b): reap rooms left behind by abandoned pending
-    // links and empty DM rooms. Only the open-registration surface accumulates
-    // these (strangers probing / abandoning), so it's scoped there.
-    if ctx.open_registration {
+    // Periodic maintenance: the #95 room power-level check runs for EVERY
+    // deployment (a static bridge's room can be misconfigured too — it
+    // happened in prod), while the #87/#89b reaps stay gated on
+    // open_registration inside `run_maintenance` (only that surface
+    // accumulates stranger-probed rooms).
+    {
         let ctx = ctx.clone();
         let client = client.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(MAINTENANCE_INTERVAL);
+            let mut tick = tokio::time::interval(maintenance_interval());
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
@@ -3158,6 +3283,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn misconfig_notice_names_event_fix_and_docs() {
+        let n = misconfig_notice("Game Night", 50, 0, "\nGuide: https://x.test/g");
+        assert!(n.contains("voice bridge 'Game Night'"));
+        assert!(n.contains("org.matrix.msc3401.call.member"));
+        assert!(n.contains("needs power level 50"));
+        assert!(n.contains("join at 0"));
+        assert!(n.contains("Element Call"));
+        assert!(n.contains("/devtools"));
+        assert!(n.ends_with("\nGuide: https://x.test/g"));
+        // Without a docs url the notice is self-contained.
+        assert!(!misconfig_notice("x", 50, 0, "").contains("Guide:"));
+    }
+
+    #[test]
+    fn misconfig_cooldown_gates_per_room() {
+        // The #95 notify path rides cooldown_check keyed by room id: first
+        // sighting notifies (and stamps), repeats inside the window stay
+        // silent, and a second room is independent.
+        let mut stamps = HashMap::new();
+        let t0 = Instant::now();
+        assert_eq!(cooldown_check(&mut stamps, "!a:x", t0, MISCONFIG_NOTIFY_COOLDOWN), None);
+        assert!(
+            cooldown_check(&mut stamps, "!a:x", t0 + Duration::from_secs(300), MISCONFIG_NOTIFY_COOLDOWN)
+                .is_some()
+        );
+        assert_eq!(cooldown_check(&mut stamps, "!b:x", t0, MISCONFIG_NOTIFY_COOLDOWN), None);
+        // Past the window the room re-notifies.
+        assert_eq!(
+            cooldown_check(&mut stamps, "!a:x", t0 + MISCONFIG_NOTIFY_COOLDOWN + Duration::from_secs(1), MISCONFIG_NOTIFY_COOLDOWN),
+            None
+        );
+    }
+
+    #[test]
     fn parse_operator_tooling_verbs() {
         // #94: status/stats take no args; msg needs mxid + text; announce
         // distinguishes the confirm word from announcement text.
@@ -4006,6 +4165,7 @@ mod tests {
             docs_url: None,
             instance_notice: None,
             pending_announce: StdMutex::new(None),
+            notify_stamps: StdMutex::new(HashMap::new()),
             notice_tx: None,
         };
         (ctx, control_rx)

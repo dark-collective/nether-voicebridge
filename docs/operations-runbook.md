@@ -32,6 +32,16 @@ Plus one 📊 **daily digest** even when everything is quiet — audit events in
 the last 24 h, journal counts, connection counts. **If the digest stops
 appearing, the monitor itself is broken** — that's the dead-man's-switch.
 
+Since v0.3.0-alpha.24 the bridge also **detects the most common breakage
+itself** (#95 tiers 1–2): every maintenance sweep (~5 min,
+`NVB_MAINTENANCE_INTERVAL_SECS` to override) it checks each bridged room's
+`m.room.power_levels` for the `org.matrix.msc3401.call.member = 0`
+requirement. A broken room gets a chat notice posted into it (with the fix),
+its owner gets a DM, a `room_misconfigured` audit event is appended, and a
+`bridged room misconfigured` WARN reaches the ops alerts — rate-limited to
+once per room per day. Static bridges are covered too; no configuration
+needed.
+
 The audit trail (`<data_dir>/audit.jsonl`, rotated to `.1` at 64 MiB) records
 every link/approve/unlink/ban/report/invite decision with the actor's MXID —
 `jq` over it answers "who did what" directly.
