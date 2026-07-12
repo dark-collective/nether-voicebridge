@@ -172,6 +172,33 @@ impl MatrixManagementClient {
         Ok(())
     }
 
+    /// This client's own MXID (for teardown leaves and assertions).
+    pub fn mxid(&self) -> &str {
+        &self.mxid
+    }
+
+    /// Leave `room` as `mxid` (appservice masquerade) — scenario teardown so
+    /// drill rooms don't accumulate across runs. Best-effort semantics belong
+    /// to the caller.
+    pub async fn leave_as(&self, room: &str, mxid: &str) -> Result<()> {
+        let url = format!("{}/_matrix/client/v3/rooms/{}/leave", self.base, enc(room));
+        let resp = self
+            .http
+            .post(url)
+            .query(&[("user_id", &mxid.to_string())])
+            .bearer_auth(&self.as_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .context("leave request")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("leave failed: {status}: {body}");
+        }
+        Ok(())
+    }
+
     /// Poll `joined_members` until the bot is a joined member (its DM auto-join
     /// is a raw appservice `POST /join`, so it lands server-side within a beat
     /// of the invite). Errors at `timeout`.
@@ -318,6 +345,31 @@ impl MatrixManagementClient {
             }
             if tokio::time::Instant::now() >= deadline {
                 bail!("no bot reply to the command in {room} within {timeout:?}");
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// Poll until the bot posts a message containing `needle` after
+    /// `after_event` — for UNPROMPTED bot messages (#95: the maintenance
+    /// sweep's room-misconfigured notice), where earlier bot chatter (the
+    /// greeting) must be skipped rather than returned.
+    pub async fn wait_for_bot_message_containing(
+        &self,
+        room: &str,
+        after_event: &str,
+        needle: &str,
+        timeout: Duration,
+    ) -> Result<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            for m in self.bot_replies_after(room, after_event).await? {
+                if m.contains(needle) {
+                    return Ok(m);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("no bot message containing {needle:?} in {room} within {timeout:?}");
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }

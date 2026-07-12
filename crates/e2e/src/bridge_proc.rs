@@ -228,7 +228,7 @@ impl BridgeUnderTest {
         tenants_toml: &str,
         workdir: &Path,
     ) -> Result<Self> {
-        Self::start_inner(cfg, profile, tenants_toml, workdir, false, None).await
+        Self::start_inner(cfg, profile, tenants_toml, workdir, false, None, &[]).await
     }
 
     /// Like [`start`](Self::start) but with the `[management]` self-serve stack
@@ -242,7 +242,20 @@ impl BridgeUnderTest {
         tenants_toml: &str,
         workdir: &Path,
     ) -> Result<Self> {
-        Self::start_inner(cfg, profile, tenants_toml, workdir, true, None).await
+        Self::start_inner(cfg, profile, tenants_toml, workdir, true, None, &[]).await
+    }
+
+    /// Like [`start_with_management`](Self::start_with_management) with extra
+    /// env vars for the bridge child (#95's `room_misconfig_notice` compresses
+    /// the maintenance sweep via `NVB_MAINTENANCE_INTERVAL_SECS`).
+    pub async fn start_with_management_env(
+        cfg: &E2eConfig,
+        profile: Profile,
+        tenants_toml: &str,
+        workdir: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self> {
+        Self::start_inner(cfg, profile, tenants_toml, workdir, true, None, extra_env).await
     }
 
     /// Like [`start`](Self::start) but with the puppet pool restricted to the
@@ -255,7 +268,7 @@ impl BridgeUnderTest {
         workdir: &Path,
         pool_size: usize,
     ) -> Result<Self> {
-        Self::start_inner(cfg, profile, tenants_toml, workdir, false, Some(pool_size)).await
+        Self::start_inner(cfg, profile, tenants_toml, workdir, false, Some(pool_size), &[]).await
     }
 
     async fn start_inner(
@@ -265,6 +278,7 @@ impl BridgeUnderTest {
         workdir: &Path,
         management: bool,
         pool_size: Option<usize>,
+        extra_env: &[(&str, &str)],
     ) -> Result<Self> {
         let data_dir = workdir.join("data");
         tokio::fs::create_dir_all(&data_dir).await.context("creating bridge workdir")?;
@@ -325,6 +339,9 @@ impl BridgeUnderTest {
             Profile::Real => {
                 cmd.env_remove("NVB_TIMING");
             }
+        }
+        for (k, v) in extra_env {
+            cmd.env(k, v);
         }
 
         let mut child = cmd.spawn().context("spawning bridge-under-test")?;

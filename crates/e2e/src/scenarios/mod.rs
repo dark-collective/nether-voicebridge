@@ -6,6 +6,7 @@
 pub mod audio;
 pub mod lifecycle;
 pub mod mgmt_self_serve;
+pub mod room_misconfig;
 pub mod moderation;
 pub mod multi_bridge_isolation;
 pub mod overflow_fcfs;
@@ -18,6 +19,7 @@ pub fn all() -> Vec<&'static ScenarioDef> {
     vec![
         &smoke::SMOKE_OPEN_CLOSE,
         &mgmt_self_serve::MGMT_SELF_SERVE_LINK,
+        &room_misconfig::ROOM_MISCONFIG_NOTICE,
         &audio::AUDIO_M2D_UNENC,
         &audio::AUDIO_D2M_UNENC,
         &audio::AUDIO_M2D_ENC,
