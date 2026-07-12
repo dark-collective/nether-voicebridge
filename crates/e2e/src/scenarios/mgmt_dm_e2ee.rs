@@ -80,7 +80,7 @@ async fn run(ctx: Arc<Ctx>) -> Result<()> {
     // Teardown either way: the crypto actor leaves + logs out its ephemeral
     // device, then the bridge drains. The bot's own membership is left for its
     // #89b empty-room reap (prod appservice namespace — not ours to leave).
-    if let Err(e) = user.teardown(&dm).await {
+    if let Err(e) = user.teardown(Some(&dm)).await {
         eprintln!("crypto-dm teardown failed (non-fatal): {e}");
     }
     match result {

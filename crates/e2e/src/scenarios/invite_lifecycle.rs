@@ -24,11 +24,20 @@
 //!   creation — before even the operator's message could be sent into it,
 //!   403 "sender's membership `leave` is not `join`"); flipped to `Pass`
 //!   with alpha.25's reap exemption for pending-invite rooms.
+//!
+//!   The target is a CRYPTO client, not the raw-CS one: live testing showed
+//!   the SDK's `create_dm` mints the operator-msg DM **encrypted** (initial
+//!   `m.room.encryption`), and the 📣 is sent while the target is still
+//!   invited — so reading it requires a device that existed at send time
+//!   (the SDK pre-shares the megolm session to invited members' devices).
+//!   A deviceless raw-CS user sees only ciphertext, exactly like a real
+//!   `msg` recipient on a non-E2EE client would.
 
 use anyhow::{Context as _, Result, bail};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::actors::crypto_dm::MatrixCryptoDmClient;
 use crate::actors::mgmt_client::MatrixManagementClient;
 use crate::bridge_proc::{BridgeUnderTest, tenant_entry};
 use crate::scenario::{Ctx, Expectation, ScenarioDef};
@@ -195,12 +204,16 @@ async fn run_reap(ctx: Arc<Ctx>) -> Result<()> {
     let op = MatrixManagementClient::register(cfg, "nvbtest_operator", "NVB Test Operator")
         .await
         .context("registering operator")?;
-    let target =
-        MatrixManagementClient::register(cfg, "nvbtest_dmtarget", "NVB Test DM Target").await?;
+    // Crypto target, registered (device keys + OTKs uploaded) BEFORE the
+    // operator's `msg`: the bot's `create_dm` DM is encrypted and the megolm
+    // session is shared to devices present at send time.
+    let target = MatrixCryptoDmClient::register(cfg, "nvbtest_dmtarget", "NVB Test DM Target")
+        .await
+        .context("registering crypto target")?;
     // Stale pending invites from earlier (failed) runs would confuse the
-    // which-room-did-the-bot-just-open scan — snapshot and reject them first.
-    for stale in target.invited_rooms().await? {
-        if let Err(e) = target.leave_as(&stale, target.mxid()).await {
+    // which-room-did-the-bot-just-open scan — reject them first.
+    for stale in target.invited_rooms() {
+        if let Err(e) = target.reject_invite(&stale).await {
             eprintln!("rejecting stale invite {stale} failed (non-fatal): {e}");
         }
     }
@@ -228,12 +241,11 @@ async fn run_reap(ctx: Arc<Ctx>) -> Result<()> {
         }
     };
     // Drill rooms must not accumulate: the target leaves (or rejects) the
-    // bot-initiated DM, the operator leaves their command DM. The bot's own
-    // memberships are its #89b reap's problem.
-    if let Some(room) = &pending_dm {
-        if let Err(e) = target.leave_as(room, target.mxid()).await {
-            eprintln!("reap-drill target leave failed (non-fatal): {e}");
-        }
+    // bot-initiated DM and logs out its ephemeral device, the operator
+    // leaves their command DM. The bot's own memberships are its #89b reap's
+    // problem.
+    if let Err(e) = target.teardown(pending_dm.as_deref()).await {
+        eprintln!("reap-drill target teardown failed (non-fatal): {e}");
     }
     if let Some(room) = &op_dm {
         if let Err(e) = op.leave_as(room, op.mxid()).await {
@@ -245,7 +257,7 @@ async fn run_reap(ctx: Arc<Ctx>) -> Result<()> {
 
 async fn drive_reap(
     op: &MatrixManagementClient,
-    target: &MatrixManagementClient,
+    target: &MatrixCryptoDmClient,
     bridge: &BridgeUnderTest,
     pending_dm: &mut Option<String>,
     op_dm: &mut Option<String>,
@@ -274,7 +286,7 @@ async fn drive_reap(
     // Find the bot-initiated DM via the target's pending invites.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let room = loop {
-        if let Some(room) = target.invited_rooms().await?.into_iter().next() {
+        if let Some(room) = target.invited_rooms().into_iter().next() {
             break room;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -304,14 +316,14 @@ async fn drive_reap(
     // (b) …the target can still accept it…
     target.join(&room).await.context("accepting the pending DM invite")?;
     // (c) …into a room the bot still inhabits, with the operator message
-    // readable ("\u{0}" sentinel = scan the whole page; the bot sent it before
-    // we were joined, so there is no marker of ours to anchor on).
+    // READABLE — the DM is encrypted (SDK `create_dm`), so this decrypts the
+    // pre-join 📣 via the megolm session the bot shared to our device while
+    // we were still invited.
     target
         .wait_for_bot_message_containing(
             &room,
-            "\u{0}",
             "Message from the bridge operator",
-            Duration::from_secs(15),
+            Duration::from_secs(30),
         )
         .await
         .context("operator message not readable after accepting the invite")?;

@@ -205,6 +205,70 @@ impl MatrixCryptoDmClient {
             .context("createRoom response missing room_id")
     }
 
+    /// Rooms this user currently holds a PENDING invite to, via the synced
+    /// client. #99's reap-race target finds the DM the BOT initiated this way
+    /// (and pre-cleans stale invites from aborted earlier runs).
+    pub fn invited_rooms(&self) -> Vec<String> {
+        self.client.invited_rooms().iter().map(|r| r.room_id().to_string()).collect()
+    }
+
+    /// Accept a pending invite (SDK join, so the crypto client's state moves
+    /// to Joined and decryption of the room's history can proceed).
+    pub async fn join(&self, room: &str) -> Result<()> {
+        let room_id: matrix_sdk::ruma::OwnedRoomId = room.parse().context("parsing room id")?;
+        let r = self
+            .client
+            .get_room(&room_id)
+            .with_context(|| format!("crypto-dm client does not know room {room}"))?;
+        r.join().await.context("crypto-dm join")?;
+        Ok(())
+    }
+
+    /// Reject a pending invite (teardown / stale-invite pre-clean).
+    pub async fn reject_invite(&self, room: &str) -> Result<()> {
+        let room_id: matrix_sdk::ruma::OwnedRoomId = room.parse().context("parsing room id")?;
+        if let Some(r) = self.client.get_room(&room_id) {
+            r.leave().await.context("crypto-dm invite reject")?;
+        }
+        Ok(())
+    }
+
+    /// The MXIDs currently joined to `room` (raw CS `joined_members` over the
+    /// appservice masquerade — membership asserts don't need the SDK).
+    pub async fn joined_members(&self, room: &str) -> Result<Vec<String>> {
+        let enc: String = room
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        let url = format!("{}/_matrix/client/v3/rooms/{}/joined_members", self.base, enc);
+        let resp = self
+            .http
+            .get(url)
+            .query(&[("user_id", &self.mxid)])
+            .bearer_auth(&self.as_token)
+            .send()
+            .await
+            .context("joined_members request")?;
+        if !resp.status().is_success() {
+            bail!("joined_members failed: {}", resp.status());
+        }
+        let json: Value = resp.json().await.context("joined_members JSON")?;
+        Ok(json["joined"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    /// This client's own MXID (assertions / operator `msg` addressing).
+    pub fn mxid(&self) -> &str {
+        &self.mxid
+    }
+
     /// The SDK room, once the sync loop has caught up to our (server-side)
     /// membership. The room was created over the raw CS API, so the client
     /// only learns of it from sync — poll briefly.
@@ -327,12 +391,15 @@ impl MatrixCryptoDmClient {
         Ok(())
     }
 
-    /// Teardown: leave the DM (so drill rooms don't accumulate), stop the sync
-    /// loop, and `logout()` — deleting this run's ephemeral device server-side.
-    pub async fn teardown(self, room: &str) -> Result<()> {
-        if let Ok(sdk_room) = self.sdk_room(room, Duration::from_secs(5)).await {
-            if let Err(e) = sdk_room.leave().await {
-                tracing::warn!(error = %e, "crypto-dm leave failed (continuing to logout)");
+    /// Teardown: leave the DM if given (so drill rooms don't accumulate),
+    /// stop the sync loop, and `logout()` — deleting this run's ephemeral
+    /// device server-side.
+    pub async fn teardown(self, room: Option<&str>) -> Result<()> {
+        if let Some(room) = room {
+            if let Ok(sdk_room) = self.sdk_room(room, Duration::from_secs(5)).await {
+                if let Err(e) = sdk_room.leave().await {
+                    tracing::warn!(error = %e, "crypto-dm leave failed (continuing to logout)");
+                }
             }
         }
         self.sync_task.abort();
