@@ -3,6 +3,38 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-beta.1] - 2026-07-12
+
+**Alpha → beta.** The self-serve hosted flow has now been exercised end-to-end
+by real strangers on three homeservers — every failure they found in one long
+night is fixed or honestly tracked, and the live test suite grew to cover the
+whole invite/DM lifecycle, encrypted DMs included. Thank you, first testers.
+
+### Added
+- **Modern (v12, domainless) room ids are fully supported (#103).** `link`,
+  `ban`, and `report` accept both room-id generations, and first-contact
+  federated joins send explicit `via` hints (the requester's homeserver) —
+  domainless ids carry no implicit routing. Found by a real user whose
+  homeserver mints the new form; their literal room id is now a unit test.
+- **Invite/DM lifecycle test coverage (#99).** A crypto-capable E2EE DM test
+  actor and scenarios for encrypted-DM commands, offline-invite handling, and
+  bot-initiated-DM survival — the classes of failure only real federation
+  exposed. Suite: 23 live scenarios.
+
+### Fixed
+- **The empty-DM reaper now asks the server before reaping (#97).** The
+  alpha.25 exemption read the SDK's lagging room summary and could still
+  retract a seconds-old outreach invite; the gate is now a server-side
+  pending-invite query, failing safe on error.
+- Shape-rejected `link` attempts are now logged (previously reply-only —
+  invisible in triage).
+
+### Known
+- The FIRST message of an operator `msg`/`announce` to a user with no
+  existing DM can be undecryptable for them (#104; tracked by a live
+  known-fail scenario). Self-serve users who DM the bot themselves are
+  unaffected.
+
 ## [0.3.0-alpha.25] - 2026-07-12
 
 ### Fixed

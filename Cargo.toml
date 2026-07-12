@@ -23,7 +23,7 @@ default-members = [
 # (matches the Matrix bridge ecosystem — mautrix, Synapse, Element); all
 # dependencies (Apache-2.0 / MIT / ISC) are compatible.
 [workspace.package]
-version = "0.3.0-alpha.25"
+version = "0.3.0-beta.1"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 repository = "https://nether.codes/dark/nether-voicebridge"
