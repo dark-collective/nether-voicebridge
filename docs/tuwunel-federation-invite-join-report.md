@@ -78,16 +78,31 @@ So B answers unauthenticated probes correctly; only the authenticated
 event-exchange endpoints (`make_join`/`send_join`/`invite`) return bodies A
 cannot parse — consistently, in both directions of the relationship.
 
-**Questions.**
-1. Which response struct produces `missing field \`event\`` at line 1 col 1–2
-   here — `make_join`, `send_join` (v1/v2), or the `v2/invite` response? The
-   error string doesn't name the endpoint; that would help a lot.
-2. Is there any code path where Tuwunel commits a `200` for these endpoints
-   but writes an empty/partial JSON body (error after status committed,
-   response body dropped by a streaming layer, etc.)?
-3. Known 1.8.1 regression in this area? (Both ends are 1.8.1.)
-4. What `RUST_LOG`/tracing filter on the *requesting* side would log the raw
-   response body so we can capture exactly what B returns?
+**Root-cause update (live capture).** `missing field \`event\` at line 1,
+column 2` means the parser exhausted the object right after `{` — **B is
+returning HTTP 200 with a literal empty body `{}`** on authenticated
+federation writes, alongside intermittent transport-level failures
+(`Request error: error sending request`), while GETs stay healthy. That
+pattern points at a reverse proxy / tunnel fallback / filtering middleware in
+front of B's Tuwunel rather than Tuwunel core — we're pursuing that with B's
+operator. Filing anyway because two requester-side improvements would have
+saved hours:
+
+**Asks.**
+1. **Name the endpoint in the error.** `Server returned bad 200 response:
+   Deserialization(…)` doesn't say whether `make_join`, `send_join`, or
+   `v2/invite` failed — with a fleet of identical errors we couldn't tell
+   which exchange was breaking without packet-level work.
+2. **`createRoom` should surface a failed federated invite, not WARN and
+   continue.** When the `v2/invite` send fails, the room is created and the
+   response is a clean 200 — the invitee's membership event simply never
+   exists. From the client's perspective the invite silently vanished
+   (`WARN tuwunel_api::client::room::create: Failed to send invite`). At
+   minimum the createRoom response could carry a warning; ideally a
+   per-invite failure surface.
+3. What `RUST_LOG`/tracing filter on the requesting side logs the raw
+   response body for federation exchanges, for the next time someone needs
+   to see the `{}` with their own eyes?
 
 Happy to provide precise timestamps/room ids privately and to coordinate with
 B's operator (who is reachable to us). The visible user impact is that DMs
