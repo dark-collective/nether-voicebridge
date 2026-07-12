@@ -38,15 +38,11 @@ pub fn generate_config(cfg: &E2eConfig) -> String {
 /// on puppet 0, neither of which the audio/smoke scenarios want — so the
 /// #76 scenario uses [`BridgeUnderTest::start_with_management`] and everything
 /// else stays byte-identical.
-pub fn generate_config_with_management(cfg: &E2eConfig) -> String {
-    render_config(cfg, &cfg.puppet_tokens, true, "")
-}
-
-/// [`generate_config_with_management`] with extra raw `[limits]` lines appended
-/// (#99): the invite-lifecycle scenarios arm knobs the standing block leaves
-/// unset on purpose — `mgmt_cooldown_secs` foremost, whose absence is exactly
-/// why the suite never reproduced #97.
-pub fn generate_config_with_management_limits(cfg: &E2eConfig, extra_limits: &str) -> String {
+/// `extra_limits` (#99) appends raw `[limits]` lines so the invite-lifecycle
+/// scenarios can arm knobs the standing block leaves unset on purpose —
+/// `mgmt_cooldown_secs` foremost, whose absence is exactly why the suite
+/// never reproduced #97. Empty for everyone else.
+pub fn generate_config_with_management(cfg: &E2eConfig, extra_limits: &str) -> String {
     render_config(cfg, &cfg.puppet_tokens, true, extra_limits)
 }
 
@@ -338,7 +334,7 @@ impl BridgeUnderTest {
         tokio::fs::create_dir_all(&secrets_dir).await.context("creating bridge secrets dir")?;
         let config_path = secrets_dir.join("config.toml");
         let real_config = match (management, pool_size) {
-            (true, _) => generate_config_with_management_limits(cfg, extra_limits),
+            (true, _) => generate_config_with_management(cfg, extra_limits),
             (false, Some(n)) => generate_config_with_pool_size(cfg, n),
             (false, None) => generate_config(cfg),
         };
@@ -607,7 +603,13 @@ mod tests {
             std::env::temp_dir().join(format!("nvb-e2e-mgmtcfg-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg_path = dir.join("config.toml");
-        std::fs::write(&cfg_path, generate_config_with_management(&cfg)).unwrap();
+        // Exercise the #99 extra-limits seam too: the appended raw line must
+        // parse into `[limits]` alongside the standing knobs.
+        std::fs::write(
+            &cfg_path,
+            generate_config_with_management(&cfg, "mgmt_cooldown_secs = 60\n"),
+        )
+        .unwrap();
 
         let loaded = nvb_config::Config::load(cfg_path.to_str().unwrap()).expect("config loads");
         let m = loaded.management.as_ref().expect("[management] block present");
@@ -617,6 +619,7 @@ mod tests {
         assert_eq!(loaded.limits.max_tenants_per_owner, Some(1));
         // #77 anti-Sybil knobs resolve too.
         assert_eq!(loaded.limits.max_tenants_per_guild, Some(2));
+        assert_eq!(loaded.limits.mgmt_cooldown_secs, Some(60));
         assert_eq!(
             loaded.limits.link_attempt_budget(),
             Some((3, std::time::Duration::from_secs(3600)))

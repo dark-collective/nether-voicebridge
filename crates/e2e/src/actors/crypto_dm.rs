@@ -169,11 +169,6 @@ impl MatrixCryptoDmClient {
         })
     }
 
-    /// This client's own MXID (for assertions).
-    pub fn mxid(&self) -> &str {
-        &self.mxid
-    }
-
     /// Create an **encrypted** direct room inviting the bridge bot — the shape
     /// Element mints for a new DM by default (`m.room.encryption` in
     /// `initial_state`, `is_direct` riding the invite). Raw CS call over the
