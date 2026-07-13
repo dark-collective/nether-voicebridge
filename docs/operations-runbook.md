@@ -27,10 +27,13 @@ It checks, per window:
 | Log noise | journal cursor | ⚠️ WARN rate over threshold (restart bursts trip this once — expected) |
 | Service down | systemd | 💀 unit not active |
 | Egress anomaly | `ss` on the bridge PID | 🔌 TCP count outside envelope; 👁 any remote endpoint not in the allow-set (Cloudflare/Discord edge, homeserver, private ranges) |
+| Verification gate (#117) | Discord API, once daily with the digest | ⚠ any puppet bot's guild count ≥ `TRIPWIRE` (default 60; Discord's hard cap is 100 servers/app) — start the App Verification paperwork early |
 
 Plus one 📊 **daily digest** even when everything is quiet — audit events in
-the last 24 h, journal counts, connection counts. **If the digest stops
-appearing, the monitor itself is broken** — that's the dead-man's-switch.
+the last 24 h, journal counts, connection counts, and the **puppet-pool guild
+footprint** (`pool: b1=4 b2=3 … distinct=4` — per-bot guild counts from the
+Discord API, #117). **If the digest stops appearing, the monitor itself is
+broken** — that's the dead-man's-switch.
 
 Since v0.3.0-alpha.24 the bridge also **detects the most common breakage
 itself** (#95 tiers 1–2): every maintenance sweep (~5 min,
