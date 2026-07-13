@@ -204,6 +204,40 @@ impl MatrixManagementClient {
             .context("createRoom(v12) response missing room_id")
     }
 
+    /// Create an **invite-only** room WITHOUT inviting the bot (#111): the
+    /// link-an-invite-only-room drill runs `link` first (probe join 403s →
+    /// awaiting-invite intent), then sends the bot the invite via
+    /// [`invite`](Self::invite). Ships the `m.call.member` PL-0 override so
+    /// the resumed probe's prereq checks pass; the creator's explicit PL 100
+    /// satisfies `require_room_authority`.
+    pub async fn create_private_room_prepped(&self) -> Result<String> {
+        let resp = self
+            .http
+            .post(format!("{}/_matrix/client/v3/createRoom", self.base))
+            .query(&[("user_id", &self.mxid)])
+            .bearer_auth(&self.as_token)
+            .json(&serde_json::json!({
+                "preset": "private_chat",
+                "power_level_content_override": {
+                    "events": { "org.matrix.msc3401.call.member": 0 },
+                },
+            }))
+            .send()
+            .await
+            .context("createRoom(private) request")?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("createRoom(private) failed: {status}: {body}");
+        }
+        let json: Value =
+            serde_json::from_str(&body).context("createRoom(private) response JSON")?;
+        json["room_id"]
+            .as_str()
+            .map(str::to_owned)
+            .context("createRoom(private) response missing room_id")
+    }
+
     /// Invite `mxid` into `room` (as this user). Used to grow a DM past the
     /// two-member `is_command_room` threshold for the #71 gate test.
     pub async fn invite(&self, room: &str, mxid: &str) -> Result<()> {

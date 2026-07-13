@@ -92,11 +92,12 @@ presence).
 
 ## Get the bridge bot into your Matrix room
 
-1. **Invite the bridge bot** if your room is restricted or invite-only. The
-   bot joins as a full appservice member — it doesn't need `guest_access` on
-   the room — but a restricted/invite-only room still needs it **invited**
-   first (or added to the room's allow-space). The hosted instance's bridge
-   bot is `@voicebridge_as:nether.im`.
+1. **Restricted or invite-only room?** Run `link` first — the bot can't join
+   on its own, and its reply will ask you to **invite it within a time
+   window**; send that invite from your own account, from the room, and the
+   link continues automatically. (The bot joins as a full appservice member —
+   no `guest_access` needed; a room in the allow-space needs no invite.) The
+   hosted instance's bridge bot is `@voicebridge_as:nether.im`.
 2. **Make sure your room allows power level 0 for `org.matrix.msc3401.call.member`.**
    This is the standard Element Call setup — without it, ghosts (and, in an
    encrypted room, the E2EE subscriber) can't post their call membership, and
