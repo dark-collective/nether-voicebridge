@@ -586,6 +586,20 @@ async fn handle_room_events(
             RoomEvent::E2eeStateChanged { participant, state } => {
                 tracing::info!(identity = %participant.identity(), ?state, "LiveKit: E2EE state changed");
             }
+            // #116: the SFU's view of a participant's link quality. Emitted on
+            // CHANGES only, so every event is worth a line — this is the
+            // packet-loss signal choppy-audio reports previously lacked (the
+            // bridge's own frame metrics stay clean when the loss is on
+            // another participant's leg to the SFU).
+            RoomEvent::ConnectionQualityChanged { quality, participant } => {
+                use livekit::prelude::ConnectionQuality as Q;
+                let identity = participant.identity();
+                if matches!(quality, Q::Poor | Q::Lost) {
+                    tracing::warn!(identity = %identity, ?quality, "LiveKit: connection quality degraded (#116)");
+                } else {
+                    tracing::info!(identity = %identity, ?quality, "LiveKit: connection quality changed");
+                }
+            }
             other => {
                 tracing::debug!(event = ?other, "LiveKit room event");
             }
