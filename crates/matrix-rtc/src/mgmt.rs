@@ -1983,6 +1983,27 @@ struct ProbeReport {
     already_member: bool,
 }
 
+/// The reply when the probe's initial room JOIN fails (#111). The remedy depends
+/// on the requester's tier: an operator may invite the bot into any room (operator
+/// invites are always accepted), so they get the invite-me path; a self-serve
+/// user's invite to a non-operator is auto-rejected by the DMs-only gate, so
+/// "invite the bot first" is unsatisfiable for them — they instead get the
+/// make-it-publicly-joinable / ask-the-operator remedy.
+fn join_failure_reply(room_id: &str, err: &str, bot: &str, requester_is_operator: bool) -> String {
+    let remedy = if requester_is_operator {
+        format!(
+            "If the room is invite-only or restricted, invite {bot} to it first, then run \
+             `link` again."
+        )
+    } else {
+        "If the room is invite-only or restricted, make it publicly joinable and run `link` \
+         again, or ask the instance operator to link it for you. (I can't accept a room \
+         invite from a non-operator, so inviting me won't work.)"
+            .to_string()
+    };
+    format!("❌ The bridge bot could not join {room_id}: {err}\n{remedy}\nNothing was written.")
+}
+
 /// Run every room/guild prerequisite probe BEFORE tenants.toml is touched.
 /// `Err` carries the complete user-facing reply text — probe failures are
 /// operator errors, not bugs, so they go to the DM rather than the log.
@@ -2006,6 +2027,10 @@ async fn probe_room_prereqs(
     // Resolution hint for the first-contact join (#103): the requester's
     // server domain — required in practice for domainless v12 room ids.
     via_hint: Option<&str>,
+    // #111: tailors the join-failure remedy to the requester's tier — a self-serve
+    // user can't invite the bot (DMs-only gate), so "invite me first" is a dead end
+    // for them.
+    requester_is_operator: bool,
 ) -> Result<ProbeReport, String> {
     // Was the bot already a member before this probe? (A running bridge keeps it
     // joined.) If the read fails, assume YES — never risk leaving a bridged room
@@ -2036,11 +2061,11 @@ async fn probe_room_prereqs(
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             // The join itself failed → nothing to leave.
-            return Err(format!(
-                "❌ The bridge bot could not join {room_id}: {e}\n\
-                 If the room is invite-only or restricted, invite {} to it first, then run `link` again.\n\
-                 Nothing was written.",
-                ctx.own_user
+            return Err(join_failure_reply(
+                room_id,
+                &e.to_string(),
+                ctx.own_user.as_str(),
+                requester_is_operator,
             ));
         }
         Err(_) => {
@@ -2508,8 +2533,15 @@ async fn handle_link(
     // `require_room_authority` the probe also checks the SENDER's power in
     // the room (two-sided link auth, Matrix side).
     let authority_sender = ctx.require_room_authority.then_some(sender);
-    let report = match probe_room_prereqs(ctx, &room_id, &guild_id, authority_sender, mxid_domain(sender))
-        .await
+    let report = match probe_room_prereqs(
+        ctx,
+        &room_id,
+        &guild_id,
+        authority_sender,
+        mxid_domain(sender),
+        ctx.is_operator(sender),
+    )
+    .await
     {
         Ok(r) => r,
         Err(msg) => {
@@ -4405,6 +4437,27 @@ mod tests {
         let later = t0 + Duration::from_secs(600);
         assert!(insert_pending(&mut map, test_pending("111", later), later, ttl).is_ok());
         assert_eq!(map.len(), 1);
+    }
+
+    // ── #111: join-failure reply is tier-aware ───────────────────────────────
+
+    #[test]
+    fn join_failure_reply_operator_says_invite_me() {
+        let msg = join_failure_reply("!r:x.org", "403 Forbidden", "@bot:x.org", true);
+        assert!(msg.contains("invite @bot:x.org to it first"), "{msg}");
+        assert!(msg.contains("!r:x.org") && msg.contains("403 Forbidden"), "{msg}");
+        assert!(msg.contains("Nothing was written."), "{msg}");
+    }
+
+    #[test]
+    fn join_failure_reply_self_serve_drops_dead_end_invite_advice() {
+        let msg = join_failure_reply("!r:x.org", "403 Forbidden", "@bot:x.org", false);
+        // A self-serve user's invite to the bot is auto-rejected, so the remedy must
+        // NOT tell them to invite it first — it offers the reachable alternatives.
+        assert!(!msg.contains("invite @bot:x.org to it first"), "{msg}");
+        assert!(msg.contains("publicly joinable"), "{msg}");
+        assert!(msg.contains("ask the instance operator"), "{msg}");
+        assert!(msg.contains("Nothing was written."), "{msg}");
     }
 
     // ── Discord-side approval redemption (#76 part 2) ────────────────────────
