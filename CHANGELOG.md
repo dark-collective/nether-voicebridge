@@ -3,6 +3,29 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-beta.4] - 2026-07-13
+
+**Invite-only rooms are now self-serve linkable.** The last structural gap in
+self-serve onboarding: rooms the bot cannot join on its own no longer require
+operator intervention.
+
+### Added
+- **Awaiting-invite link resume (#111).** A `link` of a room the bot cannot
+  join now arms a single-use intent (default 30 min, `[limits]
+  invite_intent_ttl_secs` to tune): invite the bot to that room — from the
+  same account that ran `link` — and the link continues automatically to the
+  normal Discord-approval step. Works for every tier; strictly matched to the
+  exact requester and room; failed or abandoned resumes leave the room again.
+- **`list` now shows your in-flight state**: links awaiting Discord approval
+  (with the code and time left) and links awaiting your invite — so the DM
+  always tells you where things stand.
+
+### Changed
+- Docs (self-serve walkthrough, hosted instance): the restricted-room flow is
+  now "run `link` first, invite the bot when it asks"; puppet-pool invite
+  guidance clarified (any subset in any order works; spread partial invites
+  across the pool).
+
 ## [0.3.0-beta.3] - 2026-07-13
 
 **Beta polish from live feedback.** A self-serve usability fix surfaced by a real
