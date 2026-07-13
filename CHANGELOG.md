@@ -3,6 +3,31 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0-beta.3] - 2026-07-13
+
+**Beta polish from live feedback.** A self-serve usability fix surfaced by a real
+beta user, plus a CI-infrastructure change that stops the test harness from
+flaking itself. No change to the shipped bridge's runtime behaviour beyond the
+reworded reply.
+
+### Fixed
+- **Self-serve `link` failure no longer gives unfollowable advice (#111).** When
+  the bot cannot join a room a self-serve user asked to bridge, the reply used to
+  say "invite the bot to it first, then run `link` again" — but a self-serve
+  user's invite to the bot is auto-rejected (the DMs-only gate), so that was a
+  dead end. The reply is now tier-aware: operators still get the invite-me path;
+  self-serve users are told to make the room publicly joinable or ask the
+  instance operator to link it. (Join-failure remedy only — the pending-link
+  invite-gate exemption remains future work, so #111 stays open.)
+
+### Changed
+- **CI and the live E2E harness now serialize on the shared runner host.** They
+  share one physical machine, and a CPU-heavy CI build running alongside an e2e
+  audio scenario garbled its timing scores (spurious reds). Both workflows now
+  share a fixed concurrency group so at most one runs at a time, with `nice` on
+  the CI build steps as a fallback. CI/infra only — no effect on the release
+  binaries.
+
 ## [0.3.0-beta.2] - 2026-07-12
 
 **The federation fixture pays for itself.** A second, operator-run test
