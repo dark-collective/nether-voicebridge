@@ -159,6 +159,13 @@ pub struct LimitsConfig {
     /// knob is set; defaults to 60 s when omitted.
     #[serde(default)]
     pub global_link_window_secs: Option<u64>,
+    /// How long (seconds) a `link` of a room the bot could not join stays
+    /// "awaiting the requester's invite" before lapsing (#111). Within this
+    /// window the requester may invite the bot to that room and the link
+    /// resumes automatically; afterwards they just run `link` again. Defaults
+    /// to 1800 (30 minutes) when omitted.
+    #[serde(default)]
+    pub invite_intent_ttl_secs: Option<u64>,
 }
 
 impl LimitsConfig {

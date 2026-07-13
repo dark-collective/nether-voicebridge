@@ -190,6 +190,13 @@ struct BotCtx {
     /// Pending (probed, unapproved) links, keyed by approval code. Pruned
     /// lazily on insert/lookup; capped at [`PENDING_LINK_CAP`].
     pending: StdMutex<HashMap<String, PendingLink>>,
+    /// Links whose probe could not JOIN the room, awaiting the requester's
+    /// invite (#111). Keyed by `(requester, room_id)`; pruned lazily and by
+    /// the maintenance sweep; capped at [`AWAITING_INVITE_CAP`].
+    awaiting_invite: StdMutex<HashMap<(String, String), AwaitingInvite>>,
+    /// TTL for `awaiting_invite` entries (`[limits] invite_intent_ttl_secs`,
+    /// default 30 min).
+    invite_intent_ttl: Duration,
     /// Open registration (#43): non-allowlisted users get the self-serve
     /// command subset (DM-only). `false` ⇒ they are ignored entirely.
     open_registration: bool,
@@ -380,6 +387,71 @@ fn prune_expired_pending(map: &mut HashMap<String, PendingLink>, now: Instant, t
     map.retain(|_, p| now.saturating_duration_since(p.created) < ttl);
 }
 
+/// A `link` whose probe could not JOIN the room, held until the requester
+/// invites the bot to it (#111). Keyed by `(requester, room_id)` — the resume
+/// triggers only on an invite from EXACTLY that MXID for EXACTLY that room.
+/// Unlike [`PendingLink`] there is no approval code and no room membership yet,
+/// so expiry is a pure map-drop (nothing to reap).
+struct AwaitingInvite {
+    /// The fully-parsed tenant from the original `link` (owner = requester);
+    /// `created` is refreshed at resume time.
+    tenant: NewTenant,
+    /// The DM the `link` was issued in — the resume replies there.
+    origin_room: matrix_sdk::ruma::OwnedRoomId,
+    created: Instant,
+}
+
+/// Cap on simultaneously awaiting-invite intents (#111). Sybil pressure on this
+/// table costs one velocity-gated `link` per entry (and one MXID each, given
+/// the 1-per-requester rule), so a full table only means "try again later".
+const AWAITING_INVITE_CAP: usize = 32;
+
+fn prune_expired_intents(
+    map: &mut HashMap<(String, String), AwaitingInvite>,
+    now: Instant,
+    ttl: Duration,
+) {
+    map.retain(|_, a| now.saturating_duration_since(a.created) < ttl);
+}
+
+/// Record an awaiting-invite intent (#111), enforcing one-per-requester (a
+/// re-`link` REPLACES the previous intent — `Ok(Some(room))` names what was
+/// dropped) and the global cap (`Err` = user-facing refusal).
+fn register_awaiting_invite(
+    map: &mut HashMap<(String, String), AwaitingInvite>,
+    requester: &str,
+    intent: AwaitingInvite,
+    now: Instant,
+    ttl: Duration,
+) -> Result<Option<String>, String> {
+    prune_expired_intents(map, now, ttl);
+    // One intent per requester: drop any previous one, whatever room it named.
+    let prev_key = map.keys().find(|(r, _)| r == requester).cloned();
+    let replaced = prev_key.and_then(|k| map.remove(&k)).map(|a| a.tenant.room_id);
+    if map.len() >= AWAITING_INVITE_CAP {
+        return Err(format!(
+            "There are already {AWAITING_INVITE_CAP} links awaiting an invite — try again once \
+             one completes or lapses."
+        ));
+    }
+    map.insert((requester.to_owned(), intent.tenant.room_id.clone()), intent);
+    Ok(replaced)
+}
+
+/// Does `(requester, room_id)` have a live awaiting-invite intent (#111)?
+/// Pure read (plus expiry pruning) — the intent is only CONSUMED after the
+/// invite's join succeeds, so a failed join leaves it available for a retry.
+fn has_matching_intent(
+    map: &mut HashMap<(String, String), AwaitingInvite>,
+    requester: &str,
+    room_id: &str,
+    now: Instant,
+    ttl: Duration,
+) -> bool {
+    prune_expired_intents(map, now, ttl);
+    map.contains_key(&(requester.to_owned(), room_id.to_owned()))
+}
+
 /// Insert a pending link under a fresh code, enforcing the cap. Returns the
 /// code, or a user-facing refusal when the table is full.
 fn insert_pending(
@@ -515,6 +587,15 @@ async fn run_maintenance(ctx: &BotCtx, client: &Client) {
         for room in leave {
             leave_room_best_effort(ctx, &room, "abandoned pending link (#87)").await;
         }
+    }
+
+    // #111: drop lapsed awaiting-invite intents (hygiene — they are also pruned
+    // lazily on every insert/lookup). No room to leave: an intent by definition
+    // predates any membership. Expiry is silent; the arming reply already told
+    // the requester the window and that a lapsed one just needs `link` again.
+    {
+        let mut map = ctx.awaiting_invite.lock().unwrap_or_else(PoisonError::into_inner);
+        prune_expired_intents(&mut map, Instant::now(), ctx.invite_intent_ttl);
     }
 
     // #89b: leave DM rooms that are now empty (only the bot remains), unless a
@@ -995,6 +1076,8 @@ pub async fn run(
             .require_discord_approval
             .then(|| Duration::from_secs(cfg.approval_timeout_secs)),
         pending: StdMutex::new(HashMap::new()),
+        awaiting_invite: StdMutex::new(HashMap::new()),
+        invite_intent_ttl: Duration::from_secs(limits.invite_intent_ttl_secs.unwrap_or(1800)),
         open_registration: cfg.open_registration,
         self_serve_allow: StdMutex::new(self_serve_allow),
         self_serve_allow_path,
@@ -1260,6 +1343,20 @@ async fn handle_invite_gated(ctx: &BotCtx, invite: Option<&InviteDetails>, room:
     // a public operator watches for probing. `banned` is the fail-closed
     // reject; `false` accept never gets that far.
     let inviter = invite.map(|i| i.sender.as_str()).unwrap_or("<unknown>");
+    // #111: does this invite match a live awaiting-invite intent — an invite
+    // from EXACTLY the MXID that just `link`ed EXACTLY this room? Peek only:
+    // the intent is consumed after the join succeeds, so a failed join leaves
+    // it available for a retry invite.
+    let intent_matched = invite.is_some_and(|i| {
+        let mut map = ctx.awaiting_invite.lock().unwrap_or_else(PoisonError::into_inner);
+        has_matching_intent(
+            &mut map,
+            &i.sender,
+            room_id.as_str(),
+            Instant::now(),
+            ctx.invite_intent_ttl,
+        )
+    });
     let accept = match invite {
         Some(i) if ctx.is_operator(&i.sender) => {
             tracing::info!(room_id = %room_id, inviter = %i.sender, "accepting invite from allowlisted operator");
@@ -1283,6 +1380,16 @@ async fn handle_invite_gated(ctx: &BotCtx, invite: Option<&InviteDetails>, room:
                     "room_id": room_id.as_str(), "reason": "banned",
                 }));
                 false
+            } else if intent_matched {
+                // #111: the sender's own `link` armed this — accept a non-direct
+                // room invite, bypassing the DMs-only gate, the global budget,
+                // and the #89a cooldown (single-use; velocity-gated at intent
+                // creation; the ban check above still applies).
+                tracing::info!(room_id = %room_id, inviter = %i.sender, "accepting invite matching an awaiting-invite link intent (#111)");
+                audit(ctx, &i.sender, "invite_accepted", serde_json::json!({
+                    "room_id": room_id.as_str(), "reason": "link_intent",
+                }));
+                true
             } else if !i.is_direct {
                 tracing::info!(room_id = %room_id, inviter = %i.sender, "rejecting non-direct invite from self-serve user (DMs only)");
                 audit(ctx, &i.sender, "invite_rejected", serde_json::json!({
@@ -1326,9 +1433,13 @@ async fn handle_invite_gated(ctx: &BotCtx, invite: Option<&InviteDetails>, room:
     }
     // Per-sender invite cooldown (#89a): a self-serve user can't churn invite
     // auto-joins (each grows the bot's joined-room set). Operators exempt; inert
-    // when `mgmt_cooldown_secs` is unset.
+    // when `mgmt_cooldown_secs` is unset. A matched-intent invite is exempt too
+    // (#111): a fresh user's onboarding DM-join stamps this cooldown moments
+    // before their `link`, so the follow-up room invite lands inside it — and
+    // the intent is single-use and velocity-gated at creation, so the
+    // exemption is not a churn vector.
     if let Some(i) = invite {
-        if !ctx.is_operator(&i.sender) {
+        if !ctx.is_operator(&i.sender) && !intent_matched {
             if let Some(remaining) = ctx.invite_cooldown(&i.sender) {
                 tracing::info!(room_id = %room_id, inviter = %i.sender, remaining, "invite cooldown — declining self-serve invite (#89a)");
                 audit(ctx, &i.sender, "invite_rejected", serde_json::json!({
@@ -1356,6 +1467,27 @@ async fn handle_invite_gated(ctx: &BotCtx, invite: Option<&InviteDetails>, room:
     .await
     {
         Ok(Ok(())) => {
+            if intent_matched {
+                // #111: consume the intent and resume the interrupted link.
+                // No greeting (this is a group room — `greet_when_joined`'s
+                // #85 anti-spoof would LEAVE it) and no #89a stamp (the resume
+                // is the tail of the already-stamped `link`, not a new action).
+                let intent = invite.and_then(|i| {
+                    let mut map =
+                        ctx.awaiting_invite.lock().unwrap_or_else(PoisonError::into_inner);
+                    map.remove(&(i.sender.clone(), room_id.to_string()))
+                });
+                match intent {
+                    Some(intent) => resume_link_after_invite(ctx, room, intent).await,
+                    None => {
+                        // Expired in the join window (rare). The join was made
+                        // for the intent alone — undo it.
+                        tracing::info!(room_id = %room_id, "awaiting-invite intent lapsed during the join — leaving (#111)");
+                        leave_room_best_effort(ctx, room_id.as_str(), "lapsed awaiting-invite intent (#111)").await;
+                    }
+                }
+                return;
+            }
             // #97: the #89a cooldown is stamped only on a SUCCESSFUL join —
             // a failed or duplicate attempt must never arm the tripwire that
             // declines the next delivery of the same invite.
@@ -1371,6 +1503,67 @@ async fn handle_invite_gated(ctx: &BotCtx, invite: Option<&InviteDetails>, room:
         }
         Err(_) => tracing::error!(room_id = %room_id, "join timed out after 30 s"),
     }
+}
+
+/// #111: an accepted invite consumed `sender`'s awaiting-invite intent — resume
+/// the interrupted `link` from the probe onward. Runs inline in the (SDK-
+/// spawned) invite handler; replies go to the intent's origin DM. The probe
+/// runs with `assume_probe_created` so a failure reaps the invite-created join
+/// (#83) instead of pinning the bot in the room.
+async fn resume_link_after_invite(ctx: &BotCtx, room: &Room, intent: AwaitingInvite) {
+    let mut tenant = intent.tenant;
+    let sender = tenant.owner.clone().unwrap_or_default();
+    audit(ctx, &sender, "link_resumed", serde_json::json!({
+        "name": tenant.name, "room_id": tenant.room_id, "guild_id": tenant.guild_id,
+    }));
+    // The origin DM carries every reply (including the approval code) — without
+    // it the link cannot proceed, so undo the intent-created join and bail.
+    let Some(origin) = room.client().get_room(&intent.origin_room) else {
+        tracing::warn!(room_id = %tenant.room_id, requester = %sender, "resume-after-invite: origin DM is gone — abandoning the link (#111)");
+        leave_room_best_effort(ctx, &tenant.room_id, "resumed link lost its origin DM (#111)")
+            .await;
+        return;
+    };
+    let authority_sender = ctx.require_room_authority.then_some(sender.as_str());
+    let report = match probe_room_prereqs(
+        ctx,
+        &tenant.room_id,
+        &tenant.guild_id,
+        authority_sender,
+        mxid_domain(&sender),
+        true,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(failure) => {
+            // No second intent on a Join failure here — the bot was literally
+            // just invited; re-arming would loop. Report and stop.
+            let msg = match failure {
+                ProbeFailure::Join(err) => format!(
+                    "❌ I was invited to {} but re-joining it failed: {err}\nNothing was \
+                     written — run `link` again.",
+                    tenant.room_id
+                ),
+                ProbeFailure::Other(msg) => msg,
+            };
+            reply(&origin, &format!("📨 Continuing your link after the invite…\n{msg}")).await;
+            return;
+        }
+    };
+    // Refresh the creation stamp: the tenant is born now, not at `link` time.
+    tenant.created = Some(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    );
+    reply(&origin, &format!(
+        "📨 Invite received — continuing your link of {}.",
+        tenant.room_id
+    ))
+    .await;
+    finish_link(ctx, &origin, &sender, tenant, report).await;
 }
 
 /// Post the greeting once the SDK's local state catches up with the join
@@ -1983,23 +2176,44 @@ struct ProbeReport {
     already_member: bool,
 }
 
-/// The reply when the probe's initial room JOIN fails (#111). The remedy depends
-/// on the requester's tier: an operator may invite the bot into any room (operator
-/// invites are always accepted), so they get the invite-me path; a self-serve
-/// user's invite to a non-operator is auto-rejected by the DMs-only gate, so
-/// "invite the bot first" is unsatisfiable for them — they instead get the
-/// make-it-publicly-joinable / ask-the-operator remedy.
-fn join_failure_reply(room_id: &str, err: &str, bot: &str, requester_is_operator: bool) -> String {
-    let remedy = if requester_is_operator {
-        format!(
-            "If the room is invite-only or restricted, invite {bot} to it first, then run \
-             `link` again."
-        )
-    } else {
-        "If the room is invite-only or restricted, make it publicly joinable and run `link` \
-         again, or ask the instance operator to link it for you. (I can't accept a room \
-         invite from a non-operator, so inviting me won't work.)"
-            .to_string()
+/// A failed [`probe_room_prereqs`], split so callers can react to the JOIN
+/// failure specifically (#111: that's the arm that arms an awaiting-invite
+/// intent). `Join` carries the raw join error; `Other` carries a complete
+/// user-facing reply.
+enum ProbeFailure {
+    Join(String),
+    Other(String),
+}
+
+/// The reply when the probe's initial room JOIN fails (#111). `intent` is the
+/// outcome of arming the awaiting-invite intent: `Ok(replaced)` = armed (with
+/// the room id of a previous intent this replaced, if any); `Err(refusal)` =
+/// the intent table is full, fall back to actionable-but-manual advice.
+fn join_failure_reply(
+    room_id: &str,
+    err: &str,
+    bot: &str,
+    ttl_mins: u64,
+    intent: &Result<Option<String>, String>,
+) -> String {
+    let remedy = match intent {
+        Ok(replaced) => {
+            let replaced_note = replaced
+                .as_ref()
+                .map(|r| format!("\n(This replaces your earlier pending invite for {r}.)"))
+                .unwrap_or_default();
+            format!(
+                "📨 If the room is invite-only or restricted: **invite {bot} to it within \
+                 {ttl_mins} minutes** — the invite must come from this account — and I'll \
+                 continue the link automatically. If the window lapses, just run `link` \
+                 again. Alternatively, make the room publicly joinable and re-run \
+                 `link`.{replaced_note}"
+            )
+        }
+        Err(refusal) => format!(
+            "If the room is invite-only or restricted, make it publicly joinable and run \
+             `link` again, or ask the instance operator to link it for you. ({refusal})"
+        ),
     };
     format!("❌ The bridge bot could not join {room_id}: {err}\n{remedy}\nNothing was written.")
 }
@@ -2027,23 +2241,28 @@ async fn probe_room_prereqs(
     // Resolution hint for the first-contact join (#103): the requester's
     // server domain — required in practice for domainless v12 room ids.
     via_hint: Option<&str>,
-    // #111: tailors the join-failure remedy to the requester's tier — a self-serve
-    // user can't invite the bot (DMs-only gate), so "invite me first" is a dead end
-    // for them.
-    requester_is_operator: bool,
-) -> Result<ProbeReport, String> {
+    // #111: the resume-after-invite path KNOWS the membership was created for
+    // this link moments ago (the invite-accept join), but the server read below
+    // would report it as pre-existing — so that path forces "probe-created"
+    // semantics, keeping the #83 reap-on-failure applicable.
+    assume_probe_created: bool,
+) -> Result<ProbeReport, ProbeFailure> {
     // Was the bot already a member before this probe? (A running bridge keeps it
     // joined.) If the read fails, assume YES — never risk leaving a bridged room
     // (#83, fail-safe). Only a membership the probe CREATES may be reaped.
-    let already_member = crate::matrix::appservice_is_room_joined(
-        &ctx.http,
-        &ctx.homeserver_url,
-        &ctx.appservice_token,
-        room_id,
-        ctx.own_user.as_str(),
-    )
-    .await
-    .unwrap_or(true);
+    let already_member = if assume_probe_created {
+        false
+    } else {
+        crate::matrix::appservice_is_room_joined(
+            &ctx.http,
+            &ctx.homeserver_url,
+            &ctx.appservice_token,
+            room_id,
+            ctx.own_user.as_str(),
+        )
+        .await
+        .unwrap_or(true)
+    };
 
     // 1. Join (hard): covers restricted/invite-only rooms and typo'd room ids.
     match tokio::time::timeout(
@@ -2060,19 +2279,15 @@ async fn probe_room_prereqs(
     {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            // The join itself failed → nothing to leave.
-            return Err(join_failure_reply(
-                room_id,
-                &e.to_string(),
-                ctx.own_user.as_str(),
-                requester_is_operator,
-            ));
+            // The join itself failed → nothing to leave. The caller composes
+            // the reply (#111: it may arm an awaiting-invite intent).
+            return Err(ProbeFailure::Join(e.to_string()));
         }
         Err(_) => {
-            return Err(format!(
+            return Err(ProbeFailure::Other(format!(
                 "❌ Joining {room_id} timed out after 15 s — is the homeserver reachable?\n\
                  Nothing was written."
-            ));
+            )));
         }
     }
 
@@ -2099,7 +2314,7 @@ async fn probe_room_prereqs(
                     Err(e) => tracing::warn!(room_id, error = %e, "failed to leave room after a failed link probe (#83)"),
                 }
             }
-            Err(msg)
+            Err(ProbeFailure::Other(msg))
         }
     }
 }
@@ -2295,6 +2510,53 @@ async fn handle_list(ctx: &BotCtx, room: &Room, sender: &str) {
             }
         }
         Err(e) => lines.push(format!("(could not read tenants.toml: {e})")),
+    }
+    // In-flight link state (#111 avoid-confusion): pending Discord approvals
+    // and awaiting-invite intents, so `list` always shows where things stand.
+    // Self-serve users see their own; operators see everyone's (codes only to
+    // their own requester — an operator relaying a code would bypass the
+    // Discord-side Manage-Server check's point).
+    let now = Instant::now();
+    if let Some(ttl) = ctx.approval_ttl {
+        let map = ctx.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        for (code, p) in map.iter() {
+            let mine = p.requester == sender;
+            if !mine && only_owned_by.is_some() {
+                continue;
+            }
+            let left = ttl.saturating_sub(now.saturating_duration_since(p.created));
+            let code_part = if mine {
+                format!("`/bridge approve code:{code}`")
+            } else {
+                format!("requested by {}", p.requester)
+            };
+            lines.push(format!(
+                "⏳ '{}' awaiting Discord approval in guild {} — {code_part} ({} left)",
+                p.tenant.name,
+                p.tenant.guild_id,
+                human_secs(left.as_secs()),
+            ));
+        }
+    }
+    {
+        let mut map = ctx.awaiting_invite.lock().unwrap_or_else(PoisonError::into_inner);
+        prune_expired_intents(&mut map, now, ctx.invite_intent_ttl);
+        for ((req, room_id), a) in map.iter() {
+            if only_owned_by.is_some() && req != sender {
+                continue;
+            }
+            let left = ctx
+                .invite_intent_ttl
+                .saturating_sub(now.saturating_duration_since(a.created));
+            let who = if req == sender { "your".to_string() } else { format!("{req}'s") };
+            lines.push(format!(
+                "📨 '{}' awaiting {who} invite to {room_id} ({} left) — invite {} from that \
+                 room to continue",
+                a.tenant.name,
+                human_secs(left.as_secs()),
+                ctx.own_user,
+            ));
+        }
     }
     if lines.is_empty() {
         let text = if only_owned_by.is_some() {
@@ -2532,24 +2794,6 @@ async fn handle_link(
     // is still caught by add_tenant_entry's own rejection). With
     // `require_room_authority` the probe also checks the SENDER's power in
     // the room (two-sided link auth, Matrix side).
-    let authority_sender = ctx.require_room_authority.then_some(sender);
-    let report = match probe_room_prereqs(
-        ctx,
-        &room_id,
-        &guild_id,
-        authority_sender,
-        mxid_domain(sender),
-        ctx.is_operator(sender),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(msg) => {
-            reply(room, &msg).await;
-            return;
-        }
-    };
-
     let tenant = NewTenant {
         name: name.clone(),
         server,
@@ -2567,6 +2811,74 @@ async fn handle_link(
         ),
     };
 
+    let authority_sender = ctx.require_room_authority.then_some(sender);
+    let report = match probe_room_prereqs(
+        ctx,
+        &room_id,
+        &guild_id,
+        authority_sender,
+        mxid_domain(sender),
+        false,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(ProbeFailure::Join(err)) => {
+            // #111: the room may simply be invite-only — arm an awaiting-invite
+            // intent so the requester's own invite resumes this link, and say so.
+            let intent_outcome = {
+                let mut map =
+                    ctx.awaiting_invite.lock().unwrap_or_else(PoisonError::into_inner);
+                register_awaiting_invite(
+                    &mut map,
+                    sender,
+                    AwaitingInvite {
+                        tenant,
+                        origin_room: room.room_id().to_owned(),
+                        created: Instant::now(),
+                    },
+                    Instant::now(),
+                    ctx.invite_intent_ttl,
+                )
+            };
+            if intent_outcome.is_ok() {
+                audit(ctx, sender, "link_awaiting_invite", serde_json::json!({
+                    "name": name, "room_id": room_id, "guild_id": guild_id,
+                }));
+            }
+            reply(room, &join_failure_reply(
+                &room_id,
+                &err,
+                ctx.own_user.as_str(),
+                ctx.invite_intent_ttl.as_secs().div_ceil(60),
+                &intent_outcome,
+            ))
+            .await;
+            return;
+        }
+        Err(ProbeFailure::Other(msg)) => {
+            reply(room, &msg).await;
+            return;
+        }
+    };
+
+    finish_link(ctx, room, sender, tenant, report).await;
+}
+
+/// The post-probe tail of a `link`: hold it pending Discord approval, or commit
+/// directly when approvals are off. Shared by [`handle_link`] and the #111
+/// resume-after-invite path (replies land in `room` — the requester's DM).
+async fn finish_link(
+    ctx: &BotCtx,
+    room: &Room,
+    sender: &str,
+    tenant: NewTenant,
+    report: ProbeReport,
+) {
+    let name = tenant.name.clone();
+    let room_id = tenant.room_id.clone();
+    let guild_id = tenant.guild_id.clone();
+    let channel_id = tenant.channel_id.clone();
     // Two-sided link auth, Discord side (#47): hold the fully-probed link
     // pending until someone with Manage Server in the target guild claims the
     // code via `/bridge approve` — nothing is written until then.
@@ -4442,22 +4754,114 @@ mod tests {
     // ── #111: join-failure reply is tier-aware ───────────────────────────────
 
     #[test]
-    fn join_failure_reply_operator_says_invite_me() {
-        let msg = join_failure_reply("!r:x.org", "403 Forbidden", "@bot:x.org", true);
-        assert!(msg.contains("invite @bot:x.org to it first"), "{msg}");
+    fn join_failure_reply_with_intent_says_invite_me() {
+        let msg = join_failure_reply("!r:x.org", "403 Forbidden", "@bot:x.org", 30, &Ok(None));
+        assert!(msg.contains("invite @bot:x.org to it within 30 minutes"), "{msg}");
         assert!(msg.contains("!r:x.org") && msg.contains("403 Forbidden"), "{msg}");
         assert!(msg.contains("Nothing was written."), "{msg}");
+        assert!(!msg.contains("replaces"), "{msg}");
     }
 
     #[test]
-    fn join_failure_reply_self_serve_drops_dead_end_invite_advice() {
-        let msg = join_failure_reply("!r:x.org", "403 Forbidden", "@bot:x.org", false);
-        // A self-serve user's invite to the bot is auto-rejected, so the remedy must
-        // NOT tell them to invite it first — it offers the reachable alternatives.
-        assert!(!msg.contains("invite @bot:x.org to it first"), "{msg}");
+    fn join_failure_reply_names_the_replaced_intent() {
+        let msg = join_failure_reply(
+            "!r:x.org",
+            "403",
+            "@bot:x.org",
+            30,
+            &Ok(Some("!old:x.org".into())),
+        );
+        assert!(msg.contains("replaces your earlier pending invite for !old:x.org"), "{msg}");
+    }
+
+    #[test]
+    fn join_failure_reply_full_table_falls_back_to_manual_advice() {
+        let msg =
+            join_failure_reply("!r:x.org", "403", "@bot:x.org", 30, &Err("table full".into()));
+        assert!(!msg.contains("within 30 minutes"), "{msg}");
         assert!(msg.contains("publicly joinable"), "{msg}");
         assert!(msg.contains("ask the instance operator"), "{msg}");
-        assert!(msg.contains("Nothing was written."), "{msg}");
+        assert!(msg.contains("table full"), "{msg}");
+    }
+
+    // ── #111: awaiting-invite intent table ───────────────────────────────────
+
+    fn test_intent(room: &str, created: Instant) -> AwaitingInvite {
+        AwaitingInvite {
+            tenant: NewTenant {
+                name: "t".into(),
+                server: "s".into(),
+                room_id: room.into(),
+                guild_id: "1".into(),
+                channel_id: "2".into(),
+                owner: Some("@u:x".into()),
+                created: Some(0),
+            },
+            origin_room: "!dm:x".try_into().unwrap(),
+            created,
+        }
+    }
+
+    #[test]
+    fn intent_matches_exact_sender_and_room_only() {
+        let ttl = Duration::from_secs(600);
+        let now = Instant::now();
+        let mut map = HashMap::new();
+        register_awaiting_invite(&mut map, "@u:x", test_intent("!r:x", now), now, ttl).unwrap();
+        assert!(has_matching_intent(&mut map, "@u:x", "!r:x", now, ttl));
+        assert!(!has_matching_intent(&mut map, "@evil:x", "!r:x", now, ttl), "wrong sender");
+        assert!(!has_matching_intent(&mut map, "@u:x", "!other:x", now, ttl), "wrong room");
+        // Peek does not consume.
+        assert!(has_matching_intent(&mut map, "@u:x", "!r:x", now, ttl));
+    }
+
+    #[test]
+    fn intent_replaces_per_requester_and_expires() {
+        let ttl = Duration::from_secs(600);
+        let t0 = Instant::now();
+        let mut map = HashMap::new();
+        assert_eq!(
+            register_awaiting_invite(&mut map, "@u:x", test_intent("!a:x", t0), t0, ttl).unwrap(),
+            None
+        );
+        // Second intent for the SAME requester replaces the first, naming it.
+        assert_eq!(
+            register_awaiting_invite(&mut map, "@u:x", test_intent("!b:x", t0), t0, ttl).unwrap(),
+            Some("!a:x".to_string())
+        );
+        assert_eq!(map.len(), 1);
+        assert!(!has_matching_intent(&mut map, "@u:x", "!a:x", t0, ttl));
+        // TTL expiry drops it.
+        let later = t0 + Duration::from_secs(601);
+        assert!(!has_matching_intent(&mut map, "@u:x", "!b:x", later, ttl));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn intent_cap_refuses_but_expiry_frees() {
+        let ttl = Duration::from_secs(600);
+        let t0 = Instant::now();
+        let mut map = HashMap::new();
+        for i in 0..AWAITING_INVITE_CAP {
+            register_awaiting_invite(
+                &mut map,
+                &format!("@u{i}:x"),
+                test_intent(&format!("!r{i}:x"), t0),
+                t0,
+                ttl,
+            )
+            .unwrap();
+        }
+        assert!(
+            register_awaiting_invite(&mut map, "@new:x", test_intent("!n:x", t0), t0, ttl)
+                .is_err()
+        );
+        let later = t0 + Duration::from_secs(601);
+        assert!(
+            register_awaiting_invite(&mut map, "@new:x", test_intent("!n:x", later), later, ttl)
+                .is_ok()
+        );
+        assert_eq!(map.len(), 1);
     }
 
     // ── Discord-side approval redemption (#76 part 2) ────────────────────────
@@ -4517,6 +4921,8 @@ mod tests {
             require_room_authority: false,
             approval_ttl: Some(ttl),
             pending: StdMutex::new(HashMap::new()),
+            awaiting_invite: StdMutex::new(HashMap::new()),
+            invite_intent_ttl: Duration::from_secs(1800),
             open_registration: true,
             self_serve_allow: StdMutex::new(None),
             self_serve_allow_path: format!("{d}/self_serve_allow.toml"),

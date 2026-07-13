@@ -68,9 +68,13 @@ Two room prerequisites, both verified by the bot before anything is created:
         devtools power_levels with the override highlighted, misleading
         Roles & Permissions dropdown. -->
 
-2. **If the room is restricted/invite-only, invite the bridge bot** to it first.
-   The bot joins as a full appservice member (no `guest_access` needed), but a
-   restricted room still needs it invited or in the allow-space.
+2. **Restricted/invite-only room? Run `link` first, then invite the bot when
+   it asks.** The bot can't join such a room on its own, so the `link` reply
+   will tell you to invite it (default window: 30 minutes). Send that invite
+   **from your own account, from the room itself** — the moment it arrives,
+   the link continues automatically. (The bot joins as a full appservice
+   member; no `guest_access` needed. A room in your server's allow-space
+   needs no invite at all.)
 
 ## Step 2 — DM the management bot
 
@@ -192,6 +196,6 @@ an error message** — worth knowing so they don't look like breakage:
 | The bot joined but never answers | You're messaging it in a group room — commands only work in a 2-person DM. |
 | "not a moderator" style refusal on `link` | You need a personal Moderator role (an explicit power-level grant ≥ 50, above the room default) in the target room — ask a room admin to promote *you specifically*; a permissive room-wide default isn't enough. |
 | Probe failure about power levels | The room doesn't allow PL 0 for `org.matrix.msc3401.call.member` — see Step 1. |
-| Probe failure joining the room | Restricted room and the bot isn't invited — see Step 1. |
+| Probe failure joining the room | Restricted room: the reply asks you to invite the bot — do that from the room, from the same account you ran `link` with, within the window it names. `list` shows any link still awaiting your invite. |
 | `/bridge approve` says unknown/expired | The code timed out, was already used, was minted for a different guild — or you ran it on a different bridge instance's bot (each instance only knows its own codes). Run `link` again for a fresh code. |
 | Approved, but no audio | Usually the puppet bots aren't in the guild or lack Connect/Speak on the channel — recheck the invite links and channel permission overrides. |

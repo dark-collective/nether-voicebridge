@@ -258,13 +258,19 @@ async fn drive(cfg: &E2eConfig, bridge: &BridgeUnderTest) -> Result<()> {
         bail!("expected a deny-list refusal for the banned room; got: {banned:?}");
     }
 
-    // 8. Self-serve scoping: `list` shows only mgr's own committed tenants
-    //    (none — pending links are not written), NOT the seeded foreign one;
-    //    `unlink` of the foreign tenant is refused.
+    // 8. Self-serve scoping: `list` shows mgr's own state — no committed
+    //    tenants, but the GoodLink pending approval from the positive-link
+    //    step (the #111 avoid-confusion status surface) — and NOT the seeded
+    //    foreign tenant; `unlink` of the foreign tenant is refused.
     let ev = mgr.send(&dm, "list").await?;
     let list = mgr.wait_for_reply(&dm, &ev, reply_to).await?;
-    if !list.to_lowercase().contains("no bridges") || list.contains(SEEDED_TENANT) {
-        bail!("self-serve list leaked a foreign tenant or was non-empty; got: {list:?}");
+    if list.contains(SEEDED_TENANT) {
+        bail!("self-serve list leaked a foreign tenant; got: {list:?}");
+    }
+    if !list.contains("GoodLink") || !list.contains("awaiting Discord approval") {
+        bail!(
+            "self-serve list does not surface the user's own pending link (#111 status); got: {list:?}"
+        );
     }
     let ev = mgr.send(&dm, &format!("unlink \"{SEEDED_TENANT}\"")).await?;
     let unlink = mgr.wait_for_reply(&dm, &ev, reply_to).await?;
