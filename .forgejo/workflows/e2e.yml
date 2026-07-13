@@ -20,10 +20,13 @@ on:
   schedule:
     - cron: '0 6 * * *'   # nightly ~06:00 UTC — runs the full compressed suite
 
-# One live run at a time — the harness and any concurrent CI build share a host,
-# and overlapping audio runs garble each other's timing scores (#38 note).
+# One live run at a time, AND never alongside a CI build. The harness and CI share
+# a physical host, and overlapping CPU-heavy work garbles the audio timing scores
+# (#38 note). The `live-host` group is shared with ci.yml so Forgejo serializes
+# {any CI run, this harness} to one at a time; cancel-in-progress stays false so a
+# queued CI push waits for the harness rather than cancelling it.
 concurrency:
-  group: e2e-live
+  group: live-host
   cancel-in-progress: false
 
 jobs:

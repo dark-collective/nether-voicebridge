@@ -10,11 +10,16 @@ on:
     branches: ['**']
   pull_request:
 
-# One self-hosted runner, shared with release builds — a superseded push on the
-# same ref should yield its slot immediately.
+# Serialize against the live E2E harness. CI and e2e.yml share one physical host,
+# and a CPU-heavy build running alongside an e2e audio scenario garbles its timing
+# scores (#38 note — cost 9 false reds on 2026-07-12). The FIXED `live-host` group
+# is shared with e2e.yml so Forgejo runs at most one of {any CI run, the harness}
+# at a time. A per-ref suffix is deliberately dropped (it would let CI overlap
+# e2e), and cancel-in-progress is false so an incoming CI push waits for a running
+# harness instead of cancelling it — at the cost of no same-ref CI superseding.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: live-host
+  cancel-in-progress: false
 
 jobs:
   test:
@@ -66,8 +71,13 @@ jobs:
       # --locked: the songbird/livekit pins are load-bearing (CLAUDE.md
       # constraint 7); CI must never resolve a floated lockfile. The vendored
       # [patch.crates-io] songbird is in-tree and needs nothing special.
+      # Belt-and-suspenders under `nice`: if the shared `live-host` group above
+      # ever fails to serialize cross-workflow on this Forgejo version, a niced
+      # build still yields CPU to the normal-priority audio/bridge threads on the
+      # host. `nice` is free when uncontended (it only reorders under contention),
+      # and cargo propagates its niceness to the rustc children.
       - name: cargo test
-        run: cargo test --workspace --locked
+        run: nice -n 19 cargo test --workspace --locked
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: nice -n 19 cargo clippy --workspace --all-targets --locked -- -D warnings
