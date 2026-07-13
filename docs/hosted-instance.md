@@ -59,9 +59,17 @@ needs to be invited to your Discord server — with **Connect, Speak, Use Voice
 Activity, Change Nickname** — before it can serve your server's bridges (see
 [How the puppet pool works](discord-bot-setup.md#how-the-puppet-pool-works)
 for why: the bridge allocates puppets **per (bot, guild)**, so a bot can only
-speak in a guild it has actually joined). Invite **every** bot below if you
-want the full pool available to your server; inviting only some partitions
-your server to a smaller slice of it.
+speak in a guild it has actually joined). How many you invite is up to you:
+
+- **Any subset, in any order, works.** The bridge discovers which bots are in
+  your server automatically — there is no required order and nothing to
+  configure. Inviting bots 2, 5 and 7 works exactly like inviting 1, 2 and 3.
+- **K invited bots ≈ K simultaneously-named Matrix speakers** in a voice
+  channel. Invite the whole pool for maximum capacity; a Matrix speaker beyond
+  your invited count still gets through, just without its own named puppet.
+- **If you only want a few, please pick them at random** rather than starting
+  from the top of the list — Discord caps each bot application at 100 servers,
+  and spreading the load keeps every bot below that ceiling for longer.
 
 - [Voice Bridge 01](https://discord.com/oauth2/authorize?client_id=1515386525653930055&permissions=103809024&integration_type=0&scope=bot)
 - [Voice Bridge 02](https://discord.com/oauth2/authorize?client_id=1515387208046088364&permissions=103809024&integration_type=0&scope=bot)
