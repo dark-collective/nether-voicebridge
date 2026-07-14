@@ -3,6 +3,32 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-07-14
+
+**The 0.3.0 series goes stable.** This is the first non-prerelease since 0.2.x:
+the releases page, `/releases/latest`, and the `:latest` container tags now
+resolve here instead of the months-old 0.2.4. Functionally it is beta.4 plus
+two verified fixes; the full story of the series is in the alpha/beta entries
+below. (Semver note: 0.x still signals a young project — 1.0 is planned after
+the post-stability refactor.)
+
+### Fixed
+- **Operator invites into populated rooms stick (#120).** The #85 anti-spoof
+  greet-leave ran after every accepted invite, so an operator inviting the bot
+  into a >2-member room saw it join and silently leave seconds later,
+  breaking the manual invite-then-relink flow. Operator-accepted invites now
+  keep the join (the greeting is skipped; the self-serve anti-spoof leave is
+  unchanged). Guarded by the new `mgmt_operator_room_invite` scenario.
+
+### Added
+- **Per-participant LiveKit connection-quality logging (#116).** The SFU's
+  view of every participant's link (WARN on Poor/Lost) — the packet-loss
+  signal that choppy-audio triage previously lacked.
+- Ops: the nvb-watch daily digest now reports the puppet-pool guild footprint
+  with a Discord App-Verification tripwire alert (#117); the nightly e2e run
+  moved to 08:30 UTC, clear of the runner host's apt-daily-upgrade window
+  that was garbling its audio oracles.
+
 ## [0.3.0-beta.4] - 2026-07-13
 
 **Invite-only rooms are now self-serve linkable.** The last structural gap in

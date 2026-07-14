@@ -18,7 +18,13 @@ on:
         required: false
         default: 'compressed'
   schedule:
-    - cron: '0 6 * * *'   # nightly ~06:00 UTC — runs the full compressed suite
+    # Nightly full compressed suite. 08:30 UTC ON PURPOSE: the runner host's
+    # apt-daily-upgrade.timer fires ~06:00-07:00 UTC and its dpkg/IO load
+    # garbles the audio-oracle scenarios — every 06:00 nightly from 07-11 to
+    # 07-14 was red from exactly this while manually-dispatched runs passed
+    # (post-mortem: issue #123). 08:30 clears that window and mautrix's 04:15
+    # nvb-backup.
+    - cron: '30 8 * * *'
 
 # One live run at a time, AND never alongside a CI build. The harness and CI share
 # a physical host, and overlapping CPU-heavy work garbles the audio timing scores
