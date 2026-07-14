@@ -1,4 +1,4 @@
-//! Scenario registry (27 scenarios). Each scenario is a static
+//! Scenario registry (28 scenarios). Each scenario is a static
 //! [`ScenarioDef`]; with the #6 live variant (`steal_release_repromotion`,
 //! which also has a hermetic twin in `puppet.rs`'s unit tests) every row of
 //! the design doc's catalogue runs live. The #99 invite-lifecycle additions
@@ -18,6 +18,7 @@ pub mod mgmt_self_serve;
 pub mod room_misconfig;
 pub mod moderation;
 pub mod multi_bridge_isolation;
+pub mod operator_room_invite;
 pub mod overflow_fcfs;
 pub mod smoke;
 pub mod steal_repromotion;
@@ -32,6 +33,7 @@ pub fn all() -> Vec<&'static ScenarioDef> {
         &invite_lifecycle::MGMT_INVITE_OFFLINE,
         &invite_lifecycle::MGMT_DM_PENDING_REAP,
         &link_invite_only::MGMT_LINK_INVITE_ONLY,
+        &operator_room_invite::MGMT_OPERATOR_ROOM_INVITE,
         &federation::FED_DM_INVITE_LIFECYCLE,
         &federation::FED_COLD_OUTREACH_UTD,
         &federation::FED_LINK_V12,

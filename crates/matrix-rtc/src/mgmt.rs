@@ -1496,7 +1496,12 @@ async fn handle_invite_gated(ctx: &BotCtx, invite: Option<&InviteDetails>, room:
                     ctx.stamp_invite_cooldown(&i.sender);
                 }
             }
-            greet_when_joined(room.clone(), ctx.docs_url.clone(), ctx.instance_notice.clone())
+            greet_when_joined(
+                room.clone(),
+                ctx.docs_url.clone(),
+                ctx.instance_notice.clone(),
+                invite.is_some_and(|i| ctx.is_operator(&i.sender)),
+            )
         }
         Ok(Err(e)) => {
             tracing::error!(room_id = %room_id, error = %e, "failed to join invited room")
@@ -1570,7 +1575,17 @@ async fn resume_link_after_invite(ctx: &BotCtx, room: &Room, intent: AwaitingInv
 /// (the appservice-asserted join is a raw HTTP call, so the `Room` stays in
 /// Invited state until the next sync — sending immediately would fail).
 /// Detached + best-effort: the greeting is a nicety, `help` always works.
-fn greet_when_joined(room: Room, docs_url: Option<String>, instance_notice: Option<String>) {
+fn greet_when_joined(
+    room: Room,
+    docs_url: Option<String>,
+    instance_notice: Option<String>,
+    // #120: was the invite accepted on the OPERATOR arm? The #85 anti-spoof
+    // leave below exists to stop SELF-SERVE users pulling the bot into group
+    // rooms via a forged `is_direct`; an operator may place the bot anywhere by
+    // definition (the documented invite-then-relink flow for restricted rooms),
+    // so their group-room joins are kept — just not greeted.
+    from_operator: bool,
+) {
     tokio::spawn(async move {
         for delay in [1u64, 3, 10] {
             tokio::time::sleep(Duration::from_secs(delay)).await;
@@ -1582,6 +1597,14 @@ fn greet_when_joined(room: Room, docs_url: Option<String>, instance_notice: Opti
                     // group room, leave instead of greeting — the command gate
                     // already ignores >2-member rooms, so it'd just be dead weight.
                     if !is_command_room(r.joined_members_count()) {
+                        if from_operator {
+                            // #120: an operator parked the bot in a group room on
+                            // purpose (usually ahead of a `link`). Stay joined,
+                            // skip the greeting (the command gate ignores this
+                            // room anyway).
+                            tracing::info!(room_id = %r.room_id(), members = r.joined_members_count(), "operator-invited group room — staying joined, skipping greeting (#120)");
+                            return;
+                        }
                         tracing::warn!(room_id = %r.room_id(), members = r.joined_members_count(), "invited room is not a DM (spoofed is_direct?) — leaving (#85)");
                         if let Err(e) = r.leave().await {
                             tracing::warn!(room_id = %r.room_id(), error = %e, "failed to leave non-DM invited room");
