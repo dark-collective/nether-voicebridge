@@ -1358,6 +1358,18 @@ async fn drain_room_events(
                 Some(livekit::RoomEvent::E2eeStateChanged { participant, state }) => {
                     tracing::info!(identity = %participant.identity(), ?state, "ghost LiveKit E2EE state changed");
                 }
+                // #116: SFU-reported link quality — for the ghost's OWN uplink
+                // (identity = this ghost) and any participant it observes.
+                // Change-driven, so unthrottled logging is safe.
+                Some(livekit::RoomEvent::ConnectionQualityChanged { quality, participant }) => {
+                    use livekit::prelude::ConnectionQuality as Q;
+                    let identity = participant.identity();
+                    if matches!(quality, Q::Poor | Q::Lost) {
+                        tracing::warn!(identity = %identity, ?quality, "ghost LiveKit connection quality degraded (#116)");
+                    } else {
+                        tracing::info!(identity = %identity, ?quality, "ghost LiveKit connection quality changed");
+                    }
+                }
                 Some(other) => tracing::trace!(event = ?other, "ghost LiveKit room event"),
                 None => break,
             },
