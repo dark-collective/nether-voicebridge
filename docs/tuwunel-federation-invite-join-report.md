@@ -1,5 +1,18 @@
 # Upstream bug report draft — Tuwunel↔Tuwunel federated invite-joins failing
 
+> **STATUS 2026-07-19 — LIKELY OBE (overtaken by events); DO NOT FILE.**
+> Tuwunel **v1.8.2** (2026-07-17) upstream-fixes the exact mechanism described
+> here: *"A proxy or CDN answering a federation request with non-JSON is treated
+> as transient rather than evicting the route outright"* (release notes), plus
+> profile queries now return `404 M_NOT_FOUND` instead of an empty `200`
+> (empty-200 hardening). The `bad 200 response / missing field "event"` failures
+> below were `nether.im` evicting+caching the route after `tinier.town`'s Caddy
+> served a silent empty `200` on the legacy `:8448` fallback — precisely what
+> 1.8.2 now treats as transient. **`nether.im` is already on 1.8.2.**
+> Recommendation: don't file the report; once `tinier.town` also reaches ≥1.8.2,
+> confirm the A→B join path recovers and close the loop with @dau. The two
+> dau-side questions in the internal notes are moot for filing purposes.
+
 _Internal memo + paste-ready issue body for the Tuwunel tracker
 (https://github.com/matrix-construct/tuwunel/issues). Written 2026-07-12 from
 the nether.im operator's logs; file it as yourself (same personal-submission
