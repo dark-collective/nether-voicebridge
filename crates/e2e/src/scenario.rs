@@ -99,12 +99,47 @@ pub async fn run_scenarios(
     let mut reports = Vec::new();
     for def in defs {
         let artifacts = run_root.join(def.name);
-        tokio::fs::create_dir_all(&artifacts).await?;
-        let ctx = Arc::new(Ctx { cfg: cfg.clone(), profile, artifacts: artifacts.clone() });
 
         eprintln!("── scenario {} ──", def.name);
         let started = std::time::Instant::now();
-        let outcome = tokio::time::timeout(profile.scenario_timeout(), (def.run)(ctx)).await;
+
+        // This is a Tier-3 LIVE suite against real Discord/Matrix/Cloudflare, so
+        // Pass-expected scenarios fail intermittently on transient infra blips —
+        // homeserver 502s dropping a phantom's membership-heartbeat mid-run,
+        // Discord voice-state propagation lag at the tail of a long suite, etc.
+        // (root-caused in #124). Retry a Pass-expected hard failure ONCE before
+        // recording it: each scenario re-sweeps stale test memberships on entry,
+        // so the retry starts clean, and a genuine regression fails BOTH attempts
+        // — this masks flakiness without masking bugs. A KnownFail never retries
+        // (its failure is the expected outcome), and a Skip is terminal (the
+        // fixture is absent — retrying can't conjure it).
+        let max_attempts = match def.expectation {
+            Expectation::Pass => 2,
+            Expectation::KnownFail { .. } => 1,
+        };
+        let mut outcome = None;
+        for attempt in 1..=max_attempts {
+            // Fresh per-attempt artifacts dir + Ctx so the retry's WAVs/report
+            // overwrite the previous attempt's (we keep the last attempt's).
+            tokio::fs::create_dir_all(&artifacts).await?;
+            let ctx = Arc::new(Ctx { cfg: cfg.clone(), profile, artifacts: artifacts.clone() });
+            let res = tokio::time::timeout(profile.scenario_timeout(), (def.run)(ctx)).await;
+            // Terminal on success or Skip; a hard failure/timeout is retryable.
+            let retryable = match &res {
+                Ok(Ok(())) => false,
+                Ok(Err(e)) => !e.is::<Skip>(),
+                Err(_) => true,
+            };
+            let last = !retryable || attempt == max_attempts;
+            outcome = Some(res);
+            if last {
+                break;
+            }
+            eprintln!("   attempt {attempt} failed — retrying once (transient-infra tolerance, #124)");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+        // `max_attempts >= 1`, so the loop body always ran and set `outcome`.
+        let outcome = outcome.expect("scenario loop runs at least once");
         let duration_ms = started.elapsed().as_millis();
 
         let (outcome, error) = match (outcome, def.expectation) {
@@ -211,7 +246,54 @@ mod tests {
         run: skipping,
     };
 
-    #[tokio::test]
+    // A Pass-expected scenario that fails its FIRST attempt then succeeds — the
+    // runner's single retry (transient-infra tolerance, #124) must turn it green.
+    static FLAKY_ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    fn flaky_then_pass(_: Arc<Ctx>) -> super::ScenarioFuture {
+        Box::pin(async {
+            let n = FLAKY_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 { anyhow::bail!("transient blip") } else { Ok(()) }
+        })
+    }
+    static FLAKY: ScenarioDef =
+        ScenarioDef { name: "flaky", expectation: Expectation::Pass, run: flaky_then_pass };
+
+    // A KnownFail must NOT be retried (its failure is the expected outcome, and a
+    // retry would just double the run time). This one asserts single invocation.
+    static KF_ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    fn count_then_fail(_: Arc<Ctx>) -> super::ScenarioFuture {
+        Box::pin(async {
+            KF_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("expected gap")
+        })
+    }
+    static KF_COUNTED: ScenarioDef = ScenarioDef {
+        name: "kf_counted",
+        expectation: Expectation::KnownFail { issue: "#124" },
+        run: count_then_fail,
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_turns_a_transient_failure_green_and_spares_knownfail() {
+        let dir = std::env::temp_dir().join(format!("nvb-e2e-retry-{}", std::process::id()));
+        FLAKY_ATTEMPTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        KF_ATTEMPTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let defs = [&FLAKY, &KF_COUNTED];
+        let report = run_scenarios(&defs, dummy_cfg(dir.clone()), Profile::Compressed)
+            .await
+            .expect("runner completes");
+        let by_name: std::collections::HashMap<_, _> =
+            report.scenarios.iter().map(|s| (s.name.as_str(), s.outcome.as_str())).collect();
+        // First attempt failed, retry passed → recorded as pass, and it ran twice.
+        assert_eq!(by_name["flaky"], "pass");
+        assert_eq!(FLAKY_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // KnownFail ran exactly once (no retry).
+        assert_eq!(by_name["kf_counted"], "known_fail");
+        assert_eq!(KF_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn outcomes_and_report_json() {
         let dir = std::env::temp_dir().join(format!("nvb-e2e-report-{}", std::process::id()));
         let defs = [&OK, &BAD, &GAP, &FIXED_GAP, &SKIPPED, &SKIPPED_GAP];

@@ -43,3 +43,9 @@ async-trait = { workspace = true }
 futures-util = { workspace = true }
 libc = { workspace = true }
 base64 = { workspace = true }
+
+[dev-dependencies]
+# `test-util` enables tokio's paused clock (`#[tokio::test(start_paused = true)]`)
+# so the scenario runner's inter-attempt retry backoff (#124) is virtualized in
+# unit tests instead of really sleeping.
+tokio = { workspace = true, features = ["test-util"] }
