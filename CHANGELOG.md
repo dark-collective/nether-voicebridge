@@ -3,7 +3,11 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.1] - 2026-07-26
+
+**One-way-deafness fix.** A latent race in the vendored voice stack could
+permanently silence a speaker toward Matrix after a fast leave+rejoin; it was
+also the true mechanism behind the #124 nightly recovery-cluster failures.
 
 ### Fixed
 - **Fast leave+rejoin no longer permanently deafens the receive side (#127).**
@@ -25,6 +29,17 @@ adheres to [Semantic Versioning](https://semver.org/).
   tick, stretching captures to ~2× wall clock as half-rate chop (oracle
   glitches ≈200). Real audio now wins; zero-fill only applies to targets with
   no write in that tick.
+- **e2e: `steal_release_repromotion` no longer races the stale-membership
+  reaper.** The scenario's membership-only phantoms are, to the #25 reaper,
+  exactly what it exists to retract (an `m.call.member` with no LiveKit
+  participant) — under the compressed 3 s `reap_grace` it emptied Alice's and
+  Bob's memberships ~4 s after the subscriber connected, racing the
+  steal→release→re-promotion choreography and producing both of the scenario's
+  #124-era failure shapes. Its bridge-under-test now runs with `reap_grace_ms`
+  pushed past the scenario's runtime via a new per-scenario `[timing]`-override
+  hook (the reaper itself is covered by `reap_release` under `--profile
+  real`). The cross-channel re-promotion logic was verified innocent all
+  along.
 
 ### Added
 - **DAVE-layer diagnostics in the vendored songbird (#127).** Every MLS

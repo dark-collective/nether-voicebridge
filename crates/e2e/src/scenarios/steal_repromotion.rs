@@ -28,6 +28,12 @@
 //! grace). Membership-driven, no audio oracle — low-flake. Runs with prod up
 //! (dedicated harness bots + the nvbtest appservice).
 //!
+//! The bridge-under-test runs with `reap_grace_ms` pushed to 5 min: the
+//! phantoms are exactly what the #25 stale-membership reaper exists to kill
+//! (a membership with no LiveKit participant), and the compressed 3 s grace
+//! reaps them mid-choreography otherwise — see the note at the
+//! `start_with_pool_size_timing` call.
+//!
 //! The issue's guild-isolation half (a freed bot only serves guilds it is a
 //! member of) stays hermetic-only — the live env has a single test guild — see
 //! `puppet.rs::freed_bot_only_repromotes_guild_capable_channel`.
@@ -85,10 +91,28 @@ async fn run_steal_repromotion(ctx: Arc<Ctx>) -> Result<()> {
     // activation can only be satisfied by stealing, deterministically.
     let mut tenants = tenant_entry(NAME_A, &cfg.room_a, &cfg.guild_id, &cfg.channel_a);
     tenants.push_str(&tenant_entry(NAME_C, &room_c, &cfg.guild_id, &channel_c));
-    let bridge =
-        BridgeUnderTest::start_with_pool_size(cfg, ctx.profile, &tenants, &ctx.artifacts.join("bridge"), 2)
-            .await
-            .context("starting bridge-under-test")?;
+    // Hold the #25 stale-membership reaper off this scenario's phantoms. They
+    // are membership-only (never in the LiveKit roster) — to the reaper that
+    // IS a phantom, and under the compressed 3 s `reap_grace` it retracts
+    // Alice's and Bob's m.call.member ~4 s after the subscriber connects,
+    // racing the steal→release→re-promotion choreography (~5-10 s): lose the
+    // race before Carol leaves and Bob is gone from overflow (re-promotion
+    // times out); lose it after and the releases empty channel A under the
+    // final assert. Diagnosed 2026-07-26 (#127 follow-up); this — not
+    // homeserver 502s — was the mechanism behind most of this scenario's
+    // #124-era reds ("reaped phantom m.call.member" in the bridge log). The
+    // reaper itself is covered by `reap_release` under `--profile real`;
+    // every other `[timing]` key stays compressed.
+    let bridge = BridgeUnderTest::start_with_pool_size_timing(
+        cfg,
+        ctx.profile,
+        &tenants,
+        &ctx.artifacts.join("bridge"),
+        2,
+        "reap_grace_ms = 300000\n",
+    )
+    .await
+    .context("starting bridge-under-test")?;
     if let Err(e) = bridge.await_ready(&[NAME_A, NAME_C], Duration::from_secs(120)).await {
         bridge.kill().await;
         return Err(e);
