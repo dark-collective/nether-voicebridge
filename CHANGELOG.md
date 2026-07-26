@@ -3,6 +3,40 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Fast leave+rejoin no longer permanently deafens the receive side (#127).**
+  The vendored songbird tracked voice-gateway disconnects with a lazy tombstone
+  swept every 5 s; a user who left and rejoined inside one sweep interval (a
+  mod voice-kick + the #46 same-bot recovery, a quick channel hop, a Discord
+  blip) had their *fresh* SSRC mapping reaped by the sweep, after which every
+  DAVE-encrypted packet from them was silently discarded — the anchor went
+  permanently deaf to that speaker (Discord→Matrix one-way silence) until the
+  bridge cycled, with zero log evidence. A re-speaking user now cancels the
+  pending tombstone and eagerly retires their previous SSRC. Root of the #124
+  nightly recovery-cluster reds: the failures were timing-gated on Discord's
+  voice-state propagation speed, which is why they vanished on the 07-19 quiet
+  host (laggy week) and returned deterministic-looking after it sped up.
+- **e2e: the listener recorder no longer double-writes a rejoined puppet.**
+  After the fix above, a fast-rejoining target is briefly reachable via two
+  mapped SSRCs (the dead one lingers in songbird's `silent` set for the decode
+  timeout); the recorder wrote 20 ms of audio *plus* 20 ms of zero-fill per
+  tick, stretching captures to ~2× wall clock as half-rate chop (oracle
+  glitches ≈200). Real audio now wins; zero-fill only applies to targets with
+  no write in that tick.
+
+### Added
+- **DAVE-layer diagnostics in the vendored songbird (#127).** Every MLS
+  gateway arm (prepare_epoch — including the previously-invisible ignored
+  `epoch != 1` case — transitions, external sender, proposals, commit,
+  welcome, session reinit) and every silent packet-drop branch in the receive
+  path now logs at `debug`; the mixer WARNs (throttled) when DAVE is
+  negotiated but frames leave without frame encryption — the exact
+  send-side state mandatory-DAVE SFUs punish with silent non-delivery. The
+  e2e harness and nightly workflow enable `songbird=debug` so artifacts
+  capture all of it.
+
 ## [0.3.0] - 2026-07-14
 
 **The 0.3.0 series goes stable.** This is the first non-prerelease since 0.2.x:

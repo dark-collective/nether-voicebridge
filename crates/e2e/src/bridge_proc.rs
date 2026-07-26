@@ -362,8 +362,13 @@ impl BridgeUnderTest {
             .env("NVB_LOG_JSON", "1")
             .env(
                 "RUST_LOG",
+                // songbird=debug: cheap (no steady-state per-packet debug sites)
+                // and it surfaces the vendored DAVE diagnostics — tombstone
+                // cancellation and encrypted-packet drops (#127) — in the
+                // artifact logs, where an SSRC-mapping wedge is otherwise
+                // completely silent.
                 "nether_voicebridge=info,nvb_audio=info,nvb_discord=info,\
-                 nvb_matrix_rtc=info,nvb_config=info",
+                 nvb_matrix_rtc=info,nvb_config=info,songbird=debug",
             )
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

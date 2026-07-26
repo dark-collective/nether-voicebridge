@@ -35,7 +35,10 @@ use rubato::{FftFixedOut, Resampler};
 use std::{
     io::Write,
     result::Result as StdResult,
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use symphonia_core::{
@@ -47,7 +50,7 @@ use symphonia_core::{
     units::Time,
 };
 use tokio::runtime::Handle;
-use tracing::error;
+use tracing::{error, warn};
 
 #[cfg(test)]
 use crate::driver::test_config::{OutputMessage, OutputMode};
@@ -645,6 +648,7 @@ impl Mixer {
         };
 
         if conn.dave_protocol_version.load(Ordering::Relaxed) != 0 {
+            let mut dave_encrypted = false;
             if let Some(ref mut dave_session) = *conn.dave_session.write().unwrap() {
                 if dave_session.is_ready() {
                     let encrypted = dave_session
@@ -656,6 +660,21 @@ impl Mixer {
 
                     payload[first_payload_byte..first_payload_byte + payload_len]
                         .copy_from_slice(&encrypted);
+                    dave_encrypted = true;
+                }
+            }
+            if !dave_encrypted {
+                // Diagnostic (#127): DAVE was negotiated on this connection but
+                // the session is absent or not ready, so this frame leaves with
+                // transport encryption only. E2EE peers cannot decrypt it —
+                // audible as one-way silence. Throttled: first + every ~5 s.
+                static DAVE_PLAINTEXT_FRAMES: AtomicUsize = AtomicUsize::new(0);
+                let n = DAVE_PLAINTEXT_FRAMES.fetch_add(1, Ordering::Relaxed);
+                if n % 250 == 0 {
+                    warn!(
+                        frames = n + 1,
+                        "DAVE: sending WITHOUT frame encryption (session absent/not ready) — E2EE peers will not hear this"
+                    );
                 }
             }
         }

@@ -103,7 +103,7 @@ jobs:
           NVB_E2E_PUPPET_TOKENS: ${{ secrets.NVB_E2E_PUPPET_TOKENS }}
           NVB_E2E_BRIDGE_BIN: target/debug/nether-voicebridge
           NVB_E2E_ARTIFACTS: e2e-artifacts
-          RUST_LOG: nvb_e2e=info,nvb_matrix_rtc=warn
+          RUST_LOG: nvb_e2e=info,nvb_matrix_rtc=warn,songbird=debug
         run: |
           set -euo pipefail
           # No fixture as_token (e.g. a fork without the secret) → drop the url
@@ -162,7 +162,7 @@ jobs:
           # Separate dir so this pass's report.json doesn't clobber the
           # compressed suite's (both are dumped by the summarize step).
           NVB_E2E_ARTIFACTS: e2e-artifacts-real
-          RUST_LOG: nvb_e2e=info,nvb_matrix_rtc=warn
+          RUST_LOG: nvb_e2e=info,nvb_matrix_rtc=warn,songbird=debug
         run: |
           set -euo pipefail
           target/debug/nvb-e2e run \

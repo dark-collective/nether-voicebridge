@@ -30,7 +30,7 @@ use std::{
     time::Duration,
 };
 use tokio::{net::UdpSocket, select, time::Instant};
-use tracing::{error, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 
 type RtpSequence = Wrapping<u16>;
 type RtpTimestamp = Wrapping<u32>;
@@ -212,6 +212,7 @@ impl UdpRx {
                         // one reason or another; otherwise there'd be error logs for trying to decode
                         // Opus
                         let Some(user_id) = self.ssrc_signalling.ssrc_user_map.get(&ssrc) else {
+                            debug!(ssrc, "DAVE: dropping encrypted packet from unmapped SSRC");
                             return;
                         };
                         let Some(ref mut dave_session) = *self.dave_session.write().unwrap() else {
@@ -219,6 +220,11 @@ impl UdpRx {
                         };
 
                         if !dave_session.is_ready() {
+                            debug!(
+                                ssrc,
+                                user = user_id.0,
+                                "DAVE: session not ready — dropping encrypted packet"
+                            );
                             return;
                         }
 
@@ -240,6 +246,11 @@ impl UdpRx {
                                 },
                             )) => {
                                 // Silently drop encrypted packets for users whose ratchets are not configured yet.
+                                debug!(
+                                    ssrc,
+                                    user = user_id.0,
+                                    "DAVE: no decryptor/cryptor for user — dropping packet"
+                                );
                                 return;
                             },
                             Err(e) => {

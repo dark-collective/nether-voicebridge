@@ -244,22 +244,32 @@ impl SongbirdEventHandler for ListenerTick {
         if let EventContext::VoiceTick(tick) = ctx {
             let ssrc_map = self.ssrc_map.lock().unwrap_or_else(PoisonError::into_inner);
             let mut recs = self.recordings.lock().unwrap_or_else(PoisonError::into_inner);
+            // A user can be reached by MORE THAN ONE mapped SSRC in a single
+            // tick after a fast leave+rejoin (#127): the dead connection's SSRC
+            // stays in songbird's decoder state (→ `silent`) for the decode
+            // timeout while the live one carries audio (→ `speaking`). Without
+            // per-user dedup each tick appends 20 ms of audio AND 20 ms of
+            // zeros — the capture stretches to ~2× wall clock as half-rate
+            // chop and the oracle collapses (glitches ≈200). Real audio wins;
+            // zero-fill only for users with NO write yet this tick.
+            let mut wrote: HashSet<u64> = HashSet::new();
             // Targets that sent audio this tick → append it.
             for (ssrc, data) in &tick.speaking {
                 let Some(pcm) = &data.decoded_voice else { continue };
                 let Some(uid) = ssrc_map.get(ssrc) else { continue };
-                if self.targets.contains(uid) {
+                if self.targets.contains(uid) && wrote.insert(*uid) {
                     recs.entry(*uid)
                         .or_default()
                         .extend_from_slice(&nvb_audio::downmix_stereo_to_mono(pcm));
                 }
             }
             // Targets explicitly silent this tick → 20 ms of zeros (genuine
-            // suppression gap), but only once they've started recording. A
+            // suppression gap), but only once they've started recording, and
+            // never on top of real audio written above (stale-SSRC dedup). A
             // target in neither set is a loss gap and is deliberately skipped.
             for ssrc in &tick.silent {
                 let Some(uid) = ssrc_map.get(ssrc) else { continue };
-                if self.targets.contains(uid) {
+                if self.targets.contains(uid) && wrote.insert(*uid) {
                     if let Some(buf) = recs.get_mut(uid) {
                         buf.resize(buf.len() + MONO_20MS, 0i16);
                     }

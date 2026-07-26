@@ -259,6 +259,28 @@ impl AuxNetwork {
             GatewayEvent::Speaking(ev) => {
                 #[cfg(feature = "receive")]
                 if let Some(user_id) = &ev.user_id {
+                    // A user speaking again is NOT disconnected: cancel any pending
+                    // disconnect tombstone, else the lazy cleanup sweep in `udp_rx`
+                    // (every 5 s) reaps THIS fresh mapping when the user left and
+                    // rejoined within one sweep interval (e.g. a mod kick + fast
+                    // recovery). An unmapped SSRC's DAVE packets are then silently
+                    // dropped forever → permanent one-way silence for that user.
+                    if self.ssrc_signalling.disconnected_users.remove(user_id).is_some() {
+                        debug!(
+                            user = user_id.0,
+                            ssrc = ev.ssrc,
+                            "cancelled pending disconnect tombstone (user re-speaking)"
+                        );
+                    }
+                    // Re-keying user→ssrc strands the old reverse entry; drop it
+                    // eagerly so the sweep never needs to (and a stale SSRC can't
+                    // shadow-map to this user).
+                    if let Some((_, old_ssrc)) = self.ssrc_signalling.user_ssrc_map.remove(user_id)
+                    {
+                        if old_ssrc != ev.ssrc {
+                            self.ssrc_signalling.ssrc_user_map.remove(&old_ssrc);
+                        }
+                    }
                     self.ssrc_signalling.user_ssrc_map.insert(*user_id, ev.ssrc);
                     self.ssrc_signalling.ssrc_user_map.insert(ev.ssrc, *user_id);
                 }
@@ -298,6 +320,11 @@ impl AuxNetwork {
                 }
             },
             GatewayEvent::DavePrepareTransition(ev) => {
+                debug!(
+                    transition_id = ev.transition_id,
+                    protocol_version = ev.protocol_version,
+                    "DAVE: prepare_transition"
+                );
                 self.dave_pending_transitions
                     .insert(ev.transition_id, ev.protocol_version);
 
@@ -317,9 +344,15 @@ impl AuxNetwork {
                 }
             },
             GatewayEvent::DaveExecuteTransition(ev) => {
+                debug!(transition_id = ev.transition_id, "DAVE: execute_transition");
                 self.execute_dave_transition(ev.transition_id);
             },
             GatewayEvent::DavePrepareEpoch(ev) if ev.epoch == 1 => {
+                debug!(
+                    epoch = ev.epoch,
+                    protocol_version = ev.protocol_version,
+                    "DAVE: prepare_epoch — (re)initialising session"
+                );
                 self.dave_protocol_version
                     .store(ev.protocol_version, Ordering::Relaxed);
                 match self.reinit_dave_session().await {
@@ -330,12 +363,28 @@ impl AuxNetwork {
                     _ => {},
                 }
             },
+            GatewayEvent::DavePrepareEpoch(ev) => {
+                // Diagnostic (#127): the arm above only handles epoch == 1; any
+                // other epoch is otherwise silently discarded here.
+                debug!(
+                    epoch = ev.epoch,
+                    protocol_version = ev.protocol_version,
+                    "DAVE: prepare_epoch with epoch != 1 — IGNORED (no handler)"
+                );
+            },
             GatewayEvent::DaveMlsExternalSender(ev) => {
-                if let Some(ref mut dave_session) = *self.dave_session.write().unwrap() {
-                    if let Err(e) = dave_session.set_external_sender(&ev.external_sender) {
-                        warn!(error = ?e, "error setting MLS external sender");
+                let had_session = {
+                    let mut guard = self.dave_session.write().unwrap();
+                    if let Some(ref mut dave_session) = *guard {
+                        if let Err(e) = dave_session.set_external_sender(&ev.external_sender) {
+                            warn!(error = ?e, "error setting MLS external sender");
+                        }
+                        true
+                    } else {
+                        false
                     }
-                }
+                };
+                debug!(had_session, "DAVE: external_sender received");
             },
             GatewayEvent::DaveMlsProposals(ev) => {
                 let operation_type = match ev.operation_type {
@@ -365,6 +414,11 @@ impl AuxNetwork {
                     None
                 };
 
+                debug!(
+                    op = ?ev.operation_type,
+                    sending_commit_welcome = result.is_some(),
+                    "DAVE: proposals processed"
+                );
                 if let Some(commit_welcome) = result {
                     self.ws_client
                         .send_binary(&GatewayEvent::from(DaveMlsCommitWelcome {
@@ -375,7 +429,14 @@ impl AuxNetwork {
                 }
             },
             GatewayEvent::DaveMlsAnnounceCommitTransition(ev) => {
-                match self.dave_process_commit(&ev.commit_message) {
+                let outcome = self.dave_process_commit(&ev.commit_message);
+                debug!(
+                    transition_id = ev.transition_id,
+                    ok = outcome.as_ref().is_some_and(|r| r.is_ok()),
+                    had_session = outcome.is_some(),
+                    "DAVE: announce_commit_transition processed"
+                );
+                match outcome {
                     Some(Ok(())) if ev.transition_id != 0 => {
                         let protocol_version = self.dave_protocol_version.load(Ordering::Relaxed);
 
@@ -406,7 +467,16 @@ impl AuxNetwork {
                     Some(Ok(())) | None => {},
                 }
             },
-            GatewayEvent::DaveMlsWelcome(ev) => match self.dave_process_welcome(&ev.welcome) {
+            GatewayEvent::DaveMlsWelcome(ev) => match {
+                let outcome = self.dave_process_welcome(&ev.welcome);
+                debug!(
+                    transition_id = ev.transition_id,
+                    ok = outcome.as_ref().is_some_and(|r| r.is_ok()),
+                    had_session = outcome.is_some(),
+                    "DAVE: welcome processed"
+                );
+                outcome
+            } {
                 Some(Ok(())) if ev.transition_id != 0 => {
                     let protocol_version = self.dave_protocol_version.load(Ordering::Relaxed);
 
@@ -491,6 +561,7 @@ impl AuxNetwork {
                     key_package,
                 }))
                 .await?;
+            debug!(protocol_version, "DAVE: session (re)initialised, key package sent");
         } else if let Some(ref mut dave_session) = *self.dave_session.write().unwrap() {
             dave_session.reset()?;
             dave_session.set_passthrough_mode(true, Some(10));
@@ -517,6 +588,10 @@ impl AuxNetwork {
         }
 
         self.dave_pending_transitions.remove(&transition_id);
+        debug!(
+            transition_id,
+            old_version, new_version, "DAVE: transition executed"
+        );
     }
 }
 
