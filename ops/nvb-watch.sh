@@ -189,14 +189,16 @@ if [ -n "$pid" ] && [ "$pid" != "0" ]; then
 $(echo "$strangers" | head -5 | sed 's/^/  /')")
 fi
 
-# ── 3b. e2e nightly conclusion (#124 / #123 step 4 guardrail) ────────────────
+# ── 3b. Actions conclusions: e2e nightly + master CI ─────────────────────────
 # The live e2e suite (Forgejo Actions e2e.yml) went RED for 8 days unnoticed
 # (#124) — nothing watched its conclusion. Poll the newest *scheduled* run via
 # the public Actions API and alert on a NEW failing run (state-tracked → at
 # most one alert per nightly, not every 15 min) or a stale suite (no scheduled
 # run in >30h = the 08:30 cron silently stopped firing). Read-only; no token.
+# The same response also feeds the master-CI check further down (#131).
 E2E_STATE="$STATE_DIR/e2e.lastrun"
 E2E_DIGEST=""
+CI_DIGEST=""
 e2e_json=$(curl -s -m 20 -A "nvb-watch/1.0" \
     "https://nether.codes/api/v1/repos/dark/nether-voicebridge/actions/tasks?limit=40" 2>/dev/null)
 if [ -n "$e2e_json" ]; then
@@ -231,6 +233,45 @@ if [ -n "$e2e_json" ]; then
                 ALERTS+=("🌙⏰ e2e nightly STALE — newest scheduled run #$e2e_rn was ${e2e_age_h}h ago (>30h). The 08:30 cron may have stopped firing.")
                 echo "$(date +%F)" > "$E2E_STALE_STAMP"
             fi
+        fi
+    fi
+
+    # ── ci.yml on master (#131 follow-up) ────────────────────────────────────
+    # The hermetic gate (tests + clippy -D warnings) sat RED on master for 19
+    # days (ad53ccd 07-26 → 08-14) unnoticed: this guardrail watched only
+    # e2e.yml. Same API response, no extra call. One structural difference from
+    # the nightly: a nightly re-alerts by itself (a NEW failing run number
+    # appears every day), but master CI only runs on a push — a standing red
+    # would alert exactly once, ever. That one-shot shape is precisely what hid
+    # the #130 outage, so while master stays red this re-alerts DAILY.
+    CI_STATE="$STATE_DIR/ci.lastrun"
+    CI_RED_STAMP="$STATE_DIR/ci.red.date"
+    latest_ci=$(printf '%s' "$e2e_json" | jq -r '
+        [.workflow_runs[]? | select(.workflow_id=="ci.yml" and .head_branch=="master")]
+        | sort_by(.run_started_at) | last
+        | if . == null then empty else "\(.run_number) \(.status)" end' 2>/dev/null)
+    if [ -n "$latest_ci" ]; then
+        ci_rn=${latest_ci%% *}
+        ci_st=${latest_ci##* }
+        ci_prev=$(cat "$CI_STATE" 2>/dev/null || echo "")
+        CI_DIGEST="| ci:#$ci_rn $ci_st"
+        ci_url="https://nether.codes/dark/nether-voicebridge/actions/runs/$ci_rn"
+        if [ "$latest_ci" != "$ci_prev" ]; then
+            case "$ci_st" in
+                failure)
+                    ALERTS+=("🔨❌ CI #$ci_rn FAILED on master — the hermetic gate (tests + clippy) is RED and every branch will inherit it. Triage: $ci_url")
+                    echo "$(date +%F)" > "$CI_RED_STAMP" ;;
+                success)
+                    # Green-again only after a latched red — master CI runs on
+                    # every merge, so a ✅ per green push would be pure noise.
+                    case "$ci_prev" in *failure) ALERTS+=("🔨✅ CI #$ci_rn is GREEN again on master.") ;; esac
+                    rm -f "$CI_RED_STAMP" ;;
+            esac
+            # Only latch a terminal conclusion so an in-progress run re-checks.
+            case "$ci_st" in success|failure|cancelled) echo "$latest_ci" > "$CI_STATE" ;; esac
+        elif [ "$ci_st" = "failure" ] && [ "$(cat "$CI_RED_STAMP" 2>/dev/null)" != "$(date +%F)" ]; then
+            ALERTS+=("🔨❌ CI on master is STILL RED (#$ci_rn) — daily reminder; no new push has fixed it. Triage: $ci_url")
+            echo "$(date +%F)" > "$CI_RED_STAMP"
         fi
     fi
 fi
@@ -278,7 +319,7 @@ if [ "$(cat "$DIG_FILE" 2>/dev/null)" != "$today" ]; then
     # `bridges=N/M` is deliberately in the digest: before #131 a healthy-looking
     # digest proved only that the PROCESS was up, which is exactly how a 3-day
     # outage went unnoticed. Now a green digest states bridge liveness too.
-    post "📊 nvb-watch daily digest $today — audit 24h: ${day_summary:-quiet} | journal(15m): err=$errn warn=$warnn svc=$alive ${BRIDGES_LINE:-| bridges=?} | conns: tcp=$tcpn udp=$udpn $pool_line ${E2E_DIGEST:-}"
+    post "📊 nvb-watch daily digest $today — audit 24h: ${day_summary:-quiet} | journal(15m): err=$errn warn=$warnn svc=$alive ${BRIDGES_LINE:-| bridges=?} | conns: tcp=$tcpn udp=$udpn $pool_line ${E2E_DIGEST:-} ${CI_DIGEST:-}"
     echo "$today" > "$DIG_FILE"
 fi
 exit 0

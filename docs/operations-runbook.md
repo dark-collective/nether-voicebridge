@@ -32,11 +32,14 @@ It checks, per window:
 | Service down | systemd | 💀 unit not active |
 | **Bridge down** (#131) | `bridges.json` roster + journal latch | 🧟 any configured bridge not `alive` — **re-alerted daily** until it recovers; ✅ when it comes back |
 | Roster stale (#131) | `bridges.json` `updated` stamp | 🕰 roster older than `ROSTER_STALE_SECS` (default 300 s) — the supervisor loop itself may be wedged |
+| e2e nightly red | Actions API (`e2e.yml` scheduled runs) | 🌙❌ new failing run (once per run); 🌙✅ green again; 🌙⏰ no scheduled run in >30 h (dead cron) |
+| **CI red on master** (#131) | Actions API (`ci.yml`, master only) | 🔨❌ new failing run, then **daily re-alert while red** — master CI only runs on a push, so without the reminder a standing red alerts exactly once (it sat red 19 days unnoticed, 07-26→08-14); 🔨✅ green again after a red |
 | Egress anomaly | `ss` on the bridge PID | 🔌 TCP count outside envelope; 👁 any remote endpoint not in the allow-set (Cloudflare/Discord edge, homeserver, private ranges) |
 | Verification gate (#117) | Discord API, once daily with the digest | ⚠ any puppet bot's guild count ≥ `TRIPWIRE` (default 60; Discord's hard cap is 100 servers/app) — start the App Verification paperwork early |
 
 Plus one 📊 **daily digest** even when everything is quiet — audit events in
-the last 24 h, journal counts, `bridges=N/M` liveness, connection counts, and
+the last 24 h, journal counts, `bridges=N/M` liveness, connection counts, the
+latest `e2e:#N` / `ci:#N` conclusions, and
 the **puppet-pool guild footprint** (`pool: b1=4 b2=3 … distinct=4` — per-bot
 guild counts from the Discord API, #117). **If the digest stops appearing, the
 monitor itself is broken** — that's the dead-man's-switch.

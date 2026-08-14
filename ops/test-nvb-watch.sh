@@ -27,12 +27,14 @@ case "$*" in
     *)           echo "" ;;
 esac
 EOF
-# Capture ops-room posts; return nothing for the e2e API poll.
+# Capture ops-room posts; serve a canned Actions API response when one is
+# staged at \$T/api.json (absent ⇒ empty reply, section 3b skips — most cases).
 cat > "$T/bin/curl" <<EOF
 #!/bin/bash
 for a in "\$@"; do
     case "\$a" in
         *'"msgtype"'*) printf '%s\n---\n' "\$a" >> "$T/posts.txt" ;;
+        *actions/tasks*) [ -f "$T/api.json" ] && cat "$T/api.json" ;;
     esac
 done
 exit 0
@@ -150,6 +152,40 @@ check "latch still catches a death when the roster is stale" "BRIDGE(S) DOWN" ye
 echo "== case 9: digest carries bridges=N/M =="
 DIGEST_DATE=1970-01-01 run "Aug 14 01:00 host nvb[1]: INFO bridge{name=Light Voice}: ok" "$(roster alive 0)"
 check "digest states bridge liveness" "bridges=2/2" yes
+
+ci_api() { # ci_api(run_number, status) — a master ci.yml run, no e2e runs
+    cat > "$T/api.json" <<EOF
+{"workflow_runs":[
+ {"run_number":$1,"workflow_id":"ci.yml","status":"$2","event":"push","head_branch":"master","run_started_at":"2026-08-14T12:00:00Z"},
+ {"run_number":99,"workflow_id":"ci.yml","status":"failure","event":"push","head_branch":"some-branch","run_started_at":"2026-08-14T13:00:00Z"}
+]}
+EOF
+}
+QUIET_J="Aug 14 12:00 host nvb[1]: INFO bridge{name=Light Voice}: ok"
+
+echo "== case 12: master CI failure ⇒ one alert (branch reds ignored) =="
+rm -f "$T/state/ci.lastrun" "$T/state/ci.red.date"
+ci_api 77 failure
+run "$QUIET_J" "$(roster alive 0)"
+check "CI red alert" "CI #77 FAILED on master" yes
+
+echo "== case 13: same red run again the same day ⇒ silent =="
+run "$QUIET_J" "$(roster alive 0)"
+check "no same-day repeat" "CI" no
+
+echo "== case 14: still red tomorrow, NO new run ⇒ daily reminder (the 19-day miss) =="
+echo "1970-01-01" > "$T/state/ci.red.date"
+run "$QUIET_J" "$(roster alive 0)"
+check "daily STILL RED reminder" "STILL RED (#77)" yes
+
+echo "== case 15: a green master run after the red ⇒ green-again, then quiet =="
+ci_api 78 success
+run "$QUIET_J" "$(roster alive 0)"
+check "green-again notice" "CI #78 is GREEN again" yes
+ci_api 79 success
+run "$QUIET_J" "$(roster alive 0)"
+check "no notice per ordinary green push" "GREEN again" no
+rm -f "$T/api.json"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
