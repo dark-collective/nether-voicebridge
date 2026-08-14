@@ -130,6 +130,23 @@ run "Aug 14 01:08 host nvb[1]: INFO bridge{name=Light Voice}: joined Matrix room
 check "recovery notice" "is logging again" yes
 if [ -s "$T/state/bridges.down" ]; then FAIL=$((FAIL+1)); echo "  FAIL  latch file cleared"; else PASS=$((PASS+1)); echo "  PASS  latch file cleared"; fi
 
+echo "== case 10: a fresh roster suppresses the journal latch (restart noise) =="
+# An ordinary `systemctl restart` unregisters every channel. With a roster
+# present that is authoritative, so the fallback latch must stay out of the way
+# — otherwise every restart emits one ✅ per bridge, and a restart straddling a
+# window boundary raises a false down-alert.
+rm -f "$T/state/bridges.alert" "$T/state/bridges.down"
+run 'Aug 14 18:16 host nvb[1]: INFO nvb_discord::puppet: channel unregistered from puppet pool bridge="Light Voice"
+Aug 14 18:16 host nvb[1]: INFO nvb_discord::puppet: channel unregistered from puppet pool bridge="Dark Voice"' "$(roster alive 0)"
+check "no latch chatter when the roster is fresh" "down-latch" no
+check "no false down alert on restart" "BRIDGE(S) DOWN" no
+if [ -s "$T/state/bridges.down" ]; then FAIL=$((FAIL+1)); echo "  FAIL  latch not used while roster is fresh"; else PASS=$((PASS+1)); echo "  PASS  latch not used while roster is fresh"; fi
+
+echo "== case 11: a STALE roster falls back to the latch =="
+rm -f "$T/state/bridges.alert" "$T/state/bridges.down"
+run 'Aug 14 18:16 host nvb[1]: INFO nvb_discord::puppet: channel unregistered from puppet pool bridge="Light Voice"' "$(roster alive 999)"
+check "latch still catches a death when the roster is stale" "BRIDGE(S) DOWN" yes
+
 echo "== case 9: digest carries bridges=N/M =="
 DIGEST_DATE=1970-01-01 run "Aug 14 01:00 host nvb[1]: INFO bridge{name=Light Voice}: ok" "$(roster alive 0)"
 check "digest states bridge liveness" "bridges=2/2" yes

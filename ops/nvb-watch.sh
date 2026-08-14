@@ -84,48 +84,65 @@ alive=$(systemctl is-active "$UNIT")
 # the ERROR scan above is an *event* check over a 15-minute window and a dead
 # bridge is silent. Two independent state checks now:
 #
-#   (a) the roster the supervisor publishes (v0.3.2+) — authoritative: it names
-#       every configured bridge and whether it is actually up.
-#   (b) a journal latch on the death signature — covers older builds, and
-#       cross-checks (a). `channel unregistered from puppet pool` names a bridge
-#       that just went away; it stays latched until that bridge logs again.
+#   (a) the roster the supervisor publishes (v0.3.2+) — authoritative when
+#       fresh: it names every configured bridge and whether it is actually up.
+#   (b) FALLBACK, only when (a) is absent or stale: a journal latch on the death
+#       signature. `channel unregistered from puppet pool` names a bridge that
+#       just went away; it stays latched until that bridge logs again.
 #
-# Both re-alert DAILY while a bridge stays down: the 08-11 outage produced one
-# alert, at 01:30 on a Monday, and nothing ever repeated it.
+# Either way, re-alert DAILY while a bridge stays down: the 08-11 outage produced
+# one alert, at 01:30 on a Monday, and nothing ever repeated it.
 BRIDGES_LINE=""
 DOWN_FILE="$STATE_DIR/bridges.down"
 ALERT_STAMP="$STATE_DIR/bridges.alert"
 ROSTER="${ROSTER:-/var/lib/nether-voicebridge/bridges.json}"
 
-# (b) maintain the latch from this window's journal.
-touch "$DOWN_FILE"
-while read -r b; do
-    [ -z "$b" ] && continue
-    grep -qxF "$b" "$DOWN_FILE" || echo "$b" >> "$DOWN_FILE"
-done < <(echo "$J" | grep -oP 'channel unregistered from puppet pool bridge="\K[^"]+')
-# Proof of life clears the latch — but only evidence that comes AFTER the death.
-# A bridge's dying window contains its own lines (the `bridge failed` ERROR is
-# emitted from inside its span), so "any line from this bridge" would have the
-# corpse clearing its own latch. Compare positions instead: the bridge is alive
-# only if its last log line follows the last unregistration in this window.
-# Iterate over a snapshot, since the loop rewrites the file it reads from.
-mapfile -t _latched < <(sort -u "$DOWN_FILE" | grep . || true)
-for b in "${_latched[@]:-}"; do
-    [ -z "$b" ] && continue
-    last_unreg=$(echo "$J" | grep -nF "channel unregistered from puppet pool bridge=\"$b\"" | tail -1 | cut -d: -f1)
-    last_life=$(echo "$J" | grep -nF "bridge{name=$b}" | tail -1 | cut -d: -f1)
-    if [ -n "$last_life" ] && { [ -z "$last_unreg" ] || [ "$last_life" -gt "$last_unreg" ]; }; then
-        # `grep -v` exits 1 when it filters out EVERY line — i.e. exactly when
-        # the last latched bridge recovers — so the move must not be chained
-        # behind its exit status, or the latch would stick forever and alarm
-        # daily about a bridge that is fine.
-        grep -vxF "$b" "$DOWN_FILE" > "$DOWN_FILE.tmp" || true
-        mv "$DOWN_FILE.tmp" "$DOWN_FILE"
-        ALERTS+=("✅ bridge [$b] is logging again — clearing its down-latch.")
-    fi
-done
+# (a) first: is there a fresh roster? If so it is authoritative and the journal
+# latch below is skipped entirely. The latch is a *fallback* for builds without
+# a roster — running both is noisy, because an ordinary `systemctl restart`
+# unregisters every channel and would latch (then clear) all of them, emitting
+# one ✅ per bridge and risking a false down-alert whenever the restart straddles
+# a window boundary.
+ROSTER_FRESH=0
+if [ -f "$ROSTER" ] && r_upd_probe=$(jq -r '.updated // 0' "$ROSTER" 2>/dev/null) \
+   && [ "$(( $(date +%s) - ${r_upd_probe:-0} ))" -le "${ROSTER_STALE_SECS:-300}" ]; then
+    ROSTER_FRESH=1
+    # Drop any latch left over from a pre-roster build — the roster now answers
+    # this question directly, so a stale latch could only ever misfire.
+    rm -f "$DOWN_FILE"
+fi
 
-# (a) the authoritative roster, when the running build publishes one.
+# (b) maintain the latch from this window's journal (fallback only).
+touch "$DOWN_FILE"
+if [ "$ROSTER_FRESH" = "0" ]; then
+    while read -r b; do
+        [ -z "$b" ] && continue
+        grep -qxF "$b" "$DOWN_FILE" || echo "$b" >> "$DOWN_FILE"
+    done < <(echo "$J" | grep -oP 'channel unregistered from puppet pool bridge="\K[^"]+')
+    # Proof of life clears the latch — but only evidence that comes AFTER the death.
+    # A bridge's dying window contains its own lines (the `bridge failed` ERROR is
+    # emitted from inside its span), so "any line from this bridge" would have the
+    # corpse clearing its own latch. Compare positions instead: the bridge is alive
+    # only if its last log line follows the last unregistration in this window.
+    # Iterate over a snapshot, since the loop rewrites the file it reads from.
+    mapfile -t _latched < <(sort -u "$DOWN_FILE" | grep . || true)
+    for b in "${_latched[@]:-}"; do
+        [ -z "$b" ] && continue
+        last_unreg=$(echo "$J" | grep -nF "channel unregistered from puppet pool bridge=\"$b\"" | tail -1 | cut -d: -f1)
+        last_life=$(echo "$J" | grep -nF "bridge{name=$b}" | tail -1 | cut -d: -f1)
+        if [ -n "$last_life" ] && { [ -z "$last_unreg" ] || [ "$last_life" -gt "$last_unreg" ]; }; then
+            # `grep -v` exits 1 when it filters out EVERY line — i.e. exactly when
+            # the last latched bridge recovers — so the move must not be chained
+            # behind its exit status, or the latch would stick forever and alarm
+            # daily about a bridge that is fine.
+            grep -vxF "$b" "$DOWN_FILE" > "$DOWN_FILE.tmp" || true
+            mv "$DOWN_FILE.tmp" "$DOWN_FILE"
+            ALERTS+=("✅ bridge [$b] is logging again — clearing its down-latch.")
+        fi
+    done
+fi
+
+# The roster's own verdict (when the running build publishes one).
 roster_down=""
 if [ -f "$ROSTER" ] && r_upd=$(jq -r '.updated // 0' "$ROSTER" 2>/dev/null); then
     r_age=$(( $(date +%s) - ${r_upd:-0} ))
