@@ -15,6 +15,7 @@
 //! to both sides — to the Discord side as a `CaptureRouter`, and back here to be
 //! driven — mirroring how the Discord `PuppetPool` is shared.
 
+mod auth_error;
 mod device_prune;
 mod matrix;
 pub mod mgmt;

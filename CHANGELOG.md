@@ -3,6 +3,50 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.2] - 2026-08-14
+
+**A network blip could no longer kill a bridge — and a dead bridge can no longer
+hide.** On 2026-08-11 five bridges on the public instance died inside ten
+minutes; three stayed dead for three days before anyone noticed.
+
+### Fixed
+- **Transient `/sync` errors are no longer misread as fatal auth failures
+  (#130).** The sync loops classified errors by substring-matching the
+  *stringified* error for `"401"`/`"403"`/`"M_UNKNOWN_TOKEN"` — and a
+  `matrix_sdk` error stringifies to include the request URL, which for `/sync`
+  carries `?since=<token>`. While the homeserver's sync stream sat at position
+  `5401xxxx`, every bridge's token contained the substring `401`, so an ordinary
+  transport error ("error sending request for url …") was declared a fatal auth
+  failure and the supervisor killed the bridge with no retry. Classification is
+  now structural — HTTP status plus Matrix errcode, with a transport error
+  (no HTTP response at all) never fatal — behind a pure, unit-tested decision
+  function. The same bug and fix apply to the management bot's sync loop, and
+  the raw appservice-join path now branches on a typed status instead of
+  `contains("403")`.
+- **A failed bridge restarts itself with exponential backoff (#130).** Any
+  bridge task that returns an error or panics is now respawned after
+  `bridge_restart_base_ms * 2^n` (capped at `bridge_restart_max_ms`, both new
+  `[timing]` keys; 5 s → 5 min by default), with the streak reset once a bridge
+  has been up past the cap. Operator stops, reconcile replacements and shutdown
+  are never auto-restarted. This also closes the long-standing reboot race
+  where the bridge starts before the homeserver is serving, every appservice
+  login 502s, and *all* bridges die permanently.
+
+### Added
+- **`<data_dir>/bridges.json` — a machine-readable bridge roster (#131).**
+  Written on every state transition and refreshed every 60 s, it names each
+  bridge with `alive` / `restarting` / `down`, its origin, and its failure
+  count. `nvb-watch` now alerts on any bridge that is not alive (re-alerting
+  **daily** until it recovers, since the 08-11 outage produced exactly one
+  alert, at 01:30 on a Monday), on a stale roster (dead-man's switch for the
+  supervisor loop), and reports `bridges=N/M` in the daily digest — so a quiet
+  digest asserts bridge liveness instead of merely implying it.
+- **The ops scripts are in the repo** under [`ops/`](ops/) —
+  `nvb-watch.sh`, `nvb-backup.sh`, `nvb-ops.conf.example`, plus
+  `ops/test-nvb-watch.sh`, an offline harness that drives the real watcher
+  against stubbed `journalctl`/`systemctl`/`curl`. They previously existed only
+  on the production host, unreviewed and unbackuped.
+
 ## [0.3.1] - 2026-07-26
 
 **One-way-deafness fix.** A latent race in the vendored voice stack could

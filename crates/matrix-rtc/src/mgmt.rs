@@ -1238,8 +1238,8 @@ pub async fn run(
             res = client.sync(SyncSettings::default()) => match res {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("401") || msg.contains("403") || msg.contains("M_UNKNOWN_TOKEN") {
+                    // Structure, not text — see `auth_error` and #130.
+                    if crate::auth_error::sdk_error_is_fatal_auth(&e) {
                         return Err(anyhow::anyhow!("management bot sync fatal auth error: {e}"));
                     }
                     tracing::warn!(error = %e, "management bot sync error — retrying in 5 s");

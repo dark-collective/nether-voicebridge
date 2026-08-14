@@ -1,0 +1,39 @@
+# nvb-ops — shared config for nvb-watch.sh / nvb-backup.sh.
+#
+# Deploy to /opt/nvb-ops/nvb-ops.conf (root-only). Holds NO secrets: the Matrix
+# access token lives in /opt/nvb-ops/curl-as.conf (a curl -K config, mode 600)
+# and the Discord bot tokens are read straight from the bridge config at run
+# time and never echoed.
+
+HS_URL=https://matrix.example.org
+AS_USER=@voicebridge_as:example.org
+# Private ops room the bot posts alerts and the daily digest into.
+OPS_ROOM=%21yourOpsRoomId:example.org
+UNIT=nether-voicebridge
+AUDIT=/var/lib/nether-voicebridge/audit.jsonl
+STATE_DIR=/opt/nvb-ops/state
+BACKUP_DIR=/var/backups/nether-voicebridge
+BACKUP_KEEP=14
+
+# Alert thresholds (per 15-min window)
+APPROVE_REJECT_ALERT=3
+REJECT_CLUSTER_ALERT=5
+WARN_RATE_ALERT=100
+TCP_MAX=40
+# Hosts whose resolved IPv4s are legitimate egress (space-separated). The
+# homeserver is always resolved; add the LiveKit SFU + any other direct peers.
+EXTRA_ALLOW_HOSTS=livekit.example.org
+
+# #117: per-bot guild count at which the daily digest also posts a
+# verification-gate alert (Discord hard cap = 100 servers unverified).
+TRIPWIRE=60
+NVB_CONFIG=/etc/nether-voicebridge/config.toml
+GW_STORM_ALERT=20
+
+# #131 bridge liveness. ROSTER is the roster the supervisor publishes (v0.3.2+);
+# if the file is absent, nvb-watch falls back to the journal latch alone.
+# ROSTER_STALE_SECS is the dead-man's-switch threshold — the supervisor
+# rewrites the roster every 60 s, so anything past a few minutes means the
+# supervisor loop itself is wedged.
+ROSTER=/var/lib/nether-voicebridge/bridges.json
+ROSTER_STALE_SECS=300

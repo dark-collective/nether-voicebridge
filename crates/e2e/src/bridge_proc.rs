@@ -51,6 +51,11 @@ pub fn generate_config_with_management(cfg: &E2eConfig, extra_limits: &str) -> S
 /// 1-bot pool so overflow happens regardless of how many tokens the shared
 /// `NVB_E2E_PUPPET_TOKENS` secret holds. `pool_size` is clamped to the available
 /// tokens (and to ≥1, since the config loader rejects an empty pool).
+/// Test-only since #127 moved the one live caller to
+/// [`generate_config_with_pool_size_timing`]; without the gate `--all-targets`
+/// clippy fails the build on dead code (`-D warnings`), which is what turned
+/// master's CI red at 0.3.1.
+#[cfg(test)]
 pub fn generate_config_with_pool_size(cfg: &E2eConfig, pool_size: usize) -> String {
     generate_config_with_pool_size_timing(cfg, pool_size, "")
 }

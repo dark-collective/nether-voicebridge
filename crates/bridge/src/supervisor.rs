@@ -26,6 +26,7 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::roster;
 use nvb_audio::routing::{CaptureRouter, PlaybackRouter};
 use nvb_config::{
     BridgeConfig, LimitsConfig, LiveKeys, ServerProfile, TimingConfig, validate_bridge_against,
@@ -38,6 +39,11 @@ use nvb_matrix_rtc::mgmt::{BotFootprint, BridgeStatus, ControlMsg, ControlTx, Re
 /// memberships, close LiveKit) before its future is force-dropped. The
 /// per-bridge version of the process-exit drain budget.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often `<data_dir>/bridges.json` is rewritten even when nothing changes,
+/// so a stalled supervisor shows up as a stale `updated` stamp (#131). Well
+/// inside the monitor's 5-minute staleness threshold.
+const ROSTER_REFRESH: Duration = Duration::from_secs(60);
 
 /// Best-effort human-readable text from a caught panic payload (the common
 /// `&str` / `String` cases; anything else is opaque).
@@ -66,21 +72,34 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 /// NOTE: this relies on the default `panic = "unwind"` strategy — `Cargo.toml` has
 /// no `panic = "abort"`. Under `abort` the process dies before `catch_unwind` runs
 /// and this boundary silently becomes a no-op.
-async fn guard_bridge_panic<F>(label: Arc<str>, fut: F) -> Arc<str>
+async fn guard_bridge_panic<F>(label: Arc<str>, fut: F) -> (Arc<str>, BridgeOutcome)
 where
-    F: Future<Output = Arc<str>>,
+    F: Future<Output = (Arc<str>, BridgeOutcome)>,
 {
     match AssertUnwindSafe(fut).catch_unwind().await {
-        Ok(l) => l,
+        Ok(out) => out,
         Err(payload) => {
             tracing::error!(
                 bridge = %label,
                 panic = %panic_message(payload.as_ref()),
                 "bridge task PANICKED — contained; this tenant is torn down, others unaffected"
             );
-            label
+            // A panic is a failure like any other: it earns a backoff restart
+            // rather than leaving the bridge silently dead (#130).
+            (label, BridgeOutcome::Failed)
         }
     }
+}
+
+/// How a bridge future ended — the input to the restart decision (#130).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BridgeOutcome {
+    /// The bridge task returned an error, or panicked. Eligible for a backoff
+    /// restart unless it was stopped deliberately or we're shutting down.
+    Failed,
+    /// A clean return, or a cancellation-driven teardown. Never restarted —
+    /// cancellation is always something we asked for.
+    Ended,
 }
 
 /// Where a bridge came from — static `config.toml` bridges are never touched by
@@ -124,6 +143,10 @@ struct RunningBridge {
     /// without waiting for process exit.
     capture_sink: Option<Arc<CaptureSink>>,
     origin: Origin,
+    /// Set by [`stop_bridge`]: this bridge is being torn down deliberately
+    /// (operator stop, reconcile remove/replace), so its completion must NOT be
+    /// treated as a failure and auto-restarted (#130).
+    operator_stopped: bool,
     /// Set by a reconcile "changed" entry: the replacement config, spawned ONLY
     /// from the completion handler once the old future has fully dropped (store
     /// handles closed, pool channel key freed). Never spawn a replacement inline.
@@ -131,6 +154,10 @@ struct RunningBridge {
     /// When this bridge future was spawned — feeds `uptime_secs` in the
     /// operator `stats` command (#94).
     spawned_at: std::time::Instant,
+    /// While a restart backoff is being served, when it ends (#130). `None` for
+    /// a normally-spawned bridge. Only used to report `restarting` vs `alive`
+    /// in the roster the ops monitor reads.
+    backoff_until: Option<std::time::Instant>,
 }
 
 impl RunningBridge {
@@ -150,8 +177,12 @@ pub struct Supervisor {
     pool: Arc<SharedPool>,
     pool_shutdown: CancellationToken,
     running: HashMap<String, RunningBridge>,
-    /// The live bridge futures; each resolves to its bridge's label.
-    bridges: FuturesUnordered<LocalBoxFuture<'static, Arc<str>>>,
+    /// The live bridge futures; each resolves to its bridge's label and how it
+    /// ended (a failure is what arms the restart backoff — #130).
+    bridges: FuturesUnordered<LocalBoxFuture<'static, (Arc<str>, BridgeOutcome)>>,
+    /// Consecutive failures per bridge label, driving the restart backoff.
+    /// Cleared once a bridge has been up longer than `bridge_restart_max`.
+    restart_failures: HashMap<String, u32>,
     ctx: TenantsCtx,
     /// Once the operator shutdown begins, completions must not respawn pending
     /// replacements — a fresh bridge mid-drain would hang the drain.
@@ -169,6 +200,7 @@ impl Supervisor {
             pool_shutdown,
             running: HashMap::new(),
             bridges: FuturesUnordered::new(),
+            restart_failures: HashMap::new(),
             ctx,
             shutting_down: false,
             control_rx: None,
@@ -193,6 +225,24 @@ impl Supervisor {
         label: Arc<str>,
         bridge: BridgeConfig,
         origin: Origin,
+    ) -> Result<()> {
+        self.spawn_bridge_delayed(label, bridge, origin, Duration::ZERO)
+    }
+
+    /// [`spawn_bridge`](Self::spawn_bridge), but the Matrix side only starts
+    /// after `start_delay` — the restart backoff (#130).
+    ///
+    /// The delay deliberately sits *inside* the bridge future, after the pool
+    /// channel and store/device identity have been claimed: a bridge waiting to
+    /// restart still owns its slot, so a concurrent reconcile can neither
+    /// double-spawn the same store nor hand the channel to someone else. It is
+    /// cancellable, so an operator stop during backoff takes effect at once.
+    pub fn spawn_bridge_delayed(
+        &mut self,
+        label: Arc<str>,
+        bridge: BridgeConfig,
+        origin: Origin,
+        start_delay: Duration,
     ) -> Result<()> {
         let bridge = Arc::new(bridge);
 
@@ -235,8 +285,11 @@ impl Supervisor {
                 root: bridge_root.clone(),
                 capture_sink,
                 origin,
+                operator_stopped: false,
                 pending_respawn: None,
                 spawned_at: std::time::Instant::now(),
+                backoff_until: (!start_delay.is_zero())
+                    .then(|| std::time::Instant::now() + start_delay),
             },
         );
 
@@ -245,6 +298,21 @@ impl Supervisor {
         // Copied out of `self.ctx` so the `'static` bridge future doesn't borrow it.
         let timing = self.ctx.timing;
         let fut = async move {
+            let mut outcome = BridgeOutcome::Ended;
+            // Restart backoff (#130): the slot is already reserved above — store,
+            // device and pool channel stay claimed — so nothing else can take
+            // this identity while we wait, and an operator stop lands instantly
+            // because the sleep races the fresh root.
+            if !start_delay.is_zero() {
+                tracing::info!(
+                    delay_secs = start_delay.as_secs(),
+                    "bridge restart backoff — waiting before respawn"
+                );
+                tokio::select! {
+                    _ = bridge_root.cancelled() => return (fut_label, BridgeOutcome::Ended),
+                    _ = tokio::time::sleep(start_delay) => {}
+                }
+            }
             tokio::select! {
                 biased;
                 result = nvb_matrix_rtc::run(
@@ -258,8 +326,14 @@ impl Supervisor {
                 ) => {
                     match result {
                         // No reconnection yet (Phase 10); a clean exit is unexpected.
-                        Ok(_) => tracing::warn!("bridge exited cleanly (no reconnect yet)"),
-                        Err(e) => tracing::error!(error = %e, "bridge failed"),
+                        Ok(_) => {
+                            tracing::warn!("bridge exited cleanly (no reconnect yet)");
+                            outcome = BridgeOutcome::Ended;
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "bridge failed");
+                            outcome = BridgeOutcome::Failed;
+                        }
                     }
                 }
                 // Bounded teardown: once cancelled, the bridge gets
@@ -275,7 +349,7 @@ impl Supervisor {
                     );
                 }
             }
-            fut_label
+            (fut_label, outcome)
         }
         .instrument(span);
         // Wrap in a panic boundary so a panic in this one bridge is contained to
@@ -284,7 +358,58 @@ impl Supervisor {
         // normal `on_bridge_complete` teardown runs.
         self.bridges
             .push(guard_bridge_panic(label.clone(), fut).boxed_local());
+        self.publish_roster();
         Ok(())
+    }
+
+    /// Build the current roster: every running bridge, plus every *static*
+    /// bridge that is configured but absent.
+    ///
+    /// The absent ones are the point (#131). A tenant that disappears has
+    /// usually been removed on purpose, but a `config.toml` bridge can only be
+    /// missing because it died — the exact condition that stayed invisible for
+    /// three days in the 2026-08-11 outage.
+    fn roster_entries(&self) -> Vec<roster::RosterEntry> {
+        let now = std::time::Instant::now();
+        let now_secs = roster::now_secs();
+        let mut entries: Vec<roster::RosterEntry> = self
+            .running
+            .iter()
+            .map(|(label, rb)| roster::RosterEntry {
+                name: label.clone(),
+                origin: match rb.origin {
+                    Origin::Static => "static",
+                    Origin::Tenant => "tenant",
+                },
+                state: match rb.backoff_until {
+                    Some(until) if until > now => roster::BridgeState::Restarting,
+                    _ => roster::BridgeState::Alive,
+                },
+                since: now_secs.saturating_sub(rb.spawned_at.elapsed().as_secs()),
+                consecutive_failures: self.restart_failures.get(label).copied().unwrap_or(0),
+            })
+            .collect();
+        for label in &self.ctx.static_labels {
+            if !self.running.contains_key(label) {
+                entries.push(roster::RosterEntry {
+                    name: label.clone(),
+                    origin: "static",
+                    state: roster::BridgeState::Down,
+                    since: now_secs,
+                    consecutive_failures: self.restart_failures.get(label).copied().unwrap_or(0),
+                });
+            }
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        entries
+    }
+
+    /// Publish the roster to `<data_dir>/bridges.json` for the ops monitor.
+    /// Best-effort: a monitoring write must never be able to affect bridges.
+    fn publish_roster(&self) {
+        let entries = self.roster_entries();
+        let doc = roster::render(roster::now_secs(), std::process::id(), &entries);
+        roster::write(&self.ctx.data_dir, &doc);
     }
 
     /// Validate and start the boot-time tenant set (loaded from `tenants.toml`
@@ -311,15 +436,25 @@ impl Supervisor {
     fn stop_bridge(&mut self, label: &str, respawn: Option<BridgeConfig>) {
         let Some(rb) = self.running.get_mut(label) else { return };
         rb.pending_respawn = respawn;
+        // Deliberate teardown — never auto-restarted as a failure (#130).
+        rb.operator_stopped = true;
         rb.root.cancel();
     }
 
     /// A bridge's future resolved (voluntary exit, error, or cancellation):
     /// remove its channel from the puppet pool, finalize its WAV sink, drop its
     /// book-keeping, and spawn the queued replacement if a reconcile left one.
-    fn on_bridge_complete(&mut self, label: &str) {
+    fn on_bridge_complete(&mut self, label: &str, outcome: BridgeOutcome) {
+        self.on_bridge_complete_inner(label, outcome);
+        // One publish covering every exit path of the handler above, so the
+        // roster the monitor reads can never lag a death or a restart (#131).
+        self.publish_roster();
+    }
+
+    fn on_bridge_complete_inner(&mut self, label: &str, outcome: BridgeOutcome) {
         self.pool.unregister_channel(label);
         let Some(rb) = self.running.remove(label) else { return };
+        let uptime = rb.spawned_at.elapsed();
         // Cancel the root even on a voluntary/error exit (not just an operator
         // stop): the Matrix side already tears itself down before returning (#67),
         // but this is the belt-and-suspenders that guarantees any task still
@@ -346,6 +481,44 @@ impl Supervisor {
                 tracing::error!(bridge = %respawn_label, error = %e,
                     "respawn failed — bridge stays down until the next tenants reload");
             }
+            return;
+        }
+
+        // A bridge that FAILED (error return or panic) gets restarted with
+        // backoff (#130). Before this, any failure — including a transient
+        // `/sync` blip misread as fatal auth, or a startup login 502 after a
+        // host reboot — left the bridge dead for the process lifetime, with
+        // only tenant reconciles able to accidentally resurrect one.
+        if outcome != BridgeOutcome::Failed || self.shutting_down || rb.operator_stopped {
+            if outcome != BridgeOutcome::Failed {
+                self.restart_failures.remove(label);
+            }
+            return;
+        }
+
+        // A bridge that stayed up past the backoff cap counts as recovered, so
+        // an outage next week starts from the short delay again rather than
+        // inheriting an old streak.
+        let fails = self.restart_failures.entry(label.to_string()).or_insert(0);
+        if uptime >= self.ctx.timing.bridge_restart_max() {
+            *fails = 0;
+        }
+        let delay = self.ctx.timing.bridge_restart_delay(*fails);
+        *fails += 1;
+        let attempt = *fails;
+
+        tracing::warn!(
+            bridge = label,
+            attempt,
+            delay_secs = delay.as_secs(),
+            uptime_secs = uptime.as_secs(),
+            "bridge failed — scheduling automatic restart"
+        );
+        let restart_label: Arc<str> = Arc::from(label);
+        let cfg = (*rb.cfg).clone();
+        if let Err(e) = self.spawn_bridge_delayed(restart_label.clone(), cfg, rb.origin, delay) {
+            tracing::error!(bridge = %restart_label, error = %e,
+                "automatic restart could not be spawned — bridge stays down");
         }
     }
 
@@ -514,11 +687,22 @@ impl Supervisor {
         let mut sigterm = hook_signal(SignalKind::terminate(), "SIGTERM");
         let mut sighup = hook_signal(SignalKind::hangup(), "SIGHUP");
 
+        // Refresh `bridges.json` on a timer as well as on every transition, so
+        // its `updated` stamp doubles as a dead-man's switch: a roster that
+        // stops advancing means this loop is wedged, which the monitor reports
+        // rather than trusting stale contents (#131).
+        let mut roster_tick = tokio::time::interval(ROSTER_REFRESH);
+        roster_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        self.publish_roster();
+
         loop {
             tokio::select! {
-                maybe_label = self.bridges.next(), if !self.bridges.is_empty() => {
-                    if let Some(label) = maybe_label {
-                        self.on_bridge_complete(&label);
+                _ = roster_tick.tick() => {
+                    self.publish_roster();
+                }
+                maybe_done = self.bridges.next(), if !self.bridges.is_empty() => {
+                    if let Some((label, outcome)) = maybe_done {
+                        self.on_bridge_complete(&label, outcome);
                     }
                 }
                 _ = &mut pool_fut, if !pool_done => {
@@ -585,8 +769,8 @@ impl Supervisor {
         // Drain the shared puppet pool (every bot leaves voice + resets nick).
         self.pool_shutdown.cancel();
         let drained = tokio::time::timeout(TEARDOWN_TIMEOUT, async {
-            while let Some(label) = self.bridges.next().await {
-                self.on_bridge_complete(&label);
+            while let Some((label, outcome)) = self.bridges.next().await {
+                self.on_bridge_complete(&label, outcome);
             }
             if !pool_done {
                 pool_fut.await;
@@ -1027,13 +1211,15 @@ mod tests {
                 root: root.clone(),
                 capture_sink: None,
                 origin: Origin::Static,
+                operator_stopped: false,
                 pending_respawn: None,
                 spawned_at: std::time::Instant::now(),
+                backoff_until: None,
             },
         );
 
         assert!(!root.is_cancelled());
-        sup.on_bridge_complete("b");
+        sup.on_bridge_complete("b", BridgeOutcome::Ended);
         assert!(
             root.is_cancelled(),
             "a completed bridge's root must be cancelled so detached ghost tasks are torn down"
@@ -1041,45 +1227,186 @@ mod tests {
         assert!(!sup.running.contains_key("b"), "book-keeping dropped on completion");
     }
 
-    /// A bridge future that panics mid-poll. Explicit `Arc<str>` return type so the
-    /// `!` from `panic!` coerces cleanly (no unreachable-tail lint).
-    async fn panicking_bridge() -> Arc<str> {
+    /// A bridge future that panics mid-poll. Explicit return type so the `!`
+    /// from `panic!` coerces cleanly (no unreachable-tail lint).
+    async fn panicking_bridge() -> (Arc<str>, BridgeOutcome) {
         panic!("simulated bridge panic")
     }
 
     #[tokio::test]
     async fn guard_passes_through_normal_completion() {
         let label: Arc<str> = Arc::from("ok-bridge");
-        let out = guard_bridge_panic(label.clone(), async move { label }).await;
+        let (out, outcome) =
+            guard_bridge_panic(label.clone(), async move { (label, BridgeOutcome::Ended) }).await;
         assert_eq!(&*out, "ok-bridge");
+        assert_eq!(outcome, BridgeOutcome::Ended);
     }
 
     #[tokio::test]
-    async fn guard_contains_panic_and_returns_label() {
+    async fn guard_contains_panic_and_reports_failure() {
         // The inner future panics; the guard must catch it (this test must NOT
-        // unwind) and resolve to the label so on_bridge_complete can tear it down.
+        // unwind), resolve to the label so on_bridge_complete can tear it down,
+        // and report Failed so the panicking bridge earns a restart (#130).
         let label: Arc<str> = Arc::from("boom-bridge");
-        let out = guard_bridge_panic(label.clone(), panicking_bridge()).await;
+        let (out, outcome) = guard_bridge_panic(label.clone(), panicking_bridge()).await;
         assert_eq!(&*out, "boom-bridge");
+        assert_eq!(
+            outcome,
+            BridgeOutcome::Failed,
+            "a panicked bridge must be restartable, not silently dead"
+        );
     }
 
     #[tokio::test]
     async fn guard_lets_the_driving_loop_survive_a_panicking_bridge() {
-        // Mirror run()'s FuturesUnordered<LocalBoxFuture<Arc<str>>>: a panicking
-        // bridge and a healthy one both drain, and draining the panicker does not
-        // abort the set.
-        let mut set: FuturesUnordered<LocalBoxFuture<'static, Arc<str>>> =
+        // Mirror run()'s FuturesUnordered: a panicking bridge and a healthy one
+        // both drain, and draining the panicker does not abort the set.
+        let mut set: FuturesUnordered<LocalBoxFuture<'static, (Arc<str>, BridgeOutcome)>> =
             FuturesUnordered::new();
         let bad: Arc<str> = Arc::from("bad");
         let good: Arc<str> = Arc::from("good");
         set.push(guard_bridge_panic(bad.clone(), panicking_bridge()).boxed_local());
-        set.push(guard_bridge_panic(good.clone(), async move { good }).boxed_local());
+        set.push(
+            guard_bridge_panic(good.clone(), async move { (good, BridgeOutcome::Ended) })
+                .boxed_local(),
+        );
 
         let mut done: Vec<String> = Vec::new();
-        while let Some(label) = set.next().await {
+        while let Some((label, _)) = set.next().await {
             done.push(label.to_string());
         }
         done.sort();
         assert_eq!(done, vec!["bad".to_string(), "good".to_string()]);
+    }
+
+    // ── #130: a failed bridge restarts itself ────────────────────────────────
+
+    /// Build a supervisor with one running bridge, ready to complete.
+    fn sup_with_running(label: &str, operator_stopped: bool) -> Supervisor {
+        use nvb_config::PuppetsConfig;
+        let pool = SharedPool::new(&PuppetsConfig::default(), &TimingConfig::default());
+        let ctx = TenantsCtx {
+            servers: HashMap::new(),
+            // Deliberately unwritable: the roster publish is best-effort and
+            // must not affect any of these outcomes.
+            data_dir: "/nonexistent-nvb-test".into(),
+            static_keys: LiveKeys::default(),
+            static_labels: HashSet::new(),
+            limits: LimitsConfig::default(),
+            timing: TimingConfig::default(),
+        };
+        let mut sup = Supervisor::new(pool, CancellationToken::new(), ctx);
+        sup.running.insert(
+            label.to_string(),
+            RunningBridge {
+                cfg: Arc::new(tenant(label, "!b:x")),
+                root: CancellationToken::new(),
+                capture_sink: None,
+                origin: Origin::Static,
+                operator_stopped,
+                pending_respawn: None,
+                spawned_at: std::time::Instant::now(),
+                backoff_until: None,
+            },
+        );
+        sup
+    }
+
+    /// THE #130 REGRESSION, supervisor half. A bridge whose task returned an
+    /// error used to be gone for the process lifetime — three of them stayed
+    /// dead for three days. It must now come back on a backoff.
+    #[test]
+    fn a_failed_bridge_is_rescheduled() {
+        let mut sup = sup_with_running("b", false);
+        sup.on_bridge_complete("b", BridgeOutcome::Failed);
+        assert!(
+            sup.running.contains_key("b"),
+            "a failed bridge must be re-spawned, not left dead"
+        );
+        assert_eq!(sup.restart_failures.get("b").copied(), Some(1));
+        let rb = &sup.running["b"];
+        assert!(rb.backoff_until.is_some(), "the respawn must serve a backoff first");
+        assert!(!rb.operator_stopped, "the fresh bridge starts un-stopped");
+    }
+
+    #[test]
+    fn an_operator_stopped_bridge_is_not_restarted() {
+        let mut sup = sup_with_running("b", true);
+        sup.on_bridge_complete("b", BridgeOutcome::Failed);
+        assert!(
+            !sup.running.contains_key("b"),
+            "a deliberate stop must stay stopped"
+        );
+    }
+
+    #[test]
+    fn a_clean_exit_is_not_restarted_and_clears_the_streak() {
+        let mut sup = sup_with_running("b", false);
+        sup.restart_failures.insert("b".to_string(), 3);
+        sup.on_bridge_complete("b", BridgeOutcome::Ended);
+        assert!(!sup.running.contains_key("b"));
+        assert_eq!(sup.restart_failures.get("b"), None);
+    }
+
+    #[test]
+    fn shutdown_never_respawns() {
+        let mut sup = sup_with_running("b", false);
+        sup.shutting_down = true;
+        sup.on_bridge_complete("b", BridgeOutcome::Failed);
+        assert!(
+            !sup.running.contains_key("b"),
+            "a fresh bridge mid-drain would hang the drain"
+        );
+    }
+
+    #[test]
+    fn backoff_grows_with_consecutive_failures_and_is_capped() {
+        let t = TimingConfig::default();
+        assert_eq!(t.bridge_restart_delay(0), Duration::from_secs(5));
+        assert_eq!(t.bridge_restart_delay(1), Duration::from_secs(10));
+        assert_eq!(t.bridge_restart_delay(2), Duration::from_secs(20));
+        // Capped, and a long streak must not overflow the shift.
+        assert_eq!(t.bridge_restart_delay(20), t.bridge_restart_max());
+        assert_eq!(t.bridge_restart_delay(u32::MAX), t.bridge_restart_max());
+    }
+
+    /// A bridge that ran fine for a long time before dying starts its backoff
+    /// from scratch, rather than inheriting a streak from an old outage.
+    #[test]
+    fn long_uptime_resets_the_failure_streak() {
+        let mut sup = sup_with_running("b", false);
+        sup.restart_failures.insert("b".to_string(), 6);
+        let stable = sup.ctx.timing.bridge_restart_max() + Duration::from_secs(1);
+        if let Some(rb) = sup.running.get_mut("b") {
+            rb.spawned_at = std::time::Instant::now() - stable;
+        }
+        sup.on_bridge_complete("b", BridgeOutcome::Failed);
+        assert_eq!(
+            sup.restart_failures.get("b").copied(),
+            Some(1),
+            "streak resets to a first failure after a long healthy run"
+        );
+    }
+
+    /// #131: the roster must show a configured-but-absent static bridge as
+    /// `down` — the state that was invisible for three days.
+    #[test]
+    fn roster_reports_missing_static_bridges_as_down() {
+        let mut sup = sup_with_running("alive-one", false);
+        sup.ctx.static_labels = HashSet::from(["alive-one".to_string(), "dead-one".to_string()]);
+        let entries = sup.roster_entries();
+        let dead = entries.iter().find(|e| e.name == "dead-one").expect("listed");
+        assert_eq!(dead.state, roster::BridgeState::Down);
+        let alive = entries.iter().find(|e| e.name == "alive-one").expect("listed");
+        assert_eq!(alive.state, roster::BridgeState::Alive);
+    }
+
+    #[test]
+    fn roster_reports_a_backing_off_bridge_as_restarting() {
+        let mut sup = sup_with_running("b", false);
+        sup.on_bridge_complete("b", BridgeOutcome::Failed);
+        let entries = sup.roster_entries();
+        assert_eq!(entries[0].state, roster::BridgeState::Restarting);
+        assert_eq!(entries[0].consecutive_failures, 1);
     }
 }
