@@ -3,7 +3,7 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.2] - 2026-08-14
 
 **A network blip could no longer kill a bridge — and a dead bridge can no longer
 hide.** On 2026-08-11 five bridges on the public instance died inside ten
