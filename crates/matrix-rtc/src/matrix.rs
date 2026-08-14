@@ -579,8 +579,12 @@ pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Cli
             tracing::info!(room_id = %room_id, "joined Matrix room (appservice-asserted full member)")
         }
         Ok(Err(e)) => {
-            let msg = e.to_string();
-            if msg.contains("403") || msg.contains("M_FORBIDDEN") {
+            // Branch on the response's status, not on the error text — a room id
+            // or URL containing "403" must not fake a permission problem (#130).
+            let forbidden = e
+                .downcast_ref::<AppserviceHttpError>()
+                .is_some_and(|h| h.status == reqwest::StatusCode::FORBIDDEN);
+            if forbidden {
                 tracing::error!(
                     room_id = %room_id, error = %e,
                     "appservice-asserted join forbidden (403) — for a restricted/non-public room the bot still needs an invite (or allow-space membership)"
@@ -813,10 +817,32 @@ pub(crate) async fn appservice_join_room(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("{status}: {body}"));
+        return Err(AppserviceHttpError { status, body }.into());
     }
     Ok(())
 }
+
+/// A non-2xx response from a raw appservice-asserted CS-API call, carrying the
+/// status as a *value* rather than only as text.
+///
+/// Callers used to classify these with `e.to_string().contains("403")`, the
+/// same class of bug as #130 — a room id or URL containing "403" would match.
+/// `Display` is deliberately unchanged (`"403 Forbidden: {body}"`), because the
+/// management bot surfaces it verbatim in operator DMs; branch on `.status` via
+/// `downcast_ref` instead of on the text.
+#[derive(Debug)]
+pub(crate) struct AppserviceHttpError {
+    pub(crate) status: reqwest::StatusCode,
+    pub(crate) body: String,
+}
+
+impl std::fmt::Display for AppserviceHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for AppserviceHttpError {}
 
 /// Leave a room via an appservice-asserted `POST /rooms/{id}/leave` — the mirror
 /// of [`appservice_join_room`]. Used to undo a `link` preflight join when the
@@ -845,7 +871,7 @@ pub(crate) async fn appservice_leave_room(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("{status}: {body}"));
+        return Err(AppserviceHttpError { status, body }.into());
     }
     Ok(())
 }
@@ -872,7 +898,7 @@ pub(crate) async fn appservice_is_room_joined(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("{status}: {body}"));
+        return Err(AppserviceHttpError { status, body }.into());
     }
     let body: serde_json::Value = resp.json().await.context("parse joined_rooms")?;
     Ok(body
@@ -910,7 +936,7 @@ pub(crate) async fn appservice_pending_invites(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("{status}: {body}"));
+        return Err(AppserviceHttpError { status, body }.into());
     }
     let json: serde_json::Value = resp.json().await.context("members response JSON")?;
     Ok(json["chunk"].as_array().map(|c| c.len()).unwrap_or(0))
@@ -945,7 +971,7 @@ pub(crate) async fn get_room_event(
     }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("{status}: {body}"));
+        return Err(AppserviceHttpError { status, body }.into());
     }
     let event = resp.json().await.context("parsing room event")?;
     Ok(Some(event))
@@ -977,7 +1003,7 @@ pub(crate) async fn get_room_state(
     }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("{status}: {body}"));
+        return Err(AppserviceHttpError { status, body }.into());
     }
     let content = resp
         .json()
@@ -1147,9 +1173,10 @@ pub(crate) async fn run(
             res = client.sync(SyncSettings::default()) => match res {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    let msg = e.to_string();
-                    // 401/403 are auth failures — propagate immediately.
-                    if msg.contains("401") || msg.contains("403") || msg.contains("M_UNKNOWN_TOKEN") {
+                    // Decide on the error's STRUCTURE (status + errcode), never
+                    // its text: the stringified error embeds the sync URL, whose
+                    // `since=` token can itself contain "401"/"403" (#130).
+                    if crate::auth_error::sdk_error_is_fatal_auth(&e) {
                         return Err(anyhow::anyhow!("Matrix sync fatal auth error: {e}"));
                     }
                     tracing::warn!(error = %e, "Matrix sync error — retrying in 5 s");

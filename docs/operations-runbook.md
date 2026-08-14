@@ -12,9 +12,13 @@ deployment but generic — paths assume the deb install (`/etc/nether-voicebridg
 
 A small ops-side watcher (not part of the bridge binary — it keeps working even
 if the bridge wedges) runs from a systemd timer every 15 minutes and posts to a
-private Matrix **ops room** as the bridge bot. On the nether.im instance it
-lives at `/opt/nvb-ops/nvb-watch.sh` with config in `/opt/nvb-ops/nvb-ops.conf`;
-auth is a root-only curl config holding the appservice token.
+private Matrix **ops room** as the bridge bot. The scripts live in
+[`ops/`](../ops/) in this repo — `nvb-watch.sh`, `nvb-backup.sh` and
+`nvb-ops.conf.example` — and are deployed to `/opt/nvb-ops/` on the host, with
+config in `/opt/nvb-ops/nvb-ops.conf`; auth is a root-only curl config holding
+the appservice token. Edit them **in the repo and redeploy**, not in place.
+`ops/test-nvb-watch.sh` exercises the alerting logic offline against stubbed
+`journalctl`/`systemctl`/`curl` — run it after any change (it needs `jq`).
 
 It checks, per window:
 
@@ -26,14 +30,37 @@ It checks, per window:
 | Bridge errors | journal cursor | ❌ any ERROR line (quoted) |
 | Log noise | journal cursor | ⚠️ WARN rate over threshold (restart bursts trip this once — expected) |
 | Service down | systemd | 💀 unit not active |
+| **Bridge down** (#131) | `bridges.json` roster + journal latch | 🧟 any configured bridge not `alive` — **re-alerted daily** until it recovers; ✅ when it comes back |
+| Roster stale (#131) | `bridges.json` `updated` stamp | 🕰 roster older than `ROSTER_STALE_SECS` (default 300 s) — the supervisor loop itself may be wedged |
 | Egress anomaly | `ss` on the bridge PID | 🔌 TCP count outside envelope; 👁 any remote endpoint not in the allow-set (Cloudflare/Discord edge, homeserver, private ranges) |
 | Verification gate (#117) | Discord API, once daily with the digest | ⚠ any puppet bot's guild count ≥ `TRIPWIRE` (default 60; Discord's hard cap is 100 servers/app) — start the App Verification paperwork early |
 
 Plus one 📊 **daily digest** even when everything is quiet — audit events in
-the last 24 h, journal counts, connection counts, and the **puppet-pool guild
-footprint** (`pool: b1=4 b2=3 … distinct=4` — per-bot guild counts from the
-Discord API, #117). **If the digest stops appearing, the monitor itself is
-broken** — that's the dead-man's-switch.
+the last 24 h, journal counts, `bridges=N/M` liveness, connection counts, and
+the **puppet-pool guild footprint** (`pool: b1=4 b2=3 … distinct=4` — per-bot
+guild counts from the Discord API, #117). **If the digest stops appearing, the
+monitor itself is broken** — that's the dead-man's-switch.
+
+### Why bridge liveness is checked separately (#130 / #131)
+
+`💀 unit not active` only proves the **process** is alive. On 2026-08-11 five
+bridges died *inside* a healthy-looking process and three stayed dead for three
+days, while every daily digest read `err=0 warn=0 svc=active` — because the
+ERROR scan is an *event* check over a 15-minute window and a dead bridge is
+silent. Since v0.3.2 the supervisor publishes `<data_dir>/bridges.json`:
+
+```json
+{"updated": 1755000000, "pid": 570490,
+ "bridges": [{"name":"Light Voice","origin":"static","state":"alive",
+              "since":1754990000,"consecutive_failures":0}]}
+```
+
+`state` is `alive`, `restarting` (serving a restart backoff) or `down`. The
+watcher alerts on anything not `alive`, on a stale `updated` stamp, and — for
+builds without the roster — on a journal latch over
+`channel unregistered from puppet pool`, cleared only by a bridge log line that
+*follows* the unregistration. `bridges=N/M` in the digest means a quiet digest
+now positively asserts bridge liveness instead of merely implying it.
 
 Since v0.3.0-alpha.24 the bridge also **detects the most common breakage
 itself** (#95 tiers 1–2): every maintenance sweep (~5 min,

@@ -224,6 +224,13 @@ pub struct TimingConfig {
     pub quarantine_base_ms: u64,
     /// Cap on the exponential quarantine backoff. Historical value 120 s.
     pub quarantine_max_ms: u64,
+    /// Base delay before the supervisor restarts a bridge whose task failed;
+    /// grows `base * 2^n` per consecutive failure (#130). A bridge that stays
+    /// up longer than `bridge_restart_max_ms` resets the count.
+    pub bridge_restart_base_ms: u64,
+    /// Cap on the exponential bridge-restart backoff — also the "this bridge is
+    /// stable again" threshold that resets the failure count.
+    pub bridge_restart_max_ms: u64,
     /// How often the reconcile sweep probes each active puppet's voice
     /// connection (backstop for a silent connection death). Historical
     /// value 15 s.
@@ -245,6 +252,8 @@ impl Default for TimingConfig {
             anchor_idle_grace_ms: 90_000,
             quarantine_base_ms: 15_000,
             quarantine_max_ms: 120_000,
+            bridge_restart_base_ms: 5_000,
+            bridge_restart_max_ms: 300_000,
             voice_health_sweep_ms: 15_000,
             session_rotate_min_interval_ms: 90_000,
         }
@@ -264,6 +273,8 @@ impl TimingConfig {
             anchor_idle_grace_ms: 3_000,
             quarantine_base_ms: 1_000,
             quarantine_max_ms: 3_000,
+            bridge_restart_base_ms: 1_000,
+            bridge_restart_max_ms: 3_000,
             voice_health_sweep_ms: 1_000,
             session_rotate_min_interval_ms: 3_000,
         }
@@ -293,6 +304,20 @@ impl TimingConfig {
     pub fn quarantine_max(&self) -> Duration {
         Duration::from_millis(self.quarantine_max_ms)
     }
+    pub fn bridge_restart_base(&self) -> Duration {
+        Duration::from_millis(self.bridge_restart_base_ms)
+    }
+    pub fn bridge_restart_max(&self) -> Duration {
+        Duration::from_millis(self.bridge_restart_max_ms)
+    }
+    /// The backoff before restart attempt `n` (0-based) of a failed bridge:
+    /// `base * 2^n`, capped at `bridge_restart_max`. Saturating, so a long-lived
+    /// failure streak can't overflow the shift.
+    pub fn bridge_restart_delay(&self, consecutive_failures: u32) -> Duration {
+        let base = self.bridge_restart_base_ms;
+        let scaled = base.saturating_mul(1u64 << consecutive_failures.min(32));
+        Duration::from_millis(scaled.min(self.bridge_restart_max_ms))
+    }
     pub fn voice_health_sweep(&self) -> Duration {
         Duration::from_millis(self.voice_health_sweep_ms)
     }
@@ -319,6 +344,10 @@ pub struct TimingOverrides {
     pub quarantine_base_ms: Option<u64>,
     #[serde(default)]
     pub quarantine_max_ms: Option<u64>,
+    #[serde(default)]
+    pub bridge_restart_base_ms: Option<u64>,
+    #[serde(default)]
+    pub bridge_restart_max_ms: Option<u64>,
     #[serde(default)]
     pub voice_health_sweep_ms: Option<u64>,
     #[serde(default)]
@@ -361,6 +390,8 @@ impl TimingOverrides {
         apply!(anchor_idle_grace_ms);
         apply!(quarantine_base_ms);
         apply!(quarantine_max_ms);
+        apply!(bridge_restart_base_ms);
+        apply!(bridge_restart_max_ms);
         apply!(voice_health_sweep_ms);
         apply!(session_rotate_min_interval_ms);
         Ok(t)

@@ -1,3 +1,4 @@
+mod roster;
 mod supervisor;
 
 use anyhow::{Context, Result};
