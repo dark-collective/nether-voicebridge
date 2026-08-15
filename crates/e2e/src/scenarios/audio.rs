@@ -799,9 +799,25 @@ async fn run_d2m_enc(ctx: Arc<Ctx>) -> Result<()> {
     // capture_wav=true: the bridge writes Tap B (`publish_<uid>.wav`) — the
     // exact mono PCM the ghost encrypts into LiveKit — into its workdir.
     let tenants = tenant_entry_opts(bridge_name, &room_b, &cfg.guild_id, &channel_b, true);
-    let bridge = BridgeUnderTest::start(cfg, ctx.profile, &tenants, &ctx.artifacts.join("bridge"))
-        .await
-        .context("starting bridge-under-test")?;
+    // Hold the #25 stale-membership reaper off the decrypting listener (#133).
+    // `join_decrypting` bootstraps Olm before its LiveKit connect, and once
+    // that membership-post → connect latency crosses the compressed 3 s
+    // `reap_grace`, the reaper retracts the listener's m.call.member mid-probe
+    // → participants=[] → call ended → the capture anchor leaves Discord → Tap
+    // B zero-fills from that moment (the [1.00 … 0.00 0.00] oracle signature
+    // that made this the nightly's standing red, 08-08→08-15). Same class and
+    // same remedy as the #24 steal scenario; every other key stays compressed,
+    // and the reaper itself is covered by `reap_release` under `--profile
+    // real`.
+    let bridge = BridgeUnderTest::start_with_timing(
+        cfg,
+        ctx.profile,
+        &tenants,
+        &ctx.artifacts.join("bridge"),
+        "reap_grace_ms = 300000\n",
+    )
+    .await
+    .context("starting bridge-under-test")?;
     if let Err(e) = bridge.await_ready(&[bridge_name], Duration::from_secs(120)).await {
         bridge.kill().await;
         return Err(e);

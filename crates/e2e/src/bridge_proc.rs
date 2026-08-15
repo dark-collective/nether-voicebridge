@@ -339,6 +339,23 @@ impl BridgeUnderTest {
             .await
     }
 
+    /// Like [`start`](Self::start) plus extra raw `[timing]` lines layered on
+    /// the `NVB_TIMING` preset — the full-pool sibling of
+    /// [`start_with_pool_size_timing`](Self::start_with_pool_size_timing).
+    /// `audio_d2m_enc` uses this to hold the #25 reaper off its decrypting
+    /// listener (#133), the same way the #24 steal scenario holds it off its
+    /// membership-only phantoms.
+    pub async fn start_with_timing(
+        cfg: &E2eConfig,
+        profile: Profile,
+        tenants_toml: &str,
+        workdir: &Path,
+        extra_timing: &str,
+    ) -> Result<Self> {
+        Self::start_inner(cfg, profile, tenants_toml, workdir, false, None, &[], "", extra_timing)
+            .await
+    }
+
     /// Like [`start_with_pool_size`](Self::start_with_pool_size) plus extra raw
     /// `[timing]` lines layered on the `NVB_TIMING` preset (see
     /// [`generate_config_with_pool_size_timing`]). The #24 steal scenario uses
