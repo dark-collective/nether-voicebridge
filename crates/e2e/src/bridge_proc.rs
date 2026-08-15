@@ -28,6 +28,11 @@ use tokio::process::{Child, Command};
 /// (tenants reference it as `server = "test"`) plus the harness puppet pool.
 /// No `[[bridge]]` blocks and no `[timing]` — compressed timing rides the
 /// `NVB_TIMING` env preset so the C1 env path is exercised too.
+/// Test-only since #133: `start_inner` now renders every non-management config
+/// through the `_timing` variant (the plain path was how a `[timing]` override
+/// silently vanished from the real config). Kept for the loader round-trip
+/// test; gated so `--all-targets -D warnings` doesn't fail on dead code.
+#[cfg(test)]
 pub fn generate_config(cfg: &E2eConfig) -> String {
     render_config(cfg, &cfg.puppet_tokens, false, "", "")
 }
@@ -385,6 +390,37 @@ impl BridgeUnderTest {
         .await
     }
 
+    /// Choose the REAL config render for `start_inner` — extracted pure so a
+    /// unit test can pin its agreement with `generate_config_redacted`.
+    ///
+    /// The pre-#133 inline match sent the full-pool non-management path
+    /// through `generate_config(cfg)`, silently dropping the `[timing]`
+    /// override — while the redacted copy always renders it, so the artifact
+    /// showed an override the bridge never read (live run #322 resolved
+    /// `reap_grace_ms=3000` against a redacted config saying `300000`). Every
+    /// non-management arm must thread `extra_timing`, whatever the pool size.
+    fn render_real_config(
+        cfg: &E2eConfig,
+        management: bool,
+        pool_size: Option<usize>,
+        extra_limits: &str,
+        extra_timing: &str,
+    ) -> String {
+        if management {
+            debug_assert!(
+                extra_timing.is_empty(),
+                "the management render path does not thread [timing] overrides"
+            );
+            generate_config_with_management(cfg, extra_limits)
+        } else {
+            generate_config_with_pool_size_timing(
+                cfg,
+                pool_size.unwrap_or(cfg.puppet_tokens.len()),
+                extra_timing,
+            )
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn start_inner(
         cfg: &E2eConfig,
@@ -413,11 +449,8 @@ impl BridgeUnderTest {
         let secrets_dir = secrets_dir_for(workdir);
         tokio::fs::create_dir_all(&secrets_dir).await.context("creating bridge secrets dir")?;
         let config_path = secrets_dir.join("config.toml");
-        let real_config = match (management, pool_size) {
-            (true, _) => generate_config_with_management(cfg, extra_limits),
-            (false, Some(n)) => generate_config_with_pool_size_timing(cfg, n, extra_timing),
-            (false, None) => generate_config(cfg),
-        };
+        let real_config =
+            Self::render_real_config(cfg, management, pool_size, extra_limits, extra_timing);
         tokio::fs::write(&config_path, real_config).await?;
         let redacted_pool = pool_size.unwrap_or(cfg.puppet_tokens.len());
         tokio::fs::write(
@@ -606,6 +639,39 @@ mod tests {
             federation: None,
             artifacts_dir: "art".into(),
         }
+    }
+
+    /// THE #133 REGRESSION (harness half): whatever arm `start_inner` renders
+    /// the real config through, a `[timing]` override must land in BOTH the
+    /// real config and the redacted artifact copy. The full-pool path used to
+    /// drop it from the real render only — the bridge ran on the compressed
+    /// 3 s reap_grace while the artifact swore 300 s was applied.
+    #[test]
+    fn real_and_redacted_configs_agree_on_timing_overrides() {
+        let cfg = cfg();
+        let timing = "reap_grace_ms = 300000\n";
+        for pool_size in [None, Some(1)] {
+            let real =
+                BridgeUnderTest::render_real_config(&cfg, false, pool_size, "", timing);
+            let redacted = generate_config_redacted(
+                &cfg,
+                pool_size.unwrap_or(cfg.puppet_tokens.len()),
+                false,
+                "",
+                timing,
+            );
+            assert!(
+                real.contains("reap_grace_ms = 300000"),
+                "real config (pool_size={pool_size:?}) must carry the [timing] override"
+            );
+            assert!(
+                redacted.contains("reap_grace_ms = 300000"),
+                "redacted copy (pool_size={pool_size:?}) must carry the [timing] override"
+            );
+        }
+        // And the full-pool render still uses the whole pool.
+        let real = BridgeUnderTest::render_real_config(&cfg, false, None, "", timing);
+        assert!(real.contains("tok1") && real.contains("tok2"), "full pool rendered");
     }
 
     /// The generated config + tenants must satisfy the REAL loader — parse and
