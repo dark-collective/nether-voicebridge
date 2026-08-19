@@ -37,6 +37,13 @@ async fn main() -> Result<()> {
     // `nvb_discord`, `nvb_matrix_rtc`, `nvb_config`), so RUST_LOG now targets
     // those — e.g. `RUST_LOG=nvb_discord=debug,nvb_matrix_rtc=debug`.
     //
+    // `serenity=info` is deliberate (#129): gateway lifecycle lines ("Attempting
+    // to reconnect", "Received session invalidation", …) are the only external
+    // signal of an identify storm — the failure class that burns Discord's
+    // 1000-connections/day budget and gets a bot token auto-reset. Without it,
+    // 14 days of prod journal contained zero serenity lines while that risk
+    // class was entirely invisible.
+    //
     // `NVB_LOG_JSON=1` switches stdout to newline-delimited JSON events — the
     // machine-readable feed the #38 e2e harness scrapes (`nvb-e2e`'s
     // LogScraper). Anything else (unset, "0", …) keeps the human format, so
@@ -45,7 +52,7 @@ async fn main() -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new(
                 "nether_voicebridge=info,nvb_audio=info,nvb_discord=info,\
-                 nvb_matrix_rtc=info,nvb_config=info",
+                 nvb_matrix_rtc=info,nvb_config=info,serenity=info",
             )
         })
     };

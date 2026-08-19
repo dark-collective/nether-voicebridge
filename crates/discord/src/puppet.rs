@@ -39,7 +39,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -104,6 +104,47 @@ const VOICE_LEAVE_FLUSH_GRACE: Duration = Duration::from_millis(1000);
 
 /// Discord's hard cap on guild nicknames (Unicode characters).
 const NICKNAME_MAX_CHARS: usize = 32;
+
+// ─── Identify-storm circuit breaker (#129) ──────────────────────────────────
+//
+// Discord auto-resets a bot's token after ~1000 gateway connections in a day
+// (the 2026-08-08 mautrix-discord incident: a 4002-close loop burned ~1333
+// IDENTIFYs in ~5 h → token reset, bridge dead until manual re-login).
+// serenity's ShardQueuer retries identifies forever with only a ~5 s floor, so
+// a server-side rejection loop would cross that budget well inside a day —
+// and a dead puppet token needs an operator to mint a new one and edit the
+// config. Every gateway `ready` is one completed IDENTIFY (a successful
+// RESUME does not fire `ready`), so counting readies per bot counts exactly
+// what Discord's budget counts.
+
+/// Ready events within [`IDENTIFY_STORM_WINDOW`] that trip the breaker.
+/// Legitimate churn is ~a handful of identifies per DAY; ten in ten minutes is
+/// unambiguously a loop, and parking at 10 spends ~1% of the daily budget.
+const IDENTIFY_STORM_THRESHOLD: usize = 10;
+
+/// Sliding window for [`IDENTIFY_STORM_THRESHOLD`].
+const IDENTIFY_STORM_WINDOW: Duration = Duration::from_secs(600);
+
+/// How long a tripped bot stays parked (gateway down, allocations released)
+/// before `run` re-arms it. Worst case a still-broken bot costs
+/// `THRESHOLD + 1` identifies per cooldown+window ≈ 200/day — safely inside
+/// the budget while still self-healing once Discord recovers.
+const PARK_COOLDOWN: Duration = Duration::from_secs(3600);
+
+/// Slide `times` to the storm window and record `now`. `true` exactly when
+/// this identify is the threshold-th within the window — the trip point.
+fn identify_storm_tripped(
+    times: &mut std::collections::VecDeque<Instant>,
+    now: Instant,
+    window: Duration,
+    threshold: usize,
+) -> bool {
+    while times.front().is_some_and(|t| now.duration_since(*t) >= window) {
+        times.pop_front();
+    }
+    times.push_back(now);
+    times.len() >= threshold
+}
 
 /// Build a puppet nickname as `{prefix}{name}`, truncated to Discord's 32-char
 /// cap on a char boundary (the prefix is preserved; the name is trimmed). An
@@ -252,6 +293,24 @@ struct PuppetSlot {
     /// Gateway-level (per-bot); voice-session health is per-(bot, guild) in
     /// [`AllocState::health`].
     connected: Arc<AtomicBool>,
+    /// Gateway `ready` (= completed IDENTIFY) timestamps inside the storm
+    /// window (#129). Slid + appended by `note_identify_and_maybe_park`.
+    identify_times: StdMutex<std::collections::VecDeque<Instant>>,
+    /// Circuit breaker tripped (#129): this bot is parked — gateway shut down,
+    /// allocations failed over, skipped by the allocator — until `run`'s
+    /// cooldown re-arms it (or the process restarts).
+    parked: Arc<AtomicBool>,
+    /// The serenity shard manager of this bot's CURRENT client incarnation,
+    /// stashed by `run` before `client.start()`. Shutting it down is the only
+    /// way to stop a reconnect→IDENTIFY loop (#129); `run` rebuilds the client
+    /// (and restores this handle) when the bot re-arms.
+    shard_manager: StdMutex<Option<Arc<serenity::gateway::ShardManager>>>,
+    /// Cancels the CURRENT incarnation's command loop on park (#129), making
+    /// it hand `cmd_rx` back (via [`PuppetSlot::cmd_rx`]) so the re-armed
+    /// incarnation's `ready` can spawn a fresh loop over the new client's
+    /// context (the old loop's `Context` holds the dead client's songbird).
+    /// Replaced each time a command loop is spawned.
+    park_signal: StdMutex<CancellationToken>,
 }
 
 /// A swappable audio route: the mixer a participant's frames currently flow into.
@@ -470,6 +529,10 @@ impl SharedPool {
                     cmd_rx: StdMutex::new(Some(cmd_rx)),
                     guilds: RwLock::new(HashSet::new()),
                     connected: Arc::new(AtomicBool::new(false)),
+                    identify_times: StdMutex::new(std::collections::VecDeque::new()),
+                    parked: Arc::new(AtomicBool::new(false)),
+                    shard_manager: StdMutex::new(None),
+                    park_signal: StdMutex::new(CancellationToken::new()),
                 }
             })
             .collect();
@@ -664,24 +727,54 @@ impl SharedPool {
                 idx,
             };
             let token = slot.token.clone();
+            let pool = self.clone();
+            let bot_shutdown = shutdown.clone();
             futs.push(async move {
-                let res = async {
-                    // Puppets both PLAY their participant and (when anchor) CAPTURE
-                    // Discord speakers, so they need Opus decode / DAVE-receive.
-                    let sb_config = songbird::Config::default()
-                        .decode_mode(DecodeMode::Decode(DecodeConfig::default()));
-                    let mut client = Client::builder(&token, intents)
-                        .event_handler(handler)
-                        .register_songbird_from_config(sb_config)
-                        .await
-                        .map_err(|e| anyhow!("failed to build puppet {idx} client: {e}"))?;
-                    tracing::info!(idx, "starting puppet gateway");
-                    client
-                        .start()
-                        .await
-                        .map_err(|e| anyhow!("puppet {idx} client error: {e}"))
-                }
-                .await;
+                // Park/re-arm lifecycle (#129): a client whose gateway the
+                // circuit breaker shut down exits `start()` cleanly; after the
+                // cooldown, rebuild the client (fresh shard queue, fresh
+                // handle) and go again. Everything else exits the loop as
+                // before (dead puppet, degraded pool — #71).
+                let res = loop {
+                    let res = async {
+                        // Puppets both PLAY their participant and (when anchor) CAPTURE
+                        // Discord speakers, so they need Opus decode / DAVE-receive.
+                        let sb_config = songbird::Config::default()
+                            .decode_mode(DecodeMode::Decode(DecodeConfig::default()));
+                        let mut client = Client::builder(&token, intents)
+                            .event_handler(handler.clone())
+                            .register_songbird_from_config(sb_config)
+                            .await
+                            .map_err(|e| anyhow!("failed to build puppet {idx} client: {e}"))?;
+                        // Stash the shard-manager handle so the breaker can
+                        // stop this incarnation's gateway (#129).
+                        *pool.slots[idx]
+                            .shard_manager
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) =
+                            Some(client.shard_manager.clone());
+                        tracing::info!(idx, "starting puppet gateway");
+                        client
+                            .start()
+                            .await
+                            .map_err(|e| anyhow!("puppet {idx} client error: {e}"))
+                    }
+                    .await;
+                    let parked = pool.slots[idx].parked.load(Ordering::SeqCst);
+                    if !parked || bot_shutdown.is_cancelled() {
+                        break res;
+                    }
+                    tracing::warn!(
+                        idx,
+                        cooldown_s = PARK_COOLDOWN.as_secs(),
+                        "parked puppet gateway is down — cooling off before re-arm (#129)"
+                    );
+                    tokio::select! {
+                        _ = bot_shutdown.cancelled() => break res,
+                        _ = tokio::time::sleep(PARK_COOLDOWN) => {}
+                    }
+                    pool.rearm_parked(idx);
+                };
                 (idx, res)
             });
         }
@@ -887,6 +980,10 @@ impl SharedPool {
             if guard.sessions.contains_key(&(i, guild)) {
                 continue;
             }
+            // Skip a parked bot (#129): its gateway is deliberately down.
+            if slot.parked.load(Ordering::SeqCst) {
+                continue;
+            }
             // Skip pairs quarantined after a join timeout in THIS guild — picking
             // one would just fail again. A recovery timer clears the flag.
             if guard.health.get(&(i, guild)).is_some_and(|h| h.unhealthy) {
@@ -1049,6 +1146,9 @@ impl SharedPool {
                         Assign::Puppet { idx, seq }
                             if *idx != donor_anchor
                                 && self.bot_in_guild(*idx, target_guild)
+                                // Parked (#129): its assignments are being
+                                // failed over — never steal it.
+                                && !self.slots[*idx].parked.load(Ordering::SeqCst)
                                 && !guard
                                     .health
                                     .get(&(*idx, target_guild))
@@ -1517,6 +1617,16 @@ impl SharedPool {
                 .min(self.quarantine_max)
         };
 
+        self.fail_over_session(guard, idx, guild);
+        backoff
+    }
+
+    /// Fail over whatever bot `idx` was serving in `guild`: free its session
+    /// (and anchorship) there and re-home the participant to a healthy free
+    /// bot, or to overflow when none is available. Shared by the join-timeout
+    /// quarantine path ([`Self::on_join_failed`]) and the identify-storm park
+    /// (#129, [`Self::park_bot`]). Caller holds the alloc lock.
+    fn fail_over_session(&self, guard: &mut AllocState, idx: usize, guild: GuildId) {
         // Locate the (bridge, key) this bot was serving in the failed guild.
         let found = guard
             .channels
@@ -1531,8 +1641,8 @@ impl SharedPool {
         let Some((bridge, key)) = found else {
             // Participant already left during the join — just free the bot there.
             guard.sessions.remove(&(idx, guild));
-            tracing::warn!(idx, "puppet join failed; assignment already gone — quarantined");
-            return backoff;
+            tracing::warn!(idx, "puppet freed; assignment already gone");
+            return;
         };
 
         let was_anchor = guard.channels[&bridge].anchor.load(Ordering::Relaxed) == idx;
@@ -1553,7 +1663,7 @@ impl SharedPool {
                 .anchor
                 .store(NO_ANCHOR, Ordering::Relaxed);
         }
-        tracing::warn!(bridge = %bridge, key = %key, idx, was_anchor, "puppet join failed — bot quarantined; failing over");
+        tracing::warn!(bridge = %bridge, key = %key, idx, was_anchor, "puppet unavailable here — failing its assignment over");
 
         let seq = {
             guard.next_seq += 1;
@@ -1606,11 +1716,98 @@ impl SharedPool {
                 bridge = %bridge,
                 key = %key,
                 guild = %guild,
-                "puppet join failed and no healthy pool bot free — channel DEGRADED \
+                "puppet unavailable and no healthy pool bot free — channel DEGRADED \
                  (capture anchor down / audio via overflow until a bot recovers)"
             );
         }
-        backoff
+    }
+
+    /// Record one completed IDENTIFY (a gateway `ready`) for bot `idx` and trip
+    /// the circuit breaker on a storm (#129). Returns `true` when the bot is
+    /// (now) parked — the caller (`ready`) must then skip its normal wiring.
+    fn note_identify_and_maybe_park(&self, idx: usize) -> bool {
+        let slot = &self.slots[idx];
+        if slot.parked.load(Ordering::SeqCst) {
+            // A straggler ready racing the park's shutdown — ignore it.
+            return true;
+        }
+        let tripped = identify_storm_tripped(
+            &mut slot.identify_times.lock().unwrap_or_else(PoisonError::into_inner),
+            Instant::now(),
+            IDENTIFY_STORM_WINDOW,
+            IDENTIFY_STORM_THRESHOLD,
+        );
+        if tripped {
+            self.park_bot(idx);
+        }
+        tripped
+    }
+
+    /// Trip the identify-storm breaker for bot `idx` (#129): mark it parked
+    /// (the allocator skips it), fail its sessions over to the rest of the
+    /// pool, clear its guild footprint, and shut its gateway down — the only
+    /// way to stop serenity's unbounded reconnect→IDENTIFY loop before it
+    /// burns Discord's ~1000-connections/day budget and gets the token
+    /// auto-reset. `run` re-arms the bot after [`PARK_COOLDOWN`].
+    fn park_bot(&self, idx: usize) {
+        let slot = &self.slots[idx];
+        if slot.parked.swap(true, Ordering::SeqCst) {
+            return; // already parked by a racing ready
+        }
+        slot.connected.store(false, Ordering::Relaxed);
+        tracing::error!(
+            idx,
+            threshold = IDENTIFY_STORM_THRESHOLD,
+            window_s = IDENTIFY_STORM_WINDOW.as_secs(),
+            cooldown_s = PARK_COOLDOWN.as_secs(),
+            "puppet gateway IDENTIFY STORM — circuit breaker tripped: parking the bot \
+             (gateway down, allocations failing over) to protect its token from \
+             Discord's 1000-connections/day auto-reset (#129)"
+        );
+
+        // Fail over everything this bot serves, in every guild. Parking is
+        // bot-level (the gateway is shared), unlike the per-(bot,guild) voice
+        // quarantine.
+        {
+            let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+            let guard = &mut *guard;
+            let guilds: Vec<GuildId> = guard
+                .sessions
+                .keys()
+                .filter(|(i, _)| *i == idx)
+                .map(|(_, g)| *g)
+                .collect();
+            for guild in guilds {
+                self.fail_over_session(guard, idx, guild);
+            }
+            self.rebalance(guard);
+        }
+        // Forget the guild footprint so `any_bot_in_guild` (link preflight) and
+        // the operator `status` stop counting a bot that cannot serve; `ready`
+        // re-seeds it on re-arm.
+        slot.guilds.write().unwrap_or_else(PoisonError::into_inner).clear();
+
+        // Retire this incarnation's command loop (its `ctx` dies with the
+        // gateway below); it hands `cmd_rx` back for the re-armed incarnation.
+        slot.park_signal.lock().unwrap_or_else(PoisonError::into_inner).cancel();
+
+        // Stop the gateway. Spawned: `shutdown_all` must not be awaited from
+        // inside an event-handler dispatch (the runner it would join on).
+        let mgr = slot.shard_manager.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(mgr) = mgr {
+            tokio::spawn(async move { mgr.shutdown_all().await });
+        } else {
+            tracing::warn!(idx, "parked puppet has no shard-manager handle — gateway may keep reconnecting until process restart");
+        }
+    }
+
+    /// Re-arm a parked bot after its cooldown (#129): clear the breaker state
+    /// so `run`'s rebuilt client starts from a clean window.
+    fn rearm_parked(&self, idx: usize) {
+        let slot = &self.slots[idx];
+        slot.identify_times.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        slot.parked.store(false, Ordering::SeqCst);
+        tracing::warn!(idx, "parked puppet cooldown over — re-arming its gateway (#129)");
     }
 
     /// Clear a (bot, guild) join-timeout quarantine (after the backoff cooldown)
@@ -2205,6 +2402,7 @@ impl PlaybackRouter for ChannelView {
 
 /// Per-puppet gateway handler. On `ready` it captures a live [`Context`] and
 /// spawns the (channel-agnostic) command loop; it never auto-joins.
+#[derive(Clone)]
 struct PuppetHandler {
     pool: Arc<SharedPool>,
     idx: usize,
@@ -2215,6 +2413,14 @@ impl EventHandler for PuppetHandler {
     #[tracing::instrument(parent = None, name = "puppet", skip_all, fields(idx = self.idx))]
     async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!(idx = self.idx, bot_user = %ready.user.name, "puppet connected");
+
+        // Identify-storm circuit breaker (#129): every `ready` is one completed
+        // IDENTIFY against Discord's ~1000/day budget. On a storm this parks
+        // the bot (fails its work over, shuts the gateway down) — skip the
+        // normal wiring below, it would re-seed state the park just cleared.
+        if self.pool.note_identify_and_maybe_park(self.idx) {
+            return;
+        }
 
         // Record this bot's own user id so it is never minted as a ghost.
         self.pool
@@ -2296,12 +2502,18 @@ impl EventHandler for PuppetHandler {
             return;
         };
 
+        // Fresh park signal per command-loop incarnation (#129): parking
+        // cancels it, the loop hands `rx` back, and a re-armed client's ready
+        // takes it again here — with THIS (new) `ctx`.
+        let park = CancellationToken::new();
+        *slot.park_signal.lock().unwrap_or_else(PoisonError::into_inner) = park.clone();
         tokio::spawn(puppet_command_loop(
             ctx,
             self.idx,
             self.pool.nickname_prefix.clone(),
             self.pool.clone(),
             rx,
+            park,
         ));
         slot.connected.store(true, Ordering::Relaxed);
     }
@@ -2875,13 +3087,35 @@ async fn puppet_command_loop(
     nickname_prefix: Arc<str>,
     pool: Arc<SharedPool>,
     mut cmd_rx: mpsc::Receiver<PuppetCommand>,
+    park: CancellationToken,
 ) {
     // One live engagement per guild (at most one voice Call per guild per bot).
     let mut active: HashMap<GuildId, GuildConn> = HashMap::new();
     // Monotonic join generation shared across this bot's guilds; each (re)join
     // stamps its conn, so a stale `DriverDropped` is recognisable per guild.
     let mut epoch: u64 = 0;
-    while let Some(cmd) = cmd_rx.recv().await {
+    loop {
+        let cmd = tokio::select! {
+            biased;
+            // Park (#129): this loop's `ctx` belongs to the incarnation whose
+            // gateway the breaker just shut down — its songbird can no longer
+            // join voice. Hand the receiver back (the allocator's senders stay
+            // valid) so the re-armed incarnation's `ready` spawns a fresh loop
+            // over the new context, and drop this one.
+            _ = park.cancelled() => {
+                for (_, mut conn) in active.drain() {
+                    conn.cancel_gates();
+                }
+                *pool.slots[idx].cmd_rx.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(cmd_rx);
+                tracing::info!(idx, "puppet command loop parked — receiver handed back for re-arm (#129)");
+                return;
+            }
+            cmd = cmd_rx.recv() => match cmd {
+                Some(cmd) => cmd,
+                None => break,
+            },
+        };
         match cmd {
             PuppetCommand::Assign { ctx: chan, display_name, mixer } => {
                 let chan = *chan;
@@ -3803,6 +4037,66 @@ mod tests {
         // Pool exhausted → overflow.
         p.assign("A", "carol", "Carol");
         assert!(p.test_is_overflow("A", "carol"));
+    }
+
+    /// #129: the breaker trips exactly at the threshold-th IDENTIFY within the
+    /// window, and old entries slide out.
+    #[test]
+    fn identify_storm_trips_at_threshold_within_window() {
+        let w = Duration::from_secs(600);
+        let t0 = Instant::now();
+        let mut times = std::collections::VecDeque::new();
+        for i in 0..9u64 {
+            assert!(
+                !identify_storm_tripped(&mut times, t0 + Duration::from_secs(i * 60), w, 10),
+                "identify {} must not trip",
+                i + 1
+            );
+        }
+        assert!(identify_storm_tripped(&mut times, t0 + Duration::from_secs(540), w, 10));
+    }
+
+    #[test]
+    fn identify_storm_window_slides_old_entries_out() {
+        let w = Duration::from_secs(600);
+        let t0 = Instant::now();
+        let mut times = std::collections::VecDeque::new();
+        for i in 0..9u64 {
+            identify_storm_tripped(&mut times, t0 + Duration::from_secs(i * 60), w, 10);
+        }
+        // 11 min later the first two readies are outside the window: 8 in
+        // window, no trip — steady slow churn never parks a bot.
+        assert!(!identify_storm_tripped(&mut times, t0 + Duration::from_secs(660), w, 10));
+    }
+
+    /// #129: parking fails the bot's work over, hides it from the allocator,
+    /// and re-arming makes it allocatable again.
+    #[test]
+    fn parked_bot_is_skipped_and_rearm_restores_it() {
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        p.assign("A", "bob", "Bob");
+        let sa = p.test_slot_of("A", "alice").unwrap();
+
+        // Park alice's bot: her puppet fails over, and with the only other bot
+        // taken she lands in overflow (degraded, not dropped).
+        p.park_bot(sa);
+        assert!(p.test_is_overflow("A", "alice"));
+
+        // New participants must not be allocated onto the parked bot.
+        p.assign("A", "carol", "Carol");
+        assert!(p.test_is_overflow("A", "carol"));
+
+        // Re-arm: in production the rebuilt client's `ready` re-seeds the
+        // guild footprint (the park cleared it), whose rebalance promotes
+        // waiting overflow onto the bot again.
+        p.rearm_parked(sa);
+        p.note_bot_guild(sa, GuildId::new(1));
+        assert!(p.test_slot_of("A", "alice").is_some(), "alice re-promoted onto the re-armed bot");
+        // Freeing the other bot re-homes the remaining overflow speaker too.
+        p.release("A", "bob");
+        assert!(p.test_slot_of("A", "carol").is_some(), "carol re-promoted");
     }
 
     #[test]
