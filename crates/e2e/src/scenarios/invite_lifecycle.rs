@@ -62,7 +62,11 @@ pub static MGMT_INVITE_OFFLINE: ScenarioDef = ScenarioDef {
 
 pub static MGMT_DM_PENDING_REAP: ScenarioDef = ScenarioDef {
     name: "mgmt_dm_pending_reap",
-    expectation: Expectation::KnownFail { issue: "#104" },
+    // Was KnownFail{#104} (local cold-outreach UTD): Tuwunel v1.8.2 fixed the
+    // local leg — the scenario unexpected-PASSED nightlies #327/#328, and its
+    // #329 "failure" was the harness txn-dedup swallow, not #104 (the federated
+    // leg, `fed_cold_outreach_utd`, stays KnownFail). Flipped 2026-08-19 (#100).
+    expectation: Expectation::Pass,
     run: boxed_reap,
 };
 
