@@ -952,6 +952,13 @@ fn window_check(
     None
 }
 
+/// Capped exponential backoff for the management bot's startup retries (#126):
+/// 5 s → 10 s → 20 s → 40 s → 60 s cap. Same shape as the supervisor's bridge
+/// restart backoff (#130), local because `run` receives no `TimingConfig`.
+fn startup_backoff(attempt: u32) -> Duration {
+    Duration::from_secs((5u64 << attempt.min(4)).min(60))
+}
+
 /// Run the management bot to completion (cancelled by `shutdown`).
 ///
 /// Builds its own matrix-sdk client on the appservice bot account with a
@@ -986,14 +993,48 @@ pub async fn run(
         .await
         .context("building management-bot client")?;
 
-    let access_token = crate::matrix::appservice_login_as(
-        &cfg.homeserver_url,
-        &cfg.appservice_token,
-        bot_user_id.localpart(),
-        &device_id,
-    )
-    .await
-    .context("management-bot appservice login")?;
+    // #126: a homeserver that is unreachable (or 5xx-ing behind its proxy) at
+    // boot must not permanently kill the management bot. The failure mode is
+    // masked — the process stays up and `systemctl is-active` reports healthy
+    // while self-serve DMs and the operator console are silently gone — so
+    // network-shaped login failures retry with capped backoff, indefinitely.
+    // Definite config errors (401/403 bad as_token, 404 wrong URL) still fail
+    // fast and loudly.
+    let access_token = {
+        let mut attempt: u32 = 0;
+        loop {
+            match crate::matrix::appservice_login_as(
+                &cfg.homeserver_url,
+                &cfg.appservice_token,
+                bot_user_id.localpart(),
+                &device_id,
+            )
+            .await
+            {
+                Ok(token) => break token,
+                Err(e) if crate::auth_error::appservice_login_error_is_terminal(&e) => {
+                    return Err(e).context(
+                        "management-bot appservice login (non-retryable — check as_token / homeserver_url)",
+                    );
+                }
+                Err(e) => {
+                    let delay = startup_backoff(attempt);
+                    attempt = attempt.saturating_add(1);
+                    tracing::warn!(
+                        error = %format!("{e:#}"), attempt, delay_s = delay.as_secs(),
+                        "management-bot appservice login failed (homeserver not up yet?) — retrying (#126)"
+                    );
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            tracing::info!("management bot stopping (shutdown during login retry)");
+                            return Ok(());
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+            }
+        }
+    };
     client
         .restore_session(MatrixSession {
             meta: SessionMeta {
@@ -1012,13 +1053,44 @@ pub async fn run(
     // One bounded sync round: uploads this device's Olm keys (so operators'
     // encrypted DMs can reach it) and populates local room state. Handlers are
     // registered AFTER it, so the backlog consumed here is never replayed as
-    // commands.
-    match tokio::time::timeout(Duration::from_secs(60), client.sync_once(SyncSettings::default()))
+    // commands. Same #126 tolerance as the login above — auth is proven at
+    // this point, so a failure here is transport-shaped unless structurally a
+    // fatal auth error.
+    let mut attempt: u32 = 0;
+    loop {
+        match tokio::time::timeout(
+            Duration::from_secs(60),
+            client.sync_once(SyncSettings::default()),
+        )
         .await
-    {
-        Ok(Ok(_)) => tracing::info!("management bot initial sync complete"),
-        Ok(Err(e)) => return Err(anyhow::anyhow!("management bot initial sync failed: {e}")),
-        Err(_) => return Err(anyhow::anyhow!("management bot initial sync timed out after 60 s")),
+        {
+            Ok(Ok(_)) => {
+                tracing::info!("management bot initial sync complete");
+                break;
+            }
+            Ok(Err(e)) if crate::auth_error::sdk_error_is_fatal_auth(&e) => {
+                return Err(anyhow::anyhow!("management bot initial sync fatal auth error: {e}"));
+            }
+            res => {
+                let delay = startup_backoff(attempt);
+                attempt = attempt.saturating_add(1);
+                let why = match res {
+                    Ok(Err(e)) => format!("{e}"),
+                    _ => "timed out after 60 s".into(),
+                };
+                tracing::warn!(
+                    error = %why, attempt, delay_s = delay.as_secs(),
+                    "management bot initial sync failed — retrying (#126)"
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        tracing::info!("management bot stopping (shutdown during initial-sync retry)");
+                        return Ok(());
+                    }
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+        }
     }
 
     // Best-effort profile. The account is shared with the bridges (same
@@ -4885,6 +4957,14 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn startup_backoff_doubles_to_a_60s_cap() {
+        let secs: Vec<u64> = (0..7).map(|a| startup_backoff(a).as_secs()).collect();
+        assert_eq!(secs, [5, 10, 20, 40, 60, 60, 60]);
+        // Far attempts stay capped (no shift overflow).
+        assert_eq!(startup_backoff(u32::MAX).as_secs(), 60);
     }
 
     // ── Discord-side approval redemption (#76 part 2) ────────────────────────

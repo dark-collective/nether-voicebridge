@@ -759,7 +759,10 @@ pub(crate) async fn appservice_login_as(
             %status, body = %body,
             "appservice login failed — does this homeserver accept m.login.application_service for the appservice user?"
         );
-        return Err(anyhow::anyhow!("appservice login failed: {status}: {body}"));
+        // Typed, so callers can branch on retryability structurally (#126) —
+        // the rendered text is unchanged ("appservice login failed: {status}: {body}").
+        return Err(anyhow::Error::new(AppserviceHttpError { status, body })
+            .context("appservice login failed"));
     }
     let json: serde_json::Value =
         serde_json::from_str(&body).context("parsing appservice login response")?;

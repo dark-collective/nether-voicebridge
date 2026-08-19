@@ -229,9 +229,11 @@ async fn main() -> Result<()> {
 
     // Management bot (#4): a plain tokio task (its future is Send, unlike the
     // bridge futures) talking to the supervisor over the control channel. It
-    // shares the pool's shutdown token so the drain stops it too. A bot that
-    // fails (bad token, homeserver down) logs and stays down — bridges are
-    // unaffected; restart the process to retry.
+    // shares the pool's shutdown token so the drain stops it too. A homeserver
+    // that is not up yet is retried inside `mgmt::run` with capped backoff
+    // (#126); an error return here is therefore config-shaped (bad token,
+    // wrong URL) or a fatal auth failure — it logs and stays down, bridges
+    // unaffected; fix the config and restart the process.
     if let Some((mgmt_cfg, server_names, data_dir)) = mgmt_inputs {
         let control = supervisor.control_handle();
         let shutdown = pool_shutdown.clone();

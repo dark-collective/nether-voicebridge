@@ -66,6 +66,35 @@ pub(crate) fn sdk_error_is_fatal_auth(e: &matrix_sdk::Error) -> bool {
     )
 }
 
+/// Is an HTTP status from the raw appservice **login** a terminal (config-
+/// shaped) failure, or worth retrying (#126)?
+///
+/// The asymmetry argument is the same as [`is_fatal_auth`]'s but the polarity
+/// differs by status class: at login time a 4xx means the *request itself* is
+/// wrong (401/403 bad `as_token`, 404 wrong `homeserver_url` path) and will
+/// never succeed by waiting — fail fast and loudly so the operator sees a
+/// config error, not an infinite silent retry. 5xx / no-response mean the
+/// homeserver (or its front proxy) is not ready — the boot-race class that
+/// used to permanently kill the management bot until a manual restart.
+/// 408/429 are the transient members of the 4xx family.
+pub(crate) fn login_status_is_terminal(status: u16) -> bool {
+    match status {
+        408 | 429 => false,
+        400..=499 => true,
+        _ => false,
+    }
+}
+
+/// [`login_status_is_terminal`] over an [`anyhow::Error`] from
+/// `appservice_login_as`: terminal only when the chain carries a typed
+/// [`AppserviceHttpError`](crate::matrix::AppserviceHttpError) with a terminal
+/// status. Transport errors, timeouts and response-parse failures have no
+/// status and are always retryable.
+pub(crate) fn appservice_login_error_is_terminal(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::matrix::AppserviceHttpError>()
+        .is_some_and(|http| login_status_is_terminal(http.status.as_u16()))
+}
+
 /// Map the ruma error kind back to its wire errcode, for the few codes the
 /// decision above cares about. `ErrorKind` is `non_exhaustive` and carries
 /// per-variant data, so matching the handful we act on (and letting everything
@@ -144,5 +173,43 @@ mod tests {
         // room whose PL forbids it) must not take the whole bridge down.
         assert!(!is_fatal_auth(Some(404), Some("M_FORBIDDEN")));
         assert!(!is_fatal_auth(None, Some("M_FORBIDDEN")));
+    }
+
+    #[test]
+    fn login_retryability_splits_on_status_class() {
+        // The #126 boot race: homeserver/proxy not up yet — always retry.
+        for s in [500, 502, 503, 504] {
+            assert!(!login_status_is_terminal(s), "{s} must be retryable");
+        }
+        // Config errors: bad as_token, wrong URL — fail fast.
+        for s in [400, 401, 403, 404] {
+            assert!(login_status_is_terminal(s), "{s} must be terminal");
+        }
+        // Transient members of the 4xx family.
+        assert!(!login_status_is_terminal(408));
+        assert!(!login_status_is_terminal(429));
+    }
+
+    #[test]
+    fn login_error_terminal_only_with_typed_status() {
+        use crate::matrix::AppserviceHttpError;
+        let terminal = anyhow::Error::new(AppserviceHttpError {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: "{\"errcode\":\"M_UNKNOWN_TOKEN\"}".into(),
+        })
+        .context("appservice login failed");
+        assert!(appservice_login_error_is_terminal(&terminal));
+
+        let boot_race = anyhow::Error::new(AppserviceHttpError {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            body: "<html>cloudflare</html>".into(),
+        })
+        .context("appservice login failed");
+        assert!(!appservice_login_error_is_terminal(&boot_race));
+
+        // A bare transport-shaped error has no typed status: retryable.
+        let transport = anyhow::anyhow!("error sending request for url (…)")
+            .context("appservice login request");
+        assert!(!appservice_login_error_is_terminal(&transport));
     }
 }
