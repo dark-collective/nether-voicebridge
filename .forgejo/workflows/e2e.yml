@@ -6,6 +6,11 @@ name: E2E (live)
 # inherently flaky, so a red run is a triage ticket, never a merge block — the
 # per-PR hermetic gate is ci.yml. Public ids are inlined (they're already in
 # the committed e2e.example.toml); only the bot/appservice tokens are secrets.
+#
+# NOTE: Forgejo pins the nightly schedule to the commit_sha of the last
+# default-branch push that touched THIS file — a source-only merge does NOT
+# refresh it. After merging a fix the nightly must pick up, bump this file
+# (a comment edit suffices) so the schedule re-registers on current master.
 on:
   workflow_dispatch:
     inputs:
