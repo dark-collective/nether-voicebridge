@@ -3,6 +3,49 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.3] - 2026-08-20
+
+**Two more silent-death modes closed: a homeserver that isn't up yet can no
+longer permanently kill the management bot, and a Discord gateway loop can no
+longer burn a puppet's token.**
+
+### Fixed
+- **The management bot survives a homeserver-unreachable boot (#126).** If the
+  homeserver (or its front proxy) was down when the process started, the bot's
+  appservice login failed once and the bot stayed dead until a manual restart —
+  masked, because the bridges and puppets carry on and `systemctl is-active`
+  reports healthy while self-serve DMs and the operator console are silently
+  gone (observed live 2026-07-22; bridges got their half of the fix from
+  0.3.2's restart backoff). Login and the initial sync now retry
+  network-shaped failures (5xx, timeouts, transport errors) with capped
+  exponential backoff (5 s → 60 s, indefinitely, a WARN per attempt), while
+  definite config errors (401/403 bad `as_token`, 404 wrong URL) still fail
+  fast and loudly — decided structurally on a typed error, never on its text.
+
+### Added
+- **Gateway identify-storm circuit breaker (#129).** Discord auto-resets a
+  bot's token after ~1000 gateway connections in a day, and serenity retries
+  IDENTIFYs forever with only a ~5 s floor — so a server-side rejection loop
+  (the failure that killed a neighbouring bridge's bot on 2026-08-08) would
+  cost a puppet its token inside a day. Every gateway `ready` is one completed
+  IDENTIFY, so the pool now counts readies per bot: ten within ten minutes
+  parks the bot — its assignments fail over through the per-(bot, guild)
+  allocator (anchors included), its gateway is shut down, and a loud ERROR is
+  logged — then a one-hour cooldown rebuilds the client and re-arms it. Worst
+  case a still-broken bot spends ~200 identifies/day, safely inside the budget,
+  while a healthy pool covers its channels.
+- **Gateway lifecycle logging by default (#129).** The built-in log filter now
+  includes `serenity=info`, so reconnect/session-invalidation lines reach the
+  journal on every deployment — previously the storm risk class was entirely
+  invisible (14 days of production journal contained zero serenity lines).
+- **Live-suite hardening (#124/#100, harness-only).** The three-night
+  `mgmt_self_serve_link` red was the harness's own transaction ids colliding
+  across nightly runs — the homeserver deduplicates them per token *forever*,
+  silently swallowing the command sends. Transaction ids now carry a per-run
+  nonce, reply scans require the command marker to be visible before matching,
+  and `mgmt_dm_pending_reap` is expected to pass (its cold-outreach failure
+  mode is fixed on Tuwunel 1.8.2).
+
 ## [0.3.2] - 2026-08-14
 
 **A network blip could no longer kill a bridge — and a dead bridge can no longer
