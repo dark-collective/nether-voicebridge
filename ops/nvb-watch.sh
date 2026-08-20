@@ -189,6 +189,31 @@ if [ -n "$pid" ] && [ "$pid" != "0" ]; then
 $(echo "$strangers" | head -5 | sed 's/^/  /')")
 fi
 
+# ── 3a. dormant-MXID invite canary (#96) ─────────────────────────────────────
+# @nether-voicebridge_bot is the conventional bot address users may still try
+# (old docs, muscle memory) but NOTHING serves it — prod's bot is
+# @voicebridge_as. An invite to it sits pending forever, silently: exactly how
+# the first real beta user got stranded (2026-07-12). Sync as it via the
+# appservice token (same exclusive namespace) and alert on any pending invite;
+# state-latched per room so each stranded invite alerts once, and the state
+# clears when the invite set empties (a re-invite re-alerts).
+DORMANT_MXID="${DORMANT_MXID:-@nether-voicebridge_bot:nether.im}"
+DORMANT_STATE="$STATE_DIR/dormant.invites"
+enc_mxid=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$DORMANT_MXID")
+dsync=$(curl -s -m 20 -K "${NVB_CURL_AS:-/opt/nvb-ops/curl-as.conf}" \
+    "$HS_URL/_matrix/client/v3/sync?user_id=$enc_mxid&timeout=0&filter=%7B%22room%22%3A%7B%22timeline%22%3A%7B%22limit%22%3A0%7D%7D%7D" 2>/dev/null)
+if [ -n "$dsync" ]; then
+    pend=$(printf '%s' "$dsync" | jq -r '.rooms.invite // {} | keys[]' 2>/dev/null)
+    if [ -n "$pend" ]; then
+        new=$(comm -13 <(sort "$DORMANT_STATE" 2>/dev/null) <(printf '%s\n' "$pend" | sort))
+        [ -n "$new" ] && ALERTS+=("📬 Pending invite(s) to the DORMANT bot address $DORMANT_MXID — nobody serves it, the inviter is stranded (#96). Point them at @voicebridge_as:nether.im, then reject the invite:
+$(printf '%s\n' "$new" | sed 's/^/  /')")
+        printf '%s\n' "$pend" | sort > "$DORMANT_STATE"
+    else
+        : > "$DORMANT_STATE"
+    fi
+fi
+
 # ── 3b. Actions conclusions: e2e nightly + master CI ─────────────────────────
 # The live e2e suite (Forgejo Actions e2e.yml) went RED for 8 days unnoticed
 # (#124) — nothing watched its conclusion. Poll the newest *scheduled* run via
