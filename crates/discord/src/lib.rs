@@ -238,6 +238,17 @@ impl VoiceReceiver {
     /// Push each present, non-excluded speaker's 20 ms mono frame to their ghost
     /// sink. Returns the number of speaker frames dropped for want of a ghost.
     fn demux_tick(&self, tick: &songbird::events::context_data::VoiceTick) -> u64 {
+        self.demux_frames(
+            tick.speaking
+                .iter()
+                .map(|(ssrc, data)| (*ssrc, data.decoded_voice.as_deref())),
+        )
+    }
+
+    /// The per-frame demux body, seamed off `VoiceTick` (which is
+    /// `non_exhaustive` and unconstructible in tests) so the capture/forward
+    /// ordering below is unit-testable.
+    fn demux_frames<'p>(&self, frames: impl Iterator<Item = (u32, Option<&'p [i16]>)>) -> u64 {
         // One read-lock each per tick; writers (puppet join/leave, speaker
         // announce, ghost assign) are all rare relative to the 50 Hz tick.
         let excluded = self.exclude.read().unwrap_or_else(PoisonError::into_inner);
@@ -245,11 +256,11 @@ impl VoiceReceiver {
         let sinks = self.user_sinks.read().unwrap_or_else(PoisonError::into_inner);
         let optout = self.optout.read().unwrap_or_else(PoisonError::into_inner);
         let mut dropped = 0u64;
-        for (ssrc, data) in &tick.speaking {
-            if excluded.contains(ssrc) {
+        for (ssrc, pcm) in frames {
+            if excluded.contains(&ssrc) {
                 continue;
             }
-            let Some(pcm) = &data.decoded_voice else { continue };
+            let Some(pcm) = pcm else { continue };
             // Shape diagnostic (#32): a non-1920 decoded frame (short PLC on packet
             // loss, or a format surprise) is a candidate corruption source. Warn
             // rate-limited rather than silently downmixing an odd-length frame.
@@ -257,7 +268,7 @@ impl VoiceReceiver {
                 let n = self.shape_warns.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_multiple_of(50) {
                     tracing::warn!(
-                        ssrc = *ssrc,
+                        ssrc,
                         len = pcm.len(),
                         expected = STEREO_20MS_SAMPLES,
                         count = n,
@@ -265,21 +276,27 @@ impl VoiceReceiver {
                     );
                 }
             }
-            if let Some(sink) = &self.capture_sink {
-                sink.write_frame(*ssrc, pcm);
-            }
             // Attribute SSRC → user → ghost. A speaker with no mapping yet (their
             // SpeakingStateUpdate or ghost assign hasn't landed) is dropped this
             // tick; the next tick (or their next utterance) resolves it.
             // Opted-out users (#63) are dropped HERE, unconditionally — even if
             // a ghost sink still exists (e.g. mid-retirement), their audio never
-            // crosses to Matrix. This is the single Discord→Matrix choke point.
-            match ssrc_map.get(ssrc) {
+            // crosses to Matrix. This is the single Discord→Matrix choke point —
+            // and (#70 F2-5) the diagnostic WAV tap sits BEHIND both attribution
+            // and the opt-out gate: consent must be provable before any frame
+            // touches disk, so an opted-out OR not-yet-attributed speaker is
+            // never recorded (the pre-#70 tap ran first and recorded everyone).
+            match ssrc_map.get(&ssrc) {
                 Some(uid) if optout.contains(uid) => {}
-                Some(uid) => match sinks.get(uid) {
-                    Some(sink) => sink.push(&audio::downmix_stereo_to_mono(pcm)),
-                    None => dropped += 1,
-                },
+                Some(uid) => {
+                    if let Some(sink) = &self.capture_sink {
+                        sink.write_frame(ssrc, pcm);
+                    }
+                    match sinks.get(uid) {
+                        Some(sink) => sink.push(&audio::downmix_stereo_to_mono(pcm)),
+                        None => dropped += 1,
+                    }
+                }
                 None => dropped += 1,
             }
         }
@@ -441,5 +458,46 @@ mod playback_tests {
             Err(e) => println!("PROMOTE ERR: {e:?}"),
         }
         assert!(ok, "playback input failed to promote");
+    }
+
+    /// #70 F2-5: the diagnostic WAV tap sits BEHIND attribution + the opt-out
+    /// gate — an opted-out or not-yet-attributed speaker is never written to
+    /// disk, while a consenting mapped speaker still is. (The pre-#70 tap ran
+    /// before both and recorded everyone, violating the /bridge optout
+    /// contract whenever capture_wav diagnostics were on.)
+    #[test]
+    fn capture_tap_respects_optout_and_attribution() {
+        let exclude: SharedExclude = Arc::new(RwLock::new(HashSet::from([990_004u32])));
+        let ssrc_map: SsrcMap =
+            Arc::new(RwLock::new(HashMap::from([(990_001u32, 111u64), (990_002, 222)])));
+        let user_sinks: UserSinkMap = Arc::new(RwLock::new(HashMap::new()));
+        let optout: OptoutSet = Arc::new(RwLock::new(HashSet::from([222u64])));
+        let sink = Arc::new(CaptureSink::new());
+        let rx = VoiceReceiver::new(
+            Arc::from("test"),
+            exclude,
+            ssrc_map,
+            user_sinks,
+            Some(sink.clone()),
+            optout,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            0,
+        );
+        let frame = vec![0i16; STEREO_20MS_SAMPLES];
+        let dropped = rx.demux_frames(
+            [
+                (990_001u32, Some(frame.as_slice())), // mapped + consenting → captured
+                (990_002, Some(frame.as_slice())),    // mapped + OPTED OUT → never captured
+                (990_003, Some(frame.as_slice())),    // unmapped → consent unprovable → not captured
+                (990_004, Some(frame.as_slice())),    // excluded (our own puppet) → untouched
+            ]
+            .into_iter(),
+        );
+        assert_eq!(sink.captured_ssrcs(), vec![990_001]);
+        // Dropped = the consenting speaker without a ghost sink yet (1) + the
+        // unmapped speaker (1); opted-out and excluded are deliberate non-drops.
+        assert_eq!(dropped, 2);
+        // Tidy the WAV the consenting speaker's tap created in CWD.
+        let _ = std::fs::remove_file("capture_990001.wav");
     }
 }

@@ -967,6 +967,25 @@ impl SharedPool {
         }
     }
 
+    /// Is `user_id` currently recorded present in `bridge`'s voice channel?
+    /// The #70 F2-4 commit gate: `ensure_ghost` re-checks this after its
+    /// awaited member lookup so a leave processed during the await can't be
+    /// followed by a phantom ghost mint.
+    fn presence_contains(&self, bridge: &str, user_id: u64) -> bool {
+        let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.channels.get(bridge).is_some_and(|ch| ch.presence.contains(&user_id))
+    }
+
+    /// Record a SEEDED voice member's presence ahead of ghost minting — the
+    /// shared contract of the bulk-seeding paths (`guild_create`, the anchor's
+    /// cache seeding — #70 F2-3): bridge bots are never presence, and the
+    /// returned join edge gates the ghost, so seeding is idempotent across the
+    /// pool's bots AND the member's later leave is an observable edge that
+    /// retires the ghost.
+    fn seed_presence(&self, bridge: &str, user_id: u64) -> bool {
+        !self.is_bridge_bot(user_id) && self.note_presence(bridge, user_id, true)
+    }
+
     // ── Allocation (all under `self.alloc`) ──────────────────────────────────
 
     /// Claim a bot for `guild`: the first bot that is a member, healthy, and has
@@ -2568,7 +2587,7 @@ impl EventHandler for PuppetHandler {
         for ch in self.pool.channels_in_guild(guild_id) {
             if Some(ch.channel_id) == here {
                 if self.pool.note_presence(&ch.bridge, user_id, true) {
-                    ensure_ghost(&ctx, &ch, user_id, new.member.as_ref()).await;
+                    ensure_ghost(&self.pool, &ctx, &ch, user_id, new.member.as_ref()).await;
                 }
                 ch.capture_router.set_muted(&user_id.to_string(), muted);
             } else if self.pool.note_presence(&ch.bridge, user_id, false) {
@@ -2599,7 +2618,7 @@ impl EventHandler for PuppetHandler {
             }
             if let Some(ch) = self.pool.by_channel(guild.id, chan_id) {
                 if self.pool.note_presence(&ch.bridge, user_id, true) {
-                    ensure_ghost(&ctx, &ch, user_id, vs.member.as_ref()).await;
+                    ensure_ghost(&self.pool, &ctx, &ch, user_id, vs.member.as_ref()).await;
                 }
                 // Seed the initial mute state for a user already muted before this
                 // bot connected (their toggle won't arrive as a voice_state_update).
@@ -2911,7 +2930,13 @@ async fn respond_ephemeral(ctx: &Context, cmd: &CommandInteraction, text: &str) 
 /// Mint a ghost for a Discord user in the channel if they don't have one yet.
 /// Skips bridge-owned puppets and any other bot. Resolves the display name from
 /// the supplied `Member` if present, else via a lookup.
-async fn ensure_ghost(ctx: &Context, channel: &ChannelCtx, user_id: u64, member: Option<&Member>) {
+async fn ensure_ghost(
+    pool: &Arc<SharedPool>,
+    ctx: &Context,
+    channel: &ChannelCtx,
+    user_id: u64,
+    member: Option<&Member>,
+) {
     // Exclude only OUR OWN puppet/anchor bots (echo prevention, constraint #5).
     // Third-party bots (e.g. a TTS bot) ARE bridged — their audio is a legitimate
     // Discord speaker to mirror into Matrix. Our bots are doubly protected: their
@@ -2954,6 +2979,20 @@ async fn ensure_ghost(ctx: &Context, channel: &ChannelCtx, user_id: u64, member:
             }
         },
     };
+
+    // #70 F2-4: the member lookup above is awaited with NO locks held — the
+    // user's LEAVE may have been fully processed meanwhile (its `drop_ghost`
+    // found no sink to remove and did nothing). Committing now would mint a
+    // ghost with no retire path: a phantom in the call that also blocks the
+    // idle-anchor release. Re-check presence after the await; the residual
+    // window shrinks from HTTP-lookup-sized to lock-acquisition-sized.
+    // LOCK ORDER: this takes the alloc lock and must stay OUTSIDE the
+    // user_sinks write lock below — the release paths nest alloc → user_sinks,
+    // so nesting user_sinks → alloc here would arm a deadlock.
+    if !pool.presence_contains(&channel.bridge, user_id) {
+        tracing::debug!(user_id, bridge = %channel.bridge, "user left during ghost member lookup — not minting (#70)");
+        return;
+    }
 
     // Commit under the user_sinks write lock, and RE-CHECK bot_ids here: the user's
     // gateway `ready` may have landed during the (awaited) name resolution above,
@@ -3191,7 +3230,7 @@ async fn puppet_command_loop(
                 if let Some(conn) = active.get_mut(&guild) {
                     // Idempotent: drop any prior overflow gate before (re)anchoring.
                     cancel_gate(&mut conn.overflow_gate);
-                    if let Some(handle) = puppet_become_anchor(&conn.chan, idx, &ctx).await {
+                    if let Some(handle) = puppet_become_anchor(&conn.chan, idx, &ctx, &pool).await {
                         let tok = CancellationToken::new();
                         let jh = spawn_speaking_gate(
                             handle,
@@ -3334,6 +3373,7 @@ async fn puppet_become_anchor(
     channel: &ChannelCtx,
     idx: usize,
     ctx: &Context,
+    pool: &Arc<SharedPool>,
 ) -> Option<TrackHandle> {
     let manager = songbird::get(ctx).await?;
     let Some(call_lock) = manager.get(channel.guild_id) else {
@@ -3380,7 +3420,17 @@ async fn puppet_become_anchor(
         tracing::info!(count = present.len(), bridge = %channel.bridge, "seeding ghosts for existing voice members");
     }
     for uid in present {
-        ensure_ghost(ctx, channel, uid, None).await;
+        // #70 F2-3: mirror the guild_create seeding path — record presence,
+        // gate the ghost on the observed edge. A runtime-registered channel
+        // (#45 link flow) starts with an EMPTY presence set and gets no
+        // guild_create replay, so seeding via ensure_ghost alone left the
+        // user's eventual leave unobservable (`note_presence(false)` removed
+        // nothing → drop_ghost never ran): a phantom participant stayed in
+        // the Element Call indefinitely and held the anchor as if speakers
+        // were present.
+        if pool.seed_presence(&channel.bridge, uid) {
+            ensure_ghost(pool, ctx, channel, uid, None).await;
+        }
     }
     Some(overflow_handle)
 }
@@ -3494,15 +3544,21 @@ async fn puppet_join(
         let call_lock = manager.get_or_insert(channel.guild_id);
         let track = {
             let mut call = call_lock.lock().await;
-            call.add_global_event(
-                CoreEvent::DriverConnect.into(),
-                PuppetSsrcRegistrar {
-                    bridge: channel.bridge.clone(),
-                    idx,
-                    exclude: channel.exclude.clone(),
-                    current_ssrc: current_ssrc.clone(),
-                },
-            );
+            // BOTH connect events (#70 F2-6): songbird's in-driver full
+            // reconnect fires DriverReconnect — never DriverConnect — and its
+            // re-Identify may carry a fresh SSRC that must replace the old one
+            // in the exclusion set.
+            for ev in [CoreEvent::DriverConnect, CoreEvent::DriverReconnect] {
+                call.add_global_event(
+                    ev.into(),
+                    PuppetSsrcRegistrar {
+                        bridge: channel.bridge.clone(),
+                        idx,
+                        exclude: channel.exclude.clone(),
+                        current_ssrc: current_ssrc.clone(),
+                    },
+                );
+            }
             call.add_global_event(
                 CoreEvent::SpeakingStateUpdate.into(),
                 SpeakingLogger::new(channel.bridge.clone(), channel.ssrc_map.clone()),
@@ -3699,18 +3755,53 @@ struct PuppetSsrcRegistrar {
     current_ssrc: Arc<StdMutex<Option<u32>>>,
 }
 
+/// Register `ssrc` as this puppet's excluded SSRC, retiring the previously
+/// tracked one when it changed (#70 F2-6). Returns the previous SSRC. Pure
+/// over the shared state so the DriverReconnect path is unit-testable.
+///
+/// Why the removal matters: Discord's voice server recycles SSRCs. A stale
+/// puppet SSRC left in the exclusion set can later be handed to a HUMAN,
+/// whose Discord→Matrix audio would then be silently dropped by the capture
+/// gate — the worse half of the F2-6 failure (the other half, the puppet's
+/// new SSRC going unexcluded, only pollutes debug WAVs and drop counters).
+fn swap_excluded_ssrc(
+    exclude: &SharedExclude,
+    current_ssrc: &Arc<StdMutex<Option<u32>>>,
+    ssrc: u32,
+) -> Option<u32> {
+    let prev = current_ssrc
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .replace(ssrc);
+    let mut ex = exclude.write().unwrap_or_else(PoisonError::into_inner);
+    if let Some(p) = prev {
+        if p != ssrc {
+            ex.remove(&p);
+        }
+    }
+    ex.insert(ssrc);
+    prev
+}
+
 #[async_trait]
 impl SongbirdEventHandler for PuppetSsrcRegistrar {
     #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %self.bridge))]
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        if let EventContext::DriverConnect(c) = ctx {
-            self.exclude
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(c.ssrc);
-            *self.current_ssrc.lock().unwrap_or_else(PoisonError::into_inner) = Some(c.ssrc);
-            tracing::info!(idx = self.idx, ssrc = c.ssrc, "puppet SSRC registered for echo-exclusion");
-        }
+        // DriverConnect on the first connection; DriverReconnect on songbird's
+        // in-driver full reconnect (#70 F2-6), whose re-Identify may return a
+        // fresh SSRC. A same-SSRC resume makes the swap a no-op.
+        let ssrc = match ctx {
+            EventContext::DriverConnect(c) => c.ssrc,
+            EventContext::DriverReconnect(c) => c.ssrc,
+            _ => return None,
+        };
+        let prev = swap_excluded_ssrc(&self.exclude, &self.current_ssrc, ssrc);
+        tracing::info!(
+            idx = self.idx,
+            ssrc,
+            prev_ssrc = ?prev,
+            "puppet SSRC registered for echo-exclusion"
+        );
         None
     }
 }
@@ -4037,6 +4128,48 @@ mod tests {
         // Pool exhausted → overflow.
         p.assign("A", "carol", "Carol");
         assert!(p.test_is_overflow("A", "carol"));
+    }
+
+    /// #70 F2-3: seeding records presence (so the later leave is an observed
+    /// edge that retires the ghost), gates on the edge (idempotent across the
+    /// pool's bots), and never records bridge bots.
+    #[test]
+    fn seed_presence_records_edges_and_skips_bots() {
+        let p = pool(1);
+        channel(&p, "A", 1, 10);
+        assert!(p.seed_presence("A", 777), "first seed is a join edge");
+        assert!(!p.seed_presence("A", 777), "re-seed is not (idempotent)");
+        assert!(p.presence_contains("A", 777));
+        // The leave is now an observed edge — pre-#70 the anchor-seeded user
+        // was absent from presence and this returned false (phantom ghost).
+        assert!(p.note_presence("A", 777, false), "leave edge observed");
+        assert!(!p.presence_contains("A", 777));
+        // A bridge bot is never presence.
+        p.bot_ids.write().unwrap().insert(888);
+        assert!(!p.seed_presence("A", 888));
+        assert!(!p.presence_contains("A", 888));
+    }
+
+    /// #70 F2-6: a reconnect's fresh SSRC replaces the stale one in the
+    /// exclusion set (a recycled stale SSRC would silently mute a human);
+    /// a same-SSRC resume is a no-op.
+    #[test]
+    fn swap_excluded_ssrc_replaces_stale_and_noops_on_resume() {
+        let exclude: SharedExclude = Arc::new(RwLock::new(HashSet::new()));
+        let current = Arc::new(StdMutex::new(None));
+        // First connect.
+        assert_eq!(swap_excluded_ssrc(&exclude, &current, 100), None);
+        assert!(exclude.read().unwrap().contains(&100));
+        // Full reconnect with a NEW ssrc: old out, new in, tracker updated.
+        assert_eq!(swap_excluded_ssrc(&exclude, &current, 200), Some(100));
+        let ex = exclude.read().unwrap();
+        assert!(!ex.contains(&100), "stale SSRC must leave the exclusion set");
+        assert!(ex.contains(&200));
+        drop(ex);
+        assert_eq!(*current.lock().unwrap(), Some(200));
+        // Same-SSRC resume: no-op.
+        assert_eq!(swap_excluded_ssrc(&exclude, &current, 200), Some(200));
+        assert!(exclude.read().unwrap().contains(&200));
     }
 
     /// #129: the breaker trips exactly at the threshold-th IDENTIFY within the

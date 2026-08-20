@@ -94,6 +94,14 @@ impl CaptureSink {
         }
     }
 
+    /// Test-only: the SSRCs that have received at least one frame — lets the
+    /// #70 F2-5 ordering test assert who was captured without touching the
+    /// files on disk.
+    #[cfg(test)]
+    pub(crate) fn captured_ssrcs(&self) -> Vec<u32> {
+        self.inner.lock().expect("CaptureSink mutex poisoned").keys().copied().collect()
+    }
+
     /// Finalise all open WAV files.
     ///
     /// **Must** be called before exit — `hound::WavWriter` does not write the
