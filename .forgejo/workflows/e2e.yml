@@ -30,6 +30,24 @@ on:
     # (post-mortem: issue #123). 08:30 clears that window and mautrix's 04:15
     # nvb-backup.
     - cron: '30 8 * * *'
+  # Fast pre-merge evidence (#107): every CODE push to a feature/fix branch
+  # runs the management subset (~5 min, no audio, load-insensitive) against
+  # the live environment — the checks we used to dispatch by hand before every
+  # merge request. Docs-only diffs skip via the paths filter; audio scenarios
+  # stay nightly-only (host-load sensitivity). The shared `live-host`
+  # concurrency group below serializes these with nightlies and CI builds.
+  push:
+    branches:
+      - 'feat/**'
+      - 'fix/**'
+      - 'ci/**'
+      - 'e2e/**'
+    paths:
+      - 'crates/**'
+      - 'vendor/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.forgejo/workflows/e2e.yml'
 
 # One live run at a time, AND never alongside a CI build. The harness and CI share
 # a physical host, and overlapping CPU-heavy work garbles the audio timing scores
@@ -119,11 +137,15 @@ jobs:
           fi
           # workflow_dispatch supplies inputs; the nightly `schedule` event has
           # none, so it defaults to the full compressed suite. long_glitch_sweep
-          # stays opt-in (gated behind NVB_E2E_LONG) so `--all` skips it.
+          # stays opt-in (gated behind NVB_E2E_LONG) so `--all` skips it. A
+          # branch `push` (#107) runs the fast management subset — the
+          # pre-merge evidence that used to be a by-hand dispatch convention.
           SC="${{ inputs.scenarios }}"
           if [ -z "$SC" ]; then
             if [ "${{ github.event_name }}" = "schedule" ]; then
               SC="--all"
+            elif [ "${{ github.event_name }}" = "push" ]; then
+              SC="mgmt_self_serve_link room_misconfig_notice mgmt_invite_offline mgmt_dm_e2ee"
             else
               SC="smoke_open_close"
             fi
