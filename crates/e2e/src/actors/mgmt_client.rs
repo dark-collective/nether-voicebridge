@@ -25,11 +25,42 @@ use std::time::Duration;
 /// here rides the SAME shared appservice `as_token`, so a bare monotonic counter
 /// (which resets to 1 each process) collides ACROSS runs: a later run replaying
 /// `nvb1` gets the first run's event id back and NO new event, so the command
-/// never lands and `wait_for_reply` can't find its marker. The txn is therefore
-/// scoped with the process id (`nvb{pid}-{n}`) — a per-run nonce, matching the
-/// harness's other uniqueness idiom (`process::id()` in the test data dirs) —
-/// while staying `Date`/`rand`-free.
+/// never lands and `wait_for_reply` can't find its marker.
+///
+/// The pid alone (`nvb{pid}-{n}`) is NOT a sufficient per-run nonce: the nightly
+/// CI job boots an identical container each night, so with a warm compile cache
+/// the harness lands on the SAME pid night after night — and Tuwunel persists
+/// its txn→event_id map in RocksDB with no expiry. Every send whose (pid, n)
+/// was used on ANY earlier night is then silently swallowed (the server returns
+/// the OLD night's event id, creates nothing, and the command never lands),
+/// which is exactly how nightlies #327–#329 lost `mgmt_self_serve_link` &
+/// friends: `wait_for_reply` never found its marker and matched the join
+/// greeting instead. Verified live 2026-08-19: replaying run #309's `nvb3300-1`
+/// six days later returned the 08-13 event id. Hence the additional per-run
+/// wall-clock nonce below — epoch millis captured once at first send.
 static TXN: AtomicU64 = AtomicU64::new(1);
+
+/// Epoch-millis captured at the first send of this process — the per-run nonce
+/// that makes txn ids unique across (identically-pid'd) nightly containers.
+static RUN_NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+fn run_nonce() -> u64 {
+    *RUN_NONCE.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    })
+}
+
+/// One `/messages` page distilled for the reply helpers: all event ids in
+/// reverse-chronological page order, and the bot's `(event_id, body)` messages
+/// among them (same order).
+#[derive(Default)]
+struct BotPage {
+    event_ids: Vec<String>,
+    messages: Vec<(String, String)>,
+}
 
 /// A self-serve Matrix user driving the management bot over DM.
 pub struct MatrixManagementClient {
@@ -311,9 +342,7 @@ impl MatrixManagementClient {
     pub async fn await_greeting(&self, room: &str, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            // A sentinel that never equals a real event id → collect every bot
-            // message in the page.
-            if !self.bot_replies_after(room, "\u{0}").await?.is_empty() {
+            if !self.bot_page(room).await?.messages.is_empty() {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
@@ -351,10 +380,11 @@ impl MatrixManagementClient {
     pub async fn send(&self, room: &str, body: &str) -> Result<String> {
         let txn = TXN.fetch_add(1, Ordering::Relaxed);
         let url = format!(
-            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/nvb{}-{txn}",
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/nvb{}-{}-{txn}",
             self.base,
             enc(room),
             std::process::id(),
+            run_nonce(),
         );
         let resp = self
             .http
@@ -377,12 +407,10 @@ impl MatrixManagementClient {
             .context("send response missing event_id")
     }
 
-    /// Fetch the bot's `m.room.message` bodies that appear AFTER `after_event`
-    /// in the timeline (newest first). Walks the reverse-chronological
-    /// `/messages` page until it reaches our marker event, collecting bot
-    /// messages seen along the way. The marker guarantees we never mistake an
-    /// earlier reply (or the join greeting) for the answer to this command.
-    async fn bot_replies_after(&self, room: &str, after_event: &str) -> Result<Vec<String>> {
+    /// One reverse-chronological `/messages` page of `room`: every bot
+    /// `m.room.message` body (newest first) plus the set of event ids seen —
+    /// the raw material for the marker-relative helpers below.
+    async fn bot_page(&self, room: &str) -> Result<BotPage> {
         let url = format!("{}/_matrix/client/v3/rooms/{}/messages", self.base, enc(room));
         let resp = self
             .http
@@ -398,21 +426,50 @@ impl MatrixManagementClient {
         let json: Value = resp.json().await.context("messages JSON")?;
         let empty = Vec::new();
         let chunk = json["chunk"].as_array().unwrap_or(&empty);
-        let mut replies = Vec::new();
+        let mut page = BotPage::default();
         for ev in chunk {
-            if ev["event_id"].as_str() == Some(after_event) {
-                break; // reached our command — everything after is the reply set
+            if let Some(id) = ev["event_id"].as_str() {
+                page.event_ids.push(id.to_owned());
             }
             if ev["type"] == "m.room.message" && ev["sender"].as_str() == Some(self.bot_mxid.as_str()) {
                 if let Some(body) = ev["content"]["body"].as_str() {
-                    replies.push(body.to_owned());
+                    page.messages.push((ev["event_id"].as_str().unwrap_or_default().to_owned(), body.to_owned()));
                 }
+            }
+        }
+        Ok(page)
+    }
+
+    /// Fetch the bot's `m.room.message` bodies that appear AFTER `after_event`
+    /// in the timeline (oldest-after-marker first), or `None` when the marker
+    /// event is not (yet) visible in the page.
+    ///
+    /// The marker guarantees we never mistake an earlier reply (or the join
+    /// greeting) for the answer to this command — and the `None` arm is
+    /// load-bearing: a just-sent marker can lag the `/messages` view (and a
+    /// txn-deduplicated send never materializes at all, see `TXN`), and the
+    /// old break-at-marker walk silently degraded to "every bot message ever
+    /// is a reply" in that case, matching the greeting as the command's
+    /// answer (nightlies #327–#329). Not-visible must read as "not ready",
+    /// never as a reply set.
+    async fn bot_replies_after(&self, room: &str, after_event: &str) -> Result<Option<Vec<String>>> {
+        let page = self.bot_page(room).await?;
+        if !page.event_ids.iter().any(|id| id == after_event) {
+            return Ok(None);
+        }
+        let mut replies = Vec::new();
+        for id in &page.event_ids {
+            if id == after_event {
+                break; // reached our command — everything after is the reply set
+            }
+            if let Some((_, body)) = page.messages.iter().find(|(mid, _)| mid == id) {
+                replies.push(body.clone());
             }
         }
         // Collected newest-first; the reply immediately following our command
         // is the oldest of these — reverse so index 0 is that first reply.
         replies.reverse();
-        Ok(replies)
+        Ok(Some(replies))
     }
 
     /// Poll until the bot replies to the command marked by `after_event`,
@@ -425,12 +482,20 @@ impl MatrixManagementClient {
         timeout: Duration,
     ) -> Result<String> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut marker_seen = false;
         loop {
-            let replies = self.bot_replies_after(room, after_event).await?;
-            if let Some(first) = replies.into_iter().next() {
-                return Ok(first);
+            if let Some(replies) = self.bot_replies_after(room, after_event).await? {
+                marker_seen = true;
+                if let Some(first) = replies.into_iter().next() {
+                    return Ok(first);
+                }
             }
             if tokio::time::Instant::now() >= deadline {
+                if !marker_seen {
+                    bail!(
+                        "command marker {after_event} never became visible in {room} within {timeout:?} — the send did not materialize (txn-dedup swallow?)"
+                    );
+                }
                 bail!("no bot reply to the command in {room} within {timeout:?}");
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -450,7 +515,7 @@ impl MatrixManagementClient {
     ) -> Result<String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            for m in self.bot_replies_after(room, after_event).await? {
+            for m in self.bot_replies_after(room, after_event).await?.unwrap_or_default() {
                 if m.contains(needle) {
                     return Ok(m);
                 }
@@ -473,12 +538,23 @@ impl MatrixManagementClient {
         window: Duration,
     ) -> Result<()> {
         let deadline = tokio::time::Instant::now() + window;
+        let mut marker_seen = false;
         loop {
-            let replies = self.bot_replies_after(room, after_event).await?;
-            if let Some(leaked) = replies.into_iter().next() {
-                bail!("bot replied in a non-DM room (#71 gate leak): {leaked:?}");
+            if let Some(replies) = self.bot_replies_after(room, after_event).await? {
+                marker_seen = true;
+                if let Some(leaked) = replies.into_iter().next() {
+                    bail!("bot replied in a non-DM room (#71 gate leak): {leaked:?}");
+                }
             }
             if tokio::time::Instant::now() >= deadline {
+                if !marker_seen {
+                    // Silence is only meaningful if the command actually
+                    // landed — an invisible marker means the send was
+                    // swallowed, not that the bot stayed quiet.
+                    bail!(
+                        "command marker {after_event} never became visible in {room} within {window:?} — cannot attest silence"
+                    );
+                }
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
