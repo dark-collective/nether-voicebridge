@@ -3,6 +3,58 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.4] - 2026-08-20
+
+**The opt-out promise now holds everywhere — including the operator's own
+diagnostics — and newcomers get a guided walkthrough instead of a wall of
+text.**
+
+### Fixed
+- **Opted-out users are never written to diagnostic capture WAVs (#70).**
+  With `capture_wav` diagnostics enabled, the per-SSRC WAV tap ran before the
+  `/bridge optout` gate, so an opted-out user's voice was recorded to disk
+  every 20 ms even while being correctly dropped from Matrix. The tap now
+  sits behind both speaker attribution and the opt-out check — consent must
+  be provable before any frame touches disk, so opted-out and
+  not-yet-attributed speakers are never recorded.
+- **A voice channel linked at runtime no longer strands phantom participants
+  (#70).** The capture anchor's ghost seeding never recorded presence, so on
+  a channel created by the self-serve `link` flow a seeded Discord user's
+  leave was an unobserved edge: their ghost stayed in the Element Call
+  indefinitely and kept the anchor bot in voice as if speakers were present.
+  Seeding now records presence exactly like the gateway paths (bots skipped,
+  idempotent across the pool).
+- **A user who leaves during the ghost member-lookup no longer gets a
+  phantom ghost (#70).** The mint path re-checks presence after its awaited
+  member HTTP lookup, shrinking the leave-vs-mint race from lookup-sized to
+  lock-acquisition-sized.
+- **Echo-exclusion survives songbird's in-driver full reconnect (#70).** A
+  reconnect's re-Identify may carry a fresh SSRC that was never added to the
+  puppet's exclusion set — while the stale SSRC stayed excluded and would
+  silently mute any human later handed it by Discord's SSRC recycling. Both
+  connect events now register the SSRC, swapping the stale one out.
+
+### Added
+- **`tutorial` — a guided, step-by-step walkthrough over DM (#102).** Seven
+  screens from "what this does" to the Discord-side approval, one per
+  message: `next` advances, `stop` ends, and unknown chatter in a DM now
+  offers the tutorial instead of a terse "Unrecognized command". Instance
+  specifics (guide URL, approval bot name, open-beta notice) come from
+  config. Illustrated steps follow once the screenshot assets land.
+- **Declined room invites are explained (#101).** Inviting the bot to a
+  regular room (instead of a direct message) is still declined — the
+  DMs-only contract — but the bot now DMs the inviter the why and the fix,
+  rate-limited to once per inviter per hour.
+- **The greeting waits out slow federated joins (#101).** The join greeting's
+  retry window grew from ~14 s to ~60 s, so a new user on a slow federating
+  homeserver no longer lands in a silent room.
+
+### CI / ops
+- Every code push to a feature branch now runs a fast live management-suite
+  subset (#107); nvb-watch gained a canary that alerts on invites to the
+  dormant conventional bot address nobody serves (#96); `crates/audio`
+  adopts `as_chunks` for Rust 1.98's new clippy lint.
+
 ## [0.3.3] - 2026-08-20
 
 **Two more silent-death modes closed: a homeserver that isn't up yet can no
