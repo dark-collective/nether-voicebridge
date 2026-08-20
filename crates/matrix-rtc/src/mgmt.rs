@@ -251,6 +251,14 @@ struct BotCtx {
     /// sync's redelivery of a pending invite while a slow federated join is
     /// in flight. Entries are removed when handling finishes.
     invite_inflight: StdMutex<HashSet<String>>,
+    /// Per-inviter stamp of the last "DMs only" explanation DM (#101), gating
+    /// outbound explanations to [`NON_DIRECT_EXPLAIN_COOLDOWN`] — a spammer
+    /// must not be able to farm outbound DMs off invite rejections.
+    explain_stamps: StdMutex<HashMap<String, Instant>>,
+    /// Active `tutorial` walkthroughs (#102): room id → (last step SENT, last
+    /// activity). Advanced by `next`, ended by `stop` or the final step;
+    /// stale entries are pruned lazily against [`TUTORIAL_IDLE_TTL`].
+    tutorial_state: StdMutex<HashMap<String, (usize, Instant)>>,
     /// Disclosure notices to the Discord pool (#64): posted into a bridged
     /// voice channel's text chat by the command bot. Best-effort.
     notice_tx: Option<mpsc::UnboundedSender<DiscordNotice>>,
@@ -1166,6 +1174,8 @@ pub async fn run(
         pending_announce: StdMutex::new(None),
         notify_stamps: StdMutex::new(HashMap::new()),
         invite_inflight: StdMutex::new(HashSet::new()),
+        explain_stamps: StdMutex::new(HashMap::new()),
+        tutorial_state: StdMutex::new(HashMap::new()),
         notice_tx: pool_io.notice_tx,
     });
 
@@ -1288,9 +1298,14 @@ pub async fn run(
                 }
                 Parsed::Usage(usage) => reply(&room, &usage).await,
                 // Unrecognized chatter: the handler already gated to a DM above,
-                // so help out unconditionally.
+                // so help out unconditionally — and point newcomers at the
+                // guided walkthrough (#102), not just the terse verb list.
                 Parsed::Unknown => {
-                    reply(&room, "Unrecognized command — send `help` for the command list.").await;
+                    reply(
+                        &room,
+                        "I didn't recognize that. New here? Send `tutorial` for a step-by-step walkthrough, or `help` for the command list.",
+                    )
+                    .await;
                 }
             }
         },
@@ -1467,6 +1482,9 @@ async fn handle_invite_gated(ctx: &BotCtx, invite: Option<&InviteDetails>, room:
                 audit(ctx, &i.sender, "invite_rejected", serde_json::json!({
                     "room_id": room_id.as_str(), "reason": "not_direct",
                 }));
+                // #101: a wordless decline reads as broken — tell the inviter
+                // how to reach the bot (rate-limited per inviter).
+                explain_non_direct_reject(ctx, room.client(), i.sender.clone());
                 false
             } else if let Some(retry) = ctx.global_link_gate() {
                 // Global velocity gate (#84): shed self-serve invite auto-joins
@@ -1659,7 +1677,12 @@ fn greet_when_joined(
     from_operator: bool,
 ) {
     tokio::spawn(async move {
-        for delay in [1u64, 3, 10] {
+        // ~60 s total (#101): the old 1/3/10 gave up before a slow federated
+        // join + sync lag could land the Joined state ("room never reached
+        // joined state — skipping greeting", live 2026-07-12) — and the
+        // greeting is the only signal the bot is alive, so a missed one
+        // leaves a new user in a room they assume is dead.
+        for delay in [1u64, 2, 3, 6, 12, 12, 12, 12] {
             tokio::time::sleep(Duration::from_secs(delay)).await;
             let current = room.client().get_room(room.room_id());
             if let Some(r) = current {
@@ -1791,6 +1814,12 @@ enum Command {
         text: String,
     },
     AnnounceConfirm,
+    /// Start the guided walkthrough (#102). Self-serve tier.
+    Tutorial,
+    /// Advance / end the walkthrough (#102) — meaningful only with an active
+    /// tutorial in this room; otherwise they answer with a gentle pointer.
+    TutorialNext,
+    TutorialStop,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1821,11 +1850,14 @@ const REPORT_REASON_MAX: usize = 280;
 const DEFAULT_REPORTS: usize = 10;
 const MAX_REPORTS: usize = 50;
 
-const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridges (static + tenants) and whether they are running\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server] — bridge a Discord voice channel to a Matrix room\n  unlink <name> — remove a bridge created with link\n  ban <owner|guild|room> <value> — deny-list an owner MXID / Discord guild / Matrix room AND unlink every matching tenant\n  unban <owner|guild|room> <value> — remove a ban\n  bans — show the deny-lists\n  report <owner|guild|room> <value> [reason] — file an abuse report (recorded, not acted on)\n  reports [count] — show recent abuse reports, each with the `ban` to run\n  serve-allow <@mxid> / serve-remove <@mxid> — restrict the self-serve tier to an allowlist; serve-open reopens to everyone; serve-list shows it\n  status — puppet-pool guild footprint (Discord verification tripwire)\n  stats — per-bridge uptime + owner, and process memory\n  msg <@mxid> <text> — DM a user as the bridge bot\n  announce <text> — stage a DM to every bridge owner; `announce confirm` sends it\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridges (static + tenants) and whether they are running\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server] — bridge a Discord voice channel to a Matrix room\n  unlink <name> — remove a bridge created with link\n  ban <owner|guild|room> <value> — deny-list an owner MXID / Discord guild / Matrix room AND unlink every matching tenant\n  unban <owner|guild|room> <value> — remove a ban\n  bans — show the deny-lists\n  report <owner|guild|room> <value> [reason] — file an abuse report (recorded, not acted on)\n  reports [count] — show recent abuse reports, each with the `ban` to run\n  serve-allow <@mxid> / serve-remove <@mxid> — restrict the self-serve tier to an allowlist; serve-open reopens to everyone; serve-list shows it\n  status — puppet-pool guild footprint (Discord verification tripwire)\n  stats — per-bridge uptime + owner, and process memory\n  msg <@mxid> <text> — DM a user as the bridge bot\n  announce <text> — stage a DM to every bridge owner; `announce confirm` sends it\n  tutorial — the self-serve guided walkthrough (next/stop drive it)\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
 
 /// Help for self-serve users (#43): only the verbs they may run, plus the
 /// consent flow they will hit.
-const SELF_SERVE_HELP_TEXT: &str = "Voice bridge commands:\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> — bridge a Discord voice channel to a Matrix room. You must be a moderator of the Matrix room, and someone with Manage Server on the Discord side must approve the link with the `/bridge approve` command and the code you'll receive.\n  unlink <name> — remove a bridge you created\n  list — your bridges\n  report <owner|guild|room> <value> [reason] — report an abusive bridge for an operator to review\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+const SELF_SERVE_HELP_TEXT: &str = "Voice bridge commands:\n  tutorial — guided step-by-step walkthrough (start here if you're new)\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> — bridge a Discord voice channel to a Matrix room. You must be a moderator of the Matrix room, and someone with Manage Server on the Discord side must approve the link with the `/bridge approve` command and the code you'll receive.\n  unlink <name> — remove a bridge you created\n  list — your bridges\n  report <owner|guild|room> <value> [reason] — report an abusive bridge for an operator to review\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+
+const TUTORIAL_USAGE: &str =
+    "Usage: `tutorial` — start the guided walkthrough. `next` advances one step, `stop` ends it.";
 
 /// Posted into a bridged voice channel's text chat when its link is removed
 /// (#64) — by `unlink` and by a ban's teardown sweep. Deliberately neutral:
@@ -1844,6 +1876,9 @@ fn allowed_for_self_serve(cmd: &Command) -> bool {
             | Command::Link { .. }
             | Command::Unlink { .. }
             | Command::Report { .. }
+            | Command::Tutorial
+            | Command::TutorialNext
+            | Command::TutorialStop
     )
 }
 
@@ -1944,6 +1979,20 @@ fn parse_command(body: &str) -> Parsed {
             }
             _ => Parsed::Usage(ANNOUNCE_USAGE.to_string()),
         },
+        "tutorial" => match args {
+            [] => Parsed::Cmd(Command::Tutorial),
+            _ => Parsed::Usage(TUTORIAL_USAGE.to_string()),
+        },
+        // Bare words only (#102): "next week let's…" is chatter, not a step
+        // command — with arguments these fall through to Unknown.
+        "next" => match args {
+            [] => Parsed::Cmd(Command::TutorialNext),
+            _ => Parsed::Unknown,
+        },
+        "stop" => match args {
+            [] => Parsed::Cmd(Command::TutorialStop),
+            _ => Parsed::Unknown,
+        },
         _ => Parsed::Unknown,
     }
 }
@@ -2016,6 +2065,159 @@ async fn handle_command(ctx: &BotCtx, room: &Room, sender: &str, cmd: Command) {
         Command::Msg { mxid, text } => handle_msg(ctx, room, sender, &mxid, &text).await,
         Command::Announce { text } => handle_announce_stage(ctx, room, text).await,
         Command::AnnounceConfirm => handle_announce_confirm(ctx, room, sender).await,
+        Command::Tutorial => handle_tutorial_start(ctx, room).await,
+        Command::TutorialNext => handle_tutorial_next(ctx, room).await,
+        Command::TutorialStop => handle_tutorial_stop(ctx, room).await,
+    }
+}
+
+// ─── Guided walkthrough (#102) ──────────────────────────────────────────────
+//
+// Text-first: the illustrated version (m.image attachments per step, encrypted
+// via send_attachment in E2EE DMs) lands once the #98 screenshot assets exist.
+// One screen per message — a per-room cursor advanced by `next`, ended by
+// `stop` or the final step. Instance specifics (guide url, approval bot name,
+// open-beta notice) are injected from config so the copy stays
+// instance-agnostic.
+
+/// Steps in the walkthrough. Step numbers are 1-based; the cursor stores the
+/// last step SENT.
+const TUTORIAL_STEPS: usize = 7;
+
+/// Abandoned walkthrough cursors are pruned after this idle time.
+const TUTORIAL_IDLE_TTL: Duration = Duration::from_secs(24 * 3600);
+
+/// Ceiling on concurrently-tracked walkthroughs — a bound on untrusted-user
+/// state, same posture as `PENDING_LINK_CAP`.
+const TUTORIAL_CAP: usize = 200;
+
+/// The text of 1-based `step`, or `None` past the end.
+fn tutorial_step_text(ctx: &BotCtx, step: usize) -> Option<String> {
+    let guide = docs_line(ctx.docs_url.as_deref());
+    let approver = ctx
+        .approval_bot_name
+        .as_deref()
+        .map(|n| format!(" (on this instance: {n})"))
+        .unwrap_or_default();
+    let body = match step {
+        1 => format!(
+            "📖 Tutorial 1/7 — what this does\n\
+             I link a Discord voice channel to a Matrix room so both sides talk in one call: \
+             Matrix speakers appear on Discord as puppet bots, Discord speakers appear in the \
+             Matrix call as named participants.\n\
+             You'll need: a Matrix room you moderate, a Discord server (you or someone you know \
+             has Manage Server there), and about two minutes.{guide}"
+        ),
+        2 => format!(
+            "📖 Tutorial 2/7 — prepare the Matrix room\n\
+             The room must allow call membership at power level 0 — the standard Element Call \
+             setup. Easiest: start an Element Call in the room once (the call button), then hang \
+             up; that configures it. Without this, Discord speakers silently never appear in the \
+             call.{guide}"
+        ),
+        3 => format!(
+            "📖 Tutorial 3/7 — invite the puppet bots to Discord\n\
+             Each Matrix speaker is voiced by a puppet bot, so the instance's bots need to be \
+             members of your Discord server with Connect, Speak, Use Voice Activity and Change \
+             Nickname. The instance's guide page lists the invite links.{guide}"
+        ),
+        4 => "📖 Tutorial 4/7 — find your IDs\n\
+             Discord: Settings → Advanced → enable Developer Mode, then right-click your server \
+             → Copy Server ID, and right-click the voice channel → Copy Channel ID.\n\
+             Matrix: in Element, room Settings → Advanced → copy the Internal room ID (starts \
+             with !)."
+            .to_string(),
+        5 => "📖 Tutorial 5/7 — compose the link command\n\
+             Put it together (quotes around names with spaces):\n\
+             link \"My Bridge\" !yourRoomId:example.org <server-id> <channel-id>\n\
+             Send it here and I'll check the room and the Discord side, then hand you an \
+             approval code."
+            .to_string(),
+        6 => format!(
+            "📖 Tutorial 6/7 — the Discord-side approval\n\
+             Someone with Manage Server on the Discord server runs the slash command\n\
+             /bridge approve code:<your code>{approver}\n\
+             — that's the consent step proving the Discord side wants the bridge. Once approved, \
+             the bridge goes live on its own."
+        ),
+        7 => format!(
+            "📖 Tutorial 7/7 — living with your bridge\n\
+             list shows your bridges, unlink <name> removes one, report flags someone else's \
+             abusive bridge for the operators. The bridge opens when the first person joins \
+             either side and closes when the last human leaves.\n\
+             That's everything — send `help` any time for the command list.{}",
+            ctx.notice_line()
+        ),
+        _ => return None,
+    };
+    Some(body)
+}
+
+/// `tutorial` — (re)start the walkthrough in this room at step 1.
+async fn handle_tutorial_start(ctx: &BotCtx, room: &Room) {
+    // Decide under the lock, reply after it — no guard across an await.
+    let started = {
+        let now = Instant::now();
+        let mut state = ctx.tutorial_state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.retain(|_, (_, t)| now.duration_since(*t) < TUTORIAL_IDLE_TTL);
+        let key = room.room_id().to_string();
+        if !state.contains_key(&key) && state.len() >= TUTORIAL_CAP {
+            false
+        } else {
+            state.insert(key, (1, now));
+            true
+        }
+    };
+    if !started {
+        reply(room, "Too many walkthroughs are running right now — try again in a while, or send `help` for the command list.").await;
+        return;
+    }
+    let text = tutorial_step_text(ctx, 1).expect("step 1 exists");
+    reply(room, &format!("{text}\n\nSend `next` to continue, `stop` to end.")).await;
+}
+
+/// `next` — advance the walkthrough; the final step ends it.
+async fn handle_tutorial_next(ctx: &BotCtx, room: &Room) {
+    let key = room.room_id().to_string();
+    let step = {
+        let now = Instant::now();
+        let mut state = ctx.tutorial_state.lock().unwrap_or_else(PoisonError::into_inner);
+        match state.get_mut(&key) {
+            Some((step, t)) => {
+                *step += 1;
+                *t = now;
+                let s = *step;
+                if s >= TUTORIAL_STEPS {
+                    state.remove(&key); // final step: the walkthrough is done
+                }
+                Some(s)
+            }
+            None => None,
+        }
+    };
+    match step.and_then(|s| tutorial_step_text(ctx, s).map(|t| (s, t))) {
+        Some((s, text)) if s < TUTORIAL_STEPS => {
+            reply(room, &format!("{text}\n\nSend `next` to continue, `stop` to end.")).await
+        }
+        Some((_, text)) => reply(room, &text).await,
+        None => {
+            reply(room, "No tutorial in progress here — send `tutorial` to start one.").await
+        }
+    }
+}
+
+/// `stop` — abandon the walkthrough.
+async fn handle_tutorial_stop(ctx: &BotCtx, room: &Room) {
+    let removed = ctx
+        .tutorial_state
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(room.room_id().as_str())
+        .is_some();
+    if removed {
+        reply(room, "Tutorial stopped — send `tutorial` any time to start over.").await;
+    } else {
+        reply(room, "No tutorial in progress here — send `tutorial` to start one.").await;
     }
 }
 
@@ -3669,6 +3871,56 @@ fn human_secs(s: u64) -> String {
     }
 }
 
+/// How long one inviter's "DMs only" explanation suppresses the next (#101).
+const NON_DIRECT_EXPLAIN_COOLDOWN: Duration = Duration::from_secs(3600);
+
+/// Claim a once-per-`ttl` slot for `key`: prunes expired stamps, then either
+/// records `now` (→ `true`, caller may act) or finds a live stamp (→ `false`,
+/// suppressed). Pure over the map for unit tests; shared by the #101
+/// explanation gate.
+fn stamp_once(
+    stamps: &mut HashMap<String, Instant>,
+    key: &str,
+    now: Instant,
+    ttl: Duration,
+) -> bool {
+    stamps.retain(|_, t| now.duration_since(*t) < ttl);
+    if stamps.contains_key(key) {
+        return false;
+    }
+    stamps.insert(key.to_owned(), now);
+    true
+}
+
+/// #101: a self-serve user who invites the bot to a regular room (Element's
+/// "New room" instead of "Start chat") is correctly declined by the #71
+/// DMs-only gate — but a wordless decline reads as rude/broken. DM them the
+/// why and the fix. Rate-limited per inviter ([`NON_DIRECT_EXPLAIN_COOLDOWN`])
+/// and spawned, so the invite handler never blocks on outbound DM latency and
+/// a rejection spammer cannot farm outbound DMs.
+fn explain_non_direct_reject(ctx: &BotCtx, client: Client, inviter: String) {
+    let claimed = stamp_once(
+        &mut ctx.explain_stamps.lock().unwrap_or_else(PoisonError::into_inner),
+        &inviter,
+        Instant::now(),
+        NON_DIRECT_EXPLAIN_COOLDOWN,
+    );
+    if !claimed {
+        return;
+    }
+    let text = format!(
+        "👋 Thanks for the invite! I only work in direct messages, so I've declined \
+         the room invite. Start a chat with me (in Element: \"Start chat\", not \
+         \"New room\") and send `help` to get going.{}",
+        docs_line(ctx.docs_url.as_deref())
+    );
+    tokio::spawn(async move {
+        if let Err(e) = dm_user(&client, &inviter, &text).await {
+            tracing::debug!(inviter = %inviter, error = %e, "could not deliver the non-direct-invite explanation (#101)");
+        }
+    });
+}
+
 /// DM `text` to `mxid` as the bot, reusing an existing direct room when the
 /// SDK knows one (#94). Extracted so `msg` and `announce` share the path.
 async fn dm_user(client: &Client, mxid: &str, text: &str) -> Result<(), String> {
@@ -4571,6 +4823,47 @@ mod tests {
         assert_eq!(parse_command("\"stray quote"), Parsed::Unknown);
     }
 
+    /// #102: the walkthrough verbs parse, stay self-serve-allowed, and the
+    /// bare-word rule keeps "next"/"stop" chatter with arguments as Unknown.
+    #[test]
+    fn tutorial_verbs_parse_and_are_self_serve() {
+        assert_eq!(parse_command("tutorial"), Parsed::Cmd(Command::Tutorial));
+        assert_eq!(parse_command("NEXT"), Parsed::Cmd(Command::TutorialNext));
+        assert_eq!(parse_command("stop"), Parsed::Cmd(Command::TutorialStop));
+        assert!(matches!(parse_command("tutorial please"), Parsed::Usage(_)));
+        assert_eq!(parse_command("next week let's bridge"), Parsed::Unknown);
+        assert_eq!(parse_command("stop doing that"), Parsed::Unknown);
+        for cmd in [Command::Tutorial, Command::TutorialNext, Command::TutorialStop] {
+            assert!(allowed_for_self_serve(&cmd));
+        }
+    }
+
+    /// #102: every step exists up to TUTORIAL_STEPS, numbered, then ends.
+    #[test]
+    fn tutorial_steps_cover_and_terminate() {
+        let dir = test_data_dir();
+        let (ctx, _rx) = approval_ctx(&dir, Duration::from_secs(60));
+        for s in 1..=TUTORIAL_STEPS {
+            let text = tutorial_step_text(&ctx, s).expect("step exists");
+            assert!(text.contains(&format!("{s}/{TUTORIAL_STEPS}")), "step {s} numbered");
+        }
+        assert!(tutorial_step_text(&ctx, TUTORIAL_STEPS + 1).is_none());
+        assert!(tutorial_step_text(&ctx, 0).is_none());
+    }
+
+    /// #101: the once-per-ttl stamp claims, suppresses, and re-claims after
+    /// expiry — the outbound-DM rate limit on rejection explanations.
+    #[test]
+    fn stamp_once_claims_suppresses_and_expires() {
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(3600);
+        let mut stamps = HashMap::new();
+        assert!(stamp_once(&mut stamps, "@a:x", t0, ttl));
+        assert!(!stamp_once(&mut stamps, "@a:x", t0 + Duration::from_secs(10), ttl));
+        assert!(stamp_once(&mut stamps, "@b:x", t0 + Duration::from_secs(10), ttl));
+        assert!(stamp_once(&mut stamps, "@a:x", t0 + ttl + Duration::from_secs(1), ttl));
+    }
+
     #[test]
     fn numeric_id_check() {
         assert!(is_numeric_id("123456789012345678"));
@@ -5042,6 +5335,8 @@ mod tests {
             pending_announce: StdMutex::new(None),
             notify_stamps: StdMutex::new(HashMap::new()),
             invite_inflight: StdMutex::new(HashSet::new()),
+            explain_stamps: StdMutex::new(HashMap::new()),
+            tutorial_state: StdMutex::new(HashMap::new()),
             notice_tx: None,
         };
         (ctx, control_rx)
