@@ -174,7 +174,9 @@ pub fn compare_mono_48k(source: &[i16], captured: &[i16], cfg: &OracleConfig) ->
     let mut active_segs = 0usize;
     let mut dropout_segs = Vec::new();
     let mut glitch_segs = Vec::new();
-    for (seg, (s_seg, c_seg)) in s.chunks_exact(HOP).zip(c.chunks_exact(HOP)).enumerate() {
+    for (seg, (s_seg, c_seg)) in
+        s.as_chunks::<HOP>().0.iter().zip(c.as_chunks::<HOP>().0.iter()).enumerate()
+    {
         let src_active = rms_dbfs(s_seg) > ACTIVE_FLOOR_DBFS;
 
         if src_active {
@@ -374,7 +376,9 @@ fn refine(source: &[i16], captured: &[i16], coarse: isize) -> Option<(isize, f64
 
 /// Linear RMS per 10 ms hop.
 fn envelope(pcm: &[i16]) -> Vec<f64> {
-    pcm.chunks_exact(HOP)
+    pcm.as_chunks::<HOP>()
+        .0
+        .iter()
         .map(|seg| {
             let sum: f64 = seg.iter().map(|&s| (s as f64) * (s as f64)).sum();
             (sum / HOP as f64).sqrt()

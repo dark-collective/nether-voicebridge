@@ -39,7 +39,9 @@ pub const SAMPLES_20MS: usize = 960;
 /// avoid overflow, then truncated back to i16.
 pub fn downmix_stereo_to_mono(stereo: &[i16]) -> Vec<i16> {
     stereo
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|lr| ((lr[0] as i32 + lr[1] as i32) / 2) as i16)
         .collect()
 }
