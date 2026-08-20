@@ -35,6 +35,9 @@ for a in "\$@"; do
     case "\$a" in
         *'"msgtype"'*) printf '%s\n---\n' "\$a" >> "$T/posts.txt" ;;
         *actions/tasks*) [ -f "$T/api.json" ] && cat "$T/api.json" ;;
+        # Dormant-MXID canary (#96): canned sync staged at \$T/dormant.json
+        # (absent ⇒ empty reply, section 3a skips — most cases).
+        */sync?user_id=*) [ -f "$T/dormant.json" ] && cat "$T/dormant.json" ;;
     esac
 done
 exit 0
@@ -186,6 +189,25 @@ ci_api 79 success
 run "$QUIET_J" "$(roster alive 0)"
 check "no notice per ordinary green push" "GREEN again" no
 rm -f "$T/api.json"
+
+echo "== case 16: pending invite to the dormant MXID ⇒ one alert (#96) =="
+printf '%s\n' '{"rooms":{"invite":{"!stranded:example.org":{}}}}' > "$T/dormant.json"
+run "$QUIET_J" "$(roster alive 0)"
+check "dormant-invite alert posted" "DORMANT bot address" yes
+check "names the stranded room" "!stranded:example.org" yes
+
+echo "== case 17: same pending invite next tick ⇒ silent (latched) =="
+run "$QUIET_J" "$(roster alive 0)"
+check "no repeat alert" "DORMANT bot address" no
+
+echo "== case 18: invite cleared then re-invited ⇒ re-alerts =="
+printf '%s\n' '{"rooms":{}}' > "$T/dormant.json"
+run "$QUIET_J" "$(roster alive 0)"
+check "quiet while clear" "DORMANT bot address" no
+printf '%s\n' '{"rooms":{"invite":{"!stranded:example.org":{}}}}' > "$T/dormant.json"
+run "$QUIET_J" "$(roster alive 0)"
+check "re-invite re-alerts" "DORMANT bot address" yes
+rm -f "$T/dormant.json"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
