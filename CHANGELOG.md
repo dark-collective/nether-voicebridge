@@ -3,7 +3,11 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.6] - 2026-09-27
+
+**Follow-through on the 0.3.5 stall: the next silent sync stall gets logged,
+and the device pile that made it slow can finally be cleaned up — by the
+harness, by the bridge's own prune, and by a new operator tool.**
 
 ### Added
 - **Management bot sync-loop stall watchdog.** A sync iteration that never
