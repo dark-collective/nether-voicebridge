@@ -19,16 +19,21 @@ adheres to [Semantic Versioning](https://semver.org/).
   loop needs — that pile is what made a 1 s greeting a 30 s stall. After each
   scenario's bridge exits, the harness deletes the devices recorded in its
   `data/*/device_id` markers (best effort, only ever after the process is
-  gone). **Requires MSC4190 on the appservice registration**
-  (`device_management: true` on Tuwunel): without it the homeserver refuses
-  every client-API device delete for appservice users (403, no UIA path —
-  the same wall the bridge's own #53 prune hits), the harness logs
-  `deleted = 0`, and the pile keeps growing. Same prerequisite for
-  `ops/nvb-prune-devices.sh` below.
+  gone).
+
+### Fixed
+- **Device pruning works on Tuwunel again (no MSC4190 needed).** The #53
+  prune's fallback logged in as the retired device and then issued a self
+  `DELETE /devices/{id}`, which Tuwunel refuses with an empty UIA challenge —
+  so retired devices were never actually deleted. The fallback now calls
+  `POST /logout` with that session instead, which removes the device without
+  UIA (re-probed on 1.9.2). Shared by the startup prune, the harness cleanup
+  above, and `ops/nvb-prune-devices.sh`.
 - **`ops/nvb-prune-devices.sh`** — reports (and with `--apply` deletes) a
   bot's dead devices: anything not in a `device_id` marker under the data
   dir and unseen by the server for 24 h. Dry run by default; live ids are
-  never touched (the #53 wedge).
+  never touched (the #53 wedge). Deletes via masqueraded `DELETE`, else
+  login-as-device + `/logout`.
 - **nvb-watch counts the bot's devices daily** (`| devices: …` in the digest)
   and alerts at `DEVICE_TRIPWIRE` (default 150); an optional `E2E_BOT_MXID`
   watches the harness identity too.

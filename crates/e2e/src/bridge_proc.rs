@@ -629,11 +629,8 @@ impl BridgeUnderTest {
     /// the next scenario's fresh stores mint their own. Ghost devices are
     /// left alone (separate users, pruned by the bridge's own #34 path).
     ///
-    /// Effective only once the appservice registration carries MSC4190
-    /// (`device_management: true` on Tuwunel): until then the homeserver
-    /// refuses every client-API device delete for appservice users and this
-    /// logs `deleted = 0` (live-confirmed 2026-09-27: run #400 minted 8,
-    /// the count went 3,340 → 3,348).
+    /// Deletion is the #53 two-step (masqueraded `DELETE`, else login as the
+    /// device and `POST /logout`), which works on Tuwunel without MSC4190.
     async fn delete_minted_devices(&self) {
         let data = self.workdir.join("data");
         let Ok(mut stores) = tokio::fs::read_dir(&data).await else { return };
