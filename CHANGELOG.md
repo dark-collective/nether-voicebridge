@@ -20,6 +20,10 @@ adheres to [Semantic Versioning](https://semver.org/).
   scenario's bridge exits, the harness deletes the devices recorded in its
   `data/*/device_id` markers (best effort, only ever after the process is
   gone).
+- **`ops/nvb-prune-devices.sh`** — reports (and with `--apply` deletes) a
+  bot's dead devices: anything not in a `device_id` marker under the data
+  dir and unseen by the server for 24 h. Dry run by default; live ids are
+  never touched (the #53 wedge).
 - **nvb-watch counts the bot's devices daily** (`| devices: …` in the digest)
   and alerts at `DEVICE_TRIPWIRE` (default 150); an optional `E2E_BOT_MXID`
   watches the harness identity too.
