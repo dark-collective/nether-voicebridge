@@ -1484,7 +1484,7 @@ async fn handle_invite_gated(ctx: &BotCtx, invite: Option<&InviteDetails>, room:
                 }));
                 // #101: a wordless decline reads as broken — tell the inviter
                 // how to reach the bot (rate-limited per inviter).
-                explain_non_direct_reject(ctx, room.client(), i.sender.clone());
+                explain_non_direct_reject(ctx, i.sender.clone());
                 false
             } else if let Some(retry) = ctx.global_link_gate() {
                 // Global velocity gate (#84): shed self-serve invite auto-joins
@@ -3898,7 +3898,7 @@ fn stamp_once(
 /// why and the fix. Rate-limited per inviter ([`NON_DIRECT_EXPLAIN_COOLDOWN`])
 /// and spawned, so the invite handler never blocks on outbound DM latency and
 /// a rejection spammer cannot farm outbound DMs.
-fn explain_non_direct_reject(ctx: &BotCtx, client: Client, inviter: String) {
+fn explain_non_direct_reject(ctx: &BotCtx, inviter: String) {
     let claimed = stamp_once(
         &mut ctx.explain_stamps.lock().unwrap_or_else(PoisonError::into_inner),
         &inviter,
@@ -3914,9 +3914,35 @@ fn explain_non_direct_reject(ctx: &BotCtx, client: Client, inviter: String) {
          \"New room\") and send `help` to get going.{}",
         docs_line(ctx.docs_url.as_deref())
     );
+    // Deliberately NOT `dm_user` (SDK `create_dm` + encrypted `send`): that
+    // path races this bot's own sync loop on the crypto store and stalled it
+    // for ~31 s in the live trace of 2026-09-27 — long enough that a DM invite
+    // accepted moments earlier was never seen as Joined, so it was never
+    // greeted (nightly `mgmt_self_serve_link` red 09-24 → 09-27). The
+    // explanation is a non-sensitive, one-line notice, so it goes out as a
+    // plaintext room over the raw appservice API, which touches no SDK state
+    // at all. See `matrix::appservice_dm_plaintext`.
+    let http = ctx.http.clone();
+    let homeserver_url = ctx.homeserver_url.clone();
+    let appservice_token = ctx.appservice_token.clone();
+    let own_user = ctx.own_user.to_string();
     tokio::spawn(async move {
-        if let Err(e) = dm_user(&client, &inviter, &text).await {
-            tracing::debug!(inviter = %inviter, error = %e, "could not deliver the non-direct-invite explanation (#101)");
+        match crate::matrix::appservice_dm_plaintext(
+            &http,
+            &homeserver_url,
+            &appservice_token,
+            &own_user,
+            &inviter,
+            &text,
+        )
+        .await
+        {
+            Ok(room_id) => {
+                tracing::info!(inviter = %inviter, room_id = %room_id, "sent the non-direct-invite explanation (#101, plaintext DM)");
+            }
+            Err(e) => {
+                tracing::debug!(inviter = %inviter, error = %e, "could not deliver the non-direct-invite explanation (#101)");
+            }
         }
     });
 }
