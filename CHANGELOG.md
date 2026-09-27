@@ -3,6 +3,31 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.5] - 2026-09-27
+
+**A hotfix for the management bot: a DM invite accepted right after a
+rejected room invite was never greeted, because the bot's own "I only work
+in DMs" notice stalled its sync loop for half a minute.**
+
+### Fixed
+- **The management bot no longer goes deaf for ~30 s after declining a
+  non-direct invite.** The #101 explanation ("I only work in direct
+  messages…") was sent through the SDK as an encrypted DM. That send claims
+  one-time keys for the bot's own sibling devices and then holds the crypto
+  store transaction while the bot's sync loop waits on the same lock at the
+  end of its iteration — traced live on 2026-09-27: the sync loop went silent
+  for ~31 s. Any DM invite the bot accepted in that window was joined
+  server-side but never seen as joined by the SDK, so the newcomer got no
+  greeting and no replies until the stall cleared (nightly
+  `mgmt_self_serve_link` red from 2026-09-24, every run at the second DM,
+  with no code change — the trigger surfaced with Tuwunel 1.9.2). The
+  explanation is a one-line, non-sensitive notice, so it now goes out as a
+  **plaintext** direct room created and posted over the appservice-asserted
+  client API, which touches no SDK state at all: no key claim, no Olm
+  session, no store transaction, nothing to stall. Operator outreach
+  (`msg`, `announce`, misconfiguration heads-ups) is unchanged and stays
+  end-to-end encrypted.
+
 ## [0.3.4] - 2026-08-20
 
 **The opt-out promise now holds everywhere — including the operator's own
