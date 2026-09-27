@@ -847,6 +847,93 @@ impl std::fmt::Display for AppserviceHttpError {
 
 impl std::error::Error for AppserviceHttpError {}
 
+/// Open a **plaintext** direct room with `target` as the bot and post `text`
+/// into it — over the raw appservice-asserted client API, never through the
+/// SDK `Client`.
+///
+/// This exists for the one outbound notice that must not touch the SDK's
+/// crypto store: the #101 "I only work in DMs" explanation that follows a
+/// rejected non-direct invite. Sent via the SDK (`create_dm` + encrypted
+/// `send`), that message races the management bot's own sync loop — the
+/// encrypted send does a `/keys/claim` for the bot's sibling devices and then
+/// sits inside the crypto store transaction, while the sync loop blocks on the
+/// same store lock at the end of its iteration. Live-traced 2026-09-27: the
+/// sync loop went silent for ~31 s, which is exactly how a DM invite accepted
+/// a moment earlier "never reached Joined" and was never greeted (nightly red
+/// 09-24 → 09-27). A plaintext room needs no key claim, no Olm session, no
+/// store transaction — so the explanation can't stall anything.
+///
+/// The room is `is_direct` for the invitee (their client files it as a DM) and
+/// otherwise a throwaway: if they never accept, the #89b empty-room sweep
+/// leaves it once the pending invite is gone. Returns the new room id.
+pub(crate) async fn appservice_dm_plaintext(
+    http: &reqwest::Client,
+    homeserver_url: &str,
+    appservice_token: &str,
+    own_user: &str,
+    target: &str,
+    text: &str,
+) -> Result<String> {
+    let create_url = crate::rtc::ghost::cs_url(homeserver_url, &["createRoom"], Some(own_user))?;
+    let resp = http
+        .post(create_url)
+        .bearer_auth(appservice_token)
+        .json(&serde_json::json!({
+            "preset": "trusted_private_chat",
+            "is_direct": true,
+            "invite": [target],
+        }))
+        .send()
+        .await
+        .context("appservice createRoom request")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppserviceHttpError { status, body }.into());
+    }
+    let created: serde_json::Value = resp.json().await.context("createRoom response JSON")?;
+    let room_id = created["room_id"]
+        .as_str()
+        .map(str::to_owned)
+        .context("createRoom response missing room_id")?;
+
+    let txn = plaintext_txn_id();
+    let send_url = crate::rtc::ghost::cs_url(
+        homeserver_url,
+        &["rooms", &room_id, "send", "m.room.message", &txn],
+        Some(own_user),
+    )?;
+    let resp = http
+        .put(send_url)
+        .bearer_auth(appservice_token)
+        .json(&serde_json::json!({ "msgtype": "m.text", "body": text }))
+        .send()
+        .await
+        .context("appservice send request")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppserviceHttpError { status, body }.into());
+    }
+    Ok(room_id)
+}
+
+/// A transaction id for raw client-API sends. Wall-clock nanoseconds plus pid
+/// and a process-local counter: the homeserver de-duplicates `txnId`s per
+/// access token **forever** (Tuwunel), and the appservice token is shared by
+/// every bridge process, so a replayed id would silently return an OLD event
+/// id and create nothing. Nanos make ids unique across processes and
+/// restarts; pid + counter cover same-instant sends within one process.
+fn plaintext_txn_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("nvb-{nanos}-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
 /// Leave a room via an appservice-asserted `POST /rooms/{id}/leave` — the mirror
 /// of [`appservice_join_room`]. Used to undo a `link` preflight join when the
 /// link does not proceed AND the probe was what created the membership (#83):
@@ -1345,6 +1432,14 @@ pub(crate) async fn reap_stale_memberships(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plaintext_txn_ids_are_unique_and_prefixed() {
+        let a = super::plaintext_txn_id();
+        let b = super::plaintext_txn_id();
+        assert!(a.starts_with("nvb-") && b.starts_with("nvb-"));
+        assert_ne!(a, b, "same-instant sends must still get distinct txn ids");
+    }
+
     use super::{resolve_affected_user, resolve_ghost_device_salt, resolve_store_device_id};
     use matrix_sdk::ruma::OwnedUserId;
     use std::fs;
