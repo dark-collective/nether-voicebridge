@@ -25,8 +25,12 @@
 # never echoed). The delete is the appservice-masqueraded `DELETE /devices/{id}`
 # with a `{}` body (MSC4190 shape, what Tuwunel accepts for appservice users).
 set -euo pipefail
+# Environment overrides win over the conf file (so `AS_USER=@e2e:… ./script`
+# targets another identity without editing the conf).
+_env_hs="${HS_URL:-}"; _env_user="${AS_USER:-}"
 NVB_OPS_CONF="${NVB_OPS_CONF:-/opt/nvb-ops/nvb-ops.conf}"
 [ -f "$NVB_OPS_CONF" ] && . "$NVB_OPS_CONF"
+HS_URL="${_env_hs:-${HS_URL:-}}"; AS_USER="${_env_user:-${AS_USER:-}}"
 NVB_CURL_AS="${NVB_CURL_AS:-/opt/nvb-ops/curl-as.conf}"
 NVB_DATA_DIR="${NVB_DATA_DIR:-/var/lib/nether-voicebridge}"
 RECENT_HOURS="${RECENT_HOURS:-24}"
@@ -38,7 +42,11 @@ listing=$(curl -fsS -m 60 -K "$NVB_CURL_AS" "$HS_URL/_matrix/client/v3/devices?u
 total=$(jq -r '.devices | length' <<<"$listing")
 
 live_file=$(mktemp); trap 'rm -f "$live_file"' EXIT
-find "$NVB_DATA_DIR" -maxdepth 2 -name device_id -exec cat {} + 2>/dev/null | sed 's/[[:space:]]//g' | grep . > "$live_file" || true
+# One id per marker file; the files carry no trailing newline, so read them
+# one at a time rather than concatenating.
+for _m in "$NVB_DATA_DIR"/*/device_id; do
+    [ -f "$_m" ] && tr -d '[:space:]' < "$_m" && echo
+done 2>/dev/null | grep . > "$live_file" || true
 cutoff_ms=$(( ( $(date +%s) - RECENT_HOURS * 3600 ) * 1000 ))
 
 # dead = not in a marker AND not seen recently
