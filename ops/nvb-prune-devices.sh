@@ -23,7 +23,11 @@
 # Reads HS_URL / AS_USER from $NVB_OPS_CONF (default /opt/nvb-ops/nvb-ops.conf)
 # and authenticates with the curl config $NVB_CURL_AS (the appservice token,
 # never echoed). The delete is the appservice-masqueraded `DELETE /devices/{id}`
-# with a `{}` body (MSC4190 shape, what Tuwunel accepts for appservice users).
+# with a `{}` body — the MSC4190 shape. PREREQUISITE: the appservice
+# registration must carry `device_management: true` (Tuwunel's MSC4190 switch;
+# re-register via the admin room). Without it Tuwunel answers 403 "user must be
+# authenticated and device identified" to every delete, and this tool can only
+# report.
 set -euo pipefail
 # Environment overrides win over the conf file (so `AS_USER=@e2e:… ./script`
 # targets another identity without editing the conf).
