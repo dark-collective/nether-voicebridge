@@ -143,10 +143,10 @@ pub(crate) async fn query_device_keys_present(
 /// - The appservice-masqueraded delete is `403 "user must be authenticated and device
 ///   identified"` (NOT a 401 UIA challenge). MSC4190 servers accept exactly this
 ///   request UIA-free, so it stays attempt 1.
-/// - Even a self-delete by the device's own session gets `401` with EMPTY UIA flows —
-///   Tuwunel today offers no completable client-API path; the admin room is the only
-///   way. Policy refusals therefore abandon the pass with one WARN, and the retained
-///   history flushes automatically once the homeserver gains MSC4190.
+/// - A self `DELETE /devices/{id}` by the device's own session gets `401` with EMPTY
+///   UIA flows — but `POST /logout` with that session deletes the device UIA-free
+///   (re-probed on Tuwunel 1.9.2, 2026-09-27), so attempt 2 logs in as the retired
+///   device and logs it out. Policy refusals still abandon the pass with one WARN.
 pub(crate) async fn prune_retired(
     http: &reqwest::Client,
     homeserver_url: &str,
@@ -263,14 +263,36 @@ async fn delete_device(
                 return DeleteOutcome::Retry;
             }
         };
-    let url = match cs_url(homeserver_url, &["devices", device_id], None) {
+    // `POST /logout` with the device's own session deletes the device and
+    // needs no user-interactive auth — unlike a self `DELETE /devices/{id}`,
+    // which Tuwunel answers with a 401 carrying EMPTY UIA flows (probed
+    // 2026-07-03, re-probed on 1.9.2 on 2026-09-27: login-as-device +
+    // logout = 200 and the device is gone). This is what makes the prune
+    // work on a homeserver without MSC4190.
+    let url = match cs_url(homeserver_url, &["logout"], None) {
         Ok(u) => u,
         Err(_) => return DeleteOutcome::Retry,
     };
-    match send_delete(http, url, &own_token).await {
-        DeleteStatus::Gone => DeleteOutcome::Gone,
-        DeleteStatus::AuthRejected => DeleteOutcome::Refused,
-        DeleteStatus::Other => DeleteOutcome::Retry,
+    let resp = match http
+        .post(url)
+        .bearer_auth(&own_token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, device_id, "device prune: logout-as-retired-device failed (will retry next start)");
+            return DeleteOutcome::Retry;
+        }
+    };
+    match resp.status().as_u16() {
+        200 => DeleteOutcome::Gone,
+        401 | 403 => DeleteOutcome::Refused,
+        status => {
+            tracing::warn!(status, device_id, "device prune: logout-as-retired-device unexpected status");
+            DeleteOutcome::Retry
+        }
     }
 }
 

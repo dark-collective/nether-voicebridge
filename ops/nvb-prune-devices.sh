@@ -22,12 +22,11 @@
 #
 # Reads HS_URL / AS_USER from $NVB_OPS_CONF (default /opt/nvb-ops/nvb-ops.conf)
 # and authenticates with the curl config $NVB_CURL_AS (the appservice token,
-# never echoed). The delete is the appservice-masqueraded `DELETE /devices/{id}`
-# with a `{}` body — the MSC4190 shape. PREREQUISITE: the appservice
-# registration must carry `device_management: true` (Tuwunel's MSC4190 switch;
-# re-register via the admin room). Without it Tuwunel answers 403 "user must be
-# authenticated and device identified" to every delete, and this tool can only
-# report.
+# never echoed). Delete path, probed live on Tuwunel 1.9.2 (2026-09-27): the
+# masqueraded `DELETE /devices/{id}` is refused (403, MSC4190 not enabled), but
+# an appservice login *as that device* (`m.login.application_service` +
+# `device_id`) followed by `POST /logout` removes it, no UIA involved. That is
+# what this tool does; the DELETE is tried first in case MSC4190 is on.
 set -euo pipefail
 # Environment overrides win over the conf file (so `AS_USER=@e2e:… ./script`
 # targets another identity without editing the conf).
@@ -75,6 +74,18 @@ while IFS= read -r id; do
     code=$(curl -s -o /dev/null -w '%{http_code}' -m 30 -K "$NVB_CURL_AS" -X DELETE \
         -H 'Content-Type: application/json' -d '{}' \
         "$HS_URL/_matrix/client/v3/devices/$encid?user_id=$enc")
+    if [ "$code" != 200 ] && [ "$code" != 404 ]; then
+        # No MSC4190: log in as the device, then log it out (deletes it).
+        lp="${AS_USER#@}"; lp="${lp%%:*}"
+        at=$(curl -s -m 30 -K "$NVB_CURL_AS" -X POST -H 'Content-Type: application/json' \
+            -d "{\"type\":\"m.login.application_service\",\"identifier\":{\"type\":\"m.id.user\",\"user\":\"$lp\"},\"device_id\":\"$id\"}" \
+            "$HS_URL/_matrix/client/v3/login" | jq -r '.access_token // empty' 2>/dev/null || true)
+        if [ -n "$at" ]; then
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 30 -X POST -H "Authorization: Bearer $at" \
+                -H 'Content-Type: application/json' -d '{}' "$HS_URL/_matrix/client/v3/logout")
+            unset at
+        fi
+    fi
     case "$code" in 200|404) ok=$((ok+1));; *) bad=$((bad+1)); echo "  $id -> HTTP $code";; esac
 done <<<"$dead"
 echo "deleted $ok, failed $bad; remaining: $(curl -fsS -m 60 -K "$NVB_CURL_AS" "$HS_URL/_matrix/client/v3/devices?user_id=$enc" | jq -r '.devices | length')"
