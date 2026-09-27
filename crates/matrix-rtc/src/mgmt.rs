@@ -114,7 +114,7 @@ pub struct PoolIo {
 
 use anyhow::{Context, Result};
 use matrix_sdk::{
-    Client, Room, RoomState, SessionMeta,
+    Client, LoopCtrl, Room, RoomState, SessionMeta,
     authentication::{SessionTokens, matrix::MatrixSession},
     config::SyncSettings,
     deserialized_responses::SyncOrStrippedState,
@@ -1315,14 +1315,33 @@ pub async fn run(
 
     // Sync forever, mirroring the bridge sync loop's retry policy: auth errors
     // are fatal, transient network errors back off and retry.
+    //
+    // Stall watchdog (v0.3.5 post-mortem): a sync iteration that never
+    // completes is *silent* — no error, no log line, the bot just stops
+    // answering. That is exactly how a concurrent encrypted send, holding the
+    // SDK's key-claim lock for 29 s, hid a 31 s outage until a nightly caught
+    // it (2026-09-24 → 09-27). Every completed iteration stamps
+    // `last_sync_ms`; a side task WARNs once when no iteration has completed
+    // for [`SYNC_STALL_WARN`] and INFOs on recovery, so the next stall shows
+    // up in the journal (and in nvb-watch's WARN count) instead of nowhere.
+    let last_sync_ms = Arc::new(std::sync::atomic::AtomicU64::new(epoch_ms()));
+    let _watchdog = SyncWatchdog::spawn(last_sync_ms.clone(), shutdown.clone());
     loop {
+        let stamp = last_sync_ms.clone();
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
                 tracing::info!("management bot stopping (shutdown)");
                 return Ok(());
             }
-            res = client.sync(SyncSettings::default()) => match res {
+            res = client.sync_with_result_callback(SyncSettings::default(), move |res| {
+                let stamp = stamp.clone();
+                async move {
+                    res?;
+                    stamp.store(epoch_ms(), std::sync::atomic::Ordering::Relaxed);
+                    Ok(LoopCtrl::Continue)
+                }
+            }) => match res {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     // Structure, not text — see `auth_error` and #130.
@@ -1330,6 +1349,8 @@ pub async fn run(
                         return Err(anyhow::anyhow!("management bot sync fatal auth error: {e}"));
                     }
                     tracing::warn!(error = %e, "management bot sync error — retrying in 5 s");
+                    // A logged, deliberate pause is not a stall.
+                    last_sync_ms.store(epoch_ms(), std::sync::atomic::Ordering::Relaxed);
                     tokio::select! {
                         _ = shutdown.cancelled() => return Ok(()),
                         _ = tokio::time::sleep(Duration::from_secs(5)) => {}
@@ -1337,6 +1358,84 @@ pub async fn run(
                 }
             }
         }
+    }
+}
+
+/// How long the management bot may go without completing a `/sync` iteration
+/// before the watchdog calls it stalled. The long-poll itself is 30 s, plus
+/// processing; anything past a minute means the loop is stuck, not idle.
+const SYNC_STALL_WARN: Duration = Duration::from_secs(60);
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// What the watchdog should do this tick, given how long the loop has been
+/// silent and whether it already raised the alarm. Pure so it is testable.
+#[derive(Debug, PartialEq, Eq)]
+enum StallEvent {
+    /// Silent past the threshold and not yet reported.
+    Stalled,
+    /// An iteration completed after a reported stall.
+    Recovered,
+}
+
+fn stall_event(stalled_ms: u64, already_warned: bool) -> Option<StallEvent> {
+    let past = stalled_ms > SYNC_STALL_WARN.as_millis() as u64;
+    match (past, already_warned) {
+        (true, false) => Some(StallEvent::Stalled),
+        (false, true) => Some(StallEvent::Recovered),
+        _ => None,
+    }
+}
+
+/// The side task behind the stall watchdog; aborted when dropped, so it
+/// cannot outlive the sync loop it watches.
+struct SyncWatchdog(tokio::task::JoinHandle<()>);
+
+impl Drop for SyncWatchdog {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl SyncWatchdog {
+    fn spawn(last_sync_ms: Arc<std::sync::atomic::AtomicU64>, shutdown: CancellationToken) -> Self {
+        Self(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The `last_sync_ms` value at the moment the alarm was raised, so
+            // the recovery line can say how long the loop was actually stuck.
+            let mut warned_at: Option<u64> = None;
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tick.tick() => {}
+                }
+                let last = last_sync_ms.load(std::sync::atomic::Ordering::Relaxed);
+                let stalled = epoch_ms().saturating_sub(last);
+                match stall_event(stalled, warned_at.is_some()) {
+                    Some(StallEvent::Stalled) => {
+                        warned_at = Some(last);
+                        tracing::warn!(
+                            stalled_secs = stalled / 1000,
+                            "management bot sync loop stalled — no /sync iteration completed; invites, commands and greetings are on hold until it recovers"
+                        );
+                    }
+                    Some(StallEvent::Recovered) => {
+                        let since = warned_at.take().unwrap_or(last);
+                        tracing::info!(
+                            stalled_secs = last.saturating_sub(since) / 1000,
+                            "management bot sync loop recovered"
+                        );
+                    }
+                    None => {}
+                }
+            }
+        }))
     }
 }
 
@@ -4243,6 +4342,17 @@ fn plausible_room_id(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stall_watchdog_reports_each_transition_once() {
+        use super::{StallEvent, stall_event, SYNC_STALL_WARN};
+        let past = SYNC_STALL_WARN.as_millis() as u64 + 1;
+        assert_eq!(stall_event(0, false), None, "fresh loop: quiet");
+        assert_eq!(stall_event(past, false), Some(StallEvent::Stalled));
+        assert_eq!(stall_event(past + 5_000, true), None, "stall already reported: quiet");
+        assert_eq!(stall_event(0, true), Some(StallEvent::Recovered));
+        assert_eq!(stall_event(0, false), None, "recovered and reported: quiet");
+    }
+
     use super::*;
 
     #[test]

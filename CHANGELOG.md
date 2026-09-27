@@ -3,6 +3,27 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Management bot sync-loop stall watchdog.** A sync iteration that never
+  completes is silent — no error, no log line — which is how the v0.3.5
+  stall hid for three days. The bot now stamps every completed `/sync`
+  iteration; a side task WARNs once when none has completed for 60 s and
+  INFOs on recovery with the stall's length, so the next one lands in the
+  journal and in nvb-watch's WARN count.
+- **The e2e harness deletes the bot devices it mints.** Every bridge-under-
+  test store mints a fresh device and they never went away: the e2e bot had
+  3,340 devices by 2026-09-27, and the SDK claims one-time keys for *all* of a
+  user's own devices on every encrypted send while holding the lock the sync
+  loop needs — that pile is what made a 1 s greeting a 30 s stall. After each
+  scenario's bridge exits, the harness deletes the devices recorded in its
+  `data/*/device_id` markers (best effort, only ever after the process is
+  gone).
+- **nvb-watch counts the bot's devices daily** (`| devices: …` in the digest)
+  and alerts at `DEVICE_TRIPWIRE` (default 150); an optional `E2E_BOT_MXID`
+  watches the harness identity too.
+
 ## [0.3.5] - 2026-09-27
 
 **A hotfix for the management bot: a DM invite accepted right after a

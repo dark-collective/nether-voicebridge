@@ -273,6 +273,15 @@ pub struct BridgeUnderTest {
     /// Holds the real `config.toml` (secrets) — outside the artifacts tree;
     /// removed best-effort on every teardown path (#72 F6-2).
     secrets_dir: PathBuf,
+    /// Enough to delete the devices this bridge minted once it has exited:
+    /// every fresh store mints a new `<base>-<rand>` device for the bot, and
+    /// left behind they pile up on the homeserver (3,340 for the e2e bot by
+    /// 2026-09-27). The SDK claims one-time keys for ALL own devices on every
+    /// encrypted send while holding a lock the sync loop needs, so the pile
+    /// is what turned a 1 s greeting into a 30 s stall (v0.3.5 post-mortem).
+    homeserver_url: String,
+    as_token: String,
+    bot_mxid: String,
 }
 
 impl BridgeUnderTest {
@@ -526,7 +535,17 @@ impl BridgeUnderTest {
             });
         }
 
-        Ok(Self { child, pid, scraper, workdir: workdir.to_owned(), tenants_path, secrets_dir })
+        Ok(Self {
+            child,
+            pid,
+            scraper,
+            workdir: workdir.to_owned(),
+            tenants_path,
+            secrets_dir,
+            homeserver_url: cfg.homeserver_url.trim_end_matches('/').to_owned(),
+            as_token: cfg.appservice_token.clone(),
+            bot_mxid: cfg.bot_user_id(),
+        })
     }
 
     /// Wait until every named bridge finished its initial Matrix sync + state
@@ -599,8 +618,47 @@ impl BridgeUnderTest {
         };
         // The child is confirmed gone (or force-killed) by this point — safe
         // to scrub the secrets dir regardless of outcome (#72 F6-2).
+        self.delete_minted_devices().await;
         let _ = tokio::fs::remove_dir_all(&self.secrets_dir).await;
         result
+    }
+
+    /// Delete the bot devices this (now exited) bridge minted — one per store
+    /// under `<workdir>/data/<store>/device_id`. Best effort and after the
+    /// process is gone, so a device is only ever deleted once it is dead;
+    /// the next scenario's fresh stores mint their own. Ghost devices are
+    /// left alone (separate users, pruned by the bridge's own #34 path).
+    async fn delete_minted_devices(&self) {
+        let data = self.workdir.join("data");
+        let Ok(mut stores) = tokio::fs::read_dir(&data).await else { return };
+        let mut ids = Vec::new();
+        while let Ok(Some(entry)) = stores.next_entry().await {
+            if let Ok(id) = tokio::fs::read_to_string(entry.path().join("device_id")).await {
+                let id = id.trim().to_owned();
+                if !id.is_empty() {
+                    ids.push(id);
+                }
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        let Ok(http) = reqwest::Client::builder().use_rustls_tls().build() else { return };
+        let mut gone = 0usize;
+        for id in &ids {
+            if nvb_matrix_rtc::delete_device_best_effort(
+                &http,
+                &self.homeserver_url,
+                &self.as_token,
+                &self.bot_mxid,
+                id,
+            )
+            .await
+            {
+                gone += 1;
+            }
+        }
+        tracing::info!(minted = ids.len(), deleted = gone, bot = %self.bot_mxid, "deleted the bridge-under-test's minted bot devices");
     }
 
     /// Hard-kill (scenario cleanup on failure paths). Prefer
@@ -609,6 +667,7 @@ impl BridgeUnderTest {
     pub async fn kill(mut self) {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
+        self.delete_minted_devices().await;
         let _ = tokio::fs::remove_dir_all(&self.secrets_dir).await;
     }
 }

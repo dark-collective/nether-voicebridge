@@ -33,6 +33,7 @@ use nvb_audio::routing::PlaybackRouter;
 use nvb_config::{LiveKitConfig, MatrixConfig, TimingConfig};
 
 pub use rtc::ghost::GhostPool;
+pub use device_prune::delete_device_best_effort;
 
 // #38 e2e testkit: fake Matrix call participants for the nvb-e2e harness.
 // Feature-gated — a default build compiles none of it (see `rtc/testkit.rs`).

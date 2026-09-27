@@ -274,6 +274,28 @@ async fn delete_device(
     }
 }
 
+/// Delete one of `user_mxid`'s devices, best effort, over the same two-step
+/// path the startup prune uses (appservice-masqueraded `DELETE`, then a
+/// login-as-that-device fallback). `true` when the device is gone (or was
+/// already gone). Public for the e2e harness, which mints a fresh device for
+/// every bridge-under-test store and must delete them again on teardown:
+/// the SDK claims one-time keys for ALL of a user's own devices on every
+/// encrypted send, and that claim holds a lock the sync loop needs — at
+/// 3,313 stale devices the claim took 29 s and stalled the management bot
+/// (v0.3.5 post-mortem, nightly red 2026-09-24 → 09-27).
+pub async fn delete_device_best_effort(
+    http: &reqwest::Client,
+    homeserver_url: &str,
+    as_token: &str,
+    user_mxid: &str,
+    device_id: &str,
+) -> bool {
+    matches!(
+        delete_device(http, homeserver_url, as_token, user_mxid, device_id).await,
+        DeleteOutcome::Gone
+    )
+}
+
 enum DeleteStatus {
     Gone,
     /// 401 (UIA challenge, possibly with empty flows) or 403 (policy).
