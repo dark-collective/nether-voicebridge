@@ -341,10 +341,30 @@ if [ "$(cat "$DIG_FILE" 2>/dev/null)" != "$today" ]; then
             post "🚨 nvb-watch: ⚠ puppet-bot guild count $_max ≥ tripwire ${TRIPWIRE:-60} — nearing Discord's 100-server App Verification gate; start verification (docs/nether-voicebridge-verification-runbook.md). Bot's 'status' command has the per-app detail."
         fi
     fi
+    # Bot device count (v0.3.5 post-mortem): every fresh crypto store mints a
+    # new device for the bot, and the SDK claims one-time keys for ALL of a
+    # user's own devices on every encrypted send while holding a lock the sync
+    # loop needs — 3,313 dead e2e-bot devices turned a 1 s greeting into a
+    # 29 s stall. Counted once daily from the masqueraded `/devices` listing;
+    # the tripwire fires well before the count can hurt (prod: 19 live).
+    dev_line=""
+    for _who in "${AS_USER:-}" "${E2E_BOT_MXID:-}"; do
+        [ -n "$_who" ] || continue
+        _enc=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$_who")
+        _n=$(curl -s -m 20 -K "${NVB_CURL_AS:-/opt/nvb-ops/curl-as.conf}" \
+            "$HS_URL/_matrix/client/v3/devices?user_id=$_enc" 2>/dev/null \
+            | jq -r '.devices | length' 2>/dev/null || true)
+        [[ "${_n:-}" =~ ^[0-9]+$ ]] || _n="?"
+        dev_line="$dev_line ${_who%%:*}=$_n"
+        if [[ "$_n" =~ ^[0-9]+$ ]] && [ "$_n" -ge "${DEVICE_TRIPWIRE:-150}" ]; then
+            post "🚨 nvb-watch: ⚠ $_who has $_n devices on the homeserver (tripwire ${DEVICE_TRIPWIRE:-150}). Every encrypted send claims keys for all of them under the SDK's key-claim lock and stalls the management bot's sync loop; prune the dead ones (live ids = the device_id markers under the data dir). See CHANGELOG 0.3.5."
+        fi
+    done
+    [ -n "$dev_line" ] && dev_line="| devices:$dev_line"
     # `bridges=N/M` is deliberately in the digest: before #131 a healthy-looking
     # digest proved only that the PROCESS was up, which is exactly how a 3-day
     # outage went unnoticed. Now a green digest states bridge liveness too.
-    post "📊 nvb-watch daily digest $today — audit 24h: ${day_summary:-quiet} | journal(15m): err=$errn warn=$warnn svc=$alive ${BRIDGES_LINE:-| bridges=?} | conns: tcp=$tcpn udp=$udpn $pool_line ${E2E_DIGEST:-} ${CI_DIGEST:-}"
+    post "📊 nvb-watch daily digest $today — audit 24h: ${day_summary:-quiet} | journal(15m): err=$errn warn=$warnn svc=$alive ${BRIDGES_LINE:-| bridges=?} | conns: tcp=$tcpn udp=$udpn $pool_line ${dev_line:-} ${E2E_DIGEST:-} ${CI_DIGEST:-}"
     echo "$today" > "$DIG_FILE"
 fi
 exit 0

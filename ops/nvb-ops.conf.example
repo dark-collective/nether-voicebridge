@@ -37,3 +37,9 @@ GW_STORM_ALERT=20
 # supervisor loop itself is wedged.
 ROSTER=/var/lib/nether-voicebridge/bridges.json
 ROSTER_STALE_SECS=300
+# Daily digest counts the bot's devices on the homeserver and alerts at this
+# many (v0.3.5 post-mortem: stale devices slow every encrypted send and stall
+# the management bot's sync loop). Optional second identity to watch, e.g. the
+# e2e harness bot, which mints a device per test store.
+DEVICE_TRIPWIRE=150
+#E2E_BOT_MXID=@nether-voicebridge_e2e_bot:example.org
