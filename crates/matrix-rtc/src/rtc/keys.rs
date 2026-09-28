@@ -36,7 +36,12 @@ pub struct EncKeyEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncKeyMember {
     pub claimed_device_id: String,
-    pub id: String,
+    /// Element Call / matrix-js-sdk send the sender's membership id here; Commet's
+    /// encrypted calls omit it entirely. It is diagnostic only — the peer's LiveKit
+    /// identity is `sender:claimed_device_id` — so it must never gate a key install
+    /// (a required field here silently dropped every Commet key, 2026-09-27).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 /// The `session` sub-object in the to-device content.
@@ -56,8 +61,13 @@ pub struct CallEncryptionKeysEventContent {
     pub room_id: String,
     pub member: EncKeyMember,
     pub session: EncKeySession,
+    /// Optional on the wire (js-sdk marks it `sent_ts?`); informational only.
+    #[serde(default)]
     pub sent_ts: u64,
 }
+
+/// Wire event type of the media-key to-device event.
+pub const ENCRYPTION_KEYS_EVENT_TYPE: &str = "io.element.call.encryption_keys";
 
 // ── Key generation ────────────────────────────────────────────────────────────
 //
@@ -126,7 +136,7 @@ pub(crate) fn build_key_content(
         room_id: room_id.to_owned(),
         member: EncKeyMember {
             claimed_device_id: device_id.to_owned(),
-            id: format!("{device_id}_m.call"),
+            id: Some(format!("{device_id}_m.call")),
         },
         session: EncKeySession {
             call_id: String::new(),
@@ -135,6 +145,29 @@ pub(crate) fn build_key_content(
         },
         sent_ts,
     }
+}
+
+/// Describe the *shape* of a raw to-device event's `content` for diagnostics:
+/// top-level field names plus the field names of the `keys`/`member`/`session`
+/// sub-objects. Values are never included, so a key never reaches the log.
+pub(crate) fn describe_content_shape(raw_event_json: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw_event_json) else {
+        return "<not json>".to_owned();
+    };
+    let Some(content) = v.get("content").and_then(|c| c.as_object()) else {
+        return "<no content object>".to_owned();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for (k, val) in content {
+        match (k.as_str(), val.as_object()) {
+            ("keys" | "member" | "session", Some(sub)) => {
+                let inner: Vec<&str> = sub.keys().map(String::as_str).collect();
+                parts.push(format!("{k}{{{}}}", inner.join(",")));
+            }
+            _ => parts.push(k.clone()),
+        }
+    }
+    parts.join(" ")
 }
 
 // ── Receive peers' keys and install into KeyProvider ──────────────────────────
@@ -273,6 +306,59 @@ impl PeerKeyCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Commet's encrypted calls send `member: {claimed_device_id}` with no `id`
+    /// (and Element Call marks `sent_ts` optional). A required field here made
+    /// matrix-sdk skip the typed handler silently → the caller's key was never
+    /// installed → one-way audio (2026-09-27). Both shapes must parse.
+    #[test]
+    fn commet_shaped_content_parses_without_member_id() {
+        let json = serde_json::json!({
+            "keys": {"index": 0, "key": "AAAAAAAAAAAAAAAAAAAAAA=="},
+            "member": {"claimed_device_id": "mZ3kATp88n"},
+            "room_id": "!room:nether.im",
+            "session": {"application": "m.call", "call_id": "", "scope": "m.room"}
+        });
+        let c: CallEncryptionKeysEventContent = serde_json::from_value(json).unwrap();
+        assert_eq!(c.member.claimed_device_id, "mZ3kATp88n");
+        assert_eq!(c.member.id, None);
+        assert_eq!(c.sent_ts, 0);
+        assert_eq!(peer_livekit_identity("@dark:nether.im", &c.member.claimed_device_id), "@dark:nether.im:mZ3kATp88n");
+    }
+
+    #[test]
+    fn element_call_shaped_content_still_parses_with_member_id() {
+        let json = serde_json::json!({
+            "keys": {"index": 3, "key": "AAAAAAAAAAAAAAAAAAAAAA=="},
+            "member": {"claimed_device_id": "UyGKv2k9fl", "id": "ee38c25d-d196-4f4e-b7fe-2f0b58cd5db8"},
+            "room_id": "!room:nether.im",
+            "session": {"application": "m.call", "call_id": "", "scope": "m.room"},
+            "sent_ts": 1234u64
+        });
+        let c: CallEncryptionKeysEventContent = serde_json::from_value(json).unwrap();
+        assert_eq!(c.member.id.as_deref(), Some("ee38c25d-d196-4f4e-b7fe-2f0b58cd5db8"));
+        assert_eq!(c.keys.index, 3);
+        assert_eq!(c.sent_ts, 1234);
+    }
+
+    #[test]
+    fn content_shape_lists_field_names_but_never_values() {
+        let raw = serde_json::json!({
+            "sender": "@dark:nether.im",
+            "type": ENCRYPTION_KEYS_EVENT_TYPE,
+            "content": {
+                "keys": {"index": 0, "key": "SECRETKEYBYTES=="},
+                "member": {"claimed_device_id": "mZ3kATp88n"},
+                "room_id": "!room:nether.im",
+                "session": {"application": "m.call", "call_id": "", "scope": "m.room"}
+            }
+        })
+        .to_string();
+        let shape = describe_content_shape(&raw);
+        assert_eq!(shape, "keys{index,key} member{claimed_device_id} room_id session{application,call_id,scope}");
+        assert!(!shape.contains("SECRETKEYBYTES"));
+        assert_eq!(describe_content_shape("nope"), "<not json>");
+    }
 
     #[test]
     fn peer_key_cache_records_last_writer_and_clears() {
