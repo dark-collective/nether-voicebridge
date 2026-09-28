@@ -3,7 +3,11 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.7] - 2026-09-28
+
+**Commet callers in encrypted rooms can now be heard on Discord, and the next
+client whose media-key event doesn't fit our type shows up as a WARN instead
+of silent one-way audio.**
 
 ### Fixed
 - **Matrix→Discord silent for Commet callers in encrypted rooms.** Commet's
