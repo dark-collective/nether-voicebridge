@@ -12,6 +12,12 @@
 //!   1. Post the bridge bot's m.call.member join
 //!   2. Fetch a fresh OpenID token + LiveKit JWT
 //!   3. Connect to LiveKit and subscribe to remote tracks (HKDF E2EE when on)
+//!   4. Multi-SFU (MSC4195, Element Call ≥ 0.21): every human member publishes
+//!      on the SFU their membership resolves to (`rtc::focus`) — normally their
+//!      own homeserver's. For each such SFU that is not ours, run one extra
+//!      subscribe-only session ([`ForeignSessions`]) so their tracks reach the
+//!      same router. Reconciled on join, on membership change, on a foreign
+//!      session dying, and on every reaper tick.
 //!
 //! On call-ended (last human leaves) or shutdown:
 //!   1. Disconnect from LiveKit (releases all puppet routes)
@@ -19,6 +25,7 @@
 
 mod keys;
 mod key_transport;
+pub(crate) mod focus;
 pub(crate) mod ghost;
 mod lk_jwt;
 mod membership;
@@ -39,7 +46,7 @@ use matrix_sdk::{
     Client,
     ruma::{OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -57,12 +64,14 @@ use well_known::LivekitFocusInfo;
 // `[timing]` config (`TimingConfig::reap_interval`) as `run`'s `reap_interval`
 // parameter. See [`matrix::reap_stale_memberships`].
 
-/// Shared slot for the live session's key-install notifier (#73): the to-device
-/// handler pushes the LiveKit identity of every peer whose media key it just
-/// installed, and the session's room-event loop re-subscribes any track that
-/// was subscribed before its key arrived. Set on join, cleared on teardown —
-/// same lifecycle as the shared `KeyProvider`.
-type KeyInstalledTx = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>;
+/// Shared fan-out for the live sessions' key-install notifiers (#73): the
+/// to-device handler pushes the LiveKit identity of every peer whose media key it
+/// just installed, and each session's room-event loop re-subscribes any track
+/// that was subscribed before its key arrived. One sender per live session (the
+/// primary plus every foreign-SFU subscriber); senders whose session is gone are
+/// dropped on the next push. Cleared on teardown — same lifecycle as the shared
+/// `KeyProvider`.
+type KeyInstalledTx = Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<String>>>>;
 
 /// State held while the bridge bot is connected to a live call (subscribe-only).
 struct ActiveSession {
@@ -99,6 +108,9 @@ pub(crate) async fn run(
     reap_interval: Duration,
     reap_grace: Duration,
     mut call_active_rx: watch::Receiver<bool>,
+    // Bumped by the sync loop when a human joins the call: re-resolve which SFUs
+    // the members publish on (multi-SFU fan-in) without waiting for a reaper tick.
+    mut members_gen_rx: watch::Receiver<u64>,
     router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
     shutdown: CancellationToken,
@@ -125,7 +137,7 @@ pub(crate) async fn run(
     // disconnect-recovery rejoin mints (#66) — see [`keys::PeerKeyCache`].
     let peer_keys: Arc<keys::PeerKeyCache> = Arc::new(keys::PeerKeyCache::default());
     // Key-install notifier for the live session's #73 heal gate.
-    let key_installed_tx: KeyInstalledTx = Arc::new(Mutex::new(None));
+    let key_installed_tx: KeyInstalledTx = Arc::new(Mutex::new(Vec::new()));
 
     // Bridge-bot identity, used to post/retract call membership when E2EE is on.
     let bot_user_id: OwnedUserId = mx_cfg.bot_user_id.parse()?;
@@ -195,10 +207,11 @@ pub(crate) async fn run(
                     // subscribed keyless for this identity is re-subscribed
                     // now that its key exists.
                     if installed {
-                        let slot = key_tx_ref.lock().expect("key-installed slot mutex poisoned");
-                        if let Some(tx) = slot.as_ref() {
-                            let _ = tx.send(keys::peer_livekit_identity(&sender, &claimed_device_id));
-                        }
+                        let identity = keys::peer_livekit_identity(&sender, &claimed_device_id);
+                        let mut slot = key_tx_ref.lock().expect("key-installed slot mutex poisoned");
+                        // Every live session gets the nudge; a closed receiver
+                        // (session torn down) is pruned here.
+                        slot.retain(|tx| tx.send(identity.clone()).is_ok());
                     }
                 }
                 .instrument(span)
@@ -239,6 +252,31 @@ pub(crate) async fn run(
     // First tick fires immediately; skip the missed tick rather than bursting.
     reap_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Multi-SFU fan-in: one extra subscribe-only session per SFU that a human
+    // member publishes on and that isn't ours. Everything a foreign connect needs
+    // is bundled once here (owned clones — the reconciler runs from several arms).
+    let mut foreign = ForeignSessions::default();
+    // Once the sync loop drops its sender, `changed()` errors immediately and
+    // forever — go inert instead of spinning (the call-active arm, which shares
+    // that lifetime, ends the loop anyway).
+    let mut members_gen_closed = false;
+    let fctx = ForeignCtx {
+        client: client.clone(),
+        http: http.clone(),
+        room_id: room_id.clone(),
+        bot_user_id: bot_user_id.clone(),
+        device_id: mx_cfg.device_id.clone(),
+        primary: focus.clone(),
+        ghost_prefix: ghost_prefix.clone(),
+        media_e2ee,
+        shared_provider: shared_provider.clone(),
+        key_installed_tx: key_installed_tx.clone(),
+        peer_keys: peer_keys.clone(),
+        router: router.clone(),
+        bridge: bridge.clone(),
+        shutdown: shutdown.clone(),
+    };
+
     loop {
         let is_active = *call_active_rx.borrow_and_update();
 
@@ -278,6 +316,8 @@ pub(crate) async fn run(
                     Ok(sess) => {
                         active_session = Some(sess);
                         joined = true;
+                        // Humans may already be publishing on other SFUs — fan in now.
+                        foreign.reconcile(&fctx).await;
                         // E2EE only: become a roster member so EC/Commet target
                         // us with Olm-encrypted media keys. Posted AFTER the key
                         // provider is shared (inside join_livekit) so a fast
@@ -310,6 +350,7 @@ pub(crate) async fn run(
                 // All humans left — tear down. This is a normal call-end, so
                 // release the puppets too (they leave voice).
                 tracing::info!("call ended — disconnecting subscriber");
+                foreign.disconnect_all().await;
                 teardown(&mut active_session, &shared_provider, &key_installed_tx, &router, true).await;
                 joined = false;
                 // No live roster anymore — drop the reaper's grace clocks so the
@@ -363,6 +404,9 @@ pub(crate) async fn run(
         let disc = active_session
             .as_ref()
             .map(|s| s.lk_session.disconnected.clone());
+        // Same per-iteration snapshot for the foreign sessions: any of them dying
+        // wakes the loop to reconcile (drop the dead one, reconnect with backoff).
+        let foreign_disc = foreign.disconnect_signals();
 
         // Wait for the next call-active transition, a room disconnect, a reaper
         // tick, or shutdown. Ordering (biased): a simultaneous call-end +
@@ -390,6 +434,10 @@ pub(crate) async fn run(
                 // iteration's (false,true) arm re-runs join_livekit; failures
                 // retry at reaper-tick cadence, same as an initial join.
                 tracing::warn!("LiveKit room disconnected — tearing down for rejoin");
+                // Foreign sessions share the primary's key provider/notifier
+                // slots (cleared by teardown) — drop them too; the rejoin's
+                // reconcile brings them back against the fresh slots.
+                foreign.disconnect_all().await;
                 teardown(&mut active_session, &shared_provider, &key_installed_tx, &router, false).await;
                 joined = false;
                 // The dead-room window produced bogus absence observations —
@@ -407,6 +455,39 @@ pub(crate) async fn run(
                 // membership_lingering stays true — the guarded (false,false) arm
                 // retracts if the call ends before the rejoin lands.
             }
+            changed = async {
+                if members_gen_closed {
+                    std::future::pending().await
+                } else {
+                    members_gen_rx.changed().await
+                }
+            } => {
+                match changed {
+                    // A human joined: they may publish on an SFU we aren't on yet.
+                    Ok(()) => {
+                        if joined {
+                            foreign.reconcile(&fctx).await;
+                        }
+                    }
+                    Err(_) => members_gen_closed = true,
+                }
+            }
+            _ = async {
+                if foreign_disc.is_empty() {
+                    std::future::pending::<()>().await
+                } else {
+                    let waits = foreign_disc.iter().map(|t| Box::pin(t.cancelled()));
+                    futures_util::future::select_all(waits).await;
+                }
+            } => {
+                // A foreign-SFU session died: reconcile drops it (its URL leaves
+                // the reaper's observed set immediately) and reconnects with
+                // backoff while its members are still in the call.
+                tracing::warn!("a foreign-SFU subscriber disconnected — reconciling");
+                if joined {
+                    foreign.reconcile(&fctx).await;
+                }
+            }
             _ = reap_interval.tick() => {
                 // Only meaningful with a live LiveKit roster to compare against.
                 // A dead room reads as an empty/frozen roster — every real human
@@ -416,9 +497,16 @@ pub(crate) async fn run(
                     if sess.lk_session.disconnected.is_cancelled() {
                         tracing::debug!("skipping reap tick — room disconnected, awaiting rejoin");
                     } else {
-                        let live_mxids = live_roster_mxids(&sess.lk_session.room);
+                        // Keep the foreign set current first (members leave, a
+                        // failed connect's backoff expires), then judge phantoms
+                        // against the union of every roster we actually hold.
+                        let entries = foreign.reconcile(&fctx).await;
+                        let mut live_mxids = live_roster_mxids(&sess.lk_session.room);
+                        foreign.extend_live_mxids(&mut live_mxids);
+                        let mut observed = foreign.observed_focus_urls();
+                        observed.insert(crate::rtc::focus::normalize_service_url(&focus.service_url));
                         crate::matrix::reap_stale_memberships(
-                            &client, &room_id, &bot_user_id, &ghost_prefix, &live_mxids, &mut phantom_since,
+                            &client, &room_id, &entries, &live_mxids, &observed, &mut phantom_since,
                             reap_grace,
                         )
                         .await;
@@ -436,6 +524,7 @@ pub(crate) async fn run(
     // `joined` can be false with cleanup still owed: a shutdown that lands
     // mid-disconnect-recovery (#66) has no active session but a lingering
     // membership. Gate the two halves independently.
+    foreign.disconnect_all().await;
     if active_session.is_some() || joined {
         teardown(&mut active_session, &shared_provider, &key_installed_tx, &router, false).await;
     }
@@ -467,6 +556,233 @@ fn live_roster_mxids(room: &livekit::Room) -> std::collections::HashSet<String> 
         .values()
         .map(|p| session::participant_mxid(&p.identity().to_string()).to_owned())
         .collect()
+}
+
+// ── Multi-SFU fan-in (MSC4195 `multi_sfu`) ────────────────────────────────────
+
+/// Everything a foreign-SFU connect needs, bundled once per `run` so the
+/// reconciler can be called from several loop arms. All owned clones.
+struct ForeignCtx {
+    client: Client,
+    http: reqwest::Client,
+    room_id: OwnedRoomId,
+    bot_user_id: OwnedUserId,
+    device_id: String,
+    /// Our own SFU (from `.well-known`) — never a "foreign" target.
+    primary: LivekitFocusInfo,
+    ghost_prefix: Arc<str>,
+    media_e2ee: bool,
+    shared_provider: Arc<Mutex<Option<KeyProvider>>>,
+    key_installed_tx: KeyInstalledTx,
+    peer_keys: Arc<keys::PeerKeyCache>,
+    router: Arc<dyn PlaybackRouter>,
+    bridge: Arc<str>,
+    shutdown: CancellationToken,
+}
+
+/// A live subscribe-only session on somebody else's SFU.
+struct ForeignSession {
+    focus: LivekitFocusInfo,
+    lk_session: session::LiveSession,
+}
+
+/// Initial retry delay after a failed foreign connect (doubles up to
+/// [`FOREIGN_BACKOFF_MAX`]; reset by a successful connect).
+const FOREIGN_BACKOFF_INITIAL: Duration = Duration::from_secs(15);
+const FOREIGN_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// The set of foreign-SFU subscriber sessions, keyed by normalized
+/// `livekit_service_url`, plus per-URL connect backoff.
+#[derive(Default)]
+struct ForeignSessions {
+    sessions: HashMap<String, ForeignSession>,
+    /// URL → (don't retry before, delay to apply after the next failure).
+    backoff: HashMap<String, (Instant, Duration)>,
+}
+
+impl ForeignSessions {
+    /// The disconnect tokens of every live foreign session (snapshot for `select!`).
+    fn disconnect_signals(&self) -> Vec<CancellationToken> {
+        self.sessions.values().map(|s| s.lk_session.disconnected.clone()).collect()
+    }
+
+    /// Normalized service URLs of the foreign SFUs whose roster we currently see
+    /// (connected, not dead). Feeds the reaper's observability gate.
+    fn observed_focus_urls(&self) -> HashSet<String> {
+        self.sessions
+            .iter()
+            .filter(|(_, s)| !s.lk_session.disconnected.is_cancelled())
+            .map(|(url, _)| url.clone())
+            .collect()
+    }
+
+    /// Add every foreign roster's bare MXIDs to `into` (dead sessions excluded).
+    fn extend_live_mxids(&self, into: &mut HashSet<String>) {
+        for s in self.sessions.values() {
+            if !s.lk_session.disconnected.is_cancelled() {
+                into.extend(live_roster_mxids(&s.lk_session.room));
+            }
+        }
+    }
+
+    /// Drop every foreign session (call end, primary rejoin, shutdown).
+    async fn disconnect_all(&mut self) {
+        for (url, s) in self.sessions.drain() {
+            tracing::info!(sfu = %url, alias = %s.focus.alias, "disconnecting foreign-SFU subscriber");
+            s.lk_session.disconnect().await;
+        }
+        self.backoff.clear();
+    }
+
+    /// Bring the foreign session set in line with the humans' current SFUs:
+    /// drop dead sessions and those whose SFU no longer has a human member;
+    /// connect to each SFU that has one and we don't cover yet (honouring
+    /// per-URL backoff). Returns the membership snapshot it worked from so the
+    /// caller (reaper tick) can reuse it without a second state read.
+    async fn reconcile(&mut self, ctx: &ForeignCtx) -> Vec<crate::matrix::MembershipEntry> {
+        let entries = match crate::matrix::snapshot_call_memberships(
+            &ctx.client,
+            &ctx.room_id,
+            &ctx.bot_user_id,
+            &ctx.ghost_prefix,
+        )
+        .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "multi-SFU: could not read call memberships — keeping current sessions");
+                return Vec::new();
+            }
+        };
+        let desired = foreign_foci(&entries, &ctx.primary);
+
+        // Dead or no longer needed → close.
+        let stale: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(url, s)| {
+                s.lk_session.disconnected.is_cancelled() || !desired.contains_key(url.as_str())
+            })
+            .map(|(url, _)| url.clone())
+            .collect();
+        for url in stale {
+            if let Some(s) = self.sessions.remove(&url) {
+                let dead = s.lk_session.disconnected.is_cancelled();
+                tracing::info!(sfu = %url, dead, "multi-SFU: closing foreign subscriber");
+                s.lk_session.disconnect().await;
+            }
+        }
+
+        // Missing → connect (with backoff).
+        let now = Instant::now();
+        for (url, focus) in desired {
+            if self.sessions.contains_key(&url) {
+                continue;
+            }
+            if let Some((not_before, _)) = self.backoff.get(&url) {
+                if now < *not_before {
+                    continue;
+                }
+            }
+            match connect_foreign(ctx, &focus).await {
+                Ok(lk_session) => {
+                    tracing::info!(
+                        sfu = %focus.service_url,
+                        alias = %focus.alias,
+                        "multi-SFU: subscribed to a foreign SFU (human members publish there)"
+                    );
+                    self.backoff.remove(&url);
+                    self.sessions.insert(url, ForeignSession { focus, lk_session });
+                }
+                Err(e) => {
+                    let delay = self
+                        .backoff
+                        .get(&url)
+                        .map(|(_, d)| (*d * 2).min(FOREIGN_BACKOFF_MAX))
+                        .unwrap_or(FOREIGN_BACKOFF_INITIAL);
+                    tracing::warn!(
+                        sfu = %focus.service_url,
+                        error = %e,
+                        retry_in_s = delay.as_secs(),
+                        "multi-SFU: failed to connect to a foreign SFU — its members' audio won't reach Discord until this succeeds"
+                    );
+                    self.backoff.insert(url, (now + delay, delay));
+                }
+            }
+        }
+        entries
+    }
+}
+
+/// The distinct foreign SFUs the *human* members publish on: every resolved
+/// focus that isn't our own, keyed by normalized service URL. Bridge-owned
+/// memberships (ghosts, the bot) always advertise our SFU and are skipped;
+/// members with no derivable transport contribute nothing.
+fn foreign_foci(
+    entries: &[crate::matrix::MembershipEntry],
+    primary: &LivekitFocusInfo,
+) -> HashMap<String, LivekitFocusInfo> {
+    let ours = focus::normalize_service_url(&primary.service_url);
+    let mut out = HashMap::new();
+    for e in entries {
+        if e.is_bridge_owned {
+            continue;
+        }
+        let Some(f) = &e.focus else { continue };
+        let url = focus::normalize_service_url(&f.service_url);
+        if url == ours {
+            continue;
+        }
+        out.entry(url).or_insert_with(|| f.clone());
+    }
+    out
+}
+
+/// Connect a subscribe-only session to a foreign SFU: mint an OpenID token on
+/// OUR homeserver, exchange it at THEIR lk-jwt service (`{service_url}/sfu/get`
+/// — cross-server OpenID is how every federated call participant gets in), and
+/// join their LiveKit room for this call (`livekit_alias`, normally the Matrix
+/// room id). Tracks land in the same router as the primary session; E2EE reuses
+/// the primary's key provider (keys are per publisher identity, SFU-agnostic)
+/// and registers for #73 key-install nudges.
+async fn connect_foreign(ctx: &ForeignCtx, focus: &LivekitFocusInfo) -> Result<session::LiveSession> {
+    let openid_token = openid::get_openid_token(&ctx.client).await?;
+    let room_alias = if focus.alias.is_empty() { ctx.room_id.as_str() } else { focus.alias.as_str() };
+    let jwt_resp = lk_jwt::fetch_livekit_token(
+        &ctx.http,
+        &focus.service_url,
+        room_alias,
+        &ctx.device_id,
+        &openid_token,
+    )
+    .await?;
+
+    let (key_provider, key_installed_rx) = if ctx.media_e2ee {
+        let provider = ctx.shared_provider.lock().expect("provider mutex poisoned").clone();
+        let Some(provider) = provider else {
+            anyhow::bail!("E2EE key provider not ready (primary session not joined)");
+        };
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.key_installed_tx.lock().expect("key-installed slot mutex poisoned").push(tx);
+        (Some(provider), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    session::connect(
+        &jwt_resp.url,
+        &jwt_resp.jwt,
+        key_provider,
+        key_installed_rx,
+        ctx.peer_keys.clone(),
+        ctx.client.clone(),
+        ctx.room_id.clone(),
+        ctx.router.clone(),
+        ctx.bridge.clone(),
+        ctx.ghost_prefix.clone(),
+        ctx.shutdown.clone(),
+    )
+    .await
 }
 
 /// Post the bridge bot's `m.call.member` (E2EE only). Returns `Err` so the caller's
@@ -600,7 +916,7 @@ async fn join_livekit(
         peer_keys.replay(&key_provider);
         // Key-install notifications for the session's heal gate (#73).
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        *key_installed_tx.lock().expect("key-installed slot mutex poisoned") = Some(tx);
+        key_installed_tx.lock().expect("key-installed slot mutex poisoned").push(tx);
         (Some(key_provider), Some(rx))
     } else {
         tracing::info!("media E2EE disabled — connecting without frame encryption");
@@ -643,7 +959,7 @@ fn clear_session_slots(
     key_installed_tx: &KeyInstalledTx,
 ) {
     *shared_provider.lock().expect("provider mutex poisoned") = None;
-    *key_installed_tx.lock().expect("key-installed slot mutex poisoned") = None;
+    key_installed_tx.lock().expect("key-installed slot mutex poisoned").clear();
 }
 
 /// Tear down an active session, clearing the shared provider. When

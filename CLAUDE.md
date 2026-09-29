@@ -117,6 +117,15 @@ test.
    as humans. Guarantee teardown returns the connection count to baseline.
 7. **Pin `songbird` and `livekit` to specific releases.** Both ends are
    version-sensitive (DAVE, E2EE). Never float these.
+8. **A call may span several LiveKit SFUs (MSC4195 `multi_sfu`).** Element Call
+   ≥ 0.21 publishes each participant on *their own* homeserver's SFU; only
+   legacy clients elect the oldest member's. Never assume the whole call is on
+   the SFU from our `.well-known`: resolve each member's SFU via `rtc::focus`
+   (mirrors matrix-js-sdk `getTransport()`), subscribe per foreign SFU
+   (`rtc::mod.rs::ForeignSessions`), advertise `multi_sfu` on bridge-owned
+   memberships, and never let the #25 reaper judge a member on an SFU we are
+   not connected to. Ignoring this = remote-homeserver users silently
+   unbridged AND their live memberships reaped (Limited-VC, 2026-09-28).
 
 ## Conventions
 

@@ -52,7 +52,7 @@ use matrix_sdk::{
         events::{
             SyncStateEvent,
             call::member::{
-                ActiveFocus, ActiveLivekitFocus, Application, CallApplicationContent,
+                Application, CallApplicationContent,
                 CallMemberEventContent, CallMemberStateKey, CallScope, Focus, LivekitFocus,
             },
         },
@@ -2198,6 +2198,12 @@ async fn retract_membership_raw(
 }
 
 /// Build the ghost's `m.call.member` join content — mirrors `rtc::membership::join`.
+///
+/// `focus_active` is `multi_sfu` (see `rtc::focus`): the ghost publishes on the
+/// bridge's SFU regardless of who is the oldest member, and a multi-SFU client
+/// must be told to look for it there — with `oldest_membership` a matrix.org
+/// user who started the call would resolve our transport to *their* SFU and
+/// never find the ghost's track (live-observed 2026-09-28, Limited-VC).
 fn build_membership(device_id: &OwnedDeviceId, focus: &LivekitFocusInfo) -> CallMemberEventContent {
     let foci_preferred = vec![Focus::Livekit(LivekitFocus::new(
         focus.alias.clone(),
@@ -2206,7 +2212,7 @@ fn build_membership(device_id: &OwnedDeviceId, focus: &LivekitFocusInfo) -> Call
     CallMemberEventContent::new(
         Application::Call(CallApplicationContent::new(String::new(), CallScope::Room)),
         device_id.clone(),
-        ActiveFocus::Livekit(ActiveLivekitFocus::new()),
+        super::focus::bridge_active_focus(),
         foci_preferred,
         None,
         None,
@@ -2225,6 +2231,7 @@ pub mod testkit;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use matrix_sdk::ruma::events::call::member::{ActiveFocus, ActiveLivekitFocus};
 
     fn test_pool(max_ghosts: Option<usize>) -> Arc<GhostPool> {
         let matrix_cfg = MatrixConfig {

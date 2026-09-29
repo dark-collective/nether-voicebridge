@@ -83,6 +83,39 @@ tasks and channels.
    right-click → User Volume / mute. (Avatars are static-per-puppet — see
    constraints.)
 
+### Which SFU? MatrixRTC focus selection (MSC4195, multi-SFU)
+
+A call does **not** necessarily live on one LiveKit SFU. Each `m.call.member`
+carries `focus_active.focus_selection` plus a `foci_preferred` list:
+
+- `oldest_membership` (legacy, Element Call < 0.21): everyone publishes on the
+  SFU preferred by the **oldest** active membership (by `created_ts`).
+- `multi_sfu` (Element Call ≥ 0.21 default, July 2026): everyone publishes on
+  their **own** `foci_preferred[0]` — normally their homeserver's SFU — and
+  subscribers connect to each publisher's SFU. Nothing is elected.
+
+The bridge mirrors matrix-js-sdk's `getTransport()` in `rtc::focus` to resolve
+every member's publishing SFU, then:
+
+1. The **primary subscriber** joins the bridge's own SFU (from its homeserver's
+   `.well-known` `rtc_foci`); ghosts always publish there.
+2. For each *other* SFU a human member publishes on, the RTC loop runs a
+   **foreign subscriber** session — OpenID token from our homeserver, JWT from
+   *their* `livekit_service_url/sfu/get` (the same federated path any remote
+   participant uses), joined to that SFU's room for this call. Its tracks land
+   in the same router, keyed by bare MXID, so puppets don't care which SFU a
+   user came from. Reconciled on join, on membership change, on a foreign
+   session dying, and on each reaper tick.
+3. Ghost (and E2EE-subscriber) memberships advertise `multi_sfu` so a multi-SFU
+   client looks for Discord speakers on **our** SFU rather than on whichever
+   member happens to be oldest.
+4. The stale-membership reaper (#25) treats a member on an SFU we hold no
+   session on as **unobservable**, never as absent.
+
+Why it matters: a matrix.org user on a current Element Call publishes to
+matrix.org's SFU. Before this, the bridge never heard them and — worse — reaped
+their live membership as a phantom. Live-diagnosed 2026-09-28 (`Limited-VC`).
+
 ## Echo / loop prevention (correctness-critical)
 
 The capture anchor puppet hears **everything** in the Discord channel, including

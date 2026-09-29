@@ -12,11 +12,12 @@ use matrix_sdk::Room;
 use matrix_sdk::ruma::{
     OwnedDeviceId, OwnedUserId,
     events::call::member::{
-        ActiveFocus, ActiveLivekitFocus, Application, CallApplicationContent, CallMemberEventContent,
-        CallMemberStateKey, CallScope, Focus, LivekitFocus,
+        Application, CallApplicationContent, CallMemberEventContent, CallMemberStateKey, CallScope,
+        Focus, LivekitFocus,
     },
 };
 
+use crate::rtc::focus::bridge_active_focus;
 use crate::rtc::well_known::LivekitFocusInfo;
 
 /// Post the bridge bot's join membership state event.
@@ -54,7 +55,9 @@ pub async fn join(
             CallScope::Room,
         )),
         device_id.clone(),
-        ActiveFocus::Livekit(ActiveLivekitFocus::new()),
+        // `multi_sfu`: a multi-SFU client resolves OUR transport from OUR
+        // `foci_preferred` rather than the oldest member's (see `rtc::focus`).
+        bridge_active_focus(),
         foci_preferred,
         None,  // created_ts: None on initial join
         None,  // expires: None → defaults to 4 hours

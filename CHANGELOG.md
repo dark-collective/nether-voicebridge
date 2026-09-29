@@ -3,6 +3,41 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**Multi-SFU MatrixRTC (MSC4195 `multi_sfu`): users on other homeservers can be
+bridged again.** Element Call 0.21 (July 2026) made multi-SFU the default:
+every participant publishes on its *own* homeserver's LiveKit SFU instead of
+the whole call electing one. The bridge only ever joined the SFU from its own
+`.well-known`, so a matrix.org user on a current Element Call was never heard
+(their audio went to matrix.org's SFU) — and the stale-membership reaper read
+their absence from *our* SFU as "phantom" and kept emptying their live
+membership (84 times in one evening on the `Limited-VC` tenant, 2026-09-28;
+the `bsch` tenant never worked for the same reason).
+
+### Added
+- **Per-SFU subscriber fan-in.** Every human member's publishing SFU is
+  resolved from their `m.call.member` exactly as matrix-js-sdk does
+  (`multi_sfu` ⇒ own `foci_preferred[0]`; `oldest_membership` ⇒ the oldest
+  membership's transport). For each such SFU that isn't ours the RTC loop runs
+  one extra subscribe-only LiveKit session — JWT minted at *their* lk-jwt
+  service with our OpenID token, the standard federated path — feeding the
+  same puppet router. Reconciled on join, on membership change, when a foreign
+  session dies (backoff 15 s → 5 min), and on every reaper tick; all dropped
+  at call end. E2EE shares the primary session's key provider (keys are per
+  publisher, SFU-agnostic) and the #73 heal gate.
+- **Ghost and subscriber memberships advertise `focus_selection: multi_sfu`.**
+  A multi-SFU client resolves a ghost's transport from the *ghost's*
+  `foci_preferred` — i.e. always finds Discord speakers on the bridge's SFU —
+  even when a remote user started the call. Invisible to legacy clients, which
+  only read their own `focus_active` and the oldest membership's foci.
+
+### Fixed
+- **The #25 reaper only judges members on SFUs it is connected to.** A member
+  whose resolved SFU the bridge has no live session on (or whose transport
+  can't be derived) is *unobservable*, not absent: never reaped, no phantom
+  clock. Losing a foreign session mid-grace clears its members' clocks.
+
 ## [0.3.6] - 2026-09-27
 
 **Follow-through on the 0.3.5 stall: the next silent sync stall gets logged,
