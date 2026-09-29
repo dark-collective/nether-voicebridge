@@ -195,3 +195,52 @@ fn long_probe_sweep_stays_clean() {
     let report = compare_mono_48k(&reference, &captured, &strict());
     assert_pass(&report, "3-minute sweep");
 }
+
+/// Deterministic low-level noise (±3 LSB), standing in for the -100 dBFS
+/// dither a live capture carries where nothing was sent.
+fn dither(len: usize, mut seed: u64) -> Vec<i16> {
+    (0..len)
+        .map(|_| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) % 7) as i16 - 3
+        })
+        .collect()
+}
+
+/// Stage-1 alignment must not be fooled by a capture whose FIRST second is
+/// damaged. Nightly #418 (2026-09-29): a slip inside cycle 0 made the true
+/// lag's refined score ≈ 0, so a candidate overlapping ~120 ms of tail dither
+/// won the global alignment and every cycle was then scored against silence
+/// (mean ncc 0.009) although cycles 2–7 were intact at ≥ 0.98. Long lead-in,
+/// long noisy tail, a bad first cycle: the delay must still land on the probe.
+#[test]
+fn alignment_survives_a_damaged_first_second() {
+    let probe = synth_probe_mono_48k(0xD2B2, 8_000);
+    let lead = 3_800 * 48;
+    let tail = 4_000 * 48;
+    let cycle = &probe[..48_000];
+    let slipped: Vec<i16> = {
+        // 35 ms of the first cycle arrives late: silence, then the cycle cut short.
+        let mut v = vec![0i16; 35 * 48];
+        v.extend_from_slice(&cycle[..48_000 - 35 * 48]);
+        v
+    };
+    let inverted: Vec<i16> = cycle.iter().map(|s| s.saturating_neg()).collect();
+    for (what, first_cycle) in [("35 ms slip", slipped), ("phase-inverted", inverted)] {
+        let mut captured = vec![0i16; lead];
+        captured.extend(first_cycle);
+        captured.extend_from_slice(&probe[48_000..]);
+        captured.extend(dither(tail, 0x5EED));
+        let rep = compare_mono_48k(
+            &probe,
+            &captured,
+            &OracleConfig { max_align_ms: 60_000, ..OracleConfig::default() },
+        );
+        assert!(
+            (rep.delay_samples - lead as isize).abs() <= 480,
+            "{what}: delay {} should be within one hop of {lead} (ncc={})",
+            rep.delay_samples,
+            rep.ncc
+        );
+    }
+}
