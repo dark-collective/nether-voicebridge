@@ -122,10 +122,14 @@ test.
    legacy clients elect the oldest member's. Never assume the whole call is on
    the SFU from our `.well-known`: resolve each member's SFU via `rtc::focus`
    (mirrors matrix-js-sdk `getTransport()`), subscribe per foreign SFU
-   (`rtc::mod.rs::ForeignSessions`), advertise `multi_sfu` on bridge-owned
-   memberships, and never let the #25 reaper judge a member on an SFU we are
-   not connected to. Ignoring this = remote-homeserver users silently
-   unbridged AND their live memberships reaped (Limited-VC, 2026-09-28).
+   (`rtc::mod.rs::ForeignSessions`), make ghosts publish on the **elected** SFU
+   (the oldest active membership's — the only one legacy clients such as Commet
+   listen on; `rtc::focus::elected_focus`, migrating when it moves, with
+   membership re-posts keeping `created_ts`), advertise `multi_sfu` naming that
+   SFU on bridge-owned memberships, and never let the #25 reaper judge a member
+   on an SFU we are not connected to. Ignoring this = remote-homeserver users
+   silently unbridged AND their live memberships reaped (Limited-VC,
+   2026-09-28), or Matrix-side silence for Commet users (2026-09-29).
 
 ## Conventions
 
