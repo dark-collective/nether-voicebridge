@@ -110,6 +110,10 @@ pub struct FocusEntry {
     /// only considers live memberships); an expired, un-retracted entry still
     /// gets resolved so the reaper can judge it, but never steers anyone else.
     pub active: bool,
+    /// One of ours (a ghost or the bridge bot). Ghosts advertise wherever they
+    /// currently publish, so a call with only bridge-owned members has no
+    /// election to follow — see [`elected_focus`].
+    pub bridge_owned: bool,
     pub selection: Selection,
     /// `foci_preferred[0]` (first LiveKit entry), if any.
     pub preferred: Option<LivekitFocusInfo>,
@@ -121,7 +125,17 @@ pub struct FocusEntry {
 /// (`oldest_membership`) client connects to and listens on, so it is also where
 /// the bridge's ghosts must publish: a legacy client never looks anywhere else.
 /// Ties on `created_ts` break on key so every observer agrees.
+///
+/// With **no active human** membership the election is ours to make and this
+/// returns `None` (callers fall back to the bridge's own SFU): a lone ghost that
+/// migrated to a foreign SFU would otherwise elect *itself* there forever, and
+/// every later joiner would be steered onto that homeserver's SFU. Once a human
+/// is present the true election is followed even if the oldest member is a ghost
+/// — moving it then would pull the rug from under a legacy client mid-call.
 pub fn elected_focus(entries: &[FocusEntry]) -> Option<LivekitFocusInfo> {
+    if !entries.iter().any(|e| e.active && !e.bridge_owned) {
+        return None;
+    }
     entries
         .iter()
         .filter(|e| e.active)
@@ -163,7 +177,31 @@ mod tests {
     }
 
     fn entry(key: &str, ts: u64, sel: Selection, url: Option<&str>) -> FocusEntry {
-        FocusEntry { key: key.into(), created_ts_ms: ts, active: true, selection: sel, preferred: url.map(lk) }
+        FocusEntry { key: key.into(), created_ts_ms: ts, active: true, bridge_owned: false, selection: sel, preferred: url.map(lk) }
+    }
+
+    fn ghost(key: &str, ts: u64, url: &str) -> FocusEntry {
+        FocusEntry { bridge_owned: true, ..entry(key, ts, Selection::MultiSfu, Some(url)) }
+    }
+
+    #[test]
+    fn ghosts_alone_elect_nothing_so_they_go_home() {
+        // The live 2026-09-29 sequence: Commet (oldest) elected matrix.org, the
+        // ghost migrated there and advertised it; Commet left. With only the
+        // ghost active there is no election — the caller falls back to our SFU
+        // and the ghost migrates home, so the rejoiner follows it to nether.im.
+        let only_ghost = [ghost("ghost", 200, "https://livekit-jwt.call.matrix.org")];
+        assert!(elected_focus(&only_ghost).is_none());
+        // An expired (phantom) human doesn't count as present either.
+        let phantom = FocusEntry { active: false, ..entry("gone", 100, Selection::OldestMembership, Some("https://livekit-jwt.call.matrix.org")) };
+        assert!(elected_focus(&[phantom, ghost("ghost", 200, "https://livekit-jwt.call.matrix.org")]).is_none());
+        // But with a human present, the true election holds even when the oldest
+        // is a ghost advertising a foreign SFU (never move under a legacy client).
+        let e = [
+            ghost("ghost", 200, "https://livekit-jwt.call.matrix.org"),
+            entry("commet", 300, Selection::OldestMembership, Some("https://livekit.nether.im")),
+        ];
+        assert_eq!(elected_focus(&e).unwrap().service_url, "https://livekit-jwt.call.matrix.org");
     }
 
     #[test]

@@ -1362,16 +1362,17 @@ pub(crate) async fn snapshot_call_memberships(
             None => (Selection::Unknown, None, o.origin_server_ts),
         };
         let active = !o.content.active_memberships(Some(o.origin_server_ts)).is_empty();
+        let mxid = o.sender.as_str().to_owned();
+        let is_bridge_owned = o.sender.as_str() == bot_user_id.as_str()
+            || crate::rtc::ghost::is_bridge_excluded_identity(o.sender.as_str(), ghost_prefix);
         focus_inputs.push(FocusEntry {
             key: state_key.clone(),
             created_ts_ms: u64::from(created.get()),
             active,
+            bridge_owned: is_bridge_owned,
             selection,
             preferred,
         });
-        let mxid = o.sender.as_str().to_owned();
-        let is_bridge_owned = o.sender.as_str() == bot_user_id.as_str()
-            || crate::rtc::ghost::is_bridge_excluded_identity(o.sender.as_str(), ghost_prefix);
         let legacy_state_key = state_key.starts_with('@');
         entries.push(MembershipEntry { state_key, mxid, is_bridge_owned, legacy_state_key, focus: None });
     }
