@@ -111,6 +111,11 @@ pub(crate) async fn run(
     // Bumped by the sync loop when a human joins the call: re-resolve which SFUs
     // the members publish on (multi-SFU fan-in) without waiting for a reaper tick.
     mut members_gen_rx: watch::Receiver<u64>,
+    // The call's elected SFU (`rtc::focus::elected_focus`), republished after
+    // every membership snapshot. Ghosts publish there and migrate when it moves
+    // — a legacy (`oldest_membership`) client such as Commet listens only on the
+    // elected SFU, so a ghost anywhere else is inaudible to it.
+    call_focus_tx: watch::Sender<Option<LivekitFocusInfo>>,
     router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
     shutdown: CancellationToken,
@@ -275,7 +280,11 @@ pub(crate) async fn run(
         router: router.clone(),
         bridge: bridge.clone(),
         shutdown: shutdown.clone(),
+        call_focus_tx,
     };
+    // Publish the election once up front (room state is synced by now) so a
+    // ghost minted before the first call has a value to read.
+    publish_call_focus(&fctx).await;
 
     loop {
         let is_active = *call_active_rx.borrow_and_update();
@@ -292,6 +301,9 @@ pub(crate) async fn run(
                 // keys to roster members — so there it becomes a visible, silent
                 // participant. Ghosts always post their own membership.
                 tracing::info!("call became active — connecting subscriber");
+                // Re-elect BEFORE the (slow) primary connect: ghosts pick their
+                // publish SFU off this watch the moment the call goes active.
+                publish_call_focus(&fctx).await;
 
                 match join_livekit(
                     &client,
@@ -351,6 +363,7 @@ pub(crate) async fn run(
                 // release the puppets too (they leave voice).
                 tracing::info!("call ended — disconnecting subscriber");
                 foreign.disconnect_all().await;
+                publish_call_focus(&fctx).await;
                 teardown(&mut active_session, &shared_provider, &key_installed_tx, &router, true).await;
                 joined = false;
                 // No live roster anymore — drop the reaper's grace clocks so the
@@ -500,13 +513,13 @@ pub(crate) async fn run(
                         // Keep the foreign set current first (members leave, a
                         // failed connect's backoff expires), then judge phantoms
                         // against the union of every roster we actually hold.
-                        let entries = foreign.reconcile(&fctx).await;
+                        let snapshot = foreign.reconcile(&fctx).await;
                         let mut live_mxids = live_roster_mxids(&sess.lk_session.room);
                         foreign.extend_live_mxids(&mut live_mxids);
                         let mut observed = foreign.observed_focus_urls();
                         observed.insert(crate::rtc::focus::normalize_service_url(&focus.service_url));
                         crate::matrix::reap_stale_memberships(
-                            &client, &room_id, &entries, &live_mxids, &observed, &mut phantom_since,
+                            &client, &room_id, &snapshot.entries, &live_mxids, &observed, &mut phantom_since,
                             reap_grace,
                         )
                         .await;
@@ -578,6 +591,44 @@ struct ForeignCtx {
     router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
     shutdown: CancellationToken,
+    call_focus_tx: watch::Sender<Option<LivekitFocusInfo>>,
+}
+
+/// Snapshot the memberships and publish the call's elected SFU (falling back to
+/// ours when nothing is elected) for the ghosts. Only wakes them on a change.
+async fn publish_call_focus(ctx: &ForeignCtx) {
+    match crate::matrix::snapshot_call_memberships(
+        &ctx.client,
+        &ctx.room_id,
+        &ctx.bot_user_id,
+        &ctx.ghost_prefix,
+    )
+    .await
+    {
+        Ok(snap) => publish_elected(ctx, snap.elected),
+        Err(e) => tracing::debug!(error = %e, "call-focus election: could not read memberships"),
+    }
+}
+
+fn publish_elected(ctx: &ForeignCtx, elected: Option<LivekitFocusInfo>) {
+    let chosen = elected.unwrap_or_else(|| ctx.primary.clone());
+    ctx.call_focus_tx.send_if_modified(|cur| {
+        let same = cur.as_ref().is_some_and(|c| {
+            focus::normalize_service_url(&c.service_url) == focus::normalize_service_url(&chosen.service_url)
+                && c.alias == chosen.alias
+        });
+        if same {
+            false
+        } else {
+            tracing::info!(
+                sfu = %chosen.service_url,
+                ours = chosen.service_url == ctx.primary.service_url,
+                "call-focus election changed — ghosts publish on this SFU"
+            );
+            *cur = Some(chosen.clone());
+            true
+        }
+    });
 }
 
 /// A live subscribe-only session on somebody else's SFU.
@@ -638,9 +689,10 @@ impl ForeignSessions {
     /// drop dead sessions and those whose SFU no longer has a human member;
     /// connect to each SFU that has one and we don't cover yet (honouring
     /// per-URL backoff). Returns the membership snapshot it worked from so the
-    /// caller (reaper tick) can reuse it without a second state read.
-    async fn reconcile(&mut self, ctx: &ForeignCtx) -> Vec<crate::matrix::MembershipEntry> {
-        let entries = match crate::matrix::snapshot_call_memberships(
+    /// caller (reaper tick) can reuse it without a second state read. Also
+    /// republishes the call's elected SFU for the ghosts.
+    async fn reconcile(&mut self, ctx: &ForeignCtx) -> crate::matrix::CallMemberships {
+        let snapshot = match crate::matrix::snapshot_call_memberships(
             &ctx.client,
             &ctx.room_id,
             &ctx.bot_user_id,
@@ -648,13 +700,14 @@ impl ForeignSessions {
         )
         .await
         {
-            Ok(e) => e,
+            Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "multi-SFU: could not read call memberships — keeping current sessions");
-                return Vec::new();
+                return crate::matrix::CallMemberships { entries: Vec::new(), elected: None };
             }
         };
-        let desired = foreign_foci(&entries, &ctx.primary);
+        publish_elected(ctx, snapshot.elected.clone());
+        let desired = foreign_foci(&snapshot.entries, &ctx.primary);
 
         // Dead or no longer needed → close.
         let stale: Vec<String> = self
@@ -710,7 +763,7 @@ impl ForeignSessions {
                 }
             }
         }
-        entries
+        snapshot
     }
 }
 

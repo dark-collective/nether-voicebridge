@@ -26,11 +26,20 @@ the `bsch` tenant never worked for the same reason).
   session dies (backoff 15 s → 5 min), and on every reaper tick; all dropped
   at call end. E2EE shares the primary session's key provider (keys are per
   publisher, SFU-agnostic) and the #73 heal gate.
-- **Ghost and subscriber memberships advertise `focus_selection: multi_sfu`.**
-  A multi-SFU client resolves a ghost's transport from the *ghost's*
-  `foci_preferred` — i.e. always finds Discord speakers on the bridge's SFU —
-  even when a remote user started the call. Invisible to legacy clients, which
-  only read their own `focus_active` and the oldest membership's foci.
+- **Ghosts publish on the call's *elected* SFU and follow it.** Legacy
+  `oldest_membership` clients (Commet, Element Call < 0.21) listen only on the
+  SFU elected by the oldest active membership; when that member is on another
+  homeserver, a ghost publishing on our SFU is inaudible to them (live-observed
+  with Commet on matrix.org, 2026-09-29: Discord heard Matrix, Matrix heard
+  nothing). Each ghost now reads the election from room state when it connects,
+  publishes there (JWT from that SFU's lk-jwt via its own OpenID token), and
+  migrates mid-call when the election moves — the old SFU connection is dropped,
+  the track republished, and the membership re-posted with the new
+  `foci_preferred` and its original `created_ts`, so re-posting never changes
+  who is oldest. Ghost and subscriber memberships advertise
+  `focus_selection: multi_sfu` with that exact SFU, so multi-SFU clients find
+  the track by membership and legacy clients find it by election. Legacy
+  clients ignore other members' `focus_active`, so the field is invisible to them.
 
 ### Fixed
 - **The #25 reaper only judges members on SFUs it is connected to.** A member

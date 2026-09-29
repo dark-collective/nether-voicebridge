@@ -115,6 +115,23 @@ pub struct FocusEntry {
     pub preferred: Option<LivekitFocusInfo>,
 }
 
+/// The call's **elected** SFU: the transport the oldest active membership
+/// publishes on (`multi_sfu` or `oldest_membership` ⇒ its own
+/// `foci_preferred[0]`; unknown ⇒ none). This is the one SFU a *legacy*
+/// (`oldest_membership`) client connects to and listens on, so it is also where
+/// the bridge's ghosts must publish: a legacy client never looks anywhere else.
+/// Ties on `created_ts` break on key so every observer agrees.
+pub fn elected_focus(entries: &[FocusEntry]) -> Option<LivekitFocusInfo> {
+    entries
+        .iter()
+        .filter(|e| e.active)
+        .min_by(|a, b| a.created_ts_ms.cmp(&b.created_ts_ms).then_with(|| a.key.cmp(&b.key)))
+        .and_then(|o| match o.selection {
+            Selection::Unknown => None,
+            _ => o.preferred.clone(),
+        })
+}
+
 /// Resolve the SFU each membership publishes on, keyed by membership key.
 ///
 /// `None` means no transport could be derived (unknown selection, empty
@@ -122,16 +139,7 @@ pub struct FocusEntry {
 /// The oldest membership is the minimum `created_ts_ms`, ties broken by key so
 /// the result is deterministic.
 pub fn resolve_effective_foci(entries: &[FocusEntry]) -> HashMap<String, Option<LivekitFocusInfo>> {
-    let oldest = entries
-        .iter()
-        .filter(|e| e.active)
-        .min_by(|a, b| a.created_ts_ms.cmp(&b.created_ts_ms).then_with(|| a.key.cmp(&b.key)));
-    // The transport the oldest membership itself publishes on: for `multi_sfu`
-    // or `oldest_membership` that is its own `foci_preferred[0]`; unknown ⇒ none.
-    let oldest_transport = oldest.and_then(|o| match o.selection {
-        Selection::Unknown => None,
-        _ => o.preferred.clone(),
-    });
+    let oldest_transport = elected_focus(entries);
     entries
         .iter()
         .map(|e| {
@@ -156,6 +164,25 @@ mod tests {
 
     fn entry(key: &str, ts: u64, sel: Selection, url: Option<&str>) -> FocusEntry {
         FocusEntry { key: key.into(), created_ts_ms: ts, active: true, selection: sel, preferred: url.map(lk) }
+    }
+
+    #[test]
+    fn elected_focus_is_the_oldest_active_members_transport() {
+        // Commet (legacy) on matrix.org starts the call; our ghost joins later.
+        // The election is matrix.org's SFU — where a legacy client listens, so
+        // where the ghost must publish. With the ghost oldest, it's ours.
+        let e = [
+            entry("commet", 100, Selection::OldestMembership, Some("https://livekit-jwt.call.matrix.org")),
+            entry("ghost", 200, Selection::MultiSfu, Some("https://livekit.nether.im")),
+        ];
+        assert_eq!(elected_focus(&e).unwrap().service_url, "https://livekit-jwt.call.matrix.org");
+        let e = [
+            entry("ghost", 50, Selection::MultiSfu, Some("https://livekit.nether.im")),
+            entry("commet", 100, Selection::OldestMembership, Some("https://livekit-jwt.call.matrix.org")),
+        ];
+        assert_eq!(elected_focus(&e).unwrap().service_url, "https://livekit.nether.im");
+        assert!(elected_focus(&[]).is_none());
+        assert!(elected_focus(&[entry("x", 1, Selection::Unknown, Some("https://a"))]).is_none());
     }
 
     #[test]

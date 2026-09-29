@@ -98,7 +98,7 @@ The bridge mirrors matrix-js-sdk's `getTransport()` in `rtc::focus` to resolve
 every member's publishing SFU, then:
 
 1. The **primary subscriber** joins the bridge's own SFU (from its homeserver's
-   `.well-known` `rtc_foci`); ghosts always publish there.
+   `.well-known` `rtc_foci`).
 2. For each *other* SFU a human member publishes on, the RTC loop runs a
    **foreign subscriber** session — OpenID token from our homeserver, JWT from
    *their* `livekit_service_url/sfu/get` (the same federated path any remote
@@ -106,15 +106,26 @@ every member's publishing SFU, then:
    in the same router, keyed by bare MXID, so puppets don't care which SFU a
    user came from. Reconciled on join, on membership change, on a foreign
    session dying, and on each reaper tick.
-3. Ghost (and E2EE-subscriber) memberships advertise `multi_sfu` so a multi-SFU
-   client looks for Discord speakers on **our** SFU rather than on whichever
-   member happens to be oldest.
-4. The stale-membership reaper (#25) treats a member on an SFU we hold no
+3. **Ghosts publish on the call's *elected* SFU** — the oldest active
+   membership's transport (`rtc::focus::elected_focus`), which is the only SFU a
+   legacy client listens on. Each ghost reads the election from room state on
+   connect; the RTC loop republishes it on a watch after every membership
+   snapshot, and a ghost whose SFU changed drops its old connection, republishes
+   on the new one, and re-posts its membership (same `created_ts`, so re-posting
+   never reshuffles the election). With no human present the election is a
+   ghost's own, i.e. our SFU.
+4. Ghost (and E2EE-subscriber) memberships advertise `multi_sfu` naming exactly
+   the SFU they publish on, so a multi-SFU client finds Discord speakers by
+   membership while a legacy client finds them by election. Legacy clients
+   ignore other members' `focus_active`.
+5. The stale-membership reaper (#25) treats a member on an SFU we hold no
    session on as **unobservable**, never as absent.
 
 Why it matters: a matrix.org user on a current Element Call publishes to
 matrix.org's SFU. Before this, the bridge never heard them and — worse — reaped
-their live membership as a phantom. Live-diagnosed 2026-09-28 (`Limited-VC`).
+their live membership as a phantom (live-diagnosed 2026-09-28, `Limited-VC`).
+And a matrix.org user on Commet (legacy election) elected matrix.org's SFU and
+could not hear ghosts publishing on ours (live-observed 2026-09-29).
 
 ## Echo / loop prevention (correctness-critical)
 

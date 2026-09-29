@@ -1309,15 +1309,28 @@ pub(crate) struct MembershipEntry {
     pub(crate) focus: Option<crate::rtc::well_known::LivekitFocusInfo>,
 }
 
+/// The call's memberships as read from room state, focus-resolved.
+pub(crate) struct CallMemberships {
+    /// Every non-empty membership (bridge-owned included), each with the SFU it
+    /// publishes on.
+    pub(crate) entries: Vec<MembershipEntry>,
+    /// The call's elected SFU — the oldest active membership's transport
+    /// (`rtc::focus::elected_focus`); where legacy clients listen and ghosts must
+    /// publish. `None` when there is no active membership or its transport is
+    /// unknown (callers fall back to the bridge's own SFU).
+    pub(crate) elected: Option<crate::rtc::well_known::LivekitFocusInfo>,
+}
+
 /// Read every non-empty `m.call.member` in room state and resolve each member's
-/// effective SFU. Shared by the reaper and the RTC loop's multi-SFU reconciler.
+/// effective SFU plus the call's elected one. Shared by the reaper, the RTC
+/// loop's multi-SFU reconciler, and each ghost's publish-target choice.
 pub(crate) async fn snapshot_call_memberships(
     client: &Client,
     room_id: &RoomId,
     bot_user_id: &UserId,
     ghost_prefix: &str,
-) -> Result<Vec<MembershipEntry>> {
-    use crate::rtc::focus::{FocusEntry, Selection, first_livekit_focus, resolve_effective_foci};
+) -> Result<CallMemberships> {
+    use crate::rtc::focus::{FocusEntry, Selection, elected_focus, first_livekit_focus, resolve_effective_foci};
     let room = client
         .get_room(room_id)
         .ok_or_else(|| anyhow::anyhow!("room not in local state"))?;
@@ -1366,7 +1379,8 @@ pub(crate) async fn snapshot_call_memberships(
     for e in &mut entries {
         e.focus = resolved.remove(&e.state_key).flatten();
     }
-    Ok(entries)
+    let elected = elected_focus(&focus_inputs);
+    Ok(CallMemberships { entries, elected })
 }
 
 /// Pure reaper decision. Returns the state_keys to empty **now**, and mutates
