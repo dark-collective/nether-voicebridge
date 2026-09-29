@@ -125,11 +125,14 @@ test.
    (`rtc::mod.rs::ForeignSessions`), make ghosts publish on the **elected** SFU
    (the oldest active membership's — the only one legacy clients such as Commet
    listen on; `rtc::focus::elected_focus`, migrating when it moves, with
-   membership re-posts keeping `created_ts`), advertise `multi_sfu` naming that
-   SFU on bridge-owned memberships, and never let the #25 reaper judge a member
-   on an SFU we are not connected to. Ignoring this = remote-homeserver users
-   silently unbridged AND their live memberships reaped (Limited-VC,
-   2026-09-28), or Matrix-side silence for Commet users (2026-09-29).
+   membership re-posts keeping `created_ts`), keep bridge-owned memberships on
+   the legacy `oldest_membership` (Commet SKIPS any `focus_selection` it doesn't
+   know — a `multi_sfu` ghost is invisible to it), also subscribe on each
+   member's own `foci_preferred[0]`, and never let the #25 reaper judge a
+   member unless both its resolved and preferred SFUs are watched. Ignoring
+   this = remote-homeserver users silently unbridged AND their live memberships
+   reaped (Limited-VC, 2026-09-28), or Matrix-side silence for Commet users
+   (2026-09-29).
 
 ## Conventions
 
