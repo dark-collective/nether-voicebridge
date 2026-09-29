@@ -767,10 +767,14 @@ impl ForeignSessions {
     }
 }
 
-/// The distinct foreign SFUs the *human* members publish on: every resolved
-/// focus that isn't our own, keyed by normalized service URL. Bridge-owned
-/// memberships (ghosts, the bot) always advertise our SFU and are skipped;
-/// members with no derivable transport contribute nothing.
+/// The distinct foreign SFUs the *human* members may publish on: for each human,
+/// both the SFU the election resolves for it AND its own `foci_preferred[0]` —
+/// clients don't all follow the election (Commet ignores memberships whose
+/// `focus_selection` it doesn't know and publishes on its own homeserver's SFU),
+/// and one extra subscribe-only session is far cheaper than a silent user. Keyed
+/// by normalized service URL, our own SFU excluded. Bridge-owned memberships
+/// (ghosts, the bot) are skipped; members with nothing derivable contribute
+/// nothing.
 fn foreign_foci(
     entries: &[crate::matrix::MembershipEntry],
     primary: &LivekitFocusInfo,
@@ -781,15 +785,17 @@ fn foreign_foci(
         if e.is_bridge_owned {
             continue;
         }
-        let Some(f) = &e.focus else { continue };
-        let url = focus::normalize_service_url(&f.service_url);
-        if url == ours {
-            continue;
+        for f in [&e.focus, &e.preferred].into_iter().flatten() {
+            let url = focus::normalize_service_url(&f.service_url);
+            if url == ours {
+                continue;
+            }
+            out.entry(url).or_insert_with(|| f.clone());
         }
-        out.entry(url).or_insert_with(|| f.clone());
     }
     out
 }
+
 
 /// Connect a subscribe-only session to a foreign SFU: mint an OpenID token on
 /// OUR homeserver, exchange it at THEIR lk-jwt service (`{service_url}/sfu/get`
@@ -1036,4 +1042,35 @@ async fn teardown(
         router.release_all();
     }
     clear_session_slots(shared_provider, key_installed_tx);
+}
+
+#[cfg(test)]
+mod foreign_foci_tests {
+    use super::*;
+    use crate::matrix::MembershipEntry;
+
+    fn lk(url: &str) -> Option<LivekitFocusInfo> {
+        Some(LivekitFocusInfo { alias: "!r:x".into(), service_url: url.into() })
+    }
+    fn human(key: &str, focus: Option<LivekitFocusInfo>, preferred: Option<LivekitFocusInfo>) -> MembershipEntry {
+        MembershipEntry { state_key: key.into(), mxid: key.into(), is_bridge_owned: false, legacy_state_key: false, focus, preferred }
+    }
+
+    #[test]
+    fn subscribes_on_resolved_and_preferred_sfus_but_never_ours() {
+        let ours = LivekitFocusInfo { alias: "!r:x".into(), service_url: "https://livekit.nether.im".into() };
+        let entries = [
+            // Commet: election says ours, but it really publishes on matrix.org.
+            human("commet", lk("https://livekit.nether.im"), lk("https://livekit-jwt.call.matrix.org")),
+            // A multi_sfu user on a third homeserver: both the same.
+            human("ec", lk("https://lk.example.org/"), lk("https://lk.example.org")),
+            // Our ghost advertising a foreign SFU (migrated) must not count.
+            MembershipEntry { is_bridge_owned: true, ..human("ghost", lk("https://livekit-jwt.call.matrix.org"), lk("https://livekit-jwt.call.matrix.org")) },
+            human("nothing", None, None),
+        ];
+        let got = foreign_foci(&entries, &ours);
+        let mut urls: Vec<_> = got.keys().cloned().collect();
+        urls.sort();
+        assert_eq!(urls, vec!["https://livekit-jwt.call.matrix.org", "https://lk.example.org"]);
+    }
 }

@@ -67,15 +67,22 @@ impl Selection {
 }
 
 /// The `focus_active` the bridge advertises on its own memberships (ghosts and
-/// the E2EE subscriber): `multi_sfu`, so a multi-SFU client resolves our
-/// transport from OUR `foci_preferred` — i.e. always finds ghost tracks on the
-/// bridge's SFU — even when we are not the oldest membership. Legacy clients only
-/// ever consult their own `focus_active` and the oldest membership's
-/// `foci_preferred`, so this is invisible to them.
+/// the E2EE subscriber): **`oldest_membership`**, deliberately not `multi_sfu`.
+///
+/// Commet's election (`matrix_livekit_backend.dart::findSelectedFocus`) walks
+/// memberships oldest-first and *skips any whose `focus_selection` it doesn't
+/// know* ("Unknown focus selection algorithm") — a `multi_sfu` ghost is
+/// invisible to it, so it elects nothing and falls back to its own homeserver's
+/// SFU (live-observed 2026-09-29: Commet on matrix.org never joined nether.im's
+/// SFU and heard no ghost; our reaper then emptied its live membership). With
+/// `oldest_membership` the ghost is a valid candidate whose `foci_preferred[0]`
+/// names the SFU it actually publishes on (the elected one, see `run_ghost`).
+///
+/// Multi-SFU clients are unaffected: matrix-js-sdk resolves an
+/// `oldest_membership` member's transport to the oldest membership's — i.e. the
+/// elected SFU — which is exactly where the ghost publishes.
 pub fn bridge_active_focus() -> ActiveFocus {
-    let mut f = ActiveLivekitFocus::new();
-    f.focus_selection = FocusSelection::from(MULTI_SFU);
-    ActiveFocus::Livekit(f)
+    ActiveFocus::Livekit(ActiveLivekitFocus::new())
 }
 
 /// The first LiveKit focus of a `foci_preferred` list, as our focus info.
@@ -309,17 +316,21 @@ mod tests {
     fn classifies_focus_selection_wire_values() {
         let oldest = ActiveFocus::Livekit(ActiveLivekitFocus::new());
         assert_eq!(Selection::from_active_focus(&oldest), Selection::OldestMembership);
-        assert_eq!(Selection::from_active_focus(&bridge_active_focus()), Selection::MultiSfu);
+        // Commet skips every selection it doesn't know — ours must be the legacy one.
+        assert_eq!(Selection::from_active_focus(&bridge_active_focus()), Selection::OldestMembership);
+        let mut f = ActiveLivekitFocus::new();
+        f.focus_selection = FocusSelection::from(MULTI_SFU);
+        assert_eq!(Selection::from_active_focus(&ActiveFocus::Livekit(f)), Selection::MultiSfu);
         let mut f = ActiveLivekitFocus::new();
         f.focus_selection = FocusSelection::from("something_else");
         assert_eq!(Selection::from_active_focus(&ActiveFocus::Livekit(f)), Selection::Unknown);
     }
 
     #[test]
-    fn bridge_active_focus_serializes_as_multi_sfu() {
+    fn bridge_active_focus_serializes_as_oldest_membership() {
         let v = serde_json::to_value(bridge_active_focus()).unwrap();
         assert_eq!(v["type"], "livekit");
-        assert_eq!(v["focus_selection"], "multi_sfu");
+        assert_eq!(v["focus_selection"], "oldest_membership");
     }
 
     #[test]

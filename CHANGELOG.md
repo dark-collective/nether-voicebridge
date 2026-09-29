@@ -36,10 +36,19 @@ the `bsch` tenant never worked for the same reason).
   migrates mid-call when the election moves — the old SFU connection is dropped,
   the track republished, and the membership re-posted with the new
   `foci_preferred` and its original `created_ts`, so re-posting never changes
-  who is oldest. Ghost and subscriber memberships advertise
-  `focus_selection: multi_sfu` with that exact SFU, so multi-SFU clients find
-  the track by membership and legacy clients find it by election. Legacy
-  clients ignore other members' `focus_active`, so the field is invisible to them.
+  who is oldest. Ghost and subscriber memberships keep the spec's legacy
+  `focus_selection: oldest_membership` with `foci_preferred` naming exactly
+  that SFU: Commet's election skips any `focus_selection` it doesn't know, so a
+  `multi_sfu` ghost was invisible to it (it elected nothing and fell back to
+  its own SFU — live-observed), while multi-SFU Element Call resolves an
+  `oldest_membership` member to the oldest member's SFU, which is where the
+  ghost publishes. Live-verified 2026-09-29 with Commet on matrix.org in both
+  orders (ghost first: Commet followed to nether.im; Commet first: ghost
+  published on matrix.org, then migrated home when Commet left).
+- **Defensive subscribe.** Not every client follows the election, so the bridge
+  also subscribes on each human member's own `foci_preferred[0]`, and the
+  reaper only judges a member once both its resolved and its preferred SFU are
+  watched. A mis-electing client is heard anyway and can never be reaped alive.
 
 ### Fixed
 - **The #25 reaper only judges members on SFUs it is connected to.** A member

@@ -1307,6 +1307,12 @@ pub(crate) struct MembershipEntry {
     /// The SFU this member publishes its media on, resolved per MSC4195 focus
     /// selection (`rtc::focus`). `None` = no transport could be derived.
     pub(crate) focus: Option<crate::rtc::well_known::LivekitFocusInfo>,
+    /// The member's own `foci_preferred[0]`. Clients don't all follow the
+    /// election (Commet ignores memberships with a `focus_selection` it doesn't
+    /// know and falls back to its own homeserver's SFU), so a member may really
+    /// be publishing HERE rather than on `focus`. The RTC loop subscribes on
+    /// both, and the reaper only judges a member once both are watched.
+    pub(crate) preferred: Option<crate::rtc::well_known::LivekitFocusInfo>,
 }
 
 /// The call's memberships as read from room state, focus-resolved.
@@ -1371,10 +1377,17 @@ pub(crate) async fn snapshot_call_memberships(
             active,
             bridge_owned: is_bridge_owned,
             selection,
-            preferred,
+            preferred: preferred.clone(),
         });
         let legacy_state_key = state_key.starts_with('@');
-        entries.push(MembershipEntry { state_key, mxid, is_bridge_owned, legacy_state_key, focus: None });
+        entries.push(MembershipEntry {
+            state_key,
+            mxid,
+            is_bridge_owned,
+            legacy_state_key,
+            focus: None,
+            preferred,
+        });
     }
     let mut resolved = resolve_effective_foci(&focus_inputs);
     for e in &mut entries {
@@ -1397,10 +1410,12 @@ pub(crate) async fn snapshot_call_memberships(
 ///
 /// "Observable" (multi-SFU, MSC4195): `live_mxids` is only ground truth for the
 /// SFUs we hold a live connection to — `observed_focus_urls`, normalized. A member
-/// publishing on any other SFU (or whose transport we can't derive) is simply
-/// invisible to us, not absent, and is never judged. Without this the reaper
-/// emptied a matrix.org user's *live* membership 84× in one evening because they
-/// were on matrix.org's SFU while we only watched nether.im's.
+/// is judged only when BOTH the SFU the election says it publishes on (`focus`)
+/// AND its own `foci_preferred[0]` (`preferred`) are watched — clients don't all
+/// follow the election (Commet, 2026-09-29), so either may be the truth. A member
+/// with neither derivable is never judged. Without this the reaper emptied a
+/// matrix.org user's *live* membership 84× in one evening because they were on
+/// matrix.org's SFU while we only watched nether.im's.
 fn classify_stale_memberships(
     live_mxids: &HashSet<String>,
     observed_focus_urls: &HashSet<String>,
@@ -1421,10 +1436,15 @@ fn classify_stale_memberships(
         if e.legacy_state_key {
             continue; // can't overwrite an @-state-key as the bot
         }
-        let observable = e
-            .focus
-            .as_ref()
-            .is_some_and(|f| observed_focus_urls.contains(&normalize_service_url(&f.service_url)));
+        let watched = |f: &Option<crate::rtc::well_known::LivekitFocusInfo>| {
+            f.as_ref()
+                .is_some_and(|f| observed_focus_urls.contains(&normalize_service_url(&f.service_url)))
+        };
+        // Every SFU this member might really be on must be watched; at least one
+        // must be known at all.
+        let candidates = [&e.focus, &e.preferred];
+        let known: Vec<_> = candidates.iter().filter(|f| f.is_some()).collect();
+        let observable = !known.is_empty() && known.iter().all(|f| watched(f));
         if !observable {
             phantom_since.remove(&e.state_key); // on an SFU we don't watch — no evidence
             continue;
@@ -1754,11 +1774,34 @@ mod tests {
             is_bridge_owned: owned,
             legacy_state_key: legacy,
             focus: focus(OUR_SFU),
+            preferred: focus(OUR_SFU),
         }
     }
 
     fn entry_on(state_key: &str, mxid: &str, focus: Option<LivekitFocusInfo>) -> MembershipEntry {
-        MembershipEntry { focus, ..entry(state_key, mxid, false, false) }
+        MembershipEntry { preferred: focus.clone(), focus, ..entry(state_key, mxid, false, false) }
+    }
+
+    /// Commet (2026-09-29): the election said "nether.im" (it followed the oldest
+    /// ghost on paper) but the client really published on its own matrix.org SFU.
+    /// A member whose resolved and preferred SFUs differ is judged only when BOTH
+    /// are watched — otherwise it was reaped alive.
+    #[test]
+    fn member_is_judged_only_when_resolved_and_preferred_sfus_are_both_watched() {
+        let key = "_@commet:matrix.org_DEV_m.call";
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        let entries = [MembershipEntry { focus: focus(OUR_SFU), preferred: focus(THEIR_SFU), ..entry(key, "@commet:matrix.org", false, false) }];
+        // Only our SFU watched → not judged, no clock.
+        assert!(classify_stale_memberships(&live(&[]), &ours(), &entries, &mut since, t0 + GRACE * 3, GRACE).is_empty());
+        assert!(since.is_empty());
+        // Both watched and absent from both → a genuine phantom, reaped after grace.
+        let both: HashSet<String> = HashSet::from([OUR_SFU.to_owned(), THEIR_SFU.to_owned()]);
+        assert!(classify_stale_memberships(&live(&[]), &both, &entries, &mut since, t0, GRACE).is_empty());
+        assert_eq!(classify_stale_memberships(&live(&[]), &both, &entries, &mut since, t0 + GRACE, GRACE), vec![key.to_string()]);
+        // A member with no derivable SFU at all is never judged.
+        let unknown = [MembershipEntry { focus: None, preferred: None, ..entry("_@x:y_D_m.call", "@x:y", false, false) }];
+        assert!(classify_stale_memberships(&live(&[]), &both, &unknown, &mut since, t0 + GRACE * 3, GRACE).is_empty());
     }
 
     fn live(mxids: &[&str]) -> HashSet<String> {

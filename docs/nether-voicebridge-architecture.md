@@ -114,12 +114,16 @@ every member's publishing SFU, then:
    on the new one, and re-posts its membership (same `created_ts`, so re-posting
    never reshuffles the election). With no human present the election is a
    ghost's own, i.e. our SFU.
-4. Ghost (and E2EE-subscriber) memberships advertise `multi_sfu` naming exactly
-   the SFU they publish on, so a multi-SFU client finds Discord speakers by
-   membership while a legacy client finds them by election. Legacy clients
-   ignore other members' `focus_active`.
-5. The stale-membership reaper (#25) treats a member on an SFU we hold no
-   session on as **unobservable**, never as absent.
+4. Ghost (and E2EE-subscriber) memberships advertise the legacy
+   `oldest_membership` with `foci_preferred` naming exactly the SFU they publish
+   on. Not `multi_sfu`: Commet's election skips every `focus_selection` it
+   doesn't know, so a `multi_sfu` ghost is invisible to it and it falls back to
+   its own homeserver's SFU. Multi-SFU Element Call resolves an
+   `oldest_membership` member to the oldest member's SFU — where the ghost is.
+5. Defensively, the bridge also subscribes on each human member's own
+   `foci_preferred[0]` (clients don't all follow the election), and the
+   stale-membership reaper (#25) judges a member only when both its resolved and
+   its preferred SFU are watched; anyone else is **unobservable**, never absent.
 
 Why it matters: a matrix.org user on a current Element Call publishes to
 matrix.org's SFU. Before this, the bridge never heard them and — worse — reaped
