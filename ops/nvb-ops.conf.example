@@ -19,7 +19,14 @@ BACKUP_KEEP=14
 APPROVE_REJECT_ALERT=3
 REJECT_CLUSTER_ALERT=5
 WARN_RATE_ALERT=100
-TCP_MAX=40
+# Sizing (2026-09-28): the count is ESTABLISHED sockets of the bridge process.
+# Idle prod with 22 bridges + 7 puppets sits at ~37–44; every OPEN call adds a
+# LiveKit signalling socket, ICE-TCP and one homeserver connection per ghost,
+# and sessions linger through the leave grace after a human leaves. One
+# operator hopping through six rooms in 20 min hit 61 against an envelope of
+# 60 (false alarm). 90 leaves headroom for a handful of concurrent calls while
+# still catching a leak, which ratchets up and never comes back down.
+TCP_MAX=90
 # Hosts whose resolved IPv4s are legitimate egress (space-separated). The
 # homeserver is always resolved; add the LiveKit SFU + any other direct peers.
 EXTRA_ALLOW_HOSTS=livekit.example.org

@@ -44,7 +44,11 @@ use anyhow::Result;
 use livekit::e2ee::key_provider::{KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions};
 use matrix_sdk::{
     Client,
-    ruma::{OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId},
+    event_handler::RawEvent,
+    ruma::{
+        OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId,
+        events::{AnyToDeviceEvent, ToDeviceEvent},
+    },
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -167,7 +171,7 @@ pub(crate) async fn run(
                     let sender = ev.sender.as_str().to_owned();
                     let content = ev.content;
                     let claimed_device_id = content.member.claimed_device_id.clone();
-                    let member_id = content.member.id.clone();
+                    let member_id = content.member.id.clone().unwrap_or_else(|| "-".to_owned());
                     let key_index = content.keys.index;
                     let key_b64 = content.keys.key.clone();
 
@@ -222,6 +226,35 @@ pub(crate) async fn run(
                 .instrument(span)
             },
         );
+    }
+
+    // Interop tripwire (2026-09-27): the typed handler above never runs for an
+    // `io.element.call.encryption_keys` event whose content fails to deserialize —
+    // matrix-sdk logs that only under `matrix_sdk::event_handler=warn`, which prod
+    // doesn't enable. That is exactly how Commet's key (no `member.id`) vanished:
+    // no install, no log, one-way audio. Re-parse the raw JSON here and WARN with
+    // the field *names* only — never the key bytes.
+    {
+        let bridge = bridge.clone();
+        client.add_event_handler(move |ev: AnyToDeviceEvent, raw: RawEvent| {
+            let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
+            async move {
+                if ev.event_type().to_string() != keys::ENCRYPTION_KEYS_EVENT_TYPE {
+                    return;
+                }
+                if let Err(e) =
+                    serde_json::from_str::<ToDeviceEvent<CallEncryptionKeysEventContent>>(raw.get())
+                {
+                    tracing::warn!(
+                        sender = %ev.sender(),
+                        error = %e,
+                        shape = %keys::describe_content_shape(raw.get()),
+                        "unparseable io.element.call.encryption_keys to-device — peer media key NOT installed (client interop gap)"
+                    );
+                }
+            }
+            .instrument(span)
+        });
     }
 
     // ── Static fields derived from config/client ──────────────────────────────

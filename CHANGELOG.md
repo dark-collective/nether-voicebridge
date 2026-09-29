@@ -55,6 +55,25 @@ the `bsch` tenant never worked for the same reason).
   whose resolved SFU the bridge has no live session on (or whose transport
   can't be derived) is *unobservable*, not absent: never reaped, no phantom
   clock. Losing a foreign session mid-grace clears its members' clocks.
+## [0.3.7] - 2026-09-28
+
+**Commet callers in encrypted rooms can now be heard on Discord, and the next
+client whose media-key event doesn't fit our type shows up as a WARN instead
+of silent one-way audio.**
+
+### Fixed
+- **Matrix→Discord silent for Commet callers in encrypted rooms.** Commet's
+  experimental encrypted calls send `io.element.call.encryption_keys` without
+  `member.id`; the bridge's strict content type rejected it, matrix-sdk dropped
+  the event without a log line, and the caller's frames stayed undecryptable
+  (`MissingKey`) while the ghosts' keys reached them fine — one-way audio.
+  `member.id` and `sent_ts` are now optional; neither is used for identity
+  (that is `sender:claimed_device_id`).
+
+### Added
+- To-device interop tripwire: an `io.element.call.encryption_keys` event that
+  fails to parse is now logged at WARN with its field shape (names only, never
+  key bytes) instead of vanishing.
 
 ## [0.3.6] - 2026-09-27
 
