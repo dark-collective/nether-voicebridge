@@ -870,7 +870,7 @@ async fn run_ghost(
         let mut presence_membership: Option<tokio::task::JoinHandle<()>> = None;
         if !*call_active_rx.borrow_and_update() {
             presence_membership = Some(tokio::spawn(
-                post_membership_until_joined(
+                keep_membership_posted(
                     cfg.clone(),
                     ghost_mxid.clone(),
                     device_id.clone(),
@@ -976,7 +976,7 @@ async fn run_ghost(
             h.abort();
         }
         let mut membership_handle = tokio::spawn(
-            post_membership_until_joined(
+            keep_membership_posted(
                 cfg.clone(),
                 ghost_mxid.clone(),
                 device_id.clone(),
@@ -1082,7 +1082,7 @@ async fn run_ghost(
                 // track now lives. Drop the previous poster first.
                 membership_handle.abort();
                 membership_handle = tokio::spawn(
-                    post_membership_until_joined(
+                    keep_membership_posted(
                         cfg.clone(),
                         ghost_mxid.clone(),
                         device_id.clone(),
@@ -1098,8 +1098,11 @@ async fn run_ghost(
             }
         }
 
-        // 7. Teardown. Stop the membership-retry task first (it observes `cancel`)
-        // and await it so a late join can't race past the leave below and linger.
+        // 7. Teardown. The membership keeper runs until `cancel` fires (it also
+        // refreshes the expiry hourly), so make sure it has — a `SourceClosed`
+        // exit reaches here with `cancel` still live — then await it so a post in
+        // flight lands BEFORE the leave below and can't linger as a phantom.
+        cancel.cancel();
         let _ = membership_handle.await;
         // Retract call membership (best-effort; a no-op if we never joined). The
         // LiveKit room is closed by the event-drain task once `cancel` fires.
@@ -2187,11 +2190,36 @@ async fn fetch_openid_token(cfg: &GhostConfig, ghost_mxid: &str) -> Result<OpenI
     Ok(token)
 }
 
-/// Post the ghost's `m.call.member` join, retrying with backoff until it lands or
-/// `cancel` fires. Self-heals a transient failure (e.g. a room whose
-/// `org.matrix.msc3401.call.member` power level is wrong, then fixed) without the
-/// Discord user having to rejoin. Bounded in practice by the ghost's lifetime.
-async fn post_membership_until_joined(
+/// How long a posted membership is valid for (MSC4143 `expires`; Element Call's
+/// default). Clients treat a membership as gone once `created_ts + expires` passes.
+const MEMBERSHIP_EXPIRES: Duration = Duration::from_secs(4 * 3600);
+/// How often a live ghost re-posts to push its expiry out. One hour leaves three
+/// hours of slack for a homeserver hiccup.
+const MEMBERSHIP_REFRESH: Duration = Duration::from_secs(3600);
+
+/// The `expires` to post *now* so the membership stays valid for
+/// [`MEMBERSHIP_EXPIRES`] from now while `created_ts` stays put (the age is what
+/// the call-focus election is decided on, so it must never move).
+///
+/// Why: `expires` is relative to `created_ts`, not to the post. Pinning
+/// `created_ts` across re-posts (0.3.8) meant a re-post kept the ORIGINAL expiry
+/// — a Discord user who had been in the channel > 4 h stayed invisible to every
+/// Matrix client even after the ghost re-posted (live: huxley, Light Voice,
+/// 2026-09-30). Element Call does exactly this: fixed `created_ts`, growing
+/// `expires`, periodic refresh.
+fn membership_expires(created_ts_ms: u64, now_ms: u64) -> Duration {
+    Duration::from_millis(now_ms.saturating_sub(created_ts_ms)) + MEMBERSHIP_EXPIRES
+}
+
+/// Keep the ghost's `m.call.member` join posted until `cancel` fires: post it
+/// (retrying with backoff until it lands — self-heals e.g. a room whose
+/// `org.matrix.msc3401.call.member` power level is wrong, then fixed), then
+/// re-post every [`MEMBERSHIP_REFRESH`] with a fresh `expires` so a long-present
+/// ghost never ages out of the call. Each post computes `expires` from the fixed
+/// `created_ts` (see [`membership_expires`]). Exits promptly on `cancel`; a post
+/// in flight completes first, so a caller that awaits this before posting its
+/// leave never has a stale join land after it.
+async fn keep_membership_posted(
     cfg: GhostConfig,
     ghost_mxid: String,
     device_id: String,
@@ -2199,26 +2227,41 @@ async fn post_membership_until_joined(
     created_ts: Option<MilliSecondsSinceUnixEpoch>,
     cancel: CancellationToken,
 ) {
-    let mut backoff = Duration::from_secs(2);
-    let max = Duration::from_secs(30);
+    let mut first = true;
     loop {
-        match post_membership_at(&cfg, &ghost_mxid, &device_id, &focus, created_ts, false).await {
-            Ok(()) => {
-                tracing::info!(sfu = %focus.service_url, "ghost call membership posted — visible in call");
-                return;
+        // Post (with retry) until it lands or we are cancelled.
+        let mut backoff = Duration::from_secs(2);
+        let max = Duration::from_secs(30);
+        loop {
+            match post_membership_at(&cfg, &ghost_mxid, &device_id, &focus, created_ts, false).await {
+                Ok(()) => {
+                    if first {
+                        tracing::info!(sfu = %focus.service_url, "ghost call membership posted — visible in call");
+                    } else {
+                        tracing::info!(sfu = %focus.service_url, "ghost call membership refreshed (expiry extended)");
+                    }
+                    first = false;
+                    break;
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    retry_in_s = backoff.as_secs(),
+                    "ghost post_membership failed — retrying (room may need m.call.member at PL 0)"
+                ),
             }
-            Err(e) => tracing::warn!(
-                error = %e,
-                retry_in_s = backoff.as_secs(),
-                "ghost post_membership failed — retrying (room may need m.call.member at PL 0)"
-            ),
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(max);
         }
+        // Landed — sleep until the next refresh (or retire).
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(backoff) => {}
+            _ = tokio::time::sleep(MEMBERSHIP_REFRESH) => {}
         }
-        backoff = (backoff * 2).min(max);
     }
 }
 
@@ -2255,7 +2298,12 @@ async fn post_membership_at(
     let content = if leave {
         CallMemberEventContent::new_empty(None)
     } else {
-        build_membership(&device, focus, created_ts)
+        // A fixed `created_ts` needs a growing `expires`, or re-posts inherit the
+        // original expiry (see `membership_expires`). Without `created_ts` the
+        // server timestamp is the age and ruma's 4 h default applies from it.
+        let now_ms = u64::from(MilliSecondsSinceUnixEpoch::now().get());
+        let expires = created_ts.map(|c| membership_expires(u64::from(c.get()), now_ms));
+        build_membership(&device, focus, created_ts, expires)
     };
     put_call_member_state(cfg, ghost_mxid, state_key.as_ref(), &content).await
 }
@@ -2328,6 +2376,7 @@ fn build_membership(
     device_id: &OwnedDeviceId,
     focus: &LivekitFocusInfo,
     created_ts: Option<MilliSecondsSinceUnixEpoch>,
+    expires: Option<Duration>,
 ) -> CallMemberEventContent {
     let foci_preferred = vec![Focus::Livekit(LivekitFocus::new(
         focus.alias.clone(),
@@ -2339,7 +2388,7 @@ fn build_membership(
         super::focus::bridge_active_focus(),
         foci_preferred,
         created_ts,
-        None,
+        expires,
     )
 }
 
@@ -2520,6 +2569,33 @@ mod tests {
         // Once cancel fires it exits with `false` (a teardown, not a real change).
         cancel.cancel();
         assert!(!changed_or_park(&mut rx, &cancel).await);
+    }
+
+    #[test]
+    fn membership_expires_grows_with_age_so_created_ts_can_stay_fixed() {
+        // Fresh post: plain 4 h.
+        assert_eq!(membership_expires(1_000, 1_000), MEMBERSHIP_EXPIRES);
+        // Ten hours after created_ts (huxley): expiry must still reach 4 h past NOW.
+        let ten_h = 10 * 3600 * 1000;
+        assert_eq!(membership_expires(1_000, 1_000 + ten_h), Duration::from_millis(ten_h) + MEMBERSHIP_EXPIRES);
+        // Clock skew (created in the future) never underflows.
+        assert_eq!(membership_expires(5_000, 1_000), MEMBERSHIP_EXPIRES);
+    }
+
+    #[test]
+    fn build_membership_carries_created_ts_and_expires_on_the_wire() {
+        let focus = LivekitFocusInfo { alias: "!r:x".into(), service_url: "https://lk".into() };
+        let created = MilliSecondsSinceUnixEpoch(1_700_000_000_000u64.try_into().unwrap());
+        let c = build_membership(&"D1".into(), &focus, Some(created), Some(Duration::from_millis(36_000_000)));
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["created_ts"], 1_700_000_000_000u64);
+        assert_eq!(v["expires"], 36_000_000u64);
+        assert_eq!(v["focus_active"]["focus_selection"], "oldest_membership");
+        // The ruma default when nothing is pinned (presence posts before 0.3.8 shape).
+        let d = build_membership(&"D1".into(), &focus, None, None);
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["expires"], 14_400_000u64);
+        assert!(v.get("created_ts").is_none());
     }
 
     #[test]

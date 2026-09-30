@@ -3,6 +3,21 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Long-present Discord users vanished from the Matrix call after 4 hours.** A
+  ghost's `m.call.member` carries `expires` relative to `created_ts`, and 0.3.8
+  pinned `created_ts` across re-posts (so the call-focus election stays stable)
+  — which meant a re-post inherited the *original* expiry and the server
+  deduplicated it. A Discord user who had sat in the channel for more than
+  4 hours before a call started was invisible to Commet and Element even
+  though their audio flowed (live: Light Voice, 2026-09-30). Ghosts now do
+  what Element Call does: `created_ts` stays fixed, every post computes
+  `expires` so the membership is valid for 4 hours *from now*, and a keeper
+  task re-posts hourly for as long as the ghost lives (presence and active
+  phases, and after a migration).
+
 ## [0.3.8] - 2026-09-30
 
 **Multi-SFU MatrixRTC (MSC4195 `multi_sfu`): users on other homeservers can be
