@@ -3,7 +3,7 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.9] - 2026-09-30
 
 ### Fixed
 - **Long-present Discord users vanished from the Matrix call after 4 hours.** A
