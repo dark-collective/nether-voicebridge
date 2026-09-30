@@ -3,7 +3,7 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.8] - 2026-09-30
 
 **Multi-SFU MatrixRTC (MSC4195 `multi_sfu`): users on other homeservers can be
 bridged again.** Element Call 0.21 (July 2026) made multi-SFU the default:
