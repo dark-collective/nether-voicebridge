@@ -274,6 +274,11 @@ pub(crate) async fn run(
     // E2EE membership-retry task for the current activation (cancel + its handle).
     let mut membership_cancel: Option<CancellationToken> = None;
     let mut membership_handle: Option<tokio::task::JoinHandle<()>> = None;
+    // The bot's roster membership age for the current activation (E2EE only):
+    // fixed at the first post and reused by every refresh and by a rejoin after
+    // a disconnect, so the call-focus election never reshuffles on our account;
+    // cleared whenever the membership is retracted.
+    let mut membership_created: Option<matrix_sdk::ruma::MilliSecondsSinceUnixEpoch> = None;
     // True while an E2EE membership we posted may still be in room state. Usually
     // tracks `joined`, EXCEPT during disconnect recovery (#66): the recovery arm
     // sets `joined = false` but deliberately leaves the membership posted (we
@@ -371,13 +376,16 @@ pub(crate) async fn run(
                         if media_e2ee {
                             let mc = shutdown.child_token();
                             membership_cancel = Some(mc.clone());
+                            let created = *membership_created
+                                .get_or_insert_with(matrix_sdk::ruma::MilliSecondsSinceUnixEpoch::now);
                             membership_handle = Some(tokio::spawn(
-                                post_membership_until_joined(
+                                keep_membership_posted(
                                     client.clone(),
                                     room_id.clone(),
                                     bot_user_id.clone(),
                                     device_id.clone(),
                                     focus.clone(),
+                                    created,
                                     mc,
                                 )
                                 .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
@@ -417,6 +425,7 @@ pub(crate) async fn run(
                     retract_membership(&client, &room_id, &bot_user_id, &device_id).await;
                 }
                 membership_lingering = false;
+                membership_created = None;
             }
 
             (false, false) if membership_lingering => {
@@ -438,6 +447,7 @@ pub(crate) async fn run(
                     retract_membership(&client, &room_id, &bot_user_id, &device_id).await;
                 }
                 membership_lingering = false;
+                membership_created = None;
             }
 
             _ => {}
@@ -886,45 +896,65 @@ async fn post_membership(
     bot_user_id: &OwnedUserId,
     device_id: &OwnedDeviceId,
     focus: &LivekitFocusInfo,
+    created_ts: matrix_sdk::ruma::MilliSecondsSinceUnixEpoch,
 ) -> anyhow::Result<()> {
     let room = client
         .get_room(room_id)
         .ok_or_else(|| anyhow::anyhow!("room not in local state — cannot post E2EE membership"))?;
-    membership::join(&room, bot_user_id, device_id, focus).await
+    membership::join(&room, bot_user_id, device_id, focus, created_ts).await
 }
 
-/// Post the bridge bot's `m.call.member`, retrying with backoff until it lands or
-/// `cancel` fires (call-end / shutdown). Self-heals a transient failure (e.g. an
-/// encrypted room whose `org.matrix.msc3401.call.member` power level is wrong, then
-/// fixed) so receive recovers without a reconnect.
-async fn post_membership_until_joined(
+/// Keep the bridge bot's `m.call.member` posted until `cancel` fires (call-end /
+/// shutdown / disconnect recovery): post it, retrying with backoff until it lands
+/// — self-heals a transient failure (e.g. an encrypted room whose
+/// `org.matrix.msc3401.call.member` power level is wrong, then fixed) so receive
+/// recovers without a reconnect — then re-post every
+/// [`membership::MEMBERSHIP_REFRESH`] with a fresh `expires` computed from the
+/// fixed `created_ts`. Without the refresh a single encrypted call longer than
+/// 4 h silently dropped the bot from the roster, and with it every peer's media
+/// key delivery. Same model as the ghosts (`rtc::ghost::keep_membership_posted`).
+async fn keep_membership_posted(
     client: Client,
     room_id: OwnedRoomId,
     bot_user_id: OwnedUserId,
     device_id: OwnedDeviceId,
     focus: LivekitFocusInfo,
+    created_ts: matrix_sdk::ruma::MilliSecondsSinceUnixEpoch,
     cancel: CancellationToken,
 ) {
-    let mut backoff = Duration::from_secs(2);
-    let max = Duration::from_secs(30);
+    let mut first = true;
     loop {
-        match post_membership(&client, &room_id, &bot_user_id, &device_id, &focus).await {
-            Ok(()) => {
-                tracing::info!("bridge participant posted to call (E2EE key receipt enabled)");
-                return;
+        let mut backoff = Duration::from_secs(2);
+        let max = Duration::from_secs(30);
+        loop {
+            match post_membership(&client, &room_id, &bot_user_id, &device_id, &focus, created_ts).await {
+                Ok(()) => {
+                    if first {
+                        tracing::info!("bridge participant posted to call (E2EE key receipt enabled)");
+                    } else {
+                        tracing::info!("bridge participant membership refreshed (expiry extended)");
+                    }
+                    first = false;
+                    break;
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    retry_in_s = backoff.as_secs(),
+                    "failed to post bridge m.call.member — retrying (room may need m.call.member at PL 0); E2EE receive is down until it lands"
+                ),
             }
-            Err(e) => tracing::warn!(
-                error = %e,
-                retry_in_s = backoff.as_secs(),
-                "failed to post bridge m.call.member — retrying (room may need m.call.member at PL 0); E2EE receive is down until it lands"
-            ),
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(max);
         }
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(backoff) => {}
+            _ = tokio::time::sleep(membership::MEMBERSHIP_REFRESH) => {}
         }
-        backoff = (backoff * 2).min(max);
     }
 }
 

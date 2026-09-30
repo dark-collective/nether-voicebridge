@@ -2190,26 +2190,9 @@ async fn fetch_openid_token(cfg: &GhostConfig, ghost_mxid: &str) -> Result<OpenI
     Ok(token)
 }
 
-/// How long a posted membership is valid for (MSC4143 `expires`; Element Call's
-/// default). Clients treat a membership as gone once `created_ts + expires` passes.
-const MEMBERSHIP_EXPIRES: Duration = Duration::from_secs(4 * 3600);
-/// How often a live ghost re-posts to push its expiry out. One hour leaves three
-/// hours of slack for a homeserver hiccup.
-const MEMBERSHIP_REFRESH: Duration = Duration::from_secs(3600);
-
-/// The `expires` to post *now* so the membership stays valid for
-/// [`MEMBERSHIP_EXPIRES`] from now while `created_ts` stays put (the age is what
-/// the call-focus election is decided on, so it must never move).
-///
-/// Why: `expires` is relative to `created_ts`, not to the post. Pinning
-/// `created_ts` across re-posts (0.3.8) meant a re-post kept the ORIGINAL expiry
-/// — a Discord user who had been in the channel > 4 h stayed invisible to every
-/// Matrix client even after the ghost re-posted (live: huxley, Light Voice,
-/// 2026-09-30). Element Call does exactly this: fixed `created_ts`, growing
-/// `expires`, periodic refresh.
-fn membership_expires(created_ts_ms: u64, now_ms: u64) -> Duration {
-    Duration::from_millis(now_ms.saturating_sub(created_ts_ms)) + MEMBERSHIP_EXPIRES
-}
+// Expiry helpers are shared with the bridge bot's own roster membership — see
+// `rtc::membership::{membership_expires, MEMBERSHIP_EXPIRES, MEMBERSHIP_REFRESH}`.
+use super::membership::{MEMBERSHIP_REFRESH, membership_expires};
 
 /// Keep the ghost's `m.call.member` join posted until `cancel` fires: post it
 /// (retrying with backoff until it lands — self-heals e.g. a room whose
@@ -2404,6 +2387,7 @@ pub mod testkit;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::membership::MEMBERSHIP_EXPIRES;
     use matrix_sdk::ruma::events::call::member::{ActiveFocus, ActiveLivekitFocus};
 
     fn test_pool(max_ghosts: Option<usize>) -> Arc<GhostPool> {
