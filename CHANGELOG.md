@@ -3,6 +3,17 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **The bridge bot's own E2EE roster membership now refreshes too.** In an
+  encrypted room the bot posts an `m.call.member` so peers send it their media
+  keys; it was posted once per call with the default 4-hour expiry, so a single
+  encrypted call longer than 4 hours silently dropped the bot from the roster
+  and stopped key delivery. It now uses the same keeper as the ghosts: fixed
+  `created_ts` per activation (kept across a disconnect-recovery rejoin),
+  `expires` recomputed on every post, hourly refresh until the call ends.
+
 ## [0.3.9] - 2026-09-30
 
 ### Fixed
