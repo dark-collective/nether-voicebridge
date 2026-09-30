@@ -3,7 +3,7 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.10] - 2026-09-30
 
 ### Fixed
 - **The bridge bot's own E2EE roster membership now refreshes too.** In an
