@@ -3,6 +3,58 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**Multi-SFU MatrixRTC (MSC4195 `multi_sfu`): users on other homeservers can be
+bridged again.** Element Call 0.21 (July 2026) made multi-SFU the default:
+every participant publishes on its *own* homeserver's LiveKit SFU instead of
+the whole call electing one. The bridge only ever joined the SFU from its own
+`.well-known`, so a matrix.org user on a current Element Call was never heard
+(their audio went to matrix.org's SFU) — and the stale-membership reaper read
+their absence from *our* SFU as "phantom" and kept emptying their live
+membership (84 times in one evening on the `Limited-VC` tenant, 2026-09-28;
+the `bsch` tenant never worked for the same reason).
+
+### Added
+- **Per-SFU subscriber fan-in.** Every human member's publishing SFU is
+  resolved from their `m.call.member` exactly as matrix-js-sdk does
+  (`multi_sfu` ⇒ own `foci_preferred[0]`; `oldest_membership` ⇒ the oldest
+  membership's transport). For each such SFU that isn't ours the RTC loop runs
+  one extra subscribe-only LiveKit session — JWT minted at *their* lk-jwt
+  service with our OpenID token, the standard federated path — feeding the
+  same puppet router. Reconciled on join, on membership change, when a foreign
+  session dies (backoff 15 s → 5 min), and on every reaper tick; all dropped
+  at call end. E2EE shares the primary session's key provider (keys are per
+  publisher, SFU-agnostic) and the #73 heal gate.
+- **Ghosts publish on the call's *elected* SFU and follow it.** Legacy
+  `oldest_membership` clients (Commet, Element Call < 0.21) listen only on the
+  SFU elected by the oldest active membership; when that member is on another
+  homeserver, a ghost publishing on our SFU is inaudible to them (live-observed
+  with Commet on matrix.org, 2026-09-29: Discord heard Matrix, Matrix heard
+  nothing). Each ghost now reads the election from room state when it connects,
+  publishes there (JWT from that SFU's lk-jwt via its own OpenID token), and
+  migrates mid-call when the election moves — the old SFU connection is dropped,
+  the track republished, and the membership re-posted with the new
+  `foci_preferred` and its original `created_ts`, so re-posting never changes
+  who is oldest. Ghost and subscriber memberships keep the spec's legacy
+  `focus_selection: oldest_membership` with `foci_preferred` naming exactly
+  that SFU: Commet's election skips any `focus_selection` it doesn't know, so a
+  `multi_sfu` ghost was invisible to it (it elected nothing and fell back to
+  its own SFU — live-observed), while multi-SFU Element Call resolves an
+  `oldest_membership` member to the oldest member's SFU, which is where the
+  ghost publishes. Live-verified 2026-09-29 with Commet on matrix.org in both
+  orders (ghost first: Commet followed to nether.im; Commet first: ghost
+  published on matrix.org, then migrated home when Commet left).
+- **Defensive subscribe.** Not every client follows the election, so the bridge
+  also subscribes on each human member's own `foci_preferred[0]`, and the
+  reaper only judges a member once both its resolved and its preferred SFU are
+  watched. A mis-electing client is heard anyway and can never be reaped alive.
+
+### Fixed
+- **The #25 reaper only judges members on SFUs it is connected to.** A member
+  whose resolved SFU the bridge has no live session on (or whose transport
+  can't be derived) is *unobservable*, not absent: never reaped, no phantom
+  clock. Losing a foreign session mid-grace clears its members' clocks.
 ## [0.3.7] - 2026-09-28
 
 **Commet callers in encrypted rooms can now be heard on Discord, and the next

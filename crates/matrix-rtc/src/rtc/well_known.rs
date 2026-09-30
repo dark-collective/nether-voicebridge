@@ -9,7 +9,7 @@ use serde::Deserialize;
 use tracing::Instrument;
 
 /// A LiveKit focus entry from the `.well-known/matrix/client` endpoint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LivekitFocusInfo {
     /// The alias used to identify the LiveKit room within the SFU.
     pub alias: String,

@@ -1152,7 +1152,7 @@ mod tests {
             service_url: "https://livekit.nether.im".into(),
         };
         let member = |sender: &str, device: &str| {
-            let content = super::super::build_membership(&device.into(), &focus);
+            let content = super::super::build_membership(&device.into(), &focus, None);
             serde_json::json!({
                 "type": CALL_MEMBER_EVENT_TYPE,
                 "sender": sender,

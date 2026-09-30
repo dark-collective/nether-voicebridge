@@ -117,6 +117,22 @@ test.
    as humans. Guarantee teardown returns the connection count to baseline.
 7. **Pin `songbird` and `livekit` to specific releases.** Both ends are
    version-sensitive (DAVE, E2EE). Never float these.
+8. **A call may span several LiveKit SFUs (MSC4195 `multi_sfu`).** Element Call
+   ≥ 0.21 publishes each participant on *their own* homeserver's SFU; only
+   legacy clients elect the oldest member's. Never assume the whole call is on
+   the SFU from our `.well-known`: resolve each member's SFU via `rtc::focus`
+   (mirrors matrix-js-sdk `getTransport()`), subscribe per foreign SFU
+   (`rtc::mod.rs::ForeignSessions`), make ghosts publish on the **elected** SFU
+   (the oldest active membership's — the only one legacy clients such as Commet
+   listen on; `rtc::focus::elected_focus`, migrating when it moves, with
+   membership re-posts keeping `created_ts`), keep bridge-owned memberships on
+   the legacy `oldest_membership` (Commet SKIPS any `focus_selection` it doesn't
+   know — a `multi_sfu` ghost is invisible to it), also subscribe on each
+   member's own `foci_preferred[0]`, and never let the #25 reaper judge a
+   member unless both its resolved and preferred SFUs are watched. Ignoring
+   this = remote-homeserver users silently unbridged AND their live memberships
+   reaped (Limited-VC, 2026-09-28), or Matrix-side silence for Commet users
+   (2026-09-29).
 
 ## Conventions
 

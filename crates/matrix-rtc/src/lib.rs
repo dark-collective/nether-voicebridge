@@ -182,6 +182,13 @@ pub async fn run(
     // its E2EE media key to the new member. A monotonic counter so a missed edge is
     // still observed via the changed value (vs. a Notify's lost-wakeup risk).
     let (members_gen_tx, members_gen_rx) = watch::channel(0u64);
+    // The RTC loop also watches it: a joining human may publish on an SFU the
+    // bridge isn't subscribed to yet (multi-SFU fan-in, `rtc::focus`).
+    let members_gen_rx_rtc = members_gen_rx.clone();
+    // Call-focus election (MSC4195): the RTC loop publishes the SFU the oldest
+    // active membership elects; ghosts publish there (and migrate when it moves)
+    // so legacy `oldest_membership` clients hear Discord speakers.
+    let (call_focus_tx, call_focus_rx) = watch::channel(None);
 
     // Drive the sync loop, the RTC subscriber, and the ghost-pool driver to
     // completion. A bare `tokio::try_join!` would DROP the sibling futures the
@@ -222,6 +229,8 @@ pub async fn run(
                 timing.reap_interval(),
                 timing.reap_grace(),
                 call_active_rx,
+                members_gen_rx_rtc,
+                call_focus_tx,
                 router,
                 bridge.clone(),
                 shutdown.clone(),
@@ -235,6 +244,7 @@ pub async fn run(
                 key_transport,
                 members_gen_rx,
                 call_active_rx_ghost,
+                call_focus_rx,
                 bridge.clone(),
                 shutdown.clone(),
             ),

@@ -52,7 +52,7 @@ use matrix_sdk::{
         events::{
             SyncStateEvent,
             call::member::{
-                ActiveFocus, ActiveLivekitFocus, Application, CallApplicationContent,
+                Application, CallApplicationContent,
                 CallMemberEventContent, CallMemberStateKey, CallScope, Focus, LivekitFocus,
             },
         },
@@ -479,6 +479,9 @@ impl GhostPool {
         // (and delivers its E2EE key) as soon as this is true, rather than waiting
         // for its Discord user to speak — so audio is instant on first utterance.
         call_active_rx: watch::Receiver<bool>,
+        // The call's elected SFU (published by `rtc::run`). Each ghost publishes
+        // there and migrates when it changes — see [`run_ghost`].
+        call_focus_rx: watch::Receiver<Option<LivekitFocusInfo>>,
         bridge: Arc<str>,
         shutdown: CancellationToken,
     ) -> Result<()> {
@@ -562,7 +565,7 @@ impl GhostPool {
                     cfg.key_transport = key_transport;
                     let focus = focus.clone().expect("focus set above");
                     let join = tokio::spawn(
-                        run_ghost(cfg, focus, client.clone(), members_gen_rx.clone(), call_active_rx.clone(), key.clone(), display_name, avatar_url, frame_rx, mute_rx, cancel.clone(), crypto_cache.clone(), key_cache.clone())
+                        run_ghost(cfg, focus, client.clone(), members_gen_rx.clone(), call_active_rx.clone(), call_focus_rx.clone(), key.clone(), display_name, avatar_url, frame_rx, mute_rx, cancel.clone(), crypto_cache.clone(), key_cache.clone())
                             .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
                     );
                     ghosts.insert(key, GhostHandle { cancel, join, mute_tx });
@@ -735,10 +738,13 @@ type GhostKeyCache = Arc<tokio::sync::Mutex<HashMap<String, [u8; 16]>>>;
 #[allow(clippy::too_many_arguments)]
 async fn run_ghost(
     cfg: GhostConfig,
-    focus: LivekitFocusInfo,
+    // The bridge's own SFU (from `.well-known`): the fallback publish target
+    // when nothing is elected.
+    default_focus: LivekitFocusInfo,
     client: Client,
     members_gen_rx: watch::Receiver<u64>,
     mut call_active_rx: watch::Receiver<bool>,
+    mut call_focus_rx: watch::Receiver<Option<LivekitFocusInfo>>,
     key: String,
     display_name: String,
     avatar_url: Option<String>,
@@ -782,6 +788,20 @@ async fn run_ghost(
     } else {
         None
     };
+
+    // Where this ghost publishes: the call's ELECTED SFU (`rtc::focus::
+    // elected_focus`, read authoritatively from room state), not necessarily
+    // ours. A legacy `oldest_membership` client (Commet, pre-0.21 Element Call)
+    // listens only on the oldest member's SFU — when that member is on another
+    // homeserver, a ghost publishing on our SFU is inaudible to it (live-observed
+    // 2026-09-29: Commet on matrix.org heard nothing from Discord). The membership
+    // advertises exactly this SFU, so multi-SFU clients find the track there too.
+    // Re-elected on every (re)connect; migrated mid-call when the election moves.
+    let mut focus = elected_focus_or(&client, &cfg, &default_focus).await;
+    // Fixed at the first post and repeated on every re-post (presence → active,
+    // migration): a membership's age is its `created_ts`, and letting it reset
+    // would reshuffle who is "oldest" — and with it the election — each time.
+    let created_ts = Some(MilliSecondsSinceUnixEpoch::now());
 
     let span = tracing::info_span!("ghost", mxid = %ghost_mxid);
     async {
@@ -855,6 +875,7 @@ async fn run_ghost(
                     ghost_mxid.clone(),
                     device_id.clone(),
                     focus.clone(),
+                    created_ts,
                     cancel.clone(),
                 )
                 .instrument(tracing::Span::current()),
@@ -908,6 +929,13 @@ async fn run_ghost(
         // the room dies (#66). Replaced with a fresh token on every reconnect so
         // a stale room's death can't re-trigger recovery.
         let mut disconnected = CancellationToken::new();
+        // The humans are in now — the election may have moved since the presence
+        // phase (a legacy joiner older than us elects THEIR SFU). Re-read state.
+        focus = elected_focus_or(&client, &cfg, &default_focus).await;
+        // Per-attempt child of `cancel`: closes just this attempt's LiveKit room
+        // (the drain task ends on it) so a focus migration can drop the old SFU
+        // connection without retiring the ghost. A retire cascades through it.
+        let mut attempt = cancel.child_token();
         let (mut source, mut track) = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -923,7 +951,7 @@ async fn run_ghost(
                 tracing::info!("ghost retired (cancelled before publish)");
                 return;
             }
-            res = connect_and_publish(&cfg, &focus, &ghost_mxid, &device_id, media_key, cancel.clone(), disconnected.clone()) => match res {
+            res = connect_and_publish(&cfg, &focus, &ghost_mxid, &device_id, media_key, attempt.clone(), disconnected.clone()) => match res {
                 Ok(out) => out,
                 Err(e) => {
                     tracing::error!(error = %e, "ghost LiveKit connect/publish failed — retracting");
@@ -947,17 +975,18 @@ async fn run_ghost(
         if let Some(h) = presence_membership.take() {
             h.abort();
         }
-        let membership_handle = tokio::spawn(
+        let mut membership_handle = tokio::spawn(
             post_membership_until_joined(
                 cfg.clone(),
                 ghost_mxid.clone(),
                 device_id.clone(),
                 focus.clone(),
+                created_ts,
                 cancel.clone(),
             )
             .instrument(tracing::Span::current()),
         );
-        tracing::info!(display_name = %display_name, "ghost publishing Discord speaker audio");
+        tracing::info!(display_name = %display_name, sfu = %focus.service_url, "ghost publishing Discord speaker audio");
         // (Key distribution + crypto bootstrap were started on presence — step 3b —
         // so a pre-warmed ghost can deliver its key the instant a human joins.)
 
@@ -971,58 +1000,101 @@ async fn run_ghost(
         // the identity, device id, and media key are all stable, so peers need
         // nothing re-delivered; the fresh room just republishes the track.
         'pump: loop {
-            match pump_audio(
+            let exit = pump_audio(
                 &mut frame_rx,
                 &source,
                 &track,
                 &mut mute_rx,
+                &mut call_focus_rx,
+                &focus,
                 &cancel,
                 &disconnected,
                 cfg.capture_wav,
                 &key,
             )
-            .await
-            {
+            .await;
+            let migrating = match exit {
                 // Retire: the ghost was released (cancel) or the Discord side
                 // dropped the speaker's sink (channel closed) — step 7 below.
                 PumpExit::Cancelled | PumpExit::SourceClosed => break 'pump,
                 PumpExit::Disconnected => {
                     tracing::warn!("ghost LiveKit room disconnected — reconnecting");
-                    let mut backoff = Duration::from_secs(2);
-                    loop {
-                        tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => break 'pump,
-                            _ = tokio::time::sleep(backoff) => {}
-                        }
-                        backoff = (backoff * 2).min(Duration::from_secs(30));
-                        disconnected = CancellationToken::new();
-                        match connect_and_publish(
-                            &cfg,
-                            &focus,
-                            &ghost_mxid,
-                            &device_id,
-                            media_key,
-                            cancel.clone(),
-                            disconnected.clone(),
-                        )
-                        .await
-                        {
-                            Ok((s, t)) => {
-                                source = s;
-                                track = t;
-                                break;
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "ghost LiveKit reconnect failed — retrying");
-                            }
-                        }
-                    }
-                    // Frames buffered while the room was down are stale audio —
-                    // drop them so the rejoined track starts live, not delayed.
-                    while frame_rx.try_recv().is_ok() {}
-                    tracing::info!("ghost LiveKit reconnected — resuming publish");
+                    false
                 }
+                PumpExit::FocusChanged => {
+                    // The watch says the election moved. Re-read room state (the
+                    // authority) and only migrate on a real change of SFU.
+                    let new_focus = elected_focus_or(&client, &cfg, &default_focus).await;
+                    if super::focus::normalize_service_url(&new_focus.service_url)
+                        == super::focus::normalize_service_url(&focus.service_url)
+                    {
+                        continue 'pump;
+                    }
+                    tracing::info!(
+                        from = %focus.service_url,
+                        to = %new_focus.service_url,
+                        "call-focus election moved — migrating ghost to the elected SFU"
+                    );
+                    focus = new_focus;
+                    // Close the old SFU connection (drain ends → room closed); the
+                    // ghost itself stays live.
+                    attempt.cancel();
+                    true
+                }
+            };
+            let mut backoff = if migrating { Duration::ZERO } else { Duration::from_secs(2) };
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break 'pump,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff.max(Duration::from_secs(1)) * 2).min(Duration::from_secs(30));
+                disconnected = CancellationToken::new();
+                attempt = cancel.child_token();
+                match connect_and_publish(
+                    &cfg,
+                    &focus,
+                    &ghost_mxid,
+                    &device_id,
+                    media_key,
+                    attempt.clone(),
+                    disconnected.clone(),
+                )
+                .await
+                {
+                    Ok((s, t)) => {
+                        source = s;
+                        track = t;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, sfu = %focus.service_url, "ghost LiveKit reconnect failed — retrying");
+                    }
+                }
+            }
+            // Frames buffered while the room was down are stale audio —
+            // drop them so the rejoined track starts live, not delayed.
+            while frame_rx.try_recv().is_ok() {}
+            if migrating {
+                // Advertise the new SFU: re-post membership (same state key, same
+                // created_ts) so every client resolves our transport to where the
+                // track now lives. Drop the previous poster first.
+                membership_handle.abort();
+                membership_handle = tokio::spawn(
+                    post_membership_until_joined(
+                        cfg.clone(),
+                        ghost_mxid.clone(),
+                        device_id.clone(),
+                        focus.clone(),
+                        created_ts,
+                        cancel.clone(),
+                    )
+                    .instrument(tracing::Span::current()),
+                );
+                tracing::info!(sfu = %focus.service_url, "ghost migrated — publishing on the elected SFU");
+            } else {
+                tracing::info!("ghost LiveKit reconnected — resuming publish");
             }
         }
 
@@ -1052,6 +1124,9 @@ enum PumpExit {
     /// The LiveKit room died (the drain task fired this attempt's `disconnected`
     /// token) — reconnect and pump again.
     Disconnected,
+    /// The call-focus election watch changed to a different SFU than the one we
+    /// publish on — re-read state and migrate if it really moved.
+    FocusChanged,
 }
 
 /// Drain the ghost's frame channel through a jitter buffer into its LiveKit
@@ -1072,6 +1147,8 @@ async fn pump_audio(
     source: &NativeAudioSource,
     track: &LocalAudioTrack,
     mute_rx: &mut watch::Receiver<bool>,
+    focus_rx: &mut watch::Receiver<Option<LivekitFocusInfo>>,
+    current_focus: &LivekitFocusInfo,
     cancel: &CancellationToken,
     disconnected: &CancellationToken,
     capture_wav: bool,
@@ -1122,6 +1199,19 @@ async fn pump_audio(
                     let muted = *mute_rx.borrow_and_update();
                     apply_track_mute(track, muted);
                     tracing::info!(muted, "ghost track mute mirrored from Discord");
+                }
+            }
+            changed = changed_or_park(focus_rx, cancel) => {
+                // The election moved. Only a different SFU is worth a migration;
+                // `run_ghost` re-reads room state before acting on it.
+                if changed {
+                    let moved = focus_rx.borrow_and_update().as_ref().is_some_and(|f| {
+                        super::focus::normalize_service_url(&f.service_url)
+                            != super::focus::normalize_service_url(&current_focus.service_url)
+                    });
+                    if moved {
+                        break PumpExit::FocusChanged;
+                    }
                 }
             }
             frame = frame_rx.recv() => {
@@ -1212,7 +1302,7 @@ async fn pump_audio(
 /// `true` only on a real change and otherwise parking on `cancel` (which fires
 /// imminently once the ghost pool drains) keeps the select cheap. Mirrors
 /// [`distribute_key_loop`]'s handling of a closed `members_gen`.
-async fn changed_or_park(rx: &mut watch::Receiver<bool>, cancel: &CancellationToken) -> bool {
+async fn changed_or_park<T>(rx: &mut watch::Receiver<T>, cancel: &CancellationToken) -> bool {
     match rx.changed().await {
         Ok(()) => true,
         Err(_) => {
@@ -2106,14 +2196,15 @@ async fn post_membership_until_joined(
     ghost_mxid: String,
     device_id: String,
     focus: LivekitFocusInfo,
+    created_ts: Option<MilliSecondsSinceUnixEpoch>,
     cancel: CancellationToken,
 ) {
     let mut backoff = Duration::from_secs(2);
     let max = Duration::from_secs(30);
     loop {
-        match post_membership(&cfg, &ghost_mxid, &device_id, &focus, false).await {
+        match post_membership_at(&cfg, &ghost_mxid, &device_id, &focus, created_ts, false).await {
             Ok(()) => {
-                tracing::info!("ghost call membership posted — visible in call");
+                tracing::info!(sfu = %focus.service_url, "ghost call membership posted — visible in call");
                 return;
             }
             Err(e) => tracing::warn!(
@@ -2141,6 +2232,20 @@ async fn post_membership(
     focus: &LivekitFocusInfo,
     leave: bool,
 ) -> Result<()> {
+    post_membership_at(cfg, ghost_mxid, device_id, focus, None, leave).await
+}
+
+/// [`post_membership`] with an explicit `created_ts`, so a re-post (presence →
+/// active, focus migration) keeps the membership's original age — the age is
+/// what the call-focus election is decided on.
+async fn post_membership_at(
+    cfg: &GhostConfig,
+    ghost_mxid: &str,
+    device_id: &str,
+    focus: &LivekitFocusInfo,
+    created_ts: Option<MilliSecondsSinceUnixEpoch>,
+    leave: bool,
+) -> Result<()> {
     let user_id: OwnedUserId = UserId::parse(ghost_mxid)
         .with_context(|| format!("parsing ghost mxid '{ghost_mxid}'"))?;
     let device: OwnedDeviceId = device_id.into();
@@ -2150,9 +2255,24 @@ async fn post_membership(
     let content = if leave {
         CallMemberEventContent::new_empty(None)
     } else {
-        build_membership(&device, focus)
+        build_membership(&device, focus, created_ts)
     };
     put_call_member_state(cfg, ghost_mxid, state_key.as_ref(), &content).await
+}
+
+/// The SFU this ghost should publish on: the call's elected focus read from room
+/// state (`crate::matrix::snapshot_call_memberships`), else `default` (ours).
+async fn elected_focus_or(client: &Client, cfg: &GhostConfig, default: &LivekitFocusInfo) -> LivekitFocusInfo {
+    let (Ok(room_id), Ok(bot)) = (RoomId::parse(&cfg.room_id), UserId::parse(&cfg.bot_user_id)) else {
+        return default.clone();
+    };
+    match crate::matrix::snapshot_call_memberships(client, &room_id, &bot, &cfg.ghost_localpart_prefix).await {
+        Ok(snap) => snap.elected.unwrap_or_else(|| default.clone()),
+        Err(e) => {
+            tracing::warn!(error = %e, "ghost: could not read call memberships for the focus election — using our SFU");
+            default.clone()
+        }
+    }
 }
 
 /// PUT a ghost's `m.call.member` state event (masqueraded as the ghost). The
@@ -2198,7 +2318,17 @@ async fn retract_membership_raw(
 }
 
 /// Build the ghost's `m.call.member` join content — mirrors `rtc::membership::join`.
-fn build_membership(device_id: &OwnedDeviceId, focus: &LivekitFocusInfo) -> CallMemberEventContent {
+///
+/// `focus_active` is `multi_sfu` (see `rtc::focus`): the ghost publishes on the
+/// bridge's SFU regardless of who is the oldest member, and a multi-SFU client
+/// must be told to look for it there — with `oldest_membership` a matrix.org
+/// user who started the call would resolve our transport to *their* SFU and
+/// never find the ghost's track (live-observed 2026-09-28, Limited-VC).
+fn build_membership(
+    device_id: &OwnedDeviceId,
+    focus: &LivekitFocusInfo,
+    created_ts: Option<MilliSecondsSinceUnixEpoch>,
+) -> CallMemberEventContent {
     let foci_preferred = vec![Focus::Livekit(LivekitFocus::new(
         focus.alias.clone(),
         focus.service_url.clone(),
@@ -2206,9 +2336,9 @@ fn build_membership(device_id: &OwnedDeviceId, focus: &LivekitFocusInfo) -> Call
     CallMemberEventContent::new(
         Application::Call(CallApplicationContent::new(String::new(), CallScope::Room)),
         device_id.clone(),
-        ActiveFocus::Livekit(ActiveLivekitFocus::new()),
+        super::focus::bridge_active_focus(),
         foci_preferred,
-        None,
+        created_ts,
         None,
     )
 }
@@ -2225,6 +2355,7 @@ pub mod testkit;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use matrix_sdk::ruma::events::call::member::{ActiveFocus, ActiveLivekitFocus};
 
     fn test_pool(max_ghosts: Option<usize>) -> Arc<GhostPool> {
         let matrix_cfg = MatrixConfig {
