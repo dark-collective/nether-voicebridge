@@ -4231,19 +4231,23 @@ fn epoch_now() -> i64 {
 
 /// `pair`: mint a code the sender's Discord account redeems with `/bridge pair`.
 async fn handle_pair(ctx: &BotCtx, room: &Room, sender: &str) {
-    let code = {
+    let minted: Option<String> = {
         let mut map = ctx.pending_pairs.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         map.retain(|_, p| now.saturating_duration_since(p.created) < PAIR_CODE_TTL);
         // One live code per person: a re-run replaces the old one.
         map.retain(|_, p| p.matrix_user != sender);
         if map.len() >= PENDING_PAIR_CAP {
-            reply(room, "Too many pairing codes are pending right now — try again in a few minutes.").await;
-            return;
+            None
+        } else {
+            let code = mint_approval_code().replacen("NVB-", "NVB-P", 1);
+            map.insert(code.clone(), PendingPair { matrix_user: sender.to_string(), created: now });
+            Some(code)
         }
-        let code = mint_approval_code().replacen("NVB-", "NVB-P", 1);
-        map.insert(code.clone(), PendingPair { matrix_user: sender.to_string(), created: now });
-        code
+    };
+    let Some(code) = minted else {
+        reply(room, "Too many pairing codes are pending right now — try again in a few minutes.").await;
+        return;
     };
     audit(ctx, sender, "pair_code", serde_json::json!({ "code": code }));
     reply(room, &format!(
@@ -5839,6 +5843,9 @@ mod tests {
             require_room_authority: false,
             approval_ttl: Some(ttl),
             pending: StdMutex::new(HashMap::new()),
+            links: nvb_config::links::LinkShared::in_memory(),
+            pending_pairs: StdMutex::new(HashMap::new()),
+            link_notice_stamps: StdMutex::new(HashMap::new()),
             awaiting_invite: StdMutex::new(HashMap::new()),
             invite_intent_ttl: Duration::from_secs(1800),
             open_registration: true,
