@@ -188,6 +188,41 @@ an error message** — worth knowing so they don't look like breakage:
   `report guild 123456789012345678 harassment`. Reports are reviewed by a
   human; nothing is removed automatically.
 
+## Being yourself on both sides (linked identities)
+
+If you are in the Discord voice channel with your own Discord account **and** in
+the Matrix room's call with your own Matrix account, the bridge would normally
+show a ghost of your Discord account on Matrix and a bot puppet of you on
+Discord. Pairing the two accounts tells the bridge they are one person:
+
+1. DM the management bot `pair`. It replies with a one-time code.
+2. On Discord, **as the account you want to link**, run `/bridge pair code:<code>`
+   in any server this bridge serves (within 10 minutes). Nobody else can do this
+   step for you, which is what makes the pairing yours.
+
+From then on, whenever that Discord account is in a bridged voice channel *and*
+your Matrix account is in that room's call, the bridge creates no ghost and no
+puppet for you and doesn't count you twice. On every other occasion you are an
+ordinary participant — nothing is stored about where you are, only that the two
+accounts belong together. If your Discord side drops out while you stay in the
+call, you get a puppet again automatically and the bot tells you once.
+
+- `pairings` lists your pairings; `unpair [discord-user-id]` removes one or all;
+  `/bridge unpair` on Discord does the same from that side.
+- You may pair several Discord accounts (a main and an alt); a Discord account
+  pairs with one Matrix account at a time.
+- `pair delegate <@mxid>` names an account that receives your notices (for people
+  who run a helper for you); `pair delegate none` clears it.
+
+Room moderators (or the bridge's owner) can also approve a **service account** in
+their room — a Matrix account that sits in the call but should get no Discord
+puppet and not count as a participant, e.g. a relay helper: `relay allow
+<room-id> <@mxid>`, `relay deny …` to revoke, `relay list <room-id>` to see them.
+Operators can additionally pin exclusions in the bridge config
+(`excluded_discord_user_ids` / `excluded_matrix_user_ids`).
+
+Design record: `docs/adr/0001-linked-identities-and-sidecars.md`.
+
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |

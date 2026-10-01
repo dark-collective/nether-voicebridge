@@ -130,6 +130,9 @@ pub struct TenantsCtx {
     /// Resolved `[timing]` grace-timer profile (#38), passed to every bridge's
     /// Matrix/RTC side at spawn. Defaults match the historical hardcoded values.
     pub timing: TimingConfig,
+    /// Linked identities (ADR 0001): the instance-wide pairing/approval stores
+    /// and the registry of live boards (one per bridge, created at spawn).
+    pub links: nvb_config::links::LinkShared,
 }
 
 /// Book-keeping for one live bridge, keyed by label in [`Supervisor::running`].
@@ -264,6 +267,30 @@ impl Supervisor {
         .context("building ghost pool")?;
         let capture_router: Arc<dyn CaptureRouter> = ghost_pool.clone();
 
+        // Linked identities (ADR 0001): one board per bridge. Its dispatcher
+        // routes Discord-side transitions into the pool and Matrix-side ones to
+        // this bridge's Matrix task (over `link_tx`).
+        let links = self.ctx.links.board_for(
+            &bridge.matrix.room_id,
+            &bridge.excluded_discord_user_ids,
+            &bridge.excluded_matrix_user_ids,
+        );
+        let (link_tx, link_rx) = tokio::sync::mpsc::unbounded_channel::<nvb_config::links::LinkEvent>();
+        {
+            let pool = self.pool.clone();
+            let label_for_pool = label.to_string();
+            links.set_dispatch(Box::new(move |ev| match ev {
+                nvb_config::links::LinkEvent::DiscordExcluded(_)
+                | nvb_config::links::LinkEvent::DiscordIncluded(_) => {
+                    pool.apply_discord_link_event(&label_for_pool, ev)
+                }
+                other => {
+                    let _ = link_tx.send(other);
+                }
+            }));
+        }
+        self.ctx.links.registry.register(&label, links.clone());
+
         // Register this bridge's channel with the shared pool → its PlaybackRouter.
         let router: Arc<dyn PlaybackRouter> = self
             .pool
@@ -273,6 +300,7 @@ impl Supervisor {
                 &bridge.discord.channel_id,
                 capture_router,
                 capture_sink.clone(),
+                links.clone(),
             )
             .with_context(|| format!("registering channel for bridge '{label}'"))?;
 
@@ -323,6 +351,8 @@ impl Supervisor {
                     ghost_pool,
                     fut_label.clone(),
                     bridge_root.clone(),
+                    links,
+                    link_rx,
                 ) => {
                     match result {
                         // No reconnection yet (Phase 10); a clean exit is unexpected.
@@ -453,6 +483,7 @@ impl Supervisor {
 
     fn on_bridge_complete_inner(&mut self, label: &str, outcome: BridgeOutcome) {
         self.pool.unregister_channel(label);
+        self.ctx.links.registry.unregister(label);
         let Some(rb) = self.running.remove(label) else { return };
         let uptime = rb.spawned_at.elapsed();
         // Cancel the root even on a voluntary/error exit (not just an operator
@@ -980,6 +1011,8 @@ mod tests {
             livekit: LiveKitConfig::default(),
             owner: None,
             created: None,
+            excluded_discord_user_ids: Vec::new(),
+            excluded_matrix_user_ids: Vec::new(),
         }
     }
 
@@ -1128,6 +1161,7 @@ mod tests {
             static_labels: HashSet::from(["Main Voice".to_string()]),
             limits: LimitsConfig::default(),
             timing: TimingConfig::default(),
+            links: nvb_config::links::LinkShared::in_memory(),
         };
         // Label collision with a static bridge.
         let t = tenant("Main Voice", "!t:x");
@@ -1155,6 +1189,7 @@ mod tests {
             static_labels: HashSet::new(),
             limits: LimitsConfig::default(),
             timing: TimingConfig::default(),
+            links: nvb_config::links::LinkShared::in_memory(),
         };
         let a = tenant("a", "!a:x");
         let b = tenant("b", "!b:x");
@@ -1170,6 +1205,7 @@ mod tests {
             static_labels: HashSet::new(),
             limits: LimitsConfig { max_tenants: Some(2), ..Default::default() },
             timing: TimingConfig::default(),
+            links: nvb_config::links::LinkShared::in_memory(),
         };
         let a = tenant("a", "!a:x");
         let b = tenant("b", "!b:x");
@@ -1200,6 +1236,7 @@ mod tests {
             static_labels: HashSet::new(),
             limits: LimitsConfig::default(),
             timing: TimingConfig::default(),
+            links: nvb_config::links::LinkShared::in_memory(),
         };
         let mut sup = Supervisor::new(pool, CancellationToken::new(), ctx);
 
@@ -1294,6 +1331,7 @@ mod tests {
             static_labels: HashSet::new(),
             limits: LimitsConfig::default(),
             timing: TimingConfig::default(),
+            links: nvb_config::links::LinkShared::in_memory(),
         };
         let mut sup = Supervisor::new(pool, CancellationToken::new(), ctx);
         sup.running.insert(

@@ -201,11 +201,40 @@ async fn main() -> Result<()> {
             mgmt_pool_io.approval_rx = Some(rx);
         }
     }
+    if mgmt_inputs.is_some() {
+        // Pairing (ADR 0001): `/bridge pair`/`unpair` → management bot.
+        let (pool_tx, mut pool_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mgmt_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        pool.enable_link_pairing(pool_tx);
+        tokio::spawn(async move {
+            while let Some((p, reply)) = pool_rx.recv().await {
+                let _ = mgmt_tx.send(nvb_matrix_rtc::mgmt::DiscordPair {
+                    code: p.code,
+                    discord_user_id: p.discord_user_id,
+                    guild_id: p.guild_id,
+                    invoker: p.invoker,
+                    reply,
+                });
+            }
+        });
+        mgmt_pool_io.pair_rx = Some(rx);
+    }
 
     // The supervisor owns every running bridge (and drives the pool's future):
     // one independent Matrix/RTC pipeline per bridge, all `!Send`, all driven on
     // this task. Each bridge future swallows its own error (logging it), so one
     // bridge failing ends *that* bridge only — the rest keep running.
+    // Linked identities (ADR 0001): instance-wide pairing + service-account
+    // stores. Unreadable stores are logged and replaced by empty ones (as for
+    // the opt-out list): the bridge must come up; the operator fixes the file.
+    let links = match nvb_config::links::LinkShared::open(&data_dir) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(error = %e, "pairings/relays stores unreadable — starting with NO linked identities");
+            nvb_config::links::LinkShared::in_memory()
+        }
+    };
+    let mgmt_links = links.clone();
     let mut supervisor = Supervisor::new(
         pool,
         pool_shutdown.clone(),
@@ -216,6 +245,7 @@ async fn main() -> Result<()> {
             static_labels,
             limits,
             timing,
+            links,
         },
     );
 
@@ -253,6 +283,7 @@ async fn main() -> Result<()> {
                 control,
                 mgmt_pool_io,
                 shutdown,
+                mgmt_links,
             )
             .await
             {

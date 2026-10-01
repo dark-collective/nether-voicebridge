@@ -3,6 +3,38 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-10-01
+
+**Linked identities: a person present on both sides is one person to the
+bridge (ADR 0001).**
+
+### Added
+- **Pairing.** A Matrix user links their own Discord account(s) with a proof on
+  each side: `pair` (management DM) mints a one-time code, `/bridge pair
+  code:…` (run as that Discord account) redeems it. While a paired Discord
+  account is in a bridged voice channel *and* its Matrix account is in the
+  room's call, the bridge creates no ghost for the one and no puppet for the
+  other, forwards neither, and counts neither as a human. Re-evaluated from
+  live presence on every change — nothing to switch off later. `unpair`,
+  `pairings`, `pair delegate <@mxid>`, `/bridge unpair`.
+- **Service accounts per room.** `relay allow|deny|list <room-id> [@mxid]`
+  (room authority or operator): a Matrix account in the call that gets no
+  puppet and is not counted — for user-run helpers such as stream relays.
+- **Config overrides** `excluded_discord_user_ids` / `excluded_matrix_user_ids`
+  per bridge: unconditional exclusion, the operator's override and the path for
+  instances without a management bot.
+- **Failover notice.** When a paired person's Discord session drops while they
+  stay in the call, they (and their delegate) are told once per 10 minutes that
+  they are bridged through a bot until it returns.
+- Exclusion transitions are first-class lifecycle events: a sidecar arriving
+  late retires an already-minted ghost/puppet; one dropping re-creates them.
+- New data files `<data_dir>/pairings.toml` and `relays.toml`; privacy policy
+  and self-serve docs updated; `docs/adr/` introduced.
+
+### Changed
+- Config schema gains two optional per-bridge lists (see above); the
+  management bot and `/bridge` command gain the verbs listed above.
+
 ## [0.3.12] - 2026-10-01
 
 **A Matrix screen share no longer plays its audio into Discord voice.**

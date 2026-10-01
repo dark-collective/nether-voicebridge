@@ -12,6 +12,7 @@ pub mod audio;
 pub mod federation;
 pub mod invite_lifecycle;
 pub mod lifecycle;
+pub mod linked_identities;
 pub mod link_invite_only;
 pub mod mgmt_dm_e2ee;
 pub mod mgmt_self_serve;
@@ -52,6 +53,7 @@ pub fn all() -> Vec<&'static ScenarioDef> {
         &moderation::RECOVERY_NO_SPARE,
         &lifecycle::REAP_RELEASE,
         &lifecycle::LEAVE_GRACE_DEBOUNCE,
+        &linked_identities::LINKED_IDENTITY_EXCLUSION,
         &overflow_fcfs::OVERFLOW_FCFS_PROMOTION,
         &multi_bridge_isolation::MULTI_BRIDGE_ISOLATION,
         &steal_repromotion::STEAL_RELEASE_REPROMOTION,

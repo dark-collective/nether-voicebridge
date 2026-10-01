@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
+use nvb_config::links::{LinkBoard, LinkEvent};
 use tracing::Instrument;
 
 use nvb_audio::routing::PlaybackRouter;
@@ -114,6 +115,7 @@ async fn apply_member_event(
     bridge: &Arc<str>,
     room: &Room,
     router: &Arc<dyn PlaybackRouter>,
+    links: &Arc<LinkBoard>,
 ) {
     let is_active = match content {
         CallMemberEventContent::Empty(_) => false,
@@ -185,8 +187,17 @@ async fn apply_member_event(
             tracing::info!(mxid = %user_id, "membership re-appeared within grace — cancelled pending release");
             return;
         }
+        // Linked identities (ADR 0001): record the arrival; if it flips a paired
+        // Discord member's status the Discord side retires that ghost; and a
+        // member who is bridge-owned (paired half present / service account /
+        // config-excluded) gets no puppet and does not count as a human.
+        let humans_before = links.matrix_humans();
+        links.dispatch_all(links.set_matrix_present(user_id.as_str(), true));
+        let excluded = links.matrix_excluded(user_id.as_str());
+        let humans_after = links.matrix_humans();
         // Genuinely new (or rejoining after a real, already-applied leave).
-        if became_nonempty {
+        let _ = became_nonempty; // superseded by the human count below
+        if humans_before == 0 && humans_after > 0 {
             tracing::info!("call active");
             let _ = call_active_tx.send(true);
         }
@@ -194,6 +205,10 @@ async fn apply_member_event(
         // key so this user can decrypt the ghost's E2EE frames. Bump the
         // membership-generation watch the ghost key-distribution loops wait on.
         members_gen_tx.send_modify(|g| *g = g.wrapping_add(1));
+        if excluded {
+            tracing::info!(mxid = %user_id, "member joined — bridge-owned (paired Discord account present, service account, or excluded) — no puppet");
+            return;
+        }
         let name = resolve_member_name(room, &user_id).await;
         tracing::info!(mxid = %user_id, display_name = %name, "member joined — assigning puppet");
         router.assign(user_id.as_str(), &name);
@@ -215,6 +230,7 @@ async fn apply_member_event(
         let pending_leaves = pending_leaves.clone();
         let call_active_tx = call_active_tx.clone();
         let shutdown = shutdown.clone();
+        let links = links.clone();
         let mxid = user_id.clone();
         let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
         tokio::spawn(
@@ -226,18 +242,18 @@ async fn apply_member_event(
                     _ = tokio::time::sleep(leave_grace) => {}
                 }
                 // Authoritative re-check under the lock: only release if still absent.
-                let (still_absent, now_empty) = {
+                let still_absent = {
                     let set = participants.lock().await;
-                    (
-                        set.iter().filter(|(u, _)| u == &mxid).count() == 0,
-                        set.is_empty(),
-                    )
+                    set.iter().filter(|(u, _)| u == &mxid).count() == 0
                 };
                 pending_leaves.lock().await.remove(&mxid);
                 if still_absent {
                     tracing::info!(mxid = %mxid, "leave grace elapsed — releasing puppet");
                     router.release(mxid.as_str());
-                    if now_empty {
+                    // Linked identities: the leave is now effective — a paired Discord
+                    // member still in the channel gets its ghost back (Discord side).
+                    links.dispatch_all(links.set_matrix_present(mxid.as_str(), false));
+                    if links.matrix_humans() == 0 {
                         tracing::info!("call ended (after grace)");
                         let _ = call_active_tx.send(false);
                     }
@@ -1118,11 +1134,63 @@ pub(crate) async fn run(
     router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
     shutdown: CancellationToken,
+    links: Arc<LinkBoard>,
+    mut link_rx: tokio::sync::mpsc::UnboundedReceiver<LinkEvent>,
 ) -> Result<()> {
     let bot_user_id: OwnedUserId = cfg.bot_user_id.parse()?;
     let room_id = RoomId::parse(&cfg.room_id)?;
     let participants: ParticipantSet = Arc::new(Mutex::new(HashSet::new()));
     let pending_leaves: PendingLeaves = Arc::new(Mutex::new(HashMap::new()));
+
+    // Linked identities (ADR 0001): Matrix-side transitions caused by Discord
+    // presence changes. A paired Discord account arriving makes its Matrix half
+    // bridge-owned (release the puppet); it leaving hands the puppet back — the
+    // "your Discord session dropped" case, which is also where the notice goes.
+    {
+        let router = router.clone();
+        let participants = participants.clone();
+        let shutdown = shutdown.clone();
+        let client = client.clone();
+        let room_id = room_id.clone();
+        let links = links.clone();
+        let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
+        tokio::spawn(
+            async move {
+                loop {
+                    let ev = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => return,
+                        ev = link_rx.recv() => match ev { Some(e) => e, None => return },
+                    };
+                    match ev {
+                        LinkEvent::MatrixExcluded(mxid) => {
+                            tracing::info!(mxid = %mxid, "member is now bridge-owned (its paired Discord account joined the channel) — releasing puppet");
+                            router.release(&mxid);
+                        }
+                        LinkEvent::MatrixIncluded { user, discord_half_vanished } => {
+                            let present = participants.lock().await.iter().any(|(u, _)| u.as_str() == user);
+                            if !present || links.matrix_excluded(&user) {
+                                continue;
+                            }
+                            let name = match (client.get_room(&room_id), user.parse::<OwnedUserId>()) {
+                                (Some(room), Ok(uid)) => resolve_member_name(&room, &uid).await,
+                                _ => user.clone(),
+                            };
+                            tracing::info!(mxid = %user, display_name = %name, discord_half_vanished, "member is no longer bridge-owned — assigning puppet");
+                            router.assign(&user, &name);
+                            if discord_half_vanished {
+                                // Notice to the person (and their delegate) — delivered by the
+                                // management bot when one is running (see `LinkNotice`).
+                                crate::links_notice::emit(&links, &user);
+                            }
+                        }
+                        LinkEvent::DiscordExcluded(_) | LinkEvent::DiscordIncluded(_) => {} // Discord side's job
+                    }
+                }
+            }
+            .instrument(span),
+        );
+    }
     let ghost_prefix: Arc<str> = Arc::from(
         crate::rtc::ghost::ghost_localpart_prefix(cfg.sender_localpart.as_deref()).as_str(),
     );
@@ -1145,6 +1213,7 @@ pub(crate) async fn run(
         let bridge = bridge.clone();
         let router = router.clone();
         let ghost_prefix = ghost_prefix.clone();
+        let links = links.clone();
         client.add_room_event_handler(&room_id, move |ev: SyncCallMemberEvent, room: Room| {
             let participants = participants.clone();
             let pending_leaves = pending_leaves.clone();
@@ -1155,6 +1224,7 @@ pub(crate) async fn run(
             let bridge = bridge.clone();
             let router = router.clone();
             let ghost_prefix = ghost_prefix.clone();
+            let links = links.clone();
             let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
             async move {
                 let Some(orig) = ev.as_original() else { return };
@@ -1177,6 +1247,7 @@ pub(crate) async fn run(
                     &bridge,
                     &room,
                     &router,
+                    &links,
                 )
                 .await;
             }
@@ -1214,6 +1285,7 @@ pub(crate) async fn run(
                 &bridge,
                 &room,
                 &router,
+                &links,
             )
             .await;
         }

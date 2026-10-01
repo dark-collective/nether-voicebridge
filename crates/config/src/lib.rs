@@ -5,7 +5,10 @@ use std::time::Duration;
 use thiserror::Error;
 
 mod banlist;
+pub mod links;
 mod optout;
+pub mod pairings;
+pub mod relays;
 mod self_serve;
 mod tenants;
 mod tenants_edit;
@@ -18,7 +21,7 @@ pub use optout::{
     ApprovalOutcome, DiscordNotice, OptoutList, add_optout, load_optout, optout_path,
     remove_optout,
 };
-pub use tenants::{TenantsFile, list_tenant_names, load_tenants, tenants_path};
+pub use tenants::{TenantsFile, list_tenant_names, load_tenants, tenant_owner_for_room, tenants_path};
 pub use tenants_edit::{
     NewTenant, PriorContent, add_tenant_entry, remove_tenant_entries_matching,
     remove_tenant_entry, restore_tenants_file, tenant_discord_channel, tenant_guilds,
@@ -615,6 +618,17 @@ pub struct BridgeConfig {
     /// `date -d @<n>`). Absent on hand-written entries.
     #[serde(default)]
     pub created: Option<i64>,
+    /// Discord user ids this bridge treats as bridge-owned unconditionally (ADR
+    /// 0001 §4): never ghosted, never captured, never counted as humans. The
+    /// operator override for accounts that will not pair, and the only mechanism
+    /// on instances without a management bot.
+    #[serde(default)]
+    pub excluded_discord_user_ids: Vec<String>,
+    /// Matrix user ids this bridge treats as bridge-owned unconditionally: never
+    /// puppeted, never counted as humans (e.g. a sidecar account on an instance
+    /// without a management bot to approve it).
+    #[serde(default)]
+    pub excluded_matrix_user_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1068,6 +1082,25 @@ pub fn validate_bridge_against(
         }
     }
 
+    // Hard: exclusion overrides must be well-formed ids (a typo here would
+    // silently exclude nobody).
+    for id in &b.excluded_discord_user_ids {
+        if id.parse::<u64>().map_or(true, |v| v == 0) {
+            return Err(ConfigError::Validation(format!(
+                "bridge '{}': excluded_discord_user_ids entry {id:?} is not a Discord user id",
+                b.label()
+            )));
+        }
+    }
+    for id in &b.excluded_matrix_user_ids {
+        if !(id.starts_with('@') && id.contains(':') && id.len() > 3) {
+            return Err(ConfigError::Validation(format!(
+                "bridge '{}': excluded_matrix_user_ids entry {id:?} is not a Matrix user id (@user:server)",
+                b.label()
+            )));
+        }
+    }
+
     // Hard: after profile-merge + auto-derive, every required Matrix field must be
     // present. Empty here means the bridge neither inherited it (no/empty profile)
     // nor set it inline.
@@ -1416,6 +1449,8 @@ impl Config {
                 // Env-var mode is operator-authored: no owner record.
                 owner: None,
                 created: None,
+                excluded_discord_user_ids: Vec::new(),
+                excluded_matrix_user_ids: Vec::new(),
             }],
         };
         cfg.resolve_bot_user_ids();
