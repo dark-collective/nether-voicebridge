@@ -3,6 +3,19 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.12] - 2026-10-01
+
+**A Matrix screen share no longer plays its audio into Discord voice.**
+
+### Fixed
+- fix(subscriber): screen-share audio/video from Matrix is never bridged into
+  Discord voice (#142). The subscriber drops publications whose source is
+  screen share or screen-share audio at publish and subscribe time and
+  unsubscribes from them; Discord users already hear a Go Live natively, so
+  forwarding the share's audio through a puppet only doubled it or fed it back
+  (Light Gaming, 2026-10-01). Supersedes 0.3.11, which was tagged but never
+  deployed.
+
 ## [0.3.11] - 2026-10-01
 
 **Harness-only release: the nightly audio oracle no longer fails an intact
