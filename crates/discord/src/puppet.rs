@@ -4533,7 +4533,7 @@ mod tests {
         // it can't serve. Partitioned pool: bot 0 ∈ guild 1, bot 1 ∈ guild 2.
         let p = pool(2);
         p.register_channel(Arc::from("A"), "1", "10", Arc::new(NoopCapture), None, test_links()).unwrap();
-        p.register_channel(Arc::from("B"), "2", "20", Arc::new(NoopCapture), None).unwrap();
+        p.register_channel(Arc::from("B"), "2", "20", Arc::new(NoopCapture), None, test_links()).unwrap();
         p.slots[0].guilds.write().unwrap().insert(GuildId::new(1));
         p.slots[1].guilds.write().unwrap().insert(GuildId::new(2));
         // B (guild 2) anchored on bot 1, plus an overflow speaker it can't promote
@@ -4682,7 +4682,7 @@ mod tests {
         // Partitioned pool: bot 0 only in guild 1, bot 1 only in guild 2.
         let p = pool(2);
         p.register_channel(Arc::from("A"), "1", "10", Arc::new(NoopCapture), None, test_links()).unwrap();
-        p.register_channel(Arc::from("B"), "2", "20", Arc::new(NoopCapture), None).unwrap();
+        p.register_channel(Arc::from("B"), "2", "20", Arc::new(NoopCapture), None, test_links()).unwrap();
         p.slots[0].guilds.write().unwrap().insert(GuildId::new(1));
         p.slots[1].guilds.write().unwrap().insert(GuildId::new(2));
 
