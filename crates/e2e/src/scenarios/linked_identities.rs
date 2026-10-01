@@ -1,0 +1,170 @@
+//! Linked identities (ADR 0001): a paired person present on BOTH sides is one
+//! person to the bridge — no ghost for the Discord half, no puppet for the
+//! Matrix half — and the exclusion flips live as either half comes and goes.
+//!
+//! The "Discord half" is a harness bot (the bridge treats non-pool bots as
+//! humans); the "Matrix half" is a presence-only [`MatrixPhantom`]. No Discord
+//! *user* account is ever automated. The pairing is seeded into the bridge's
+//! data dir before start (exactly what `pair` + `/bridge pair` would write).
+//!
+//! Order A: Matrix first. The phantom gets a puppet (alone it is ordinary);
+//! the paired Discord account arriving RELEASES that puppet and gets NO ghost;
+//! it leaving hands the puppet back (the failover-notice path).
+//! Order B: Discord first. The Discord account gets a ghost; the phantom
+//! arriving RETIRES that ghost and gets no puppet; the phantom leaving (after
+//! the leave grace) mints the ghost again.
+
+use super::audio::{await_quiescent, sweep_test_memberships};
+use crate::actors::discord::DiscordListener;
+use crate::actors::matrix::MatrixPhantom;
+use crate::bridge_proc::{BridgeUnderTest, tenant_entry};
+use crate::observers::{RoomStatePoller, decode_bot_user_id};
+use crate::scenario::{Ctx, Expectation, ScenarioDef};
+use anyhow::{Context as _, Result};
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+pub static LINKED_IDENTITY_EXCLUSION: ScenarioDef = ScenarioDef {
+    name: "linked_identity_exclusion",
+    expectation: Expectation::Pass,
+    run: |ctx| Box::pin(run(ctx)),
+};
+
+// Log anchors (substrings; the exact em-dashes never round-trip through here).
+const ASSIGNING_PUPPET: &str = "assigning puppet";
+const JOINED_NO_PUPPET: &str = "bridge-owned (paired Discord account present"; // "member joined — bridge-owned (...) — no puppet"
+const RELEASING_PUPPET: &str = "member is now bridge-owned"; // "... — releasing puppet"
+const PUPPET_BACK: &str = "member is no longer bridge-owned"; // "... — assigning puppet"
+const GHOST_ASSIGNED: &str = "ghost assigned";
+const NO_GHOST: &str = "voice member is bridge-owned"; // "... (paired/excluded) — no ghost"
+const GHOST_RETIRED: &str = "ghost retired"; // "ghost retired — member is now bridge-owned (...)"
+const GHOST_BACK: &str = "minting ghost"; // "member is no longer bridge-owned (...) — minting ghost"
+
+async fn run(ctx: Arc<Ctx>) -> Result<()> {
+    let cfg = &ctx.cfg;
+    let bridge_name = "Auto Test 01";
+    let poller = RoomStatePoller::new(cfg)?;
+    sweep_test_memberships(cfg, &poller, &cfg.room_a).await?;
+
+    // The Discord half: the first harness speaker bot. Its user id is in its token.
+    let discord_token = cfg.speaker_tokens.first().context("a harness bot token")?;
+    let discord_id = decode_bot_user_id(discord_token).context("decoding the harness bot id")?;
+    // The Matrix half: the phantom's MXID is deterministic from its localpart.
+    let localpart = "nvbtest_paired";
+    let mxid = format!("@{localpart}:{}", cfg.primary_as()?.domain);
+
+    // Seed the pairing before the bridge starts (what `pair` + `/bridge pair` persist).
+    let workdir = ctx.artifacts.join("bridge");
+    let data_dir = workdir.join("data");
+    tokio::fs::create_dir_all(&data_dir).await?;
+    tokio::fs::write(
+        data_dir.join("pairings.toml"),
+        format!("[[pairing]]\nmatrix_user = \"{mxid}\"\ndiscord_user = \"{discord_id}\"\ncreated = 0\n"),
+    )
+    .await
+    .context("seeding pairings.toml")?;
+
+    let tenants = tenant_entry(bridge_name, &cfg.room_a, &cfg.guild_id, &cfg.channel_a);
+    let bridge = BridgeUnderTest::start(cfg, ctx.profile, &tenants, &workdir)
+        .await
+        .context("starting bridge-under-test")?;
+    if let Err(e) = bridge.await_ready(&[bridge_name], Duration::from_secs(120)).await {
+        bridge.kill().await;
+        return Err(e);
+    }
+
+    let result = drive(&ctx, &bridge, discord_token, discord_id, localpart).await;
+    match result {
+        Ok(()) => {
+            let _ = await_quiescent(&poller, &cfg.room_a).await;
+            bridge.sigterm_and_wait(Duration::from_secs(20)).await.context("SIGTERM drain")
+        }
+        Err(e) => {
+            bridge.kill().await;
+            Err(e)
+        }
+    }
+}
+
+async fn drive(
+    ctx: &Ctx,
+    bridge: &BridgeUnderTest,
+    discord_token: &str,
+    discord_id: u64,
+    localpart: &str,
+) -> Result<()> {
+    let cfg = &ctx.cfg;
+    let wait = Duration::from_secs(90);
+    let since_now = |needle: &'static str| {
+        move |e: &crate::logscrape::LogEvent| e.message.contains(needle)
+    };
+
+    // ── Order A: Matrix first ────────────────────────────────────────────────
+    eprintln!("   order A: Matrix half joins first");
+    let phantom = MatrixPhantom::join(cfg, &cfg.room_a, false, false, localpart, "NVB Paired").await?;
+    bridge
+        .scraper
+        .await_event(wait, since_now(ASSIGNING_PUPPET))
+        .await
+        .context("A: the phantom alone should get a puppet")?;
+
+    let listener = DiscordListener::connect(discord_token, &cfg.guild_id, &cfg.channel_a, HashSet::new()).await?;
+    listener.join().await.context("A: Discord half joining voice")?;
+    bridge
+        .scraper
+        .await_event(wait, since_now(RELEASING_PUPPET))
+        .await
+        .context("A: the paired Discord account arriving should release the phantom's puppet")?;
+    bridge
+        .scraper
+        .await_event(wait, since_now(NO_GHOST))
+        .await
+        .context("A: the paired Discord account should get no ghost")?;
+    eprintln!("   order A: both present — puppet released, no ghost; dropping the Discord half");
+
+    let _ = listener.stop().await;
+    bridge
+        .scraper
+        .await_event(wait, since_now(PUPPET_BACK))
+        .await
+        .context("A: the Discord half dropping should hand the phantom its puppet back")?;
+    phantom.leave().await;
+    eprintln!("   order A passed");
+
+    // ── Order B: Discord first ───────────────────────────────────────────────
+    eprintln!("   order B: Discord half joins first");
+    let listener = DiscordListener::connect(discord_token, &cfg.guild_id, &cfg.channel_a, HashSet::new()).await?;
+    listener.join().await.context("B: Discord half joining voice")?;
+    bridge
+        .scraper
+        .await_event(wait, {
+            let id = discord_id.to_string();
+            move |e| e.message.contains(GHOST_ASSIGNED) && e.raw.contains(&id)
+        })
+        .await
+        .context("B: the Discord account alone should get a ghost")?;
+
+    let phantom = MatrixPhantom::join(cfg, &cfg.room_a, false, false, localpart, "NVB Paired").await?;
+    bridge
+        .scraper
+        .await_event(wait, since_now(GHOST_RETIRED))
+        .await
+        .context("B: the Matrix half arriving should retire the Discord account's ghost")?;
+    bridge
+        .scraper
+        .await_event(wait, since_now(JOINED_NO_PUPPET))
+        .await
+        .context("B: the paired Matrix half should get no puppet")?;
+    eprintln!("   order B: both present — ghost retired, no puppet; Matrix half leaves");
+
+    phantom.leave().await;
+    bridge
+        .scraper
+        .await_event(wait + Duration::from_secs(30), since_now(GHOST_BACK))
+        .await
+        .context("B: after the leave grace the Discord account should get its ghost back")?;
+    let _ = listener.stop().await;
+    eprintln!("   order B passed");
+    Ok(())
+}
