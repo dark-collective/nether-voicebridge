@@ -5028,6 +5028,76 @@ mod tests {
         assert!(!sinks.contains_key(&555), "opted-out user's ghost sink retired");
     }
 
+    /// A pool whose channel "A" has a board with the given pairings, exposing the board.
+    fn channel_with_links(p: &Arc<SharedPool>, pairs: &[(&str, u64)]) -> Arc<LinkBoard> {
+        let ps = Arc::new(nvb_config::pairings::PairingStore::in_memory());
+        for (m, d) in pairs {
+            ps.add(m, *d, 0).unwrap();
+        }
+        let links = Arc::new(LinkBoard::new(
+            "!test:hs",
+            ps,
+            Arc::new(nvb_config::relays::ServiceAccounts::in_memory()),
+            [],
+            [],
+        ));
+        p.register_channel(Arc::from("A"), "1", "10", Arc::new(NoopCapture), None, links.clone())
+            .expect("register channel");
+        for i in 0..p.slots.len() {
+            p.note_bot_guild(i, GuildId::new(1));
+        }
+        links
+    }
+
+    #[test]
+    fn link_event_discord_excluded_retires_the_ghost_sink() {
+        // ADR 0001: the paired Matrix half joined the call → the Discord member's
+        // ghost goes away (same effect as an opt-out, scoped to this channel).
+        let p = pool(1);
+        let links = channel_with_links(&p, &[("@alice:hs", 555)]);
+        mark_speaker(&p, "A", 555);
+        links.set_discord_present(555, true);
+        p.apply_discord_link_event("A", LinkEvent::DiscordExcluded(555));
+        let guard = p.alloc.lock().unwrap();
+        let sinks = guard.channels.get("A").unwrap().user_sinks.read().unwrap();
+        assert!(!sinks.contains_key(&555), "bridge-owned member's ghost sink retired");
+    }
+
+    #[test]
+    fn link_event_discord_included_without_context_is_deferred_not_panicking() {
+        // No serenity context has been cached (no voice event seen yet) — the
+        // event must be a no-op that defers to the next voice event, not a crash.
+        let p = pool(1);
+        let links = channel_with_links(&p, &[("@alice:hs", 555)]);
+        links.set_discord_present(555, true);
+        assert!(p.note_presence("A", 555, true));
+        p.apply_discord_link_event("A", LinkEvent::DiscordIncluded(555));
+        let guard = p.alloc.lock().unwrap();
+        let sinks = guard.channels.get("A").unwrap().user_sinks.read().unwrap();
+        assert!(!sinks.contains_key(&555), "no ghost minted without a context");
+    }
+
+    #[test]
+    fn link_event_for_unknown_bridge_is_ignored() {
+        let p = pool(1);
+        let _ = channel_with_links(&p, &[]);
+        p.apply_discord_link_event("nope", LinkEvent::DiscordExcluded(1));
+        p.apply_discord_link_event("nope", LinkEvent::DiscordIncluded(1));
+    }
+
+    #[test]
+    fn board_gates_ghost_when_both_halves_present() {
+        // The board, as the pool consults it: a paired member alone is ordinary;
+        // once their Matrix half is in the call they are bridge-owned.
+        let p = pool(1);
+        let links = channel_with_links(&p, &[("@alice:hs", 555)]);
+        links.set_discord_present(555, true);
+        assert!(!links.discord_excluded(555));
+        assert_eq!(links.set_matrix_present("@alice:hs", true), vec![LinkEvent::DiscordExcluded(555)]);
+        assert!(links.discord_excluded(555));
+        assert_eq!(links.discord_humans(), 0);
+    }
+
     #[test]
     fn call_end_release_all_drains_fully_without_speakers() {
         // #59 boundary: with no Discord speakers there is nothing to capture —

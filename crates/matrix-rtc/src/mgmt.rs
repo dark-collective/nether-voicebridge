@@ -4826,6 +4826,27 @@ mod tests {
     fn parse_operator_tooling_verbs() {
         // #94: status/stats take no args; msg needs mxid + text; announce
         // distinguishes the confirm word from announcement text.
+        // Linked identities (ADR 0001).
+        assert_eq!(parse_command("pair"), Parsed::Cmd(Command::Pair));
+        assert_eq!(parse_command("PAIR delegate @host:hs"), Parsed::Cmd(Command::PairDelegate { mxid: Some("@host:hs".into()) }));
+        assert_eq!(parse_command("pair delegate none"), Parsed::Cmd(Command::PairDelegate { mxid: None }));
+        assert!(matches!(parse_command("pair now please"), Parsed::Usage(_)));
+        assert_eq!(parse_command("unpair"), Parsed::Cmd(Command::Unpair { discord_user_id: None }));
+        assert_eq!(parse_command("unpair 123"), Parsed::Cmd(Command::Unpair { discord_user_id: Some("123".into()) }));
+        assert!(matches!(parse_command("unpair bob"), Parsed::Usage(_)));
+        assert_eq!(parse_command("pairings"), Parsed::Cmd(Command::Pairings));
+        assert_eq!(
+            parse_command("relay allow !r:hs @side:hs"),
+            Parsed::Cmd(Command::RelayAllow { room_id: "!r:hs".into(), mxid: "@side:hs".into() })
+        );
+        assert_eq!(
+            parse_command("relay deny !r:hs @side:hs"),
+            Parsed::Cmd(Command::RelayDeny { room_id: "!r:hs".into(), mxid: "@side:hs".into() })
+        );
+        assert_eq!(parse_command("relay list !r:hs"), Parsed::Cmd(Command::RelayList { room_id: "!r:hs".into() }));
+        assert!(matches!(parse_command("relay frobnicate !r:hs"), Parsed::Usage(_)));
+        assert!(allowed_for_self_serve(&Command::Pair));
+        assert!(allowed_for_self_serve(&Command::RelayAllow { room_id: String::new(), mxid: String::new() }));
         assert_eq!(parse_command("status"), Parsed::Cmd(Command::Status));
         assert_eq!(parse_command("stats"), Parsed::Cmd(Command::Stats));
         assert!(matches!(parse_command("status now"), Parsed::Usage(_)));
