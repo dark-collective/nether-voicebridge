@@ -5,7 +5,10 @@ use std::time::Duration;
 use thiserror::Error;
 
 mod banlist;
+pub mod links;
 mod optout;
+pub mod pairings;
+pub mod relays;
 mod self_serve;
 mod tenants;
 mod tenants_edit;
@@ -615,6 +618,17 @@ pub struct BridgeConfig {
     /// `date -d @<n>`). Absent on hand-written entries.
     #[serde(default)]
     pub created: Option<i64>,
+    /// Discord user ids this bridge treats as bridge-owned unconditionally (ADR
+    /// 0001 §4): never ghosted, never captured, never counted as humans. The
+    /// operator override for accounts that will not pair, and the only mechanism
+    /// on instances without a management bot.
+    #[serde(default)]
+    pub excluded_discord_user_ids: Vec<String>,
+    /// Matrix user ids this bridge treats as bridge-owned unconditionally: never
+    /// puppeted, never counted as humans (e.g. a sidecar account on an instance
+    /// without a management bot to approve it).
+    #[serde(default)]
+    pub excluded_matrix_user_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1063,6 +1077,25 @@ pub fn validate_bridge_against(
                 "bridge '{}': references unknown server profile '{name}' — \
                  define a [server.{name}] block (or set the fields inline in \
                  [bridge.matrix])",
+                b.label()
+            )));
+        }
+    }
+
+    // Hard: exclusion overrides must be well-formed ids (a typo here would
+    // silently exclude nobody).
+    for id in &b.excluded_discord_user_ids {
+        if id.parse::<u64>().map_or(true, |v| v == 0) {
+            return Err(ConfigError::Validation(format!(
+                "bridge '{}': excluded_discord_user_ids entry {id:?} is not a Discord user id",
+                b.label()
+            )));
+        }
+    }
+    for id in &b.excluded_matrix_user_ids {
+        if !(id.starts_with('@') && id.contains(':') && id.len() > 3) {
+            return Err(ConfigError::Validation(format!(
+                "bridge '{}': excluded_matrix_user_ids entry {id:?} is not a Matrix user id (@user:server)",
                 b.label()
             )));
         }
