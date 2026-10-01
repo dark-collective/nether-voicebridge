@@ -980,6 +980,8 @@ mod tests {
             livekit: LiveKitConfig::default(),
             owner: None,
             created: None,
+            excluded_discord_user_ids: Vec::new(),
+            excluded_matrix_user_ids: Vec::new(),
         }
     }
 

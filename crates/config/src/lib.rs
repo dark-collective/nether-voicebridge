@@ -1449,6 +1449,8 @@ impl Config {
                 // Env-var mode is operator-authored: no owner record.
                 owner: None,
                 created: None,
+                excluded_discord_user_ids: Vec::new(),
+                excluded_matrix_user_ids: Vec::new(),
             }],
         };
         cfg.resolve_bot_user_ids();
