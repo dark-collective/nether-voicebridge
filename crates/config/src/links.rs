@@ -78,9 +78,14 @@ impl LinkBoard {
 
     // ── the rule ───────────────────────────────────────────────────────────────
 
+    // Pairing-based exclusion needs BOTH halves present (ADR 0001 §2); the
+    // overrides (config lists, service accounts) are unconditional.
     fn discord_excluded_in(&self, p: &Presence, uid: u64) -> bool {
         if self.config_discord.contains(&uid) {
             return true;
+        }
+        if !p.discord.contains(&uid) {
+            return false;
         }
         match self.pairings.matrix_for_discord(uid) {
             Some(m) => p.matrix.contains(&m),
@@ -91,6 +96,9 @@ impl LinkBoard {
     fn matrix_excluded_in(&self, p: &Presence, mxid: &str) -> bool {
         if self.config_matrix.contains(mxid) || self.services.is_service(&self.room_id, mxid) {
             return true;
+        }
+        if !p.matrix.contains(mxid) {
+            return false;
         }
         self.pairings.discords_for_matrix(mxid).iter().any(|d| p.discord.contains(d))
     }
