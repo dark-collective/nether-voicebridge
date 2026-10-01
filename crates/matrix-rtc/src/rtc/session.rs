@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use livekit::{Room, RoomOptions};
 use livekit::e2ee::{E2eeOptions, EncryptionType, key_provider::KeyProvider};
 use livekit::publication::RemoteTrackPublication;
-use livekit::track::RemoteTrack;
+use livekit::track::{RemoteTrack, TrackSource};
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
 use matrix_sdk::Client;
 use matrix_sdk::ruma::{OwnedRoomId, RoomId, UserId};
@@ -247,6 +247,14 @@ async fn resolve_display_name(
     mxid_str.to_owned()
 }
 
+/// Screen-share publications (video or its audio) are never bridged (#142).
+fn is_screenshare_source(publication: &RemoteTrackPublication) -> bool {
+    matches!(
+        publication.source(),
+        TrackSource::Screenshare | TrackSource::ScreenshareAudio
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn playback_consumer(
     track: RemoteTrack,
@@ -474,6 +482,20 @@ async fn handle_room_events(
             RoomEvent::TrackSubscribed { track, publication, participant } => {
                 let sid = publication.sid().to_string();
                 let identity = participant.identity().to_string();
+                // #142: screen-share media is never bridged. Discord has no counterpart
+                // for a share (its users already hear a Go Live natively), so forwarding
+                // share AUDIO into voice only doubles it or feeds it back. Video is
+                // dropped by the consumer; audio must be dropped on SOURCE, not kind.
+                if is_screenshare_source(&publication) {
+                    tracing::info!(
+                        from_identity = %identity,
+                        track_sid = %sid,
+                        source = ?publication.source(),
+                        "LiveKit: screen-share track — not bridged, unsubscribing (#142)"
+                    );
+                    publication.set_subscribed(false);
+                    continue;
+                }
                 // The puppet's Discord nickname is resolved in the consumer task
                 // (a homeserver lookup, kept off this event loop). Element Call
                 // sets neither `name` nor metadata — log both so a regression
@@ -562,8 +584,13 @@ async fn handle_room_events(
                     from_identity = %participant.identity(),
                     track_sid = %publication.sid(),
                     kind = ?publication.kind(),
+                    source = ?publication.source(),
                     "LiveKit: remote participant published a track"
                 );
+                // #142: don't even pull screen-share media from the SFU.
+                if is_screenshare_source(&publication) {
+                    publication.set_subscribed(false);
+                }
             }
             RoomEvent::Disconnected { reason } => {
                 tracing::warn!(reason = ?reason, "LiveKit: room disconnected");
