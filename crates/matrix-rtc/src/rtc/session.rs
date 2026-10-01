@@ -769,6 +769,7 @@ mod tests {
             disconnected.clone(),
             Arc::from("test"),
             Arc::from("nether-voicebridge_"),
+            Arc::new(LinkBoard::new("!test:hs", Arc::new(nvb_config::pairings::PairingStore::in_memory()), Arc::new(nvb_config::relays::ServiceAccounts::in_memory()), [], [])),
             Arc::new(PeerKeyCache::default()),
             None,
         ));

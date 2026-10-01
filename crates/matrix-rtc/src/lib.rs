@@ -228,7 +228,7 @@ pub async fn run(
                 router.clone(),
                 bridge.clone(),
                 shutdown.clone(),
-                links,
+                links.clone(),
                 link_rx,
             ),
             &shutdown,
