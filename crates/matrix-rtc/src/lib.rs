@@ -1,3 +1,8 @@
+// clippy ≥ 1.99 (Rust 1.99.0, 2026-09-28) flags the `#[must_use]` that the
+// `async_trait` macro attaches to its generated boxed-future methods
+// (double_must_use). The attribute is the macro's, not ours; allowed crate-wide
+// so every `#[async_trait]` item here stays lint-clean under `-D warnings`.
+#![allow(clippy::double_must_use)]
 // matrix-sdk's `Client::sync` future is deeply nested; proving `Send` for it (so a
 // per-ghost crypto sync can be `tokio::spawn`ed) overflows the default 128-deep
 // trait-recursion limit. The compiler itself suggests raising it.
