@@ -110,6 +110,19 @@ pub struct DiscordApproval {
 pub struct PoolIo {
     pub approval_rx: Option<mpsc::UnboundedReceiver<DiscordApproval>>,
     pub notice_tx: Option<mpsc::UnboundedSender<DiscordNotice>>,
+    /// `/bridge pair <code>` / `/bridge unpair` invocations (ADR 0001).
+    pub pair_rx: Option<mpsc::UnboundedReceiver<DiscordPair>>,
+}
+
+/// A `/bridge pair` / `/bridge unpair` invocation forwarded by the puppet pool
+/// (ADR 0001). `code == None` ⇒ unpair. The reply is plain text, ephemeral.
+#[derive(Debug)]
+pub struct DiscordPair {
+    pub code: Option<String>,
+    pub discord_user_id: u64,
+    pub guild_id: u64,
+    pub invoker: String,
+    pub reply: oneshot::Sender<String>,
 }
 
 use anyhow::{Context, Result};
@@ -190,6 +203,13 @@ struct BotCtx {
     /// Pending (probed, unapproved) links, keyed by approval code. Pruned
     /// lazily on insert/lookup; capped at [`PENDING_LINK_CAP`].
     pending: StdMutex<HashMap<String, PendingLink>>,
+    /// Linked identities (ADR 0001): the instance-wide pairing + service
+    /// approval stores and the registry of live boards (for runtime reconcile).
+    links: nvb_config::links::LinkShared,
+    /// Pending pairing codes (`pair` → `/bridge pair <code>`), keyed by code.
+    pending_pairs: StdMutex<HashMap<String, PendingPair>>,
+    /// Last failover notice per person (ADR 0001 §5 rate limit).
+    link_notice_stamps: StdMutex<HashMap<String, Instant>>,
     /// Links whose probe could not JOIN the room, awaiting the requester's
     /// invite (#111). Keyed by `(requester, room_id)`; pruned lazily and by
     /// the maintenance sweep; capped at [`AWAITING_INVITE_CAP`].
@@ -335,6 +355,20 @@ struct PendingLink {
     /// bot was already in, is never reaped).
     probe_joined: bool,
 }
+
+/// A `pair` awaiting its `/bridge pair <code>` from the Discord side.
+struct PendingPair {
+    /// The Matrix user who asked (the account being paired).
+    matrix_user: String,
+    created: Instant,
+}
+
+/// Pairing codes live this long; a few minutes is plenty to switch to Discord.
+const PAIR_CODE_TTL: Duration = Duration::from_secs(600);
+/// Cap on simultaneously pending pairing codes (bounds a `pair` spammer).
+const PENDING_PAIR_CAP: usize = 64;
+/// Minimum gap between failover notices to one person.
+const LINK_NOTICE_COOLDOWN: Duration = Duration::from_secs(600);
 
 /// Cap on simultaneously pending links: bounds memory against a `link` spammer
 /// (each entry is tiny, so this is generous) while leaving room for honest
@@ -981,6 +1015,7 @@ pub async fn run(
     control: ControlTx,
     pool_io: PoolIo,
     shutdown: CancellationToken,
+    links: nvb_config::links::LinkShared,
 ) -> Result<()> {
     // Pair the device identity with the crypto store (#30) — same rule as the
     // bridge bot: a wiped/copied store must re-provision, never reuse the bare
@@ -1156,6 +1191,9 @@ pub async fn run(
             .require_discord_approval
             .then(|| Duration::from_secs(cfg.approval_timeout_secs)),
         pending: StdMutex::new(HashMap::new()),
+        links,
+        pending_pairs: StdMutex::new(HashMap::new()),
+        link_notice_stamps: StdMutex::new(HashMap::new()),
         awaiting_invite: StdMutex::new(HashMap::new()),
         invite_intent_ttl: Duration::from_secs(limits.invite_intent_ttl_secs.unwrap_or(1800)),
         open_registration: cfg.open_registration,
@@ -1192,6 +1230,46 @@ pub async fn run(
                     _ = shutdown.cancelled() => break,
                     msg = rx.recv() => match msg {
                         Some(approval) => handle_discord_approval(&ctx, &client, approval).await,
+                        None => break,
+                    }
+                }
+            }
+        });
+    }
+
+    // Pairing redemptions (ADR 0001): `/bridge pair` / `/bridge unpair` forwarded
+    // by the puppet pool. Separate task, same reasoning as approvals.
+    if let Some(mut rx) = pool_io.pair_rx {
+        let ctx = ctx.clone();
+        let client = client.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    msg = rx.recv() => match msg {
+                        Some(req) => handle_discord_pair(&ctx, &client, req).await,
+                        None => break,
+                    }
+                }
+            }
+        });
+    }
+
+    // Failover notices (ADR 0001 §5): bridges emit, this bot delivers (DM to the
+    // person and their delegates), rate-limited per person.
+    {
+        let (tx, mut rx) = mpsc::unbounded_channel::<crate::links_notice::LinkNotice>();
+        crate::links_notice::install_sink(tx);
+        let ctx = ctx.clone();
+        let client = client.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    msg = rx.recv() => match msg {
+                        Some(n) => deliver_link_notice(&ctx, &client, n).await,
                         None => break,
                     }
                 }
@@ -1913,6 +1991,29 @@ enum Command {
         text: String,
     },
     AnnounceConfirm,
+    /// Linked identities (ADR 0001). Self-serve tier (they only affect the sender).
+    Pair,
+    PairDelegate {
+        /// `None` clears the delegate.
+        mxid: Option<String>,
+    },
+    Unpair {
+        /// `None` ⇒ every pairing of the sender.
+        discord_user_id: Option<String>,
+    },
+    Pairings,
+    /// Service-account approvals per room (ADR 0001 §3): room authority (or operator).
+    RelayAllow {
+        room_id: String,
+        mxid: String,
+    },
+    RelayDeny {
+        room_id: String,
+        mxid: String,
+    },
+    RelayList {
+        room_id: String,
+    },
     /// Start the guided walkthrough (#102). Self-serve tier.
     Tutorial,
     /// Advance / end the walkthrough (#102) — meaningful only with an active
@@ -1949,11 +2050,14 @@ const REPORT_REASON_MAX: usize = 280;
 const DEFAULT_REPORTS: usize = 10;
 const MAX_REPORTS: usize = 50;
 
-const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridges (static + tenants) and whether they are running\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server] — bridge a Discord voice channel to a Matrix room\n  unlink <name> — remove a bridge created with link\n  ban <owner|guild|room> <value> — deny-list an owner MXID / Discord guild / Matrix room AND unlink every matching tenant\n  unban <owner|guild|room> <value> — remove a ban\n  bans — show the deny-lists\n  report <owner|guild|room> <value> [reason] — file an abuse report (recorded, not acted on)\n  reports [count] — show recent abuse reports, each with the `ban` to run\n  serve-allow <@mxid> / serve-remove <@mxid> — restrict the self-serve tier to an allowlist; serve-open reopens to everyone; serve-list shows it\n  status — puppet-pool guild footprint (Discord verification tripwire)\n  stats — per-bridge uptime + owner, and process memory\n  msg <@mxid> <text> — DM a user as the bridge bot\n  announce <text> — stage a DM to every bridge owner; `announce confirm` sends it\n  tutorial — the self-serve guided walkthrough (next/stop drive it)\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridges (static + tenants) and whether they are running\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server] — bridge a Discord voice channel to a Matrix room\n  unlink <name> — remove a bridge created with link\n  ban <owner|guild|room> <value> — deny-list an owner MXID / Discord guild / Matrix room AND unlink every matching tenant\n  unban <owner|guild|room> <value> — remove a ban\n  bans — show the deny-lists\n  report <owner|guild|room> <value> [reason] — file an abuse report (recorded, not acted on)\n  reports [count] — show recent abuse reports, each with the `ban` to run\n  serve-allow <@mxid> / serve-remove <@mxid> — restrict the self-serve tier to an allowlist; serve-open reopens to everyone; serve-list shows it\n  status — puppet-pool guild footprint (Discord verification tripwire)\n  stats — per-bridge uptime + owner, and process memory\n  msg <@mxid> <text> — DM a user as the bridge bot\n  announce <text> — stage a DM to every bridge owner; `announce confirm` sends it\n  pair / unpair / pairings — link your Matrix account to your own Discord account (be yourself on both sides; no ghost, no puppet while both are present)\n  relay allow|deny|list <room-id> [@mxid] — approve a sidecar's Matrix account as a service account in a room\n  tutorial — the self-serve guided walkthrough (next/stop drive it)\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
 
 /// Help for self-serve users (#43): only the verbs they may run, plus the
 /// consent flow they will hit.
-const SELF_SERVE_HELP_TEXT: &str = "Voice bridge commands:\n  tutorial — guided step-by-step walkthrough (start here if you're new)\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> — bridge a Discord voice channel to a Matrix room. You must be a moderator of the Matrix room, and someone with Manage Server on the Discord side must approve the link with the `/bridge approve` command and the code you'll receive.\n  unlink <name> — remove a bridge you created\n  list — your bridges\n  report <owner|guild|room> <value> [reason] — report an abusive bridge for an operator to review\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+const SELF_SERVE_HELP_TEXT: &str = "Voice bridge commands:\n  tutorial — guided step-by-step walkthrough (start here if you're new)\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> — bridge a Discord voice channel to a Matrix room. You must be a moderator of the Matrix room, and someone with Manage Server on the Discord side must approve the link with the `/bridge approve` command and the code you'll receive.\n  unlink <name> — remove a bridge you created\n  list — your bridges\n  report <owner|guild|room> <value> [reason] — report an abusive bridge for an operator to review\n  pair / unpair / pairings — link your Matrix account to your own Discord account so you are yourself on both sides (no ghost, no puppet while both are present)\n  relay allow|deny|list <room-id> [@mxid] — approve a sidecar's Matrix account as a service account in a room you moderate\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+
+const PAIR_USAGE: &str = "Usage: `pair` — get a code, then run `/bridge pair code:<code>` on Discord as the account to link. `pair delegate <@mxid>` names the sidecar account that carries you (`pair delegate none` clears it). `unpair [discord-user-id]` removes one or all of your pairings. `pairings` lists them.";
+const RELAY_USAGE: &str = "Usage: `relay allow <room-id> <@mxid>` / `relay deny <room-id> <@mxid>` / `relay list <room-id>` — approve a sidecar's Matrix account as a service account in a room you have authority over (it gets no Discord puppet and is not counted as a participant).";
 
 const TUTORIAL_USAGE: &str =
     "Usage: `tutorial` — start the guided walkthrough. `next` advances one step, `stop` ends it.";
@@ -1978,6 +2082,13 @@ fn allowed_for_self_serve(cmd: &Command) -> bool {
             | Command::Tutorial
             | Command::TutorialNext
             | Command::TutorialStop
+            | Command::Pair
+            | Command::PairDelegate { .. }
+            | Command::Unpair { .. }
+            | Command::Pairings
+            | Command::RelayAllow { .. }
+            | Command::RelayDeny { .. }
+            | Command::RelayList { .. }
     )
 }
 
@@ -2063,6 +2174,33 @@ fn parse_command(body: &str) -> Parsed {
         "stats" => match args {
             [] => Parsed::Cmd(Command::Stats),
             _ => Parsed::Usage("Usage: `stats`".to_string()),
+        },
+        "pair" => match args {
+            [] => Parsed::Cmd(Command::Pair),
+            [d, v] if d == "delegate" && v != "none" => Parsed::Cmd(Command::PairDelegate { mxid: Some(v.clone()) }),
+            [d, v] if d == "delegate" && v == "none" => Parsed::Cmd(Command::PairDelegate { mxid: None }),
+            _ => Parsed::Usage(PAIR_USAGE.to_string()),
+        },
+        "unpair" => match args {
+            [] => Parsed::Cmd(Command::Unpair { discord_user_id: None }),
+            [id] if id.chars().all(|c| c.is_ascii_digit()) => {
+                Parsed::Cmd(Command::Unpair { discord_user_id: Some(id.clone()) })
+            }
+            _ => Parsed::Usage(PAIR_USAGE.to_string()),
+        },
+        "pairings" => match args {
+            [] => Parsed::Cmd(Command::Pairings),
+            _ => Parsed::Usage(PAIR_USAGE.to_string()),
+        },
+        "relay" => match args {
+            [verb, room_id, mxid] if verb == "allow" => {
+                Parsed::Cmd(Command::RelayAllow { room_id: room_id.clone(), mxid: mxid.clone() })
+            }
+            [verb, room_id, mxid] if verb == "deny" => {
+                Parsed::Cmd(Command::RelayDeny { room_id: room_id.clone(), mxid: mxid.clone() })
+            }
+            [verb, room_id] if verb == "list" => Parsed::Cmd(Command::RelayList { room_id: room_id.clone() }),
+            _ => Parsed::Usage(RELAY_USAGE.to_string()),
         },
         "msg" => match args {
             [mxid, text @ ..] if !text.is_empty() => Parsed::Cmd(Command::Msg {
@@ -2164,6 +2302,13 @@ async fn handle_command(ctx: &BotCtx, room: &Room, sender: &str, cmd: Command) {
         Command::Msg { mxid, text } => handle_msg(ctx, room, sender, &mxid, &text).await,
         Command::Announce { text } => handle_announce_stage(ctx, room, text).await,
         Command::AnnounceConfirm => handle_announce_confirm(ctx, room, sender).await,
+        Command::Pair => handle_pair(ctx, room, sender).await,
+        Command::PairDelegate { mxid } => handle_pair_delegate(ctx, room, sender, mxid.as_deref()).await,
+        Command::Unpair { discord_user_id } => handle_unpair(ctx, room, sender, discord_user_id.as_deref()).await,
+        Command::Pairings => handle_pairings(ctx, room, sender).await,
+        Command::RelayAllow { room_id, mxid } => handle_relay(ctx, room, sender, &room_id, Some(&mxid), true).await,
+        Command::RelayDeny { room_id, mxid } => handle_relay(ctx, room, sender, &room_id, Some(&mxid), false).await,
+        Command::RelayList { room_id } => handle_relay(ctx, room, sender, &room_id, None, false).await,
         Command::Tutorial => handle_tutorial_start(ctx, room).await,
         Command::TutorialNext => handle_tutorial_next(ctx, room).await,
         Command::TutorialStop => handle_tutorial_stop(ctx, room).await,
@@ -4073,6 +4218,247 @@ async fn dm_user(client: &Client, mxid: &str, text: &str) -> Result<(), String> 
     }
     dm.send(RoomMessageEventContent::text_plain(text)).await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ─── Linked identities (ADR 0001) ───────────────────────────────────────────
+
+fn epoch_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `pair`: mint a code the sender's Discord account redeems with `/bridge pair`.
+async fn handle_pair(ctx: &BotCtx, room: &Room, sender: &str) {
+    let code = {
+        let mut map = ctx.pending_pairs.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        map.retain(|_, p| now.saturating_duration_since(p.created) < PAIR_CODE_TTL);
+        // One live code per person: a re-run replaces the old one.
+        map.retain(|_, p| p.matrix_user != sender);
+        if map.len() >= PENDING_PAIR_CAP {
+            reply(room, "Too many pairing codes are pending right now — try again in a few minutes.").await;
+            return;
+        }
+        let code = mint_approval_code().replacen("NVB-", "NVB-P", 1);
+        map.insert(code.clone(), PendingPair { matrix_user: sender.to_string(), created: now });
+        code
+    };
+    audit(ctx, sender, "pair_code", serde_json::json!({ "code": code }));
+    reply(room, &format!(
+        "To link a Discord account to `{sender}`, run this on Discord **as that account**, in any server this bridge serves, within {} minutes:
+
+`/bridge pair code:{code}`
+
+While that Discord account is in a bridged voice channel and you are in the room's call, the bridge will treat you as one person: no ghost of your Discord account on Matrix, no bot puppet of you on Discord. Several Discord accounts may be linked to you; run `pair` again for each.",
+        PAIR_CODE_TTL.as_secs() / 60
+    ))
+    .await;
+}
+
+async fn handle_pair_delegate(ctx: &BotCtx, room: &Room, sender: &str, mxid: Option<&str>) {
+    if let Some(m) = mxid {
+        if !m.starts_with('@') || !m.contains(':') {
+            reply(room, &format!("'{m}' is not a full MXID (expected @localpart:server).")).await;
+            return;
+        }
+    }
+    match ctx.links.pairings.set_delegate(sender, mxid) {
+        Ok(0) => reply(room, "You have no pairings yet — run `pair` first.").await,
+        Ok(n) => {
+            audit(ctx, sender, "pair_delegate", serde_json::json!({ "delegate": mxid, "pairings": n }));
+            reply(room, &match mxid {
+                Some(m) => format!("✅ `{m}` is now the delegate for your {n} pairing(s): it receives the notices meant for you (e.g. when your Discord session drops) and may act for you where the bridge allows it."),
+                None => format!("✅ Delegate cleared on your {n} pairing(s)."),
+            })
+            .await;
+        }
+        Err(e) => reply(room, &format!("Cannot write the pairings file: {e}")).await,
+    }
+}
+
+async fn handle_unpair(ctx: &BotCtx, room: &Room, sender: &str, discord_user_id: Option<&str>) {
+    let links = &ctx.links;
+    let result = match discord_user_id.and_then(|d| d.parse::<u64>().ok()) {
+        Some(d) => links.registry.reconcile_after(|| links.pairings.remove(sender, d).map(|b| usize::from(b))),
+        None => links.registry.reconcile_after(|| links.pairings.remove_all_for_matrix(sender)),
+    };
+    match result {
+        Ok(0) => reply(room, "Nothing to remove — no such pairing.").await,
+        Ok(n) => {
+            audit(ctx, sender, "unpair", serde_json::json!({ "discord_user_id": discord_user_id, "removed": n }));
+            reply(room, &format!("✅ Removed {n} pairing(s). You are bridged as an ordinary participant again.")).await;
+        }
+        Err(e) => reply(room, &format!("Cannot write the pairings file: {e}")).await,
+    }
+}
+
+async fn handle_pairings(ctx: &BotCtx, room: &Room, sender: &str) {
+    let list = ctx.links.pairings.pairings_for_matrix(sender);
+    if list.is_empty() {
+        reply(room, "You have no pairings. `pair` creates one.").await;
+        return;
+    }
+    let mut out = format!("Your pairings ({}):
+", list.len());
+    for p in list {
+        out.push_str(&format!(
+            "  Discord user {}{}
+",
+            p.discord_user,
+            p.delegate.as_deref().map(|d| format!(" — delegate {d}")).unwrap_or_default()
+        ));
+    }
+    reply(room, out.trim_end()).await;
+}
+
+/// `relay allow|deny|list <room> [<mxid>]`: service-account approvals are gated on
+/// authority over THAT room (operator, or — with room authority on — a moderator
+/// of the room; otherwise the room's tenant owner).
+async fn handle_relay(ctx: &BotCtx, room: &Room, sender: &str, room_id: &str, mxid: Option<&str>, allow: bool) {
+    if !room_id.starts_with('!') {
+        reply(room, &format!("'{room_id}' is not a room id (expected !opaque:server).")).await;
+        return;
+    }
+    if let Some(m) = mxid {
+        if !m.starts_with('@') || !m.contains(':') {
+            reply(room, &format!("'{m}' is not a full MXID (expected @localpart:server).")).await;
+            return;
+        }
+    }
+    if !ctx.is_operator(sender) {
+        let authorized = if ctx.require_room_authority {
+            matches!(read_sender_authority(ctx, room_id, sender).await, Ok(a) if a.ok())
+        } else {
+            tenant_owner_of_room(ctx, room_id).as_deref() == Some(sender)
+        };
+        if !authorized {
+            reply(room, "You need authority over that room (a moderator of it, or the owner of its bridge) to manage its service accounts.").await;
+            return;
+        }
+    }
+    let Some(m) = mxid else {
+        let list = ctx.links.services.list(room_id);
+        if list.is_empty() {
+            reply(room, &format!("No service accounts are approved in {room_id}.")).await;
+        } else {
+            let mut out = format!("Service accounts in {room_id}:
+");
+            for a in list {
+                out.push_str(&format!("  {} (approved by {})
+", a.user_id, a.approved_by));
+            }
+            reply(room, out.trim_end()).await;
+        }
+        return;
+    };
+    let links = &ctx.links;
+    let res = if allow {
+        links.registry.reconcile_after(|| links.services.approve(room_id, m, sender, epoch_now()))
+    } else {
+        links.registry.reconcile_after(|| links.services.revoke(room_id, m))
+    };
+    match res {
+        Ok(changed) => {
+            audit(ctx, sender, if allow { "relay_allow" } else { "relay_deny" }, serde_json::json!({ "room_id": room_id, "mxid": m, "changed": changed }));
+            reply(room, &match (allow, changed) {
+                (true, true) => format!("✅ `{m}` is a service account in {room_id}: no Discord puppet, not counted as a participant. `relay deny` reverses this."),
+                (true, false) => format!("`{m}` was already approved in {room_id}."),
+                (false, true) => format!("✅ `{m}` is no longer a service account in {room_id}."),
+                (false, false) => format!("`{m}` was not approved in {room_id}."),
+            })
+            .await;
+        }
+        Err(e) => reply(room, &format!("Cannot write the relays file: {e}")).await,
+    }
+}
+
+/// Owner (tenant creator) of the bridge whose room is `room_id`, if any.
+fn tenant_owner_of_room(ctx: &BotCtx, room_id: &str) -> Option<String> {
+    nvb_config::tenant_owner_for_room(&ctx.tenants_path, room_id)
+}
+
+/// `/bridge pair <code>` / `/bridge unpair` from Discord: redeem the code (pair)
+/// or drop every pairing of that Discord account (unpair), reconciling live state.
+async fn handle_discord_pair(ctx: &BotCtx, client: &Client, req: DiscordPair) {
+    let links = &ctx.links;
+    let Some(code) = req.code.as_deref() else {
+        // unpair: the invoker controls the Discord account, that is proof enough.
+        let owner = links.pairings.matrix_for_discord(req.discord_user_id);
+        let text = match owner {
+            None => "This Discord account is not paired with any Matrix account.".to_string(),
+            Some(m) => match links.registry.reconcile_after(|| links.pairings.remove(&m, req.discord_user_id)) {
+                Ok(_) => {
+                    audit(ctx, &req.invoker, "discord_unpair", serde_json::json!({ "matrix_user": m, "discord_user_id": req.discord_user_id.to_string() }));
+                    let _ = dm_user(client, &m, &format!("Your pairing with Discord user {} was removed from the Discord side ({}).", req.discord_user_id, req.invoker)).await;
+                    format!("✅ Unpaired from `{m}`. You are bridged as an ordinary Discord member again.")
+                }
+                Err(e) => format!("Cannot write the pairings file: {e}"),
+            },
+        };
+        let _ = req.reply.send(text);
+        return;
+    };
+    let code = normalize_code(code).replacen("NVB-", "NVB-P", 1).replacen("NVB-PP", "NVB-P", 1);
+    let pending = {
+        let mut map = ctx.pending_pairs.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        map.retain(|_, p| now.saturating_duration_since(p.created) < PAIR_CODE_TTL);
+        map.remove(&code)
+    };
+    let Some(pending) = pending else {
+        audit(ctx, &req.invoker, "pair_rejected", serde_json::json!({ "code": code, "reason": "unknown or expired" }));
+        let _ = req.reply.send(format!(
+            "Unknown or expired code `{code}` — codes expire after {} minutes; send `pair` to the Matrix management bot again for a fresh one.",
+            PAIR_CODE_TTL.as_secs() / 60
+        ));
+        return;
+    };
+    let m = pending.matrix_user;
+    let res = links.registry.reconcile_after(|| links.pairings.add(&m, req.discord_user_id, epoch_now()));
+    let text = match res {
+        Ok(()) => {
+            audit(ctx, &req.invoker, "pair", serde_json::json!({ "matrix_user": m, "discord_user_id": req.discord_user_id.to_string(), "guild_id": req.guild_id.to_string() }));
+            let _ = dm_user(client, &m, &format!("✅ Paired with Discord user {} ({}). While that account is in a bridged voice channel and you are in the room's call, you are one person to the bridge: no ghost, no puppet. `pairings` lists your pairings; `unpair` removes them.", req.discord_user_id, req.invoker)).await;
+            format!("✅ This Discord account is now paired with `{m}`.")
+        }
+        Err(nvb_config::pairings::PairErrorOrIo::Pair(nvb_config::pairings::PairError::DiscordTakenBy(other))) => {
+            format!("This Discord account is already paired with `{other}` — run `/bridge unpair` first.")
+        }
+        Err(nvb_config::pairings::PairErrorOrIo::Pair(nvb_config::pairings::PairError::AlreadyPaired)) => {
+            format!("This Discord account is already paired with `{m}`.")
+        }
+        Err(nvb_config::pairings::PairErrorOrIo::Io(e)) => format!("Cannot write the pairings file: {e}"),
+    };
+    let _ = req.reply.send(text);
+}
+
+/// Failover notice (ADR 0001 §5): DM the person and their delegates, at most
+/// once per person per [`LINK_NOTICE_COOLDOWN`].
+async fn deliver_link_notice(ctx: &BotCtx, client: &Client, n: crate::links_notice::LinkNotice) {
+    {
+        let mut stamps = ctx.link_notice_stamps.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        if stamps.get(&n.user).is_some_and(|t| now.saturating_duration_since(*t) < LINK_NOTICE_COOLDOWN) {
+            return;
+        }
+        stamps.insert(n.user.clone(), now);
+    }
+    let text = format!(
+        "ℹ️ Your Discord session left the voice channel bridged to {} while you are still in its call, so you are being bridged through a bot puppet until it returns. (This notice is sent at most once every {} minutes.)",
+        n.room_id,
+        LINK_NOTICE_COOLDOWN.as_secs() / 60
+    );
+    if let Err(e) = dm_user(client, &n.user, &text).await {
+        tracing::warn!(mxid = %n.user, error = %e, "failover notice DM failed");
+    }
+    for d in &n.delegates {
+        let dtext = format!("ℹ️ {}: {}", n.user, text.trim_start_matches("ℹ️ "));
+        if let Err(e) = dm_user(client, d, &dtext).await {
+            tracing::warn!(mxid = %d, error = %e, "failover notice DM to delegate failed");
+        }
+    }
 }
 
 /// Operator `msg` (#94): one-off DM to a specific user, audit-logged.

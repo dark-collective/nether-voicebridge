@@ -44,6 +44,18 @@ pub fn tenants_path(data_dir: &str) -> String {
 /// normal state for non-hosting deployments); any other IO/parse/shape error
 /// propagates — the caller decides whether that is fatal (boot) or a rejected
 /// reload (SIGHUP).
+/// Owner MXID of the tenant whose room is `room_id`, read raw (no profile
+/// resolution needed — `room_id`/`owner` are bridge-level fields). `None` if
+/// the file is missing/unreadable or no tenant bridges that room.
+pub fn tenant_owner_for_room(path: &str, room_id: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let file: TenantsFile = toml::from_str(&content).ok()?;
+    file.bridges
+        .iter()
+        .find(|b| b.room_id == room_id || b.matrix.room_id == room_id)
+        .and_then(|b| b.owner.clone())
+}
+
 pub fn load_tenants(
     path: &str,
     servers: &HashMap<String, ServerProfile>,

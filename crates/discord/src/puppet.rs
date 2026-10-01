@@ -455,6 +455,20 @@ pub struct LinkApproval {
     pub invoker: String,
 }
 
+/// A `/bridge pair <code>` / `/bridge unpair` invocation (ADR 0001), forwarded
+/// to the management bot which owns the pairing store. `code == None` means
+/// unpair. The reply text comes back on the oneshot (ephemeral to the invoker:
+/// pairing is personal, there is nothing to disclose to the server).
+#[derive(Debug)]
+pub struct LinkPair {
+    pub code: Option<String>,
+    /// The invoking Discord user — the account being paired/unpaired.
+    pub discord_user_id: u64,
+    pub guild_id: u64,
+    /// `name (id)` for the audit trail.
+    pub invoker: String,
+}
+
 /// Approval-command wiring (#47), set once before [`SharedPool::run`] when the
 /// management bot requires Discord-side approval. Only `bot_index` registers
 /// and serves the `/bridge` command (slash commands are per-application, and
@@ -482,6 +496,8 @@ pub struct SharedPool {
     alloc: StdMutex<AllocState>,
     /// `/bridge approve` wiring (#47) — `None` unless two-sided link auth is on.
     link_approval: std::sync::OnceLock<LinkApprovalCfg>,
+    /// `/bridge pair`/`unpair` forwarding (ADR 0001); unset ⇒ the subcommands answer "not enabled".
+    link_pairing: std::sync::OnceLock<mpsc::UnboundedSender<(LinkPair, oneshot::Sender<String>)>>,
     /// Base quarantine cooldown after a bot's `manager.join` times out (skipped
     /// by the allocator until a recovery timer makes it eligible again). The
     /// cooldown grows exponentially per consecutive failure —
@@ -578,6 +594,7 @@ impl SharedPool {
                 health: HashMap::new(),
             }),
             link_approval: std::sync::OnceLock::new(),
+            link_pairing: std::sync::OnceLock::new(),
             quarantine_base: timing.quarantine_base(),
             quarantine_max: timing.quarantine_max(),
             voice_health_sweep: timing.voice_health_sweep(),
@@ -698,6 +715,14 @@ impl SharedPool {
     ) {
         if self.link_approval.set(LinkApprovalCfg { bot_index, tx }).is_err() {
             tracing::warn!("enable_link_approval called twice — keeping the first wiring");
+        }
+    }
+
+    /// Turn on `/bridge pair` / `/bridge unpair` (ADR 0001): forwarded to the
+    /// management bot over `tx`. Served by the same command bot as `approve`.
+    pub fn enable_link_pairing(&self, tx: mpsc::UnboundedSender<(LinkPair, oneshot::Sender<String>)>) {
+        if self.link_pairing.set(tx).is_err() {
+            tracing::warn!("enable_link_pairing called twice — keeping the first wiring");
         }
     }
 
@@ -2746,11 +2771,17 @@ impl EventHandler for PuppetHandler {
             Some(BridgeSub::Optin) => {
                 handle_optout_command(&ctx, &cmd, &self.pool, false).await
             }
+            Some(BridgeSub::Pair { code }) => {
+                handle_pair_command(&ctx, &cmd, guild_id, Some(code), &self.pool).await
+            }
+            Some(BridgeSub::Unpair) => {
+                handle_pair_command(&ctx, &cmd, guild_id, None, &self.pool).await
+            }
             None => {
                 respond_ephemeral(
                     &ctx,
                     &cmd,
-                    "Usage: `/bridge approve code:<code>`, `/bridge optout`, or `/bridge optin`",
+                    "Usage: `/bridge approve code:<code>`, `/bridge optout`, `/bridge optin`, `/bridge pair code:<code>`, or `/bridge unpair`",
                 )
                 .await
             }
@@ -2844,6 +2875,51 @@ async fn handle_approve_command(
         if let Err(e) = ChannelId::new(chid).say(&ctx.http, notice).await {
             tracing::warn!(channel_id = chid, error = %e, "could not post the bridge disclosure notice (missing Send Messages on the voice channel?)");
         }
+    }
+}
+
+/// `/bridge pair <code>` / `/bridge unpair` (ADR 0001): available to everyone —
+/// it only ever affects the invoker's own account. The code↔Matrix-user match
+/// and the pairing store live on the management side; this just forwards and
+/// relays the (ephemeral) answer.
+async fn handle_pair_command(
+    ctx: &Context,
+    cmd: &CommandInteraction,
+    guild_id: GuildId,
+    code: Option<String>,
+    pool: &Arc<SharedPool>,
+) {
+    let Some(tx) = pool.link_pairing.get() else {
+        respond_ephemeral(ctx, cmd, "Account pairing is not enabled on this instance.").await;
+        return;
+    };
+    if let Err(e) = cmd
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new().ephemeral(true)),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "failed to defer /bridge pair");
+        return;
+    }
+    let (otx, orx) = oneshot::channel();
+    let req = LinkPair {
+        code,
+        discord_user_id: cmd.user.id.get(),
+        guild_id: guild_id.get(),
+        invoker: format!("{} ({})", cmd.user.name, cmd.user.id.get()),
+    };
+    let text = if tx.send((req, otx)).is_err() {
+        "The bridge's management service is not running — try again later.".to_string()
+    } else {
+        match tokio::time::timeout(Duration::from_secs(30), orx).await {
+            Ok(Ok(t)) => t,
+            _ => "No answer from the bridge's management service — ask the operator to check the logs.".to_string(),
+        }
+    };
+    if let Err(e) = cmd.edit_response(&ctx.http, EditInteractionResponse::new().content(&text)).await {
+        tracing::warn!(error = %e, "failed to send the /bridge pair outcome");
     }
 }
 
@@ -2944,6 +3020,26 @@ async fn register_bridge_command(ctx: &Context) -> Result<()> {
                 CommandOptionType::SubCommand,
                 "optin",
                 "Opt back into voice bridging",
+            ))
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "pair",
+                    "Link this Discord account to your Matrix account (code from the Matrix management bot)",
+                )
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "code",
+                        "The pairing code the Matrix management bot sent you",
+                    )
+                    .required(true),
+                ),
+            )
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "unpair",
+                "Remove the link between this Discord account and a Matrix account",
             )),
     )
     .await
@@ -2957,6 +3053,8 @@ enum BridgeSub {
     Approve { code: String },
     Optout,
     Optin,
+    Pair { code: String },
+    Unpair,
 }
 
 /// Pull the subcommand (and its arguments) out of a `/bridge` invocation.
@@ -2979,6 +3077,21 @@ fn bridge_subcommand(data: &CommandData) -> Option<BridgeSub> {
         }
         ("optout", _) => Some(BridgeSub::Optout),
         ("optin", _) => Some(BridgeSub::Optin),
+        ("pair", CommandDataOptionValue::SubCommand(subs)) => {
+            let code = subs.iter().find_map(|sub| {
+                if sub.name != "code" {
+                    return None;
+                }
+                match &sub.value {
+                    CommandDataOptionValue::String(v) if !v.trim().is_empty() => {
+                        Some(v.trim().to_string())
+                    }
+                    _ => None,
+                }
+            })?;
+            Some(BridgeSub::Pair { code })
+        }
+        ("unpair", _) => Some(BridgeSub::Unpair),
         _ => None,
     }
 }
