@@ -3,7 +3,11 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.11] - 2026-10-01
+
+**Harness-only release: the nightly audio oracle no longer fails an intact
+capture because its first second was rough, and the build stays lint-clean
+on Rust 1.99.**
 
 ### Fixed
 - **e2e audio oracle: global alignment could lock onto the silent tail of a
@@ -14,6 +18,11 @@ adheres to [Semantic Versioning](https://semver.org/).
   overlap at least half the shorter signal, refines over 3 s, and ranks
   candidates by correlation over their whole overlap. Replaying the failed
   night's WAVs through the fixed oracle gives mean NCC 0.860, 5/8 → PASS.
+
+### Changed
+- CI: `clippy::double_must_use` is allowed at the root of the crates that use
+  `async_trait` — Rust 1.99's clippy flags the `#[must_use]` the macro puts on
+  its generated methods, which broke every `-D warnings` run.
 
 ### Added
 - `crates/audio/examples/oracle_replay.rs`: replay the e2e audio oracle
