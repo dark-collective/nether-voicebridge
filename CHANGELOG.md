@@ -3,6 +3,22 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **e2e audio oracle: global alignment could lock onto the silent tail of a
+  capture.** Nightly #418 scored `audio_d2m_unenc` at mean NCC 0.009 although
+  cycles 2–7 were intact at ≥ 0.98: a slip inside the first cycle zeroed the
+  true lag's refinement score (computed over the first second only) and a lag
+  overlapping ~120 ms of tail dither won. Alignment now requires candidates to
+  overlap at least half the shorter signal, refines over 3 s, and ranks
+  candidates by correlation over their whole overlap. Replaying the failed
+  night's WAVs through the fixed oracle gives mean NCC 0.860, 5/8 → PASS.
+
+### Added
+- `crates/audio/examples/oracle_replay.rs`: replay the e2e audio oracle
+  offline on a probe/captured WAV pair from a run artifact.
+
 ## [0.3.10] - 2026-09-30
 
 ### Fixed

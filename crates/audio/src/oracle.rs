@@ -42,8 +42,19 @@ const SEG_SNR_CLAMP_DB: (f64, f64) = (0.0, 60.0);
 const GLITCH_JUMP_RATIO: f64 = 3.0;
 const GLITCH_JUMP_FLOOR: f64 = 3000.0;
 /// Minimum envelope overlap (in 10 ms hops) for an alignment lag to be
-/// considered at all — correlating a handful of segments is noise.
+/// considered at all — correlating a handful of segments is noise. The
+/// effective floor is the larger of this and half the shorter signal (see
+/// [`align`]): a lag that overlaps only the tail of a long capture must never
+/// compete with one that overlaps the whole probe.
 const MIN_ALIGN_OVERLAP_HOPS: usize = 10;
+/// Sample-precision refinement correlates over at most this many samples
+/// (3 s) from the start of the overlap — long enough that one damaged cycle
+/// cannot zero the score, short enough that long captures stay cheap.
+const REFINE_WINDOW_SAMPLES: usize = 144_000;
+/// Candidates are *ranked* by raw NCC over the whole aligned overlap, capped
+/// here (30 s) — one pass per candidate, so the cap only matters for very
+/// long captures.
+const RANK_WINDOW_SAMPLES: usize = 1_440_000;
 
 /// Pass/fail thresholds. `Default` is tuned for the *live* path (Opus + jitter
 /// in the loop); hermetic in-process chains should assert with much stricter
@@ -267,13 +278,23 @@ const ALIGN_CANDIDATE_SPACING_HOPS: isize = 5;
 /// Find the capture delay (samples; positive = captured lags the source), or
 /// `None` when no lag in range produces a meaningful correlation.
 ///
-/// Two stages: coarse search over 10 ms RMS envelopes (O(hops × lags) at
-/// 100 fps), then sample-precision refinement of the top-K coarse candidates —
-/// the best *refined* correlation wins (see [`ALIGN_CANDIDATES`]).
+/// Three stages: coarse search over 10 ms RMS envelopes (O(hops × lags) at
+/// 100 fps), sample-precision refinement of the top-K coarse candidates (see
+/// [`ALIGN_CANDIDATES`]), then the candidate with the best raw correlation
+/// over its WHOLE overlap wins.
+///
+/// Why rank on the whole overlap and not the refinement window: nightly #418
+/// (2026-09-29) had a slip inside the first cycle of an otherwise intact
+/// capture, so the true lag's first-second score was ≈ 0 and a lag overlapping
+/// ~120 ms of tail dither won — every cycle was then scored against silence.
+/// The overlap floor below (half the shorter signal) removes such tail lags
+/// outright; whole-overlap ranking makes the choice robust even when a floor
+/// still admits a poor candidate.
 fn align(source: &[i16], captured: &[i16], max_lag_samples: usize) -> Option<isize> {
     let env_s = envelope(source);
     let env_c = envelope(captured);
     let max_lag_hops = (max_lag_samples / HOP) as isize;
+    let min_overlap_hops = MIN_ALIGN_OVERLAP_HOPS.max(env_s.len().min(env_c.len()) / 2);
 
     let mut scored: Vec<(isize, f64)> = Vec::new();
     for lag in -max_lag_hops..=max_lag_hops {
@@ -283,7 +304,7 @@ fn align(source: &[i16], captured: &[i16], max_lag_samples: usize) -> Option<isi
             continue;
         }
         let n = (env_s.len() - s_off).min(env_c.len() - c_off);
-        if n < MIN_ALIGN_OVERLAP_HOPS {
+        if n < min_overlap_hops {
             continue;
         }
         let mut dot = 0f64;
@@ -315,7 +336,10 @@ fn align(source: &[i16], captured: &[i16], max_lag_samples: usize) -> Option<isi
 
     let mut best: Option<(isize, f64)> = None;
     for cand in candidates {
-        if let Some((delay, score)) = refine(source, captured, cand * HOP as isize) {
+        if let Some((delay, _)) = refine(source, captured, cand * HOP as isize) {
+            let Some(score) = raw_ncc_at(source, captured, delay, RANK_WINDOW_SAMPLES) else {
+                continue;
+            };
             if best.is_none_or(|(_, b)| score > b) {
                 best = Some((delay, score));
             }
@@ -324,35 +348,40 @@ fn align(source: &[i16], captured: &[i16], max_lag_samples: usize) -> Option<isi
     best.map(|(delay, _)| delay)
 }
 
+/// Raw-sample NCC of `captured` against `source` at `delay`, over the aligned
+/// overlap capped at `window` samples. `None` when the overlap is under one
+/// hop or either side is silent.
+fn raw_ncc_at(source: &[i16], captured: &[i16], delay: isize, window: usize) -> Option<f64> {
+    let (s_off, c_off) = if delay >= 0 { (0usize, delay as usize) } else { ((-delay) as usize, 0) };
+    if s_off >= source.len() || c_off >= captured.len() {
+        return None;
+    }
+    let n = (source.len() - s_off).min(captured.len() - c_off).min(window);
+    if n < HOP {
+        return None;
+    }
+    let mut dot = 0f64;
+    let mut es = 0f64;
+    let mut ec = 0f64;
+    for i in 0..n {
+        let a = source[s_off + i] as f64;
+        let b = captured[c_off + i] as f64;
+        dot += a * b;
+        es += a * a;
+        ec += b * b;
+    }
+    if es <= 0.0 || ec <= 0.0 {
+        return None;
+    }
+    Some(dot / (es.sqrt() * ec.sqrt()))
+}
+
 /// Sample-precision refinement of a coarse lag: search ±1 hop around it in two
-/// passes (stride 6, then stride 1 around that winner), correlating over a
-/// bounded window so long captures stay cheap. Returns `(delay, ncc)`.
+/// passes (stride 6, then stride 1 around that winner), correlating over
+/// [`REFINE_WINDOW_SAMPLES`] so long captures stay cheap. Returns
+/// `(delay, ncc-over-that-window)`; callers rank candidates separately.
 fn refine(source: &[i16], captured: &[i16], coarse: isize) -> Option<(isize, f64)> {
-    let score_at = |delay: isize| -> Option<f64> {
-        let (s_off, c_off) =
-            if delay >= 0 { (0usize, delay as usize) } else { ((-delay) as usize, 0) };
-        if s_off >= source.len() || c_off >= captured.len() {
-            return None;
-        }
-        let n = (source.len() - s_off).min(captured.len() - c_off).min(48_000);
-        if n < HOP {
-            return None;
-        }
-        let mut dot = 0f64;
-        let mut es = 0f64;
-        let mut ec = 0f64;
-        for i in 0..n {
-            let a = source[s_off + i] as f64;
-            let b = captured[c_off + i] as f64;
-            dot += a * b;
-            es += a * a;
-            ec += b * b;
-        }
-        if es <= 0.0 || ec <= 0.0 {
-            return None;
-        }
-        Some(dot / (es.sqrt() * ec.sqrt()))
-    };
+    let score_at = |delay: isize| raw_ncc_at(source, captured, delay, REFINE_WINDOW_SAMPLES);
 
     let mut best: Option<(isize, f64)> = None;
     let consider = |delay: isize, best: &mut Option<(isize, f64)>| {
