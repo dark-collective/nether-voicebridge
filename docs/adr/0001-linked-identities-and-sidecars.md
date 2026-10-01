@@ -1,6 +1,6 @@
 # ADR 0001 — Linked identities, presence-based exclusion, and the sidecar boundary
 
-**Status:** Proposed (2026-10-01). **Deciders:** operator + Claude. **Supersedes:** none.
+**Status:** Accepted (2026-10-01). **Deciders:** operator + Claude. **Supersedes:** none.
 
 ## Context
 

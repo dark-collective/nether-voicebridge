@@ -8,4 +8,4 @@ Each record has: **Context** (the problem and the constraints), **Decision** (wh
 
 | ADR | Title | Status |
 |-----|-------|--------|
-| [0001](0001-linked-identities-and-sidecars.md) | Linked identities, presence-based exclusion, and the sidecar boundary | Proposed |
+| [0001](0001-linked-identities-and-sidecars.md) | Linked identities, presence-based exclusion, and the sidecar boundary | Accepted |
