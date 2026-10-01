@@ -92,6 +92,16 @@ process data from anyone under these ages.
   size-bounded and rotate on a short operational schedule — not kept
   indefinitely.
 
+### Linked identities (optional)
+
+If you choose to pair your Matrix account with a Discord account (`pair` /
+`/bridge pair`), the bridge stores that mapping — your Matrix user ID, the
+Discord user ID, an optional delegate account you name, and when it was created
+— so it can recognise you as one person when both accounts are present. It is
+created only by you, from both accounts, and `unpair` deletes it immediately.
+Room moderators may likewise record that a specific Matrix account is a service
+account in their room (`relay allow`); `relay deny` deletes that record.
+
 ## Your rights (GDPR/UK GDPR/CCPA)
 
 Where these laws apply to you, you may request access to, correction of, or
