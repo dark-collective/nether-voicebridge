@@ -3,6 +3,19 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] - 2026-10-01
+
+**Hotfix: a bridge-owned member's audio track no longer mints a puppet.**
+
+### Fixed
+- fix(subscriber): the LiveKit track consumer now honours linked-identity
+  exclusion (ADR 0001) like the membership path does. A subscribed audio track
+  from a paired/service/excluded member assigns a puppet only while the member
+  is ordinary, re-checks about once a second, releases when they become
+  bridge-owned and assigns again when they stop being. Seen live after 0.4.0:
+  a relay account's muted microphone track created a silent puppet although
+  its membership was correctly skipped.
+
 ## [0.4.0] - 2026-10-01
 
 **Linked identities: a person present on both sides is one person to the

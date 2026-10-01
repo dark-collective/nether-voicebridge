@@ -26,7 +26,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use livekit::RoomEvent;
 
-use nvb_audio::routing::PlaybackRouter;
+use nvb_audio::routing::{ParticipantSink, PlaybackRouter};
+use nvb_config::links::LinkBoard;
 use super::keys::PeerKeyCache;
 
 /// Sample rate / channel count we ask libwebrtc to resample inbound tracks to.
@@ -120,6 +121,10 @@ pub async fn connect(
     bridge: Arc<str>,
     ghost_prefix: Arc<str>,
     parent_cancel: CancellationToken,
+    // Linked identities (ADR 0001): a subscribed track from a bridge-owned member
+    // (paired Discord account present / service account / excluded) must not
+    // mint a puppet — membership and tracks are two assignment paths; both gate.
+    links: Arc<LinkBoard>,
 ) -> Result<LiveSession> {
     let use_e2ee = key_provider.is_some();
     let span = tracing::info_span!("rtc.session", sfu_url = %url, use_e2ee);
@@ -176,6 +181,7 @@ pub async fn connect(
             disconnected.clone(),
             bridge.clone(),
             ghost_prefix,
+            links,
             peer_keys,
             key_installed_rx,
         )
@@ -270,6 +276,7 @@ async fn playback_consumer(
     room_id: OwnedRoomId,
     router: Arc<dyn PlaybackRouter>,
     cancel: CancellationToken,
+    links: Arc<LinkBoard>,
 ) {
     let RemoteTrack::Audio(audio) = track else {
         return; // video tracks are not bridged
@@ -280,10 +287,18 @@ async fn playback_consumer(
     // identity (the device suffix matters to the resolver's MXID parse).
     let display_name =
         resolve_display_name(&client, &room_id, &identity, &participant_name).await;
-    let sink = router.assign(key, &display_name);
-    // Seed the puppet's mute state right after assign (avoids racing a separate
-    // set_muted against the assign that creates the puppet).
-    router.set_muted(key, initial_muted);
+    // Linked identities (ADR 0001): while this member is bridge-owned, no puppet
+    // and no playback; re-checked ~once a second so a sidecar dropping (member
+    // becomes ordinary again) starts feeding, and one arriving stops it and releases.
+    let mut sink: Option<Arc<dyn ParticipantSink>> = None;
+    if links.matrix_excluded(key) {
+        tracing::info!(track = %key, "playback consumer: member is bridge-owned — no puppet, frames dropped until that changes");
+    } else {
+        sink = Some(router.assign(key, &display_name));
+        // Seed the puppet's mute state right after assign (avoids racing a separate
+        // set_muted against the assign that creates the puppet).
+        router.set_muted(key, initial_muted);
+    }
     let mut stream =
         NativeAudioStream::new(audio.rtc_track(), PLAYBACK_SAMPLE_RATE, PLAYBACK_CHANNELS);
     tracing::info!(track = %key, display_name = %display_name, "playback consumer started");
@@ -318,7 +333,20 @@ async fn playback_consumer(
                         );
                         peak_db = f32::NEG_INFINITY;
                     }
-                    sink.push(&f.data);
+                    if frames.is_multiple_of(50) {
+                        let excluded = links.matrix_excluded(key);
+                        if excluded && sink.is_some() {
+                            tracing::info!(track = %key, "playback consumer: member became bridge-owned — releasing puppet");
+                            router.release(key);
+                            sink = None;
+                        } else if !excluded && sink.is_none() {
+                            tracing::info!(track = %key, "playback consumer: member is ordinary again — assigning puppet");
+                            sink = Some(router.assign(key, &display_name));
+                        }
+                    }
+                    if let Some(sink) = &sink {
+                        sink.push(&f.data);
+                    }
                 }
                 None => break, // track closed
             },
@@ -425,6 +453,7 @@ async fn handle_room_events(
     disconnected: CancellationToken,
     bridge: Arc<str>,
     ghost_prefix: Arc<str>,
+    links: Arc<LinkBoard>,
     peer_keys: Arc<PeerKeyCache>,
     mut key_installed_rx: Option<UnboundedReceiver<String>>,
 ) {
@@ -548,6 +577,7 @@ async fn handle_room_events(
                         room_id.clone(),
                         router.clone(),
                         ct,
+                        links.clone(),
                     )
                     .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
                 );
@@ -739,6 +769,7 @@ mod tests {
             disconnected.clone(),
             Arc::from("test"),
             Arc::from("nether-voicebridge_"),
+            Arc::new(LinkBoard::new("!test:hs", Arc::new(nvb_config::pairings::PairingStore::in_memory()), Arc::new(nvb_config::relays::ServiceAccounts::in_memory()), [], [])),
             Arc::new(PeerKeyCache::default()),
             None,
         ));
