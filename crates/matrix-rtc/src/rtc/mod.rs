@@ -123,6 +123,7 @@ pub(crate) async fn run(
     router: Arc<dyn PlaybackRouter>,
     bridge: Arc<str>,
     shutdown: CancellationToken,
+    links: Arc<nvb_config::links::LinkBoard>,
 ) -> Result<()> {
     // Build a dedicated HTTP client on rustls.
     let http = reqwest::Client::builder().use_rustls_tls().build()?;
@@ -316,6 +317,7 @@ pub(crate) async fn run(
         key_installed_tx: key_installed_tx.clone(),
         peer_keys: peer_keys.clone(),
         router: router.clone(),
+        links: links.clone(),
         bridge: bridge.clone(),
         shutdown: shutdown.clone(),
         call_focus_tx,
@@ -360,6 +362,7 @@ pub(crate) async fn run(
                     bridge.clone(),
                     ghost_prefix.clone(),
                     shutdown.clone(),
+                    links.clone(),
                 )
                 .await
                 {
@@ -635,6 +638,7 @@ struct ForeignCtx {
     bridge: Arc<str>,
     shutdown: CancellationToken,
     call_focus_tx: watch::Sender<Option<LivekitFocusInfo>>,
+    links: Arc<nvb_config::links::LinkBoard>,
 }
 
 /// Snapshot the memberships and publish the call's elected SFU (falling back to
@@ -883,6 +887,7 @@ async fn connect_foreign(ctx: &ForeignCtx, focus: &LivekitFocusInfo) -> Result<s
         ctx.bridge.clone(),
         ctx.ghost_prefix.clone(),
         ctx.shutdown.clone(),
+        ctx.links.clone(),
     )
     .await
 }
@@ -1001,6 +1006,7 @@ async fn join_livekit(
     bridge: Arc<str>,
     ghost_prefix: Arc<str>,
     shutdown: CancellationToken,
+    links: Arc<nvb_config::links::LinkBoard>,
 ) -> Result<ActiveSession> {
     let openid_token = openid::get_openid_token(client).await?;
 
@@ -1057,6 +1063,7 @@ async fn join_livekit(
         bridge,
         ghost_prefix.clone(),
         shutdown,
+        links,
     )
     .await
     {
