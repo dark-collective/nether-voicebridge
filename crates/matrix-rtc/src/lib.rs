@@ -55,6 +55,7 @@ pub use rtc::ghost::testkit;
 /// per-participant to puppets) and the `ghost_pool` (Discord → Matrix audio,
 /// one ghost per Discord speaker — also handed to the Discord side as the
 /// `CaptureRouter`).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     matrix_cfg: &MatrixConfig,
     livekit_cfg: &LiveKitConfig,

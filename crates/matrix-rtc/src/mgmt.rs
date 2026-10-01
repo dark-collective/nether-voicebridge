@@ -1007,6 +1007,7 @@ fn startup_backoff(attempt: u32) -> Duration {
 /// dedicated device + store (same identity rules as bridges: the device id is
 /// minted per store, #30), auto-joins room invites from allowlisted operators,
 /// and serves the `link` / `unlink` / `list` / `help` commands.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     cfg: ManagementConfig,
     server_names: Vec<String>,
@@ -4285,7 +4286,7 @@ async fn handle_pair_delegate(ctx: &BotCtx, room: &Room, sender: &str, mxid: Opt
 async fn handle_unpair(ctx: &BotCtx, room: &Room, sender: &str, discord_user_id: Option<&str>) {
     let links = &ctx.links;
     let result = match discord_user_id.and_then(|d| d.parse::<u64>().ok()) {
-        Some(d) => links.registry.reconcile_after(|| links.pairings.remove(sender, d).map(|b| usize::from(b))),
+        Some(d) => links.registry.reconcile_after(|| links.pairings.remove(sender, d).map(usize::from)),
         None => links.registry.reconcile_after(|| links.pairings.remove_all_for_matrix(sender)),
     };
     match result {
