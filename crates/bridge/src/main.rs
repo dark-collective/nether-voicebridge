@@ -206,6 +206,16 @@ async fn main() -> Result<()> {
     // one independent Matrix/RTC pipeline per bridge, all `!Send`, all driven on
     // this task. Each bridge future swallows its own error (logging it), so one
     // bridge failing ends *that* bridge only — the rest keep running.
+    // Linked identities (ADR 0001): instance-wide pairing + service-account
+    // stores. Unreadable stores are logged and replaced by empty ones (as for
+    // the opt-out list): the bridge must come up; the operator fixes the file.
+    let links = match nvb_config::links::LinkShared::open(&data_dir) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(error = %e, "pairings/relays stores unreadable — starting with NO linked identities");
+            nvb_config::links::LinkShared::in_memory()
+        }
+    };
     let mut supervisor = Supervisor::new(
         pool,
         pool_shutdown.clone(),
@@ -216,6 +226,7 @@ async fn main() -> Result<()> {
             static_labels,
             limits,
             timing,
+            links,
         },
     );
 

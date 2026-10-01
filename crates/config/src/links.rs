@@ -18,7 +18,7 @@
 //! ghosts/puppets. Pure, synchronous, no I/O: the lifecycle code owns the effects.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use crate::pairings::PairingStore;
 use crate::relays::ServiceAccounts;
@@ -44,7 +44,11 @@ struct Presence {
     matrix: HashSet<String>,
 }
 
-#[derive(Debug)]
+/// Where a board's events go: installed by whoever wires the two sides (the
+/// supervisor), routing `Discord*` events to the Discord side and `Matrix*`
+/// events to the Matrix side. A board without one just drops events.
+pub type LinkDispatch = Box<dyn Fn(LinkEvent) + Send + Sync>;
+
 pub struct LinkBoard {
     room_id: String,
     pairings: Arc<PairingStore>,
@@ -52,6 +56,13 @@ pub struct LinkBoard {
     config_discord: HashSet<u64>,
     config_matrix: HashSet<String>,
     presence: Mutex<Presence>,
+    dispatch: Mutex<Option<LinkDispatch>>,
+}
+
+impl std::fmt::Debug for LinkBoard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkBoard").field("room_id", &self.room_id).finish()
+    }
 }
 
 impl LinkBoard {
@@ -69,11 +80,34 @@ impl LinkBoard {
             config_discord: config_discord.into_iter().collect(),
             config_matrix: config_matrix.into_iter().collect(),
             presence: Mutex::new(Presence::default()),
+            dispatch: Mutex::new(None),
         }
     }
 
     pub fn room_id(&self) -> &str {
         &self.room_id
+    }
+
+    /// Delegates named by this person's pairings (for notices).
+    pub fn delegates_for(&self, matrix_user: &str) -> Vec<String> {
+        self.pairings.delegates_for_matrix(matrix_user)
+    }
+
+    pub fn set_dispatch(&self, f: LinkDispatch) {
+        *self.dispatch.lock().unwrap_or_else(PoisonError::into_inner) = Some(f);
+    }
+
+    /// Deliver events to the installed dispatcher (no-op without one).
+    pub fn dispatch_all(&self, events: Vec<LinkEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let guard = self.dispatch.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(f) = guard.as_ref() {
+            for ev in events {
+                f(ev);
+            }
+        }
     }
 
     // ── the rule ───────────────────────────────────────────────────────────────
@@ -227,6 +261,86 @@ impl LinkBoard {
     }
 }
 
+/// Every live board in the process, so a runtime change to the pairing store or
+/// the service approvals can be reconciled against who is present right now:
+/// snapshot all boards, mutate, then dispatch each board's status diff.
+#[derive(Default)]
+pub struct LinkRegistry {
+    boards: RwLock<Vec<(String, Arc<LinkBoard>)>>,
+}
+
+impl LinkRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self, label: &str, board: Arc<LinkBoard>) {
+        let mut g = self.boards.write().unwrap_or_else(PoisonError::into_inner);
+        g.retain(|(l, _)| l != label);
+        g.push((label.to_string(), board));
+    }
+
+    pub fn unregister(&self, label: &str) {
+        self.boards.write().unwrap_or_else(PoisonError::into_inner).retain(|(l, _)| l != label);
+    }
+
+    pub fn boards(&self) -> Vec<Arc<LinkBoard>> {
+        self.boards.read().unwrap_or_else(PoisonError::into_inner).iter().map(|(_, b)| b.clone()).collect()
+    }
+
+    /// Run `mutate` (a pairing/approval change) and make every board's effects
+    /// match afterwards. Returns `mutate`'s result.
+    pub fn reconcile_after<R>(&self, mutate: impl FnOnce() -> R) -> R {
+        let boards = self.boards();
+        let snaps: Vec<StatusSnapshot> = boards.iter().map(|b| b.snapshot_statuses()).collect();
+        let r = mutate();
+        for (b, snap) in boards.iter().zip(snaps.iter()) {
+            b.dispatch_all(b.diff_statuses(snap));
+        }
+        r
+    }
+}
+
+/// The instance-wide identity state every bridge and the management bot share.
+#[derive(Clone)]
+pub struct LinkShared {
+    pub pairings: Arc<PairingStore>,
+    pub services: Arc<ServiceAccounts>,
+    pub registry: Arc<LinkRegistry>,
+}
+
+impl LinkShared {
+    /// Open (or create) the stores under `data_dir`.
+    pub fn open(data_dir: &str) -> Result<Self, crate::ConfigError> {
+        Ok(Self {
+            pairings: Arc::new(PairingStore::open(crate::pairings::pairings_path(data_dir))?),
+            services: Arc::new(ServiceAccounts::open(crate::relays::relays_path(data_dir))?),
+            registry: Arc::new(LinkRegistry::new()),
+        })
+    }
+
+    /// Everything in memory, nothing on disk (tests).
+    pub fn in_memory() -> Self {
+        Self {
+            pairings: Arc::new(PairingStore::in_memory()),
+            services: Arc::new(ServiceAccounts::in_memory()),
+            registry: Arc::new(LinkRegistry::new()),
+        }
+    }
+
+    /// A board for one bridge, using this instance's stores plus the bridge's
+    /// config overrides (already validated as well-formed ids).
+    pub fn board_for(&self, room_id: &str, excluded_discord: &[String], excluded_matrix: &[String]) -> Arc<LinkBoard> {
+        Arc::new(LinkBoard::new(
+            room_id,
+            self.pairings.clone(),
+            self.services.clone(),
+            excluded_discord.iter().filter_map(|s| s.parse().ok()),
+            excluded_matrix.iter().cloned(),
+        ))
+    }
+}
+
 /// Which present identities were bridge-owned at a point in time.
 #[derive(Debug, Default, Clone)]
 pub struct StatusSnapshot {
@@ -362,6 +476,25 @@ mod tests {
         assert_eq!(b.set_discord_present(1, true).len(), 1);
         assert!(b.set_discord_present(1, true).is_empty());
         assert!(b.set_matrix_present(ALICE, true).is_empty());
+    }
+
+    #[test]
+    fn registry_reconciles_a_runtime_pairing_change_through_dispatch() {
+        let ps = Arc::new(PairingStore::in_memory());
+        let b = Arc::new(LinkBoard::new(ROOM, ps.clone(), Arc::new(ServiceAccounts::in_memory()), [], []));
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let sink = got.clone();
+        b.set_dispatch(Box::new(move |ev| sink.lock().unwrap().push(ev)));
+        let reg = LinkRegistry::new();
+        reg.register("bridge-a", b.clone());
+        b.set_discord_present(1, true);
+        b.set_matrix_present(ALICE, true);
+        reg.reconcile_after(|| ps.add(ALICE, 1, 0).unwrap());
+        let evs = got.lock().unwrap().clone();
+        assert!(evs.contains(&LinkEvent::DiscordExcluded(1)));
+        assert!(evs.contains(&LinkEvent::MatrixExcluded(ALICE.into())));
+        reg.unregister("bridge-a");
+        assert!(reg.boards().is_empty());
     }
 
     #[test]

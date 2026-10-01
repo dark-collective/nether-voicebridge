@@ -23,6 +23,7 @@
 mod auth_error;
 mod device_prune;
 mod matrix;
+pub mod links_notice;
 pub mod mgmt;
 mod rtc;
 
@@ -65,6 +66,10 @@ pub async fn run(
     ghost_pool: Arc<GhostPool>,
     bridge: Arc<str>,
     shutdown: CancellationToken,
+    // Linked identities (ADR 0001): this bridge's board, and the channel on which
+    // the Discord side delivers Matrix-side transitions.
+    links: Arc<nvb_config::links::LinkBoard>,
+    link_rx: tokio::sync::mpsc::UnboundedReceiver<nvb_config::links::LinkEvent>,
 ) -> Result<()> {
     // Pair the bot's Matrix device identity with its crypto store (#30): a wiped store
     // must NOT reuse the configured (bridge-name-derived) device_id with fresh keys —
@@ -222,6 +227,8 @@ pub async fn run(
                 router.clone(),
                 bridge.clone(),
                 shutdown.clone(),
+                links,
+                link_rx,
             ),
             &shutdown,
         ),

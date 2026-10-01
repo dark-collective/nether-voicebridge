@@ -63,6 +63,7 @@ use tokio_util::sync::CancellationToken;
 
 use nvb_audio::mixer::PlaybackMixer;
 use nvb_audio::routing::{CaptureRouter, ParticipantSink, PlaybackRouter};
+use nvb_config::links::{LinkBoard, LinkEvent};
 use nvb_config::{ApprovalOutcome, DiscordNotice, PuppetsConfig, TimingConfig};
 
 use crate::{
@@ -195,6 +196,12 @@ struct ChannelCtx {
     anchor: Arc<AtomicUsize>,
     /// This channel's shared overflow mix — played by the anchor.
     overflow_mixer: Arc<PlaybackMixer>,
+    /// Linked identities (ADR 0001): who is bridge-owned right now.
+    links: Arc<LinkBoard>,
+    /// A serenity context cached from the first voice event seen for this
+    /// channel, so a later `DiscordIncluded` can mint a ghost (member lookup)
+    /// outside any event handler.
+    ghost_ctx: Arc<RwLock<Option<Context>>>,
 }
 
 /// Commands sent from the (sync) allocator to a puppet's async command loop.
@@ -344,6 +351,10 @@ struct ChannelState {
     /// Decoupled from the anchor: presence (hence ghost visibility) does not need
     /// a bot in the voice channel.
     presence: HashSet<u64>,
+    /// Linked identities (ADR 0001) for this bridge.
+    links: Arc<LinkBoard>,
+    /// See [`ChannelCtx::ghost_ctx`].
+    ghost_ctx: Arc<RwLock<Option<Context>>>,
     /// Pending grace timer for a capture-only anchor (held with no Matrix
     /// participant). Cancelled when a participant is (re)assigned within the grace;
     /// fires `release_capture_only_anchor_if_idle` so the bot leaves voice if still
@@ -635,6 +646,47 @@ impl SharedPool {
         }
     }
 
+    /// Apply a Discord-side linked-identity transition (ADR 0001) to one
+    /// bridge's channel: a member became bridge-owned → retire its ghost (same
+    /// effect as an opt-out, scoped to this channel); a member stopped being
+    /// bridge-owned while still in the channel → mint its ghost again.
+    pub fn apply_discord_link_event(self: &Arc<Self>, bridge: &str, ev: LinkEvent) {
+        match ev {
+            LinkEvent::DiscordExcluded(uid) => {
+                let ch = {
+                    let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+                    guard.channels.get(bridge).map(|c| self.ctx_for(c))
+                };
+                let Some(ch) = ch else { return };
+                let had_ghost = ch.user_sinks.read().unwrap_or_else(PoisonError::into_inner).contains_key(&uid);
+                if had_ghost {
+                    drop_ghost(&ch, uid);
+                    tracing::info!(user_id = uid, bridge, "ghost retired — member is now bridge-owned (its Matrix half joined the call)");
+                }
+                self.maybe_release_idle_anchor(bridge);
+            }
+            LinkEvent::DiscordIncluded(uid) => {
+                let ch = {
+                    let guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+                    guard.channels.get(bridge).map(|c| self.ctx_for(c))
+                };
+                let Some(ch) = ch else { return };
+                if !self.presence_contains(bridge, uid) {
+                    return;
+                }
+                let ctx = ch.ghost_ctx.read().unwrap_or_else(PoisonError::into_inner).clone();
+                let Some(ctx) = ctx else {
+                    tracing::warn!(user_id = uid, bridge, "member is no longer bridge-owned but no Discord context is cached yet — ghost deferred to its next voice event");
+                    return;
+                };
+                tracing::info!(user_id = uid, bridge, "member is no longer bridge-owned (its Matrix half left the call) — minting ghost");
+                let pool = self.clone();
+                tokio::spawn(async move { ensure_ghost(&pool, &ctx, &ch, uid, None).await });
+            }
+            LinkEvent::MatrixExcluded(_) | LinkEvent::MatrixIncluded { .. } => {} // Matrix side's job
+        }
+    }
+
     /// Turn on the `/bridge approve` command (#47 two-sided link auth): bot
     /// `bot_index` registers the global slash command at `ready` and forwards
     /// each valid invocation (with a oneshot for the outcome text) over `tx`.
@@ -667,6 +719,7 @@ impl SharedPool {
         channel_id: &str,
         capture_router: Arc<dyn CaptureRouter>,
         capture_sink: Option<Arc<CaptureSink>>,
+        links: Arc<LinkBoard>,
     ) -> Result<Arc<ChannelView>> {
         let guild_id = GuildId::new(
             guild_id
@@ -692,6 +745,8 @@ impl SharedPool {
             assignments: HashMap::new(),
             routes: HashMap::new(),
             presence: HashSet::new(),
+            links,
+            ghost_ctx: Arc::new(RwLock::new(None)),
             anchor_idle_release: None,
         };
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
@@ -878,6 +933,8 @@ impl SharedPool {
             optout: self.optout_set.clone(),
             anchor: ch.anchor.clone(),
             overflow_mixer: ch.overflow_mixer.clone(),
+            links: ch.links.clone(),
+            ghost_ctx: ch.ghost_ctx.clone(),
         }
     }
 
@@ -2587,10 +2644,20 @@ impl EventHandler for PuppetHandler {
         for ch in self.pool.channels_in_guild(guild_id) {
             if Some(ch.channel_id) == here {
                 if self.pool.note_presence(&ch.bridge, user_id, true) {
-                    ensure_ghost(&self.pool, &ctx, &ch, user_id, new.member.as_ref()).await;
+                    cache_ghost_ctx(&ch, &ctx);
+                    // Linked identities (ADR 0001): record the arrival, let the
+                    // Matrix side react if it flips a paired call member's status,
+                    // and gate this member's own ghost on its status.
+                    ch.links.dispatch_all(ch.links.set_discord_present(user_id, true));
+                    if ch.links.discord_excluded(user_id) {
+                        tracing::info!(user_id, bridge = %ch.bridge, "voice member is bridge-owned (paired/excluded) — no ghost");
+                    } else {
+                        ensure_ghost(&self.pool, &ctx, &ch, user_id, new.member.as_ref()).await;
+                    }
                 }
                 ch.capture_router.set_muted(&user_id.to_string(), muted);
             } else if self.pool.note_presence(&ch.bridge, user_id, false) {
+                ch.links.dispatch_all(ch.links.set_discord_present(user_id, false));
                 drop_ghost(&ch, user_id);
                 // The last Discord speaker leaving may leave a capture-only anchor
                 // (one held with no playback puppet) idle — release it if so.
@@ -2618,7 +2685,11 @@ impl EventHandler for PuppetHandler {
             }
             if let Some(ch) = self.pool.by_channel(guild.id, chan_id) {
                 if self.pool.note_presence(&ch.bridge, user_id, true) {
-                    ensure_ghost(&self.pool, &ctx, &ch, user_id, vs.member.as_ref()).await;
+                    cache_ghost_ctx(&ch, &ctx);
+                    ch.links.dispatch_all(ch.links.set_discord_present(user_id, true));
+                    if !ch.links.discord_excluded(user_id) {
+                        ensure_ghost(&self.pool, &ctx, &ch, user_id, vs.member.as_ref()).await;
+                    }
                 }
                 // Seed the initial mute state for a user already muted before this
                 // bot connected (their toggle won't arrive as a voice_state_update).
@@ -2930,6 +3001,14 @@ async fn respond_ephemeral(ctx: &Context, cmd: &CommandInteraction, text: &str) 
 /// Mint a ghost for a Discord user in the channel if they don't have one yet.
 /// Skips bridge-owned puppets and any other bot. Resolves the display name from
 /// the supplied `Member` if present, else via a lookup.
+/// Remember a serenity context for this channel (first one wins; any bot's works).
+fn cache_ghost_ctx(channel: &ChannelCtx, ctx: &Context) {
+    let mut g = channel.ghost_ctx.write().unwrap_or_else(PoisonError::into_inner);
+    if g.is_none() {
+        *g = Some(ctx.clone());
+    }
+}
+
 async fn ensure_ghost(
     pool: &Arc<SharedPool>,
     ctx: &Context,
@@ -2958,6 +3037,11 @@ async fn ensure_ghost(
         .unwrap_or_else(PoisonError::into_inner)
         .contains(&user_id)
     {
+        return;
+    }
+    // Linked identities (ADR 0001): a member who is bridge-owned right now
+    // (paired with a call member who is present, or config-excluded) gets no ghost.
+    if channel.links.discord_excluded(user_id) {
         return;
     }
     if channel
@@ -3429,7 +3513,11 @@ async fn puppet_become_anchor(
         // the Element Call indefinitely and held the anchor as if speakers
         // were present.
         if pool.seed_presence(&channel.bridge, uid) {
-            ensure_ghost(pool, ctx, channel, uid, None).await;
+            cache_ghost_ctx(channel, ctx);
+            channel.links.dispatch_all(channel.links.set_discord_present(uid, true));
+            if !channel.links.discord_excluded(uid) {
+                ensure_ghost(pool, ctx, channel, uid, None).await;
+            }
         }
     }
     Some(overflow_handle)
@@ -3998,6 +4086,17 @@ mod tests {
         SharedPool::new(&cfg, timing)
     }
 
+    /// An empty linked-identity board (no pairings, no approvals, no overrides).
+    fn test_links() -> Arc<LinkBoard> {
+        Arc::new(LinkBoard::new(
+            "!test:hs",
+            Arc::new(nvb_config::pairings::PairingStore::in_memory()),
+            Arc::new(nvb_config::relays::ServiceAccounts::in_memory()),
+            [],
+            [],
+        ))
+    }
+
     /// Register a channel `label` at guild/channel ids derived from `g`/`c`, and
     /// enroll every pool bot in guild `g` (in production this comes from the
     /// gateway `ready`/`guild_create` events, which don't fire in unit tests).
@@ -4008,6 +4107,7 @@ mod tests {
             &c.to_string(),
             Arc::new(NoopCapture),
             None,
+            test_links(),
         )
         .expect("register channel");
         for slot in &p.slots {
@@ -4104,7 +4204,7 @@ mod tests {
         let p = pool(1);
         channel(&p, "A", 1, 10);
         let Err(err) =
-            p.register_channel(Arc::from("A"), "1", "10", Arc::new(NoopCapture), None)
+            p.register_channel(Arc::from("A"), "1", "10", Arc::new(NoopCapture), None, test_links())
         else {
             panic!("duplicate register_channel must fail");
         };
@@ -4432,7 +4532,7 @@ mod tests {
         // A freed bot in guild 1 must NOT be pulled into a guild-2 channel's overflow
         // it can't serve. Partitioned pool: bot 0 ∈ guild 1, bot 1 ∈ guild 2.
         let p = pool(2);
-        p.register_channel(Arc::from("A"), "1", "10", Arc::new(NoopCapture), None).unwrap();
+        p.register_channel(Arc::from("A"), "1", "10", Arc::new(NoopCapture), None, test_links()).unwrap();
         p.register_channel(Arc::from("B"), "2", "20", Arc::new(NoopCapture), None).unwrap();
         p.slots[0].guilds.write().unwrap().insert(GuildId::new(1));
         p.slots[1].guilds.write().unwrap().insert(GuildId::new(2));
@@ -4581,7 +4681,7 @@ mod tests {
     fn allocates_only_guild_capable_bots() {
         // Partitioned pool: bot 0 only in guild 1, bot 1 only in guild 2.
         let p = pool(2);
-        p.register_channel(Arc::from("A"), "1", "10", Arc::new(NoopCapture), None).unwrap();
+        p.register_channel(Arc::from("A"), "1", "10", Arc::new(NoopCapture), None, test_links()).unwrap();
         p.register_channel(Arc::from("B"), "2", "20", Arc::new(NoopCapture), None).unwrap();
         p.slots[0].guilds.write().unwrap().insert(GuildId::new(1));
         p.slots[1].guilds.write().unwrap().insert(GuildId::new(2));
