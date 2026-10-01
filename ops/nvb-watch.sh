@@ -181,7 +181,14 @@ if [ -n "$pid" ] && [ "$pid" != "0" ]; then
     udpn=$(ss -unp 2>/dev/null | grep -c "pid=$pid," || true)
     # allow-set: Cloudflare edge (homeserver + Discord gateway) + private + resolved HS
     allow='^(104\.1[6-9]|104\.2[0-9]|172\.6[4-9]|172\.7[01]|162\.15[89]|108\.162|141\.101|173\.245|188\.114|190\.93|197\.234|198\.41|10\.|192\.168\.|100\.6[4-9]|100\.[7-9][0-9]|100\.1[01][0-9]|100\.12[0-7]|127\.)'
-    hs_ips=$(for h in nether.im ${EXTRA_ALLOW_HOSTS:-}; do getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}'; done | sort -u | sed 's/\./\\./g' | paste -sd'|')
+    # Multi-SFU (MSC4195, bridge v0.3.8+): the bridge also subscribes on OTHER
+    # homeservers' LiveKit SFUs (e.g. matrix-org.livekit.cloud) and ghosts may
+    # publish there. Those hosts are dynamic, so allow exactly the SFU / lk-jwt
+    # hosts the bridge itself logged connecting to in the last 24 h
+    # (`sfu_url=wss://…` from the session, `sfu=https://…` from the election).
+    sfu_hosts=$(journalctl -u "$UNIT" --since "-24h" --no-pager 2>/dev/null \
+        | grep -oE '(sfu_url=wss|sfu=https)://[A-Za-z0-9._-]+' | sed -E 's#^[a-z_]+=[a-z]+://##' | sort -u)
+    hs_ips=$(for h in nether.im ${EXTRA_ALLOW_HOSTS:-} $sfu_hosts; do getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}'; done | sort -u | sed 's/\./\\./g' | paste -sd'|')
     [ -n "$hs_ips" ] && allow="$allow|^($hs_ips)\$"
     strangers=$(printf '%s\n' "$remotes" | sort -u | grep -Ev "$allow" | grep . || true)
     [ "$tcpn" -gt "$TCP_MAX" ] && ALERTS+=("🔌 TCP connection count $tcpn exceeds envelope ($TCP_MAX) — leak or unexpected load")
