@@ -247,6 +247,7 @@ pub async fn run(
                 router,
                 bridge.clone(),
                 shutdown.clone(),
+                links.clone(),
             ),
             &shutdown,
         ),

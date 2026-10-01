@@ -181,6 +181,7 @@ pub async fn connect(
             disconnected.clone(),
             bridge.clone(),
             ghost_prefix,
+            links,
             peer_keys,
             key_installed_rx,
         )
@@ -452,6 +453,7 @@ async fn handle_room_events(
     disconnected: CancellationToken,
     bridge: Arc<str>,
     ghost_prefix: Arc<str>,
+    links: Arc<LinkBoard>,
     peer_keys: Arc<PeerKeyCache>,
     mut key_installed_rx: Option<UnboundedReceiver<String>>,
 ) {
