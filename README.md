@@ -112,10 +112,10 @@ What genuinely remains:
 
 ### Further out
 
-- **Video relay (webcam / screen share).** Carrying video — and screen/app share
-  *with* its audio — between Discord and Element Call, not just voice. This requires
-  driving Discord with **self-bots** (ToS violation) to relay video streams.
-  ([#8](https://nether.codes/dark/nether-voicebridge/issues/8))
+- **Not planned: Discord video relay (webcam / screen share).** Discord's bot API has
+  no video send or receive, so this would need automated user accounts ("self-bots"),
+  which violate Discord's Terms of Service. The bridge stays bot-only and audio-only
+  on the Discord side. ([#8](https://nether.codes/dark/nether-voicebridge/issues/8))
 - **Soundboard support.** Bridging Discord's soundboard clips (and/or a Matrix-side
   equivalent) through the audio core.
 - **Interop with mautrix-discord ghosts.** Where a room already runs the

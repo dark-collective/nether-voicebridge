@@ -8,7 +8,7 @@ design is rejected below and replaced by this one.
 
 People want to show a video stream in a bridged call that the bridge itself does not produce: a game
 captured with OBS, a camera rig, a phone, or any other external source. The bridge is
-audio-only (#8 is the long-term video relay) and must stay that way for this purpose: it should not
+audio-only on the Discord side (Discord video relay is ruled out, #8) and must stay that way: it should not
 receive, transcode or host anyone's video.
 
 What an external publisher needs, in MatrixRTC terms: a **call participant of its own** — a Matrix
@@ -103,7 +103,7 @@ reverse proxy only if the operator enables it (`[publishers] enabled = true`); o
   history. HTTP with a revocable bearer key is simpler for any tool. The DM keeps key *issuance*.
 - **The bridge ingests and publishes the stream itself (WHIP / RTMP ingest).** The only way plain
   OBS (which speaks WHIP, not MatrixRTC) can reach an **encrypted** call — an SFU-side ingress cannot
-  apply Element Call's end-to-end media encryption. Needs video in the bridge (#8). Deferred: a
+  apply Element Call's end-to-end media encryption. Needs video handling in the bridge's Matrix side (#145). Deferred: a
   later *ingest* kind of slot on the same keys, rate limits and identities.
 
 ## Consequences
@@ -117,7 +117,7 @@ key hashing, rate limits, tests); containment by event-stream policing rather th
 device per slot (cleaned up on close; device hygiene alarms must not treat stream devices as leaks);
 a privacy-policy paragraph (labels and stream-user ids are stored in the audit trail).
 
-**Does not solve:** plain OBS into encrypted rooms (needs the ingest kind, #8); bridging stream
+**Does not solve:** plain OBS into encrypted rooms (needs the ingest kind, #145); bridging stream
 video to Discord (the bridge stays audio-only; stream audio is deliberately not puppeted); proving
 what a publisher shows — authorisation is "the room authority trusts this key", exactly as with any
 participant they let in.
@@ -128,4 +128,4 @@ responsibility, as with any participant a room lets in.
 
 **Follow-ups:** implement behind `[publishers]`; mgmt commands; containment policing; scenario tests
 (slot open → EC joins → ghosts key it → close → device gone; misbehaving token revoked); ingest
-slots with #8.
+slots (#145).
