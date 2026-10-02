@@ -97,6 +97,45 @@ fn resolve_affected_user(
 /// participant set, raise call-active transitions, and drive the per-participant
 /// puppet **presence** off membership (constraint: one Discord bot per Matrix
 /// call participant, present even when muted/not transmitting). Echo-excludes the
+/// What one membership event changed in the participant set (pure; unit-tested).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParticipantDelta {
+    /// The user went from no active membership to at least one.
+    appeared: bool,
+    /// The user's last active membership ended.
+    gone: bool,
+    /// The set went from no users to some.
+    became_nonempty: bool,
+    /// A (user, state_key) membership that was not active before is now active —
+    /// i.e. a device/session that needs the ghosts' media keys (#144).
+    new_membership: bool,
+}
+
+fn update_participants(
+    set: &mut HashSet<(OwnedUserId, String)>,
+    user_id: &OwnedUserId,
+    state_key: &str,
+    is_active: bool,
+) -> ParticipantDelta {
+    let prev_users = set.iter().map(|(u, _)| u).collect::<HashSet<_>>().len();
+    let entry = (user_id.clone(), state_key.to_owned());
+    let this_user_before = set.iter().filter(|(u, _)| u == user_id).count();
+    let new_membership = if is_active {
+        set.insert(entry)
+    } else {
+        set.remove(&entry);
+        false
+    };
+    let this_user_after = set.iter().filter(|(u, _)| u == user_id).count();
+    let new_users = set.iter().map(|(u, _)| u).collect::<HashSet<_>>().len();
+    ParticipantDelta {
+        appeared: this_user_before == 0 && this_user_after > 0,
+        gone: this_user_before > 0 && this_user_after == 0,
+        became_nonempty: prev_users == 0 && new_users > 0,
+        new_membership,
+    }
+}
+
 /// bridge bot itself.
 #[allow(clippy::too_many_arguments)]
 async fn apply_member_event(
@@ -132,6 +171,7 @@ async fn apply_member_event(
     let appeared;
     let gone;
     let became_nonempty;
+    let new_membership;
     let user_id = {
         let mut set = participants.lock().await;
         // A retraction may be posted by someone other than the member it clears —
@@ -152,22 +192,24 @@ async fn apply_member_event(
         if crate::rtc::ghost::is_bridge_excluded_identity(user_id.as_str(), ghost_prefix) {
             return;
         }
-        let prev_users = set.iter().map(|(u, _)| u).collect::<HashSet<_>>().len();
-        let entry = (user_id.clone(), state_key.clone());
-        let this_user_before = set.iter().filter(|(u, _)| u == &user_id).count();
-        if is_active {
-            set.insert(entry);
-        } else {
-            set.remove(&entry);
-        }
-        let this_user_after = set.iter().filter(|(u, _)| u == &user_id).count();
-        appeared = this_user_before == 0 && this_user_after > 0;
-        gone = this_user_before > 0 && this_user_after == 0;
-        let new_users = set.iter().map(|(u, _)| u).collect::<HashSet<_>>().len();
-        became_nonempty = prev_users == 0 && new_users > 0;
+        let delta = update_participants(&mut set, &user_id, &state_key, is_active);
+        appeared = delta.appeared;
+        gone = delta.gone;
+        became_nonempty = delta.became_nonempty;
+        new_membership = delta.new_membership;
         log_snapshot(&set);
         user_id
     };
+
+    // #144: every NEW active membership is a new key recipient — a quick rejoin inside
+    // the leave grace (a fresh client session that needs the ghosts' keys again) or a
+    // second device of someone already present — not only a new MXID. Wake the ghost
+    // key loops for all of them; otherwise the device waits for the 60 s heartbeat
+    // (observed: Commet rejoin, 3 of 4 ghosts keyed it ~17 s late). A periodic refresh
+    // of an existing (user, state_key) is not new and does not bump.
+    if new_membership {
+        members_gen_tx.send_modify(|g| *g = g.wrapping_add(1));
+    }
 
     // Membership owns puppet presence: a member joining gets a (present, possibly
     // silent) named puppet keyed on their bare MXID; leaving releases it. Audio +
@@ -183,7 +225,8 @@ async fn apply_member_event(
         };
         if had_pending {
             // The puppet/subscriber were never torn down (we deferred the leave),
-            // so do NOT re-assign, re-key, or re-raise call-active.
+            // so do NOT re-assign or re-raise call-active. (The re-key already
+            // happened above: the rejoined session is a new membership.)
             tracing::info!(mxid = %user_id, "membership re-appeared within grace — cancelled pending release");
             return;
         }
@@ -201,10 +244,7 @@ async fn apply_member_event(
             tracing::info!("call active");
             let _ = call_active_tx.send(true);
         }
-        // A new human joined the call → each live ghost must (re-)deliver its media
-        // key so this user can decrypt the ghost's E2EE frames. Bump the
-        // membership-generation watch the ghost key-distribution loops wait on.
-        members_gen_tx.send_modify(|g| *g = g.wrapping_add(1));
+        // (The ghosts' media-key re-delivery for this new member was triggered above.)
         if excluded {
             tracing::info!(mxid = %user_id, "member joined — bridge-owned (paired Discord account present, service account, or excluded) — no puppet");
             return;
@@ -1615,7 +1655,28 @@ mod tests {
         assert_ne!(a, b, "same-instant sends must still get distinct txn ids");
     }
 
-    use super::{resolve_affected_user, resolve_ghost_device_salt, resolve_store_device_id};
+    use super::{resolve_affected_user, resolve_ghost_device_salt, resolve_store_device_id, update_participants};
+
+    #[test]
+    fn new_membership_flags_every_new_session_not_refreshes() {
+        // #144: a quick rejoin and a second device must re-key; a refresh must not.
+        let alice: OwnedUserId = "@alice:x".try_into().unwrap();
+        let mut set = std::collections::HashSet::new();
+        let d = update_participants(&mut set, &alice, "_@alice:x_DESK_m.call", true);
+        assert!(d.appeared && d.new_membership && d.became_nonempty);
+        // Periodic refresh of the same membership: nothing new.
+        let d = update_participants(&mut set, &alice, "_@alice:x_DESK_m.call", true);
+        assert!(!d.appeared && !d.new_membership);
+        // Second device while the first is present: not "appeared", but a new recipient.
+        let d = update_participants(&mut set, &alice, "_@alice:x_PHONE_m.call", true);
+        assert!(!d.appeared && d.new_membership);
+        // Both leave, then a quick rejoin on the same device (inside the leave grace).
+        update_participants(&mut set, &alice, "_@alice:x_PHONE_m.call", false);
+        let d = update_participants(&mut set, &alice, "_@alice:x_DESK_m.call", false);
+        assert!(d.gone && !d.new_membership);
+        let d = update_participants(&mut set, &alice, "_@alice:x_DESK_m.call", true);
+        assert!(d.appeared && d.new_membership);
+    }
     use matrix_sdk::ruma::OwnedUserId;
     use std::fs;
     use std::path::PathBuf;
