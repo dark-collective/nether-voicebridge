@@ -39,8 +39,8 @@ bridge (ADR 0001).**
 - **Failover notice.** When a paired person's Discord session drops while they
   stay in the call, they (and their delegate) are told once per 10 minutes that
   they are bridged through a bot until it returns.
-- Exclusion transitions are first-class lifecycle events: a sidecar arriving
-  late retires an already-minted ghost/puppet; one dropping re-creates them.
+- Exclusion transitions are first-class lifecycle events: a companion client
+  arriving late retires an already-minted ghost/puppet; one dropping re-creates them.
 - New data files `<data_dir>/pairings.toml` and `relays.toml`; privacy policy
   and self-serve docs updated; `docs/adr/` introduced.
 
@@ -56,9 +56,8 @@ bridge (ADR 0001).**
 - fix(subscriber): screen-share audio/video from Matrix is never bridged into
   Discord voice (#142). The subscriber drops publications whose source is
   screen share or screen-share audio at publish and subscribe time and
-  unsubscribes from them; Discord users already hear a Go Live natively, so
-  forwarding the share's audio through a puppet only doubled it or fed it back
-  (Light Gaming, 2026-10-01). Supersedes 0.3.11, which was tagged but never
+  unsubscribes from them; a screen share has no Discord voice counterpart, and
+  forwarding the share's audio through a puppet could double it or feed it back. Supersedes 0.3.11, which was tagged but never
   deployed.
 
 ## [0.3.11] - 2026-10-01

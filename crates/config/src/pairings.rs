@@ -23,8 +23,8 @@ pub struct Pairing {
     pub matrix_user: String,
     /// Discord user id, stored as a string like every other id in the config.
     pub discord_user: String,
-    /// Optional sidecar account that carries this person (receives notices on
-    /// their behalf; later, presenter slots). Grants nothing else.
+    /// Optional delegate account that acts for this person (receives notices on
+    /// their behalf). Grants nothing else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegate: Option<String>,
     /// Unix epoch seconds when the pairing was completed.

@@ -33,7 +33,7 @@ pub enum LinkEvent {
     /// A call member (present in the call) became bridge-owned: release its puppet.
     MatrixExcluded(String),
     /// A call member (present in the call) stopped being bridge-owned: it needs a puppet again.
-    /// Carries whether the member's Discord half *vanished* (true) — the "your sidecar dropped"
+    /// Carries whether the member's Discord half *vanished* (true) — the "your Discord session dropped"
     /// notice case — as opposed to the member itself just arriving.
     MatrixIncluded { user: String, discord_half_vanished: bool },
 }
@@ -406,11 +406,11 @@ mod tests {
     fn discord_half_arriving_second_excludes_the_present_matrix_half() {
         let b = board(&[(ALICE, 1)], &[], &[], &[]);
         b.set_matrix_present(ALICE, true); // puppeted so far
-        // The sidecar comes up: Alice's puppet must be released.
+        // The companion client comes up: Alice's puppet must be released.
         assert_eq!(b.set_discord_present(1, true), vec![LinkEvent::MatrixExcluded(ALICE.into())]);
         assert!(b.matrix_excluded(ALICE));
         assert!(b.discord_excluded(1));
-        // The sidecar drops: Alice needs a puppet again, and this is the notice case.
+        // The companion client drops: Alice needs a puppet again, and this is the notice case.
         assert_eq!(
             b.set_discord_present(1, false),
             vec![LinkEvent::MatrixIncluded { user: ALICE.into(), discord_half_vanished: true }]

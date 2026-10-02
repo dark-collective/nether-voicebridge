@@ -288,7 +288,7 @@ async fn playback_consumer(
     let display_name =
         resolve_display_name(&client, &room_id, &identity, &participant_name).await;
     // Linked identities (ADR 0001): while this member is bridge-owned, no puppet
-    // and no playback; re-checked ~once a second so a sidecar dropping (member
+    // and no playback; re-checked ~once a second so a companion client dropping (member
     // becomes ordinary again) starts feeding, and one arriving stops it and releases.
     let mut sink: Option<Arc<dyn ParticipantSink>> = None;
     if links.matrix_excluded(key) {
@@ -512,7 +512,7 @@ async fn handle_room_events(
                 let sid = publication.sid().to_string();
                 let identity = participant.identity().to_string();
                 // #142: screen-share media is never bridged. Discord has no counterpart
-                // for a share (its users already hear a Go Live natively), so forwarding
+                // for a share (it is not a voice), so forwarding
                 // share AUDIO into voice only doubles it or feeds it back. Video is
                 // dropped by the consumer; audio must be dropped on SOURCE, not kind.
                 if is_screenshare_source(&publication) {

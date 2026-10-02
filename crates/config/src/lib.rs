@@ -625,7 +625,7 @@ pub struct BridgeConfig {
     #[serde(default)]
     pub excluded_discord_user_ids: Vec<String>,
     /// Matrix user ids this bridge treats as bridge-owned unconditionally: never
-    /// puppeted, never counted as humans (e.g. a sidecar account on an instance
+    /// puppeted, never counted as humans (e.g. a companion client's account on an instance
     /// without a management bot to approve it).
     #[serde(default)]
     pub excluded_matrix_user_ids: Vec<String>,

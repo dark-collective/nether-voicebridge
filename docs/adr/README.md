@@ -8,5 +8,5 @@ Each record has: **Context** (the problem and the constraints), **Decision** (wh
 
 | ADR | Title | Status |
 |-----|-------|--------|
-| [0001](0001-linked-identities-and-sidecars.md) | Linked identities, presence-based exclusion, and the sidecar boundary | Accepted |
+| [0001](0001-linked-identities.md) | Linked identities, presence-based exclusion, and companion clients | Accepted |
 | [0002](0002-external-stream-publishers.md) | External stream publishers: per-stream identities for media the bridge does not produce | Proposed |

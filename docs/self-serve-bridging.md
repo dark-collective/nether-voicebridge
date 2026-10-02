@@ -209,7 +209,7 @@ call, you get a puppet again automatically and the bot tells you once.
 
 - `pairings` lists your pairings; `unpair [discord-user-id]` removes one or all;
   `/bridge unpair` on Discord does the same from that side.
-- You may pair several Discord accounts (a main and an alt); a Discord account
+- You may pair several Discord accounts (e.g. a main and a secondary account); a Discord account
   pairs with one Matrix account at a time.
 - `pair delegate <@mxid>` names an account that receives your notices (for people
   who run a helper for you); `pair delegate none` clears it.
@@ -221,7 +221,7 @@ puppet and not count as a participant, e.g. a relay helper: `relay allow
 Operators can additionally pin exclusions in the bridge config
 (`excluded_discord_user_ids` / `excluded_matrix_user_ids`).
 
-Design record: `docs/adr/0001-linked-identities-and-sidecars.md`.
+Design record: `docs/adr/0001-linked-identities.md`.
 
 ## Troubleshooting
 

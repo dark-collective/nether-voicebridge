@@ -1,6 +1,6 @@
-//! Service accounts (ADR 0001 §3): a sidecar's own Matrix account sits in a room
+//! Service accounts (ADR 0001 §3): a companion client's own Matrix account sits in a room
 //! call but represents nobody on Discord. The room's bridge authority approves it
-//! *per room* (`relay allow @sidecar:hs` in the management DM); the bridge then
+//! *per room* (`relay allow @helper:hs` in the management DM); the bridge then
 //! gives it no puppet and does not count it as a human. Persisted at
 //! `<data_dir>/relays.toml`, mirrored in memory by [`ServiceAccounts`].
 
