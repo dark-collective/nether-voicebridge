@@ -261,9 +261,26 @@ fn secrets_dir_for(workdir: &Path) -> PathBuf {
     std::env::temp_dir().join(format!("nvb-e2e-secrets-{:x}", hasher.finish()))
 }
 
+/// How long [`BridgeUnderTest::kill`] lets a SIGTERM drain run before it
+/// escalates to SIGKILL — the same budget scenarios give their graceful
+/// teardown.
+const KILL_GRACE: Duration = Duration::from_secs(20);
+
+/// How long teardown waits for the stdout/stderr pumps to hit EOF after the
+/// child is gone (a grandchild holding the pipe open must not hang it).
+const PUMP_DRAIN: Duration = Duration::from_secs(5);
+
+type LogFile = Arc<tokio::sync::Mutex<tokio::fs::File>>;
+
 pub struct BridgeUnderTest {
     child: Child,
     pid: i32,
+    /// The `bridge.log` artifact and the tasks pumping the child's
+    /// stdout/stderr into it. Teardown drains both pumps and flushes the file
+    /// once the child has exited, so the log keeps its tail (nightly #501:
+    /// the artifact ended 46 s before the scenario failed).
+    log_file: LogFile,
+    pumps: Vec<tokio::task::JoinHandle<()>>,
     pub scraper: Arc<LogScraper>,
     // Scenario surface built ahead of its first caller (the D2/D3 reconcile
     // and artifact-inspection scenarios) — see the design doc's D1 spec.
@@ -515,7 +532,8 @@ impl BridgeUnderTest {
         // Pump stdout (JSON events) and stderr (panics, glibc noise) into the
         // scraper AND a persistent raw log artifact.
         let log_file = tokio::fs::File::create(workdir.join("bridge.log")).await?;
-        let log_file = Arc::new(tokio::sync::Mutex::new(log_file));
+        let log_file: LogFile = Arc::new(tokio::sync::Mutex::new(log_file));
+        let mut pumps = Vec::with_capacity(2);
         let stdout = child.stdout.take().context("no stdout pipe")?;
         let stderr = child.stderr.take().context("no stderr pipe")?;
         for stream in [
@@ -524,7 +542,7 @@ impl BridgeUnderTest {
         ] {
             let scraper = scraper.clone();
             let log_file = log_file.clone();
-            tokio::spawn(async move {
+            pumps.push(tokio::spawn(async move {
                 let mut lines = stream.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     scraper.ingest_line(&line);
@@ -532,12 +550,14 @@ impl BridgeUnderTest {
                     let _ = f.write_all(line.as_bytes()).await;
                     let _ = f.write_all(b"\n").await;
                 }
-            });
+            }));
         }
 
         Ok(Self {
             child,
             pid,
+            log_file,
+            pumps,
             scraper,
             workdir: workdir.to_owned(),
             tenants_path,
@@ -616,6 +636,11 @@ impl BridgeUnderTest {
                 ))
             }
         };
+        let note = match &result {
+            Ok(()) => "graceful stop: exited cleanly after SIGTERM".to_owned(),
+            Err(e) => format!("graceful stop: {e:#}"),
+        };
+        self.finish_log(&note).await;
         // The child is confirmed gone (or force-killed) by this point — safe
         // to scrub the secrets dir regardless of outcome (#72 F6-2).
         self.delete_minted_devices().await;
@@ -664,12 +689,49 @@ impl BridgeUnderTest {
         tracing::info!(minted = ids.len(), deleted = gone, bot = %self.bot_mxid, "deleted the bridge-under-test's minted bot devices");
     }
 
-    /// Hard-kill (scenario cleanup on failure paths). Prefer
-    /// [`sigterm_and_wait`](Self::sigterm_and_wait) — SIGKILL leaves zombie
-    /// Discord voice sessions behind.
+    /// Drain the stdout/stderr pumps (they end at EOF once the child is
+    /// gone), append a harness marker line, and flush `bridge.log` to disk.
+    /// The marker is JSON without a `level` field, so ERROR greps over the
+    /// log never match it, and it shows exactly where the bridge's own output
+    /// ends — a short log is then provably short, not truncated.
+    async fn finish_log(&mut self, note: &str) {
+        let mut drained = true;
+        for pump in self.pumps.drain(..) {
+            drained &= tokio::time::timeout(PUMP_DRAIN, pump).await.is_ok();
+        }
+        let marker = serde_json::json!({
+            "harness": note,
+            "pumps_drained": drained,
+            "unix_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default(),
+        });
+        let mut f = self.log_file.lock().await;
+        let _ = f.write_all(format!("{marker}\n").as_bytes()).await;
+        let _ = f.flush().await;
+        let _ = f.sync_all().await;
+    }
+
+    /// Stop on a scenario's failure path: SIGTERM first so the bridge drains
+    /// (leaves Discord voice, flushes its log) and only SIGKILL after
+    /// [`KILL_GRACE`] — a bare SIGKILL leaves zombie Discord voice sessions
+    /// behind and cuts the log tail the failure needs. Unlike
+    /// [`sigterm_and_wait`](Self::sigterm_and_wait) a slow drain is not an
+    /// error here (the scenario has already failed).
     pub async fn kill(mut self) {
+        let note = if self.signal(libc::SIGTERM).is_err() {
+            "stop: SIGTERM not deliverable (already exited)".to_owned()
+        } else {
+            match tokio::time::timeout(KILL_GRACE, self.child.wait()).await {
+                Ok(Ok(status)) => format!("stop: exited after SIGTERM ({status})"),
+                Ok(Err(e)) => format!("stop: waiting after SIGTERM failed: {e}"),
+                Err(_) => format!("stop: no exit within {KILL_GRACE:?} of SIGTERM — SIGKILLed"),
+            }
+        };
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
+        self.finish_log(&note).await;
         self.delete_minted_devices().await;
         let _ = tokio::fs::remove_dir_all(&self.secrets_dir).await;
     }

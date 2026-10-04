@@ -70,6 +70,18 @@ pub struct ScenarioReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub artifacts_dir: String,
+    /// Attempts that failed before the recorded one (the #124 retry), each
+    /// with its preserved artifacts dir — so a retried failure keeps the
+    /// evidence of BOTH attempts (nightly #501 lost attempt 1's).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub earlier_attempts: Vec<EarlierAttempt>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EarlierAttempt {
+    pub attempt: u32,
+    pub error: String,
+    pub artifacts_dir: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -118,9 +130,11 @@ pub async fn run_scenarios(
             Expectation::KnownFail { .. } => 1,
         };
         let mut outcome = None;
+        let mut earlier_attempts = Vec::new();
         for attempt in 1..=max_attempts {
-            // Fresh per-attempt artifacts dir + Ctx so the retry's WAVs/report
-            // overwrite the previous attempt's (we keep the last attempt's).
+            // The recorded (last) attempt always uses `<run>/<name>`; a failed
+            // attempt that gets retried is moved aside to `<name>.attemptN`
+            // below, so this dir starts fresh every time.
             tokio::fs::create_dir_all(&artifacts).await?;
             let ctx = Arc::new(Ctx { cfg: cfg.clone(), profile, artifacts: artifacts.clone() });
             let res = tokio::time::timeout(profile.scenario_timeout(), (def.run)(ctx)).await;
@@ -131,10 +145,21 @@ pub async fn run_scenarios(
                 Err(_) => true,
             };
             let last = !retryable || attempt == max_attempts;
-            outcome = Some(res);
             if last {
+                outcome = Some(res);
                 break;
             }
+            let kept = run_root.join(format!("{}.attempt{attempt}", def.name));
+            let _ = tokio::fs::remove_dir_all(&kept).await;
+            tokio::fs::rename(&artifacts, &kept).await?;
+            earlier_attempts.push(EarlierAttempt {
+                attempt,
+                error: match res {
+                    Ok(Err(e)) => format!("{e:#}"),
+                    _ => "scenario timed out".into(),
+                },
+                artifacts_dir: kept.display().to_string(),
+            });
             eprintln!("   attempt {attempt} failed — retrying once (transient-infra tolerance, #124)");
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
@@ -177,6 +202,7 @@ pub async fn run_scenarios(
             duration_ms,
             error,
             artifacts_dir: artifacts.display().to_string(),
+            earlier_attempts,
         });
     }
 
@@ -287,6 +313,12 @@ mod tests {
         // First attempt failed, retry passed → recorded as pass, and it ran twice.
         assert_eq!(by_name["flaky"], "pass");
         assert_eq!(FLAKY_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // The failed first attempt's artifacts survive the retry, aside.
+        let flaky = report.scenarios.iter().find(|s| s.name == "flaky").unwrap();
+        assert_eq!(flaky.earlier_attempts.len(), 1);
+        assert_eq!(flaky.earlier_attempts[0].error, "transient blip");
+        assert!(dir.join("flaky.attempt1").is_dir());
+        assert!(dir.join("flaky").is_dir());
         // KnownFail ran exactly once (no retry).
         assert_eq!(by_name["kf_counted"], "known_fail");
         assert_eq!(KF_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst), 1);
