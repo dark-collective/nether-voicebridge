@@ -190,6 +190,42 @@ run "$QUIET_J" "$(roster alive 0)"
 check "no notice per ordinary green push" "GREEN again" no
 rm -f "$T/api.json"
 
+e2e_api() { # e2e_api(run_number, status) — a scheduled e2e.yml run (started now, so not "stale")
+    cat > "$T/api.json" <<EOF
+{"workflow_runs":[
+ {"run_number":$1,"workflow_id":"e2e.yml","status":"$2","event":"schedule","head_branch":"master","run_started_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+]}
+EOF
+}
+
+echo "== case 19: green nightly after green nightly ⇒ NO green-again notice =="
+rm -f "$T/state/e2e.lastrun"
+e2e_api 500 success
+run "$QUIET_J" "$(roster alive 0)"
+e2e_api 501 success
+run "$QUIET_J" "$(roster alive 0)"
+check "no green-again without a prior red" "GREEN again" no
+
+echo "== case 20: red nightly ⇒ one alert, then green ⇒ one green-again, then silent =="
+e2e_api 502 failure
+run "$QUIET_J" "$(roster alive 0)"
+check "nightly red alert" "e2e nightly #502 FAILED" yes
+run "$QUIET_J" "$(roster alive 0)"
+check "no repeat of the same red run" "e2e nightly" no
+e2e_api 503 success
+run "$QUIET_J" "$(roster alive 0)"
+check "green-again after the red" "e2e nightly #503 is GREEN again" yes
+e2e_api 504 success
+run "$QUIET_J" "$(roster alive 0)"
+check "quiet on the next green" "GREEN again" no
+
+echo "== case 21: legacy bare-number state (pre-fix) + green ⇒ no false green-again =="
+echo "504" > "$T/state/e2e.lastrun"
+e2e_api 505 success
+run "$QUIET_J" "$(roster alive 0)"
+check "legacy state does not trigger green-again" "GREEN again" no
+rm -f "$T/api.json"
+
 echo "== case 16: pending invite to the dormant MXID ⇒ one alert (#96) =="
 printf '%s\n' '{"rooms":{"invite":{"!stranded:example.org":{}}}}' > "$T/dormant.json"
 run "$QUIET_J" "$(roster alive 0)"

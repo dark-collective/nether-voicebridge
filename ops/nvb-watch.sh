@@ -242,18 +242,23 @@ if [ -n "$e2e_json" ]; then
         e2e_rn=$(echo "$latest"   | awk '{print $1}')
         e2e_st=$(echo "$latest"   | awk '{print $2}')
         e2e_at=$(echo "$latest"   | awk '{print $3}')
+        # State = "<run_number> <conclusion>" (a bare run number = the pre-fix format, conclusion unknown).
         e2e_prev=$(cat "$E2E_STATE" 2>/dev/null || echo "")
+        e2e_prev_rn=${e2e_prev%% *}
+        e2e_prev_st=""; case "$e2e_prev" in *" "*) e2e_prev_st=${e2e_prev#* } ;; esac
         E2E_DIGEST="| e2e:#$e2e_rn $e2e_st"
         run_url="https://nether.codes/dark/nether-voicebridge/actions/runs/$e2e_rn"
-        if [ "$e2e_rn" != "$e2e_prev" ]; then
+        if [ "$e2e_rn" != "$e2e_prev_rn" ]; then
             # First time we see this run number: alert once on its conclusion.
             if [ "$e2e_st" = "failure" ]; then
                 ALERTS+=("🌙❌ e2e nightly #$e2e_rn FAILED (scheduled $e2e_at) — the live regression harness is RED. Triage: $run_url  (standing cluster: issue #124).")
-            elif [ "$e2e_st" = "success" ] && [ -n "$e2e_prev" ]; then
+            elif [ "$e2e_st" = "success" ] && [ "$e2e_prev_st" = "failure" ]; then
+                # Green-again ONLY after a latched red (like the CI check below) — the old run-number-only latch
+                # announced "GREEN again" after every green night (2026-09-28 → 10-03: six false notices).
                 ALERTS+=("🌙✅ e2e nightly #$e2e_rn is GREEN again (scheduled $e2e_at).")
             fi
             # Only latch a terminal conclusion so an in-progress run re-alerts once it finishes.
-            case "$e2e_st" in success|failure|cancelled) echo "$e2e_rn" > "$E2E_STATE" ;; esac
+            case "$e2e_st" in success|failure|cancelled) echo "$e2e_rn $e2e_st" > "$E2E_STATE" ;; esac
         fi
         # Stale-suite: newest scheduled run older than 30h → cron likely dead
         # (one alert/day via a date stamp so it doesn't spam every 15 min).
