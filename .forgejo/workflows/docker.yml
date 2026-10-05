@@ -20,11 +20,18 @@ permissions:
 # Cloudflare-fronted `nether.codes` path, whose chunked registry blob upload was
 # failing mid-push with 502 / connection-reset. Forgejo stores the package by
 # owner/image regardless of the push host, so external users still
-# `docker pull nether.codes/dark/nether-voicebridge:...` (pulls go through CF
+# `docker pull nether.codes/nether/nether-voicebridge:...` (pulls go through CF
 # fine — only the large push was fragile). The runner's Docker daemon must list
 # this host under `insecure-registries` (it's plain HTTP on the tailnet).
+#
+# The image path follows the repo (`github.repository`). The repo moved from
+# the `dark` user to the `nether` org; packages are stored per owner and don't
+# follow a transfer, so the manifest job also copies every published tag to
+# LEGACY_IMAGE, keeping existing `nether.codes/dark/nether-voicebridge` pulls
+# up to date.
 env:
   REGISTRY: 100.64.0.13:3000
+  LEGACY_IMAGE: dark/nether-voicebridge
 
 jobs:
   image:
@@ -49,12 +56,12 @@ jobs:
             [registry."100.64.0.13:3000"]
               http = true
 
-      # Auth must be the `dark` account: the image namespace `nether.codes/dark/...`
-      # is a USER-owned package registry, and Forgejo only lets the owning user
-      # write to it (no repo-collaborator delegation, since `dark` is a user not an
-      # org). robocub authenticates but gets 401 reqPackageAccess on push.
-      # REGISTRY_TOKEN is a `dark` access token (write:package) stored as a repo
-      # Actions secret — value lives only in Forgejo's secret store, never here.
+      # Auth is the `dark` account: it must write both the `nether` org's
+      # packages (the image path) and the legacy `dark/...` USER namespace,
+      # which Forgejo lets only the owning user write (robocub authenticates
+      # but gets 401 reqPackageAccess there). REGISTRY_TOKEN is a `dark` access
+      # token (write:package) stored as a repo Actions secret — value lives
+      # only in Forgejo's secret store, never here.
       - name: Log in to the Forgejo container registry
         uses: docker/login-action@v3
         with:
@@ -205,6 +212,33 @@ jobs:
             docker buildx imagetools create -t "${repo}:edge" \
               "${repo}:edge" "${repo}:edge-arm64"
           fi
+
+      # Copy the canonical tag(s) just created to the pre-transfer path, so
+      # installs and docs that still say nether.codes/dark/nether-voicebridge
+      # keep getting releases. Same registry: a manifest copy, no rebuild.
+      # Skipped while the repo itself still lives at the legacy path.
+      - name: Mirror tags to the legacy image path
+        run: |
+          set -eu
+          if [ "${{ github.repository }}" = "${LEGACY_IMAGE}" ]; then
+            echo "repo is still at ${LEGACY_IMAGE}; nothing to mirror"
+            exit 0
+          fi
+          repo="${REGISTRY}/${{ github.repository }}"
+          legacy="${REGISTRY}/${LEGACY_IMAGE}"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            ref="${{ github.ref_name }}"
+            tags="$ref"
+            case "$ref" in
+              *-*) : ;;
+              *) tags="$tags latest" ;;
+            esac
+          else
+            tags="edge"
+          fi
+          for t in $tags; do
+            docker buildx imagetools create -t "${legacy}:${t}" "${repo}:${t}"
+          done
 
   # Builds the .deb/.rpm/tarball for BOTH architectures and attaches them to the
   # Forgejo Release for the tag (#49). Tag-only, and runs AFTER `manifest` so a

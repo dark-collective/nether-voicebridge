@@ -51,7 +51,7 @@ approved use case; only a support ticket settles it. Suggested text
 
 > Subject: Use-case confirmation — Discord↔Matrix voice relay bridge
 >
-> Hi — I operate an open-source bridge (AGPL, https://nether.codes/dark/nether-voicebridge) that relays live
+> Hi — I operate an open-source bridge (AGPL, https://nether.codes/nether/nether-voicebridge) that relays live
 > voice between a Discord voice channel and a Matrix room, with the explicit
 > approval of a Manage Server member for every linked channel. Bridged Matrix
 > participants appear as clearly-labelled bots; Discord participants appear as

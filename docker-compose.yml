@@ -1,6 +1,6 @@
 services:
   voicebridge:
-    image: nether.codes/dark/nether-voicebridge:latest
+    image: nether.codes/nether/nether-voicebridge:latest
     restart: unless-stopped
     volumes:
       # Persistent matrix-sdk SQLite store (session state + Olm crypto).
