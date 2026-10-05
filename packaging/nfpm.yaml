@@ -21,7 +21,7 @@ description: |
   drawn from a shared pool; Discord speakers appear in the Element Call as
   appservice ghosts. Single Rust binary; supports per-room media E2EE.
 vendor: "Nether"
-homepage: https://nether.codes/dark/nether-voicebridge
+homepage: https://nether.codes/nether/nether-voicebridge
 license: AGPL-3.0-or-later
 
 contents:

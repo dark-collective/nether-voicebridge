@@ -73,7 +73,7 @@ Thank you.
 **App IDs:** _<fill in the puppet application IDs>_
 **Privacy Policy:** https://nether.wiki/matrix/voice-bridge-privacy/
 **Terms of Service:** https://nether.wiki/matrix/voice-bridge-terms/
-**Project (open source):** https://nether.codes/dark/nether-voicebridge
+**Project (open source):** https://nether.codes/nether/nether-voicebridge
 
 ---
 

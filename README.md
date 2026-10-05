@@ -90,14 +90,14 @@ named participants.*
 The original north star — **hosted, mautrix-style bridging**, where a server
 owner invites the shared bot pool and configures everything **over DM commands**
 without installing anything — **has shipped**: runtime provisioning with tenant
-state that survives restarts ([#4](https://nether.codes/dark/nether-voicebridge/issues/4)),
-the per-`(bot, guild)` shared puppet pool ([#46](https://nether.codes/dark/nether-voicebridge/issues/46)),
-lean send-only ghost crypto ([#44](https://nether.codes/dark/nether-voicebridge/issues/44)),
+state that survives restarts ([#4](https://nether.codes/nether/nether-voicebridge/issues/4)),
+the per-`(bot, guild)` shared puppet pool ([#46](https://nether.codes/nether/nether-voicebridge/issues/46)),
+lean send-only ghost crypto ([#44](https://nether.codes/nether/nether-voicebridge/issues/44)),
 the [management bot](#runtime-bridges--the-management-bot) with
 [two-sided link auth](#two-sided-link-auth),
 [open registration](#open-registration), and the
-[abuse controls](#abuse-controls) ([#43](https://nether.codes/dark/nether-voicebridge/issues/43),
-[#47](https://nether.codes/dark/nether-voicebridge/issues/47)). It's live as the
+[abuse controls](#abuse-controls) ([#43](https://nether.codes/nether/nether-voicebridge/issues/43),
+[#47](https://nether.codes/nether/nether-voicebridge/issues/47)). It's live as the
 [hosted instance](#two-ways-to-get-a-bridge), currently in open beta.
 
 What genuinely remains:
@@ -105,7 +105,7 @@ What genuinely remains:
 - **Clean up and review.** An independent **human code review / security audit** —
   especially of the key-handling and echo-exclusion paths — plus a simplification
   pass, before picking the next big thing.
-  ([#41](https://nether.codes/dark/nether-voicebridge/issues/41))
+  ([#41](https://nether.codes/nether/nether-voicebridge/issues/41))
 - **Per-tenant process isolation.** Tenants currently share one process; a
   crashing bridge shouldn't be able to take its neighbors down. Fine for the
   beta, a real decision at scale.
@@ -115,17 +115,17 @@ What genuinely remains:
 - **Not planned: Discord video relay (webcam / screen share).** Discord's bot API has
   no video send or receive, so this would need automated user accounts ("self-bots"),
   which violate Discord's Terms of Service. The bridge stays bot-only and audio-only
-  on the Discord side. ([#8](https://nether.codes/dark/nether-voicebridge/issues/8))
+  on the Discord side. ([#8](https://nether.codes/nether/nether-voicebridge/issues/8))
 - **Soundboard support.** Bridging Discord's soundboard clips (and/or a Matrix-side
   equivalent) through the audio core.
 - **Interop with mautrix-discord ghosts.** Where a room already runs the
   [mautrix-discord](https://github.com/mautrix/discord) text/chat bridge, exploring
   whether voice ghosts could align with or reuse its existing Discord-user ghosts,
   rather than presenting a second, separate set of puppets/ghosts.
-  ([#12](https://nether.codes/dark/nether-voicebridge/issues/12))
+  ([#12](https://nether.codes/nether/nether-voicebridge/issues/12))
 
 The live roadmap board is at
-[the project's Projects tab](https://nether.codes/dark/nether-voicebridge/projects).
+[the project's Projects tab](https://nether.codes/nether/nether-voicebridge/projects).
 If any of this matters to you, say so in the community room, on
 [Discord](https://discord.gg/BQYxEdu7s2), or on the issue tracker
 (below) — interest is what moves an idea up the list.
@@ -230,7 +230,7 @@ builds, and CI/runner notes.
 ## Install (Debian/Ubuntu & Fedora/RHEL)
 
 Pre-built `.deb` and `.rpm` packages are attached to each
-[release](https://nether.codes/dark/nether-voicebridge/releases). They install the
+[release](https://nether.codes/nether/nether-voicebridge/releases). They install the
 binary to `/usr/bin`, a systemd unit, and an example config, and create a dedicated
 `nether-voicebridge` system user.
 
@@ -262,14 +262,14 @@ the packages yourself (`packaging/build-packages.sh`).
 ### Standalone binary (other distros)
 
 For distros without `.deb`/`.rpm` (Arch, Gentoo, NixOS, …), each
-[release](https://nether.codes/dark/nether-voicebridge/releases) also ships a
+[release](https://nether.codes/nether/nether-voicebridge/releases) also ships a
 self-contained tarball — the binary plus `config.example.toml`, the systemd unit,
 `LICENSE`, and this README — alongside a `SHA256SUMS` file:
 
 ```bash
 ver=<version>   # e.g. 0.2.0
 arch=x86_64     # or aarch64
-base=https://nether.codes/dark/nether-voicebridge/releases/download/v$ver
+base=https://nether.codes/nether/nether-voicebridge/releases/download/v$ver
 curl -LO $base/nether-voicebridge-$ver-$arch-linux.tar.gz
 curl -LO $base/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing   # verify
@@ -438,8 +438,8 @@ see the **[operations runbook](docs/operations-runbook.md)**.
   [`#nether-voicebridge:nether.im`](https://matrix.to/#/%23nether-voicebridge:nether.im)
   — where the work happens.
 - Issues and roadmap: the project's Forgejo repo at
-  [nether.codes/dark/nether-voicebridge](https://nether.codes/dark/nether-voicebridge)
-  — see the [roadmap board](https://nether.codes/dark/nether-voicebridge/projects).
+  [nether.codes/nether/nether-voicebridge](https://nether.codes/nether/nether-voicebridge)
+  — see the [roadmap board](https://nether.codes/nether/nether-voicebridge/projects).
 
 ## License
 

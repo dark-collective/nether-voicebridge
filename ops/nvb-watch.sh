@@ -231,8 +231,8 @@ fi
 E2E_STATE="$STATE_DIR/e2e.lastrun"
 E2E_DIGEST=""
 CI_DIGEST=""
-e2e_json=$(curl -s -m 20 -A "nvb-watch/1.0" \
-    "https://nether.codes/api/v1/repos/dark/nether-voicebridge/actions/tasks?limit=40" 2>/dev/null)
+e2e_json=$(curl -sL -m 20 -A "nvb-watch/1.0" \
+    "https://nether.codes/api/v1/repos/nether/nether-voicebridge/actions/tasks?limit=40" 2>/dev/null)
 if [ -n "$e2e_json" ]; then
     latest=$(printf '%s' "$e2e_json" | jq -r '
         [.workflow_runs[]? | select(.workflow_id=="e2e.yml" and .event=="schedule")]
@@ -247,7 +247,7 @@ if [ -n "$e2e_json" ]; then
         e2e_prev_rn=${e2e_prev%% *}
         e2e_prev_st=""; case "$e2e_prev" in *" "*) e2e_prev_st=${e2e_prev#* } ;; esac
         E2E_DIGEST="| e2e:#$e2e_rn $e2e_st"
-        run_url="https://nether.codes/dark/nether-voicebridge/actions/runs/$e2e_rn"
+        run_url="https://nether.codes/nether/nether-voicebridge/actions/runs/$e2e_rn"
         if [ "$e2e_rn" != "$e2e_prev_rn" ]; then
             # First time we see this run number: alert once on its conclusion.
             if [ "$e2e_st" = "failure" ]; then
@@ -292,7 +292,7 @@ if [ -n "$e2e_json" ]; then
         ci_st=${latest_ci##* }
         ci_prev=$(cat "$CI_STATE" 2>/dev/null || echo "")
         CI_DIGEST="| ci:#$ci_rn $ci_st"
-        ci_url="https://nether.codes/dark/nether-voicebridge/actions/runs/$ci_rn"
+        ci_url="https://nether.codes/nether/nether-voicebridge/actions/runs/$ci_rn"
         if [ "$latest_ci" != "$ci_prev" ]; then
             case "$ci_st" in
                 failure)

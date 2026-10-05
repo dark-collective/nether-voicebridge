@@ -2,7 +2,7 @@
 
 Pre-built `.deb` and `.rpm` packages let server admins install the bridge as a
 native systemd service without Docker. Packages are attached to each
-[release](https://nether.codes/dark/nether-voicebridge/releases) and built by
+[release](https://nether.codes/nether/nether-voicebridge/releases) and built by
 [`nfpm`](https://nfpm.goreleaser.com/) from a single spec, `packaging/nfpm.yaml`.
 
 ## What the package installs

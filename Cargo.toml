@@ -26,8 +26,8 @@ default-members = [
 version = "0.4.1"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-repository = "https://nether.codes/dark/nether-voicebridge"
-homepage = "https://nether.codes/dark/nether-voicebridge"
+repository = "https://nether.codes/nether/nether-voicebridge"
+homepage = "https://nether.codes/nether/nether-voicebridge"
 
 # Strip symbols from release builds. The binary statically links libwebrtc and is
 # huge with symbols (the debug build is ~900 MB); stripping cuts it several-fold so

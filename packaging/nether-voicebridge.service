@@ -1,6 +1,6 @@
 [Unit]
 Description=Nether Voice Bridge (Discord <-> Matrix voice bridge)
-Documentation=https://nether.codes/dark/nether-voicebridge
+Documentation=https://nether.codes/nether/nether-voicebridge
 After=network-online.target
 Wants=network-online.target
 

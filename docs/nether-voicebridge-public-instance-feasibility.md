@@ -5,7 +5,7 @@ Status: **analysis only** (not a build order). Companion to
 
 ## The ask
 
-[Issue #43](https://nether.codes/dark/nether-voicebridge/issues/43) (enhancement
+[Issue #43](https://nether.codes/nether/nether-voicebridge/issues/43) (enhancement
 / question) asks whether nether-voicebridge could offer a **hosted, mautrix-style
 public instance**: rather than self-hosting, a user invites a management bot,
 links their Discord voice channel to a Matrix room, and controls the bridge
