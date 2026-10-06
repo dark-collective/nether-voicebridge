@@ -155,6 +155,29 @@ impl LinkBoard {
         p.matrix.iter().filter(|m| !self.matrix_excluded_in(&p, m)).count()
     }
 
+    /// Is this call member a listener WITHOUT a puppet — present, bridge-owned only
+    /// because its paired Discord account is in the channel (not a service account,
+    /// not config-excluded)? ADR 0003: such a person still listens from Matrix.
+    pub fn matrix_listener_only(&self, mxid: &str) -> bool {
+        let p = self.presence.lock().unwrap_or_else(PoisonError::into_inner);
+        p.matrix.contains(mxid) && !self.never_listens(mxid) && self.matrix_excluded_in(&p, mxid)
+    }
+
+    /// Call members present who LISTEN from Matrix (ADR 0003): every member except
+    /// service accounts and config-excluded ones — paired members included, unlike
+    /// [`matrix_humans`](Self::matrix_humans). Drives "call active" and the Discord
+    /// capture anchor; `matrix_humans` keeps deciding who gets a puppet.
+    pub fn matrix_listeners(&self) -> usize {
+        let p = self.presence.lock().unwrap_or_else(PoisonError::into_inner);
+        p.matrix.iter().filter(|m| !self.never_listens(m)).count()
+    }
+
+    /// Service accounts and config-excluded members are helpers, not people: they
+    /// neither speak through a puppet nor count as listeners.
+    fn never_listens(&self, mxid: &str) -> bool {
+        self.config_matrix.contains(mxid) || self.services.is_service(&self.room_id, mxid)
+    }
+
     /// Voice members present and NOT bridge-owned — the Discord "humans".
     pub fn discord_humans(&self) -> usize {
         let p = self.presence.lock().unwrap_or_else(PoisonError::into_inner);
@@ -365,6 +388,32 @@ mod tests {
             sa.approve(ROOM, s, "test", 0).unwrap();
         }
         LinkBoard::new(ROOM, ps, sa, cfg_d.iter().copied(), cfg_m.iter().map(|s| s.to_string()))
+    }
+
+    /// ADR 0003: a present pair is bridge-owned (no puppet) but its Matrix half still
+    /// LISTENS; service accounts and config-excluded members never do.
+    #[test]
+    fn paired_matrix_half_is_a_listener_but_not_a_human() {
+        let b = board(&[(ALICE, 1)], &["@helper:hs"], &[], &["@cfg:hs"]);
+        b.set_matrix_present(ALICE, true);
+        assert_eq!((b.matrix_humans(), b.matrix_listeners()), (1, 1));
+        assert!(!b.matrix_listener_only(ALICE), "puppeted, an ordinary member");
+        b.set_discord_present(1, true); // the pair is complete
+        assert!(b.matrix_excluded(ALICE));
+        assert_eq!((b.matrix_humans(), b.matrix_listeners()), (0, 1), "no puppet, still listening");
+        assert!(b.matrix_listener_only(ALICE));
+        assert_eq!(b.discord_humans(), 0, "the Discord half is not a Discord listener");
+        b.set_matrix_present("@helper:hs", true);
+        b.set_matrix_present("@cfg:hs", true);
+        assert_eq!(b.matrix_listeners(), 1, "service + config-excluded accounts never listen");
+        assert!(!b.matrix_listener_only("@helper:hs"));
+        assert!(!b.matrix_listener_only("@cfg:hs"));
+        b.set_discord_present(1, false); // Discord half leaves → ordinary again
+        assert!(!b.matrix_listener_only(ALICE));
+        assert_eq!((b.matrix_humans(), b.matrix_listeners()), (1, 1));
+        b.set_matrix_present(ALICE, false);
+        assert!(!b.matrix_listener_only(ALICE), "absent members are nothing");
+        assert_eq!(b.matrix_listeners(), 0);
     }
 
     #[test]

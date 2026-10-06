@@ -205,7 +205,9 @@ your Matrix account is in that room's call, the bridge creates no ghost and no
 puppet for you and doesn't count you twice. On every other occasion you are an
 ordinary participant — nothing is stored about where you are, only that the two
 accounts belong together. If your Discord side drops out while you stay in the
-call, you get a puppet again automatically and the bot tells you once.
+call, you get a puppet again automatically and the bot tells you once. You keep hearing the
+Discord side in the call the whole time: while you are paired and present, a bridge bot may sit in the
+voice channel under its standby name to carry the Discord speakers to you.
 
 - `pairings` lists your pairings; `unpair [discord-user-id]` removes one or all;
   `/bridge unpair` on Discord does the same from that side.

@@ -190,14 +190,15 @@ async fn apply_member_event(
         // Linked identities (ADR 0001): record the arrival; if it flips a paired
         // Discord member's status the Discord side retires that ghost; and a
         // member who is bridge-owned (paired half present / service account /
-        // config-excluded) gets no puppet and does not count as a human.
-        let humans_before = links.matrix_humans();
+        // config-excluded) gets no puppet. ADR 0003: "call active" counts
+        // LISTENERS — the Matrix half of a present pairing still listens.
+        let listeners_before = links.matrix_listeners();
         links.dispatch_all(links.set_matrix_present(user_id.as_str(), true));
         let excluded = links.matrix_excluded(user_id.as_str());
-        let humans_after = links.matrix_humans();
+        let listeners_after = links.matrix_listeners();
         // Genuinely new (or rejoining after a real, already-applied leave).
-        let _ = became_nonempty; // superseded by the human count below
-        if humans_before == 0 && humans_after > 0 {
+        let _ = became_nonempty; // superseded by the listener count below
+        if listeners_before == 0 && listeners_after > 0 {
             tracing::info!("call active");
             let _ = call_active_tx.send(true);
         }
@@ -206,7 +207,13 @@ async fn apply_member_event(
         // membership-generation watch the ghost key-distribution loops wait on.
         members_gen_tx.send_modify(|g| *g = g.wrapping_add(1));
         if excluded {
-            tracing::info!(mxid = %user_id, "member joined — bridge-owned (paired Discord account present, service account, or excluded) — no puppet");
+            if links.matrix_listener_only(user_id.as_str()) {
+                // ADR 0003: no puppet, but they listen — keep Discord capture for them.
+                tracing::info!(mxid = %user_id, "member joined — paired Discord account present — no puppet, listening");
+                router.listen(user_id.as_str());
+            } else {
+                tracing::info!(mxid = %user_id, "member joined — bridge-owned (service account or excluded) — no puppet");
+            }
             return;
         }
         let name = resolve_member_name(room, &user_id).await;
@@ -250,10 +257,11 @@ async fn apply_member_event(
                 if still_absent {
                     tracing::info!(mxid = %mxid, "leave grace elapsed — releasing puppet");
                     router.release(mxid.as_str());
+                    router.unlisten(mxid.as_str());
                     // Linked identities: the leave is now effective — a paired Discord
                     // member still in the channel gets its ghost back (Discord side).
                     links.dispatch_all(links.set_matrix_present(mxid.as_str(), false));
-                    if links.matrix_humans() == 0 {
+                    if links.matrix_listeners() == 0 {
                         tracing::info!("call ended (after grace)");
                         let _ = call_active_tx.send(false);
                     }
@@ -1164,7 +1172,10 @@ pub(crate) async fn run(
                     };
                     match ev {
                         LinkEvent::MatrixExcluded(mxid) => {
-                            tracing::info!(mxid = %mxid, "member is now bridge-owned (its paired Discord account joined the channel) — releasing puppet");
+                            tracing::info!(mxid = %mxid, "member is now bridge-owned (its paired Discord account joined the channel) — releasing puppet, still listening");
+                            // Listen FIRST so the pool keeps the capture anchor through the
+                            // puppet's release (ADR 0003).
+                            router.listen(&mxid);
                             router.release(&mxid);
                         }
                         LinkEvent::MatrixIncluded { user, discord_half_vanished } => {
@@ -1178,6 +1189,8 @@ pub(crate) async fn run(
                             };
                             tracing::info!(mxid = %user, display_name = %name, discord_half_vanished, "member is no longer bridge-owned — assigning puppet");
                             router.assign(&user, &name);
+                            router.unlisten(&user); // after the assign: the anchor never lapses
+
                             if discord_half_vanished {
                                 // Notice to the person (and their delegate) — delivered by the
                                 // management bot when one is running (see `LinkNotice`).

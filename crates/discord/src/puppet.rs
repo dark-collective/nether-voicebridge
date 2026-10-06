@@ -360,6 +360,11 @@ struct ChannelState {
     /// fires `release_capture_only_anchor_if_idle` so the bot leaves voice if still
     /// idle. `Some` only while such a timer is armed.
     anchor_idle_release: Option<CancellationToken>,
+    /// Matrix call members who listen WITHOUT a puppet (ADR 0003: the Matrix half of
+    /// a present pairing). While non-empty the channel keeps a capture anchor in
+    /// voice even with no puppet assigned — capture-only, standby nickname — so the
+    /// Discord speakers keep reaching the call.
+    listeners: HashSet<String>,
 }
 
 impl ChannelState {
@@ -773,6 +778,7 @@ impl SharedPool {
             links,
             ghost_ctx: Arc::new(RwLock::new(None)),
             anchor_idle_release: None,
+            listeners: HashSet::new(),
         };
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
         // A silently-replaced ChannelState would orphan the old channel's
@@ -1316,11 +1322,17 @@ impl SharedPool {
             .channels
             .iter()
             .filter(|(_, ch)| {
-                ch.anchor.load(Ordering::Relaxed) == NO_ANCHOR && !ch.assignments.is_empty()
+                ch.anchor.load(Ordering::Relaxed) == NO_ANCHOR
+                    && (!ch.assignments.is_empty() || !ch.listeners.is_empty())
             })
             .map(|(k, ch)| (k.clone(), ch.guild_id))
             .collect();
         for (key, guild) in pending {
+            // Only listeners waiting (ADR 0003): a capture-only anchor, no steal.
+            if guard.channels.get(&key).is_some_and(|ch| ch.assignments.is_empty()) {
+                self.ensure_capture_anchor(guard, &key, false);
+                continue;
+            }
             if let Some(idx) = self.take_free_bot(guard, guild) {
                 self.activate_channel_with(guard, &key, idx);
             }
@@ -1680,7 +1692,9 @@ impl SharedPool {
                 .assignments
                 .values()
                 .any(|a| matches!(a, Assign::Puppet { idx: i, .. } if *i == idx));
-            if serves && ch.anchor.load(Ordering::Relaxed) == idx {
+            // ADR 0003: a capture-only anchor acquired for listeners serves nobody.
+            let for_listeners = ch.puppet_count() == 0 && !ch.listeners.is_empty();
+            if (serves || for_listeners) && ch.anchor.load(Ordering::Relaxed) == idx {
                 self.send_cmd(idx, PuppetCommand::BecomeAnchor { guild });
                 tracing::info!(bridge = %ch.bridge, idx, "puppet joined — activating capture anchor");
                 break;
@@ -1740,9 +1754,25 @@ impl SharedPool {
                 })
             });
         let Some((bridge, key)) = found else {
-            // Participant already left during the join — just free the bot there.
+            // Participant already left during the join — or the bot was a capture-only
+            // anchor serving nobody. Free it there; a channel that lost its anchor this
+            // way gets a fresh one if listeners still need capture (ADR 0003).
             guard.sessions.remove(&(idx, guild));
-            tracing::warn!(idx, "puppet freed; assignment already gone");
+            let orphaned: Vec<String> = guard
+                .channels
+                .iter()
+                .filter(|(_, ch)| ch.guild_id == guild && ch.anchor.load(Ordering::Relaxed) == idx)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for b in &orphaned {
+                guard.channels.get_mut(b).unwrap().anchor.store(NO_ANCHOR, Ordering::Relaxed);
+                self.send_cmd(idx, PuppetCommand::Release { guild });
+                tracing::warn!(bridge = %b, idx, "capture-only anchor unavailable here — re-anchoring");
+                self.ensure_capture_anchor(guard, b, false);
+            }
+            if orphaned.is_empty() {
+                tracing::warn!(idx, "puppet freed; assignment already gone");
+            }
             return;
         };
 
@@ -1999,6 +2029,100 @@ impl SharedPool {
         }
     }
 
+    /// ADR 0003: `key` listens from Matrix without a puppet. Keep — or acquire — the
+    /// channel's capture anchor while any such listener is present. Idempotent.
+    fn listen(self: &Arc<Self>, bridge: &str, key: &str) {
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = &mut *guard;
+        let Some(ch) = guard.channels.get_mut(bridge) else { return };
+        if !ch.listeners.insert(key.to_owned()) {
+            return;
+        }
+        Self::cancel_anchor_idle_release(guard, bridge);
+        tracing::info!(bridge, key, "listener without a puppet — keeping a capture anchor for them");
+        self.ensure_capture_anchor(guard, bridge, true);
+    }
+
+    /// The listener left or became an ordinary (puppeted) participant again. With no
+    /// listener and no puppet left, the anchor follows the same rule as after the
+    /// last puppet's release: kept briefly (grace) while Discord speakers remain,
+    /// released at once otherwise. Idempotent.
+    fn unlisten(self: &Arc<Self>, bridge: &str, key: &str) {
+        let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = &mut *guard;
+        let Some(ch) = guard.channels.get_mut(bridge) else { return };
+        if !ch.listeners.remove(key) {
+            return;
+        }
+        tracing::info!(bridge, key, "listener gone");
+        if !ch.listeners.is_empty() || ch.puppet_count() > 0 || ch.anchor.load(Ordering::Relaxed) == NO_ANCHOR {
+            return;
+        }
+        let speakers = !ch.user_sinks.read().unwrap_or_else(PoisonError::into_inner).is_empty();
+        if speakers {
+            tracing::info!(bridge, "last listener gone but Discord speakers remain — keeping capture-only anchor (grace before release)");
+            self.schedule_anchor_idle_release(guard, bridge);
+        } else {
+            self.release_anchor_locked(guard, bridge, "last listener gone, no Discord speakers");
+            self.rebalance(guard);
+        }
+    }
+
+    /// Give `bridge` a capture-only anchor if it has none: a free bot in its guild
+    /// (or, with `allow_steal`, one stolen from a channel with slack) joins voice with
+    /// the standby nickname and no participant of its own. A later participant reuses
+    /// it (Fix 2c). Caller holds the alloc lock.
+    fn ensure_capture_anchor(&self, guard: &mut AllocState, bridge: &str, allow_steal: bool) {
+        let Some(ch) = guard.channels.get(bridge) else { return };
+        if ch.anchor.load(Ordering::Relaxed) != NO_ANCHOR {
+            return;
+        }
+        let guild = ch.guild_id;
+        let idx = match self.take_free_bot(guard, guild) {
+            Some(i) => i,
+            None => match allow_steal.then(|| self.steal_for_activation(guard, bridge, guild)).flatten() {
+                Some(i) => i,
+                None => {
+                    tracing::warn!(bridge, "no free bot to capture Discord audio for a listener — waiting for one");
+                    return;
+                }
+            },
+        };
+        let Some(ch) = guard.channels.get_mut(bridge) else {
+            guard.sessions.remove(&(idx, guild));
+            return;
+        };
+        ch.anchor.store(idx, Ordering::Relaxed);
+        let ctx = self.ctx_for(ch);
+        let mixer = guard
+            .sessions
+            .get(&(idx, guild))
+            .map(|s| s.mixer.clone())
+            .unwrap_or_else(|| Arc::new(PlaybackMixer::new()));
+        self.send_cmd(idx, PuppetCommand::Assign { ctx: Box::new(ctx), display_name: String::new(), mixer });
+        self.send_cmd(idx, PuppetCommand::SetStandbyNickname { guild });
+        tracing::info!(bridge, idx, "capture-only anchor acquired for a listener (activates after join)");
+    }
+
+    /// Release `bridge`'s anchor bot outright (it serves no participant). Caller
+    /// holds the alloc lock and rebalances.
+    fn release_anchor_locked(&self, guard: &mut AllocState, bridge: &str, why: &str) {
+        let Some(ch) = guard.channels.get_mut(bridge) else { return };
+        let idx = ch.anchor.load(Ordering::Relaxed);
+        if idx == NO_ANCHOR {
+            return;
+        }
+        let guild = ch.guild_id;
+        ch.anchor.store(NO_ANCHOR, Ordering::Relaxed);
+        ch.overflow_mixer.clear();
+        if let Some(t) = ch.anchor_idle_release.take() {
+            t.cancel();
+        }
+        guard.sessions.remove(&(idx, guild));
+        self.send_cmd(idx, PuppetCommand::Release { guild });
+        tracing::info!(bridge, idx, why, "released capture-only anchor");
+    }
+
     fn set_muted(&self, bridge: &str, key: &str, muted: bool) {
         let mut guard = self.alloc.lock().unwrap_or_else(PoisonError::into_inner);
         let guard = &mut *guard;
@@ -2149,7 +2273,11 @@ impl SharedPool {
                             .read()
                             .unwrap_or_else(PoisonError::into_inner)
                             .is_empty();
-                        if is_anchor && speakers_present {
+                        // ADR 0003: a listener without a puppet (the Matrix half of a
+                        // present pairing) also needs the capture path — keep the
+                        // anchor for as long as one is present, with no grace timer.
+                        let listeners = !guard.channels[bridge].listeners.is_empty();
+                        if is_anchor && (speakers_present || listeners) {
                             // Drop only its playback identity; keep the session +
                             // anchor so it stays un-allocatable and still the
                             // elected anchor.
@@ -2159,8 +2287,12 @@ impl SharedPool {
                             }
                             self.send_cmd(idx, PuppetCommand::SetStandbyNickname { guild });
                             self.send_cmd(idx, PuppetCommand::SetMuted { guild, muted: false });
-                            tracing::info!(bridge, key, idx, "last puppet released but Discord speakers remain — keeping capture-only anchor (grace before release)");
-                            self.schedule_anchor_idle_release(guard, bridge);
+                            if listeners {
+                                tracing::info!(bridge, key, idx, "last puppet released — keeping capture-only anchor for listeners without a puppet");
+                            } else {
+                                tracing::info!(bridge, key, idx, "last puppet released but Discord speakers remain — keeping capture-only anchor (grace before release)");
+                                self.schedule_anchor_idle_release(guard, bridge);
+                            }
                             return;
                         }
                         // No overflow waiting, no capture need → free the bot.
@@ -2248,7 +2380,11 @@ impl SharedPool {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .is_empty();
-        let keep_anchor = keep_capture_anchor && anchor != NO_ANCHOR && speakers_present;
+        if !keep_capture_anchor {
+            ch.listeners.clear(); // a drain ends listening too
+        }
+        let listeners = !ch.listeners.is_empty();
+        let keep_anchor = keep_capture_anchor && anchor != NO_ANCHOR && (speakers_present || listeners);
         let mut anchor_freed = false;
         for (_key, assign) in ch.assignments.drain() {
             if let Assign::Puppet { idx, .. } = assign {
@@ -2282,7 +2418,9 @@ impl SharedPool {
         if !keep_anchor {
             ch.anchor.store(NO_ANCHOR, Ordering::Relaxed);
         }
-        if keep_anchor {
+        if keep_anchor && listeners {
+            tracing::info!(bridge, idx = anchor, "all puppets released — keeping capture-only anchor for listeners without a puppet");
+        } else if keep_anchor {
             tracing::info!(
                 bridge,
                 idx = anchor,
@@ -2333,7 +2471,7 @@ impl SharedPool {
                 .values()
                 .any(|a| matches!(a, Assign::Puppet { .. }));
             let speakers = !ch.user_sinks.read().unwrap_or_else(PoisonError::into_inner).is_empty();
-            if has_puppet || speakers {
+            if has_puppet || speakers || !ch.listeners.is_empty() {
                 return; // still in use on one side — keep the anchor
             }
             (anchor, ch.guild_id)
@@ -2397,8 +2535,8 @@ impl SharedPool {
                 .assignments
                 .values()
                 .any(|a| matches!(a, Assign::Puppet { .. }));
-            if any_puppet {
-                return; // a Matrix participant is present — keep the capture path
+            if any_puppet || !ch.listeners.is_empty() {
+                return; // a Matrix participant (or listener, ADR 0003) is present — keep the capture path
             }
             (anchor, ch.guild_id)
         };
@@ -2496,6 +2634,12 @@ impl PlaybackRouter for ChannelView {
     }
     fn release_all(&self) {
         self.pool.release_all(&self.key)
+    }
+    fn listen(&self, key: &str) {
+        self.pool.listen(&self.key, key)
+    }
+    fn unlisten(&self, key: &str) {
+        self.pool.unlisten(&self.key, key)
     }
 }
 
@@ -5242,6 +5386,96 @@ mod tests {
             );
             assert_eq!(p.test_free_count(), 0, "round {round}: all bots back on A");
         }
+    }
+
+    // ── ADR 0003: listeners without a puppet keep the capture anchor ──────────────
+
+    #[tokio::test]
+    async fn listener_alone_acquires_a_capture_only_anchor_that_a_participant_reuses() {
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        p.listen("A", "@dark:hs");
+        let anchor = p.test_anchor("A").expect("a listener alone gets a capture anchor");
+        assert_eq!(p.test_free_count(), 1, "one bot in voice for capture");
+        assert!(p.test_slot_of("A", "@dark:hs").is_none(), "the listener has no puppet");
+        p.listen("A", "@dark:hs"); // idempotent
+        assert_eq!(p.test_free_count(), 1);
+        p.assign("A", "bob", "Bob");
+        assert_eq!(p.test_slot_of("A", "bob"), Some(anchor), "bob reuses the capture-only anchor");
+        assert_eq!(p.test_free_count(), 1, "no extra bot");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_puppet_leaving_keeps_the_anchor_for_a_listener_beyond_the_grace() {
+        let timing = TimingConfig { anchor_idle_grace_ms: 5_000, ..TimingConfig::default() };
+        let p = pool_with_timing(2, &timing);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        let anchor = p.test_anchor("A").unwrap();
+        p.listen("A", "@dark:hs"); // the 2026-10-06 case: the paired person's puppet goes…
+        p.release("A", "alice");
+        assert_eq!(p.test_anchor("A"), Some(anchor), "kept for the listener");
+        tokio::time::sleep(Duration::from_millis(60_000)).await;
+        assert_eq!(p.test_anchor("A"), Some(anchor), "…and the anchor must NOT time out under them");
+        p.unlisten("A", "@dark:hs"); // no speakers → released at once
+        assert_eq!(p.test_anchor("A"), None);
+        assert_eq!(p.test_free_count(), 2, "connection count back to baseline");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_listener_leaving_with_speakers_arms_the_idle_grace() {
+        let timing = TimingConfig { anchor_idle_grace_ms: 5_000, ..TimingConfig::default() };
+        let p = pool_with_timing(2, &timing);
+        channel(&p, "A", 1, 10);
+        p.listen("A", "@dark:hs");
+        let anchor = p.test_anchor("A").unwrap();
+        mark_speaker(&p, "A", 999);
+        p.unlisten("A", "@dark:hs");
+        assert_eq!(p.test_anchor("A"), Some(anchor), "kept briefly (flap tolerance)");
+        p.unlisten("A", "@dark:hs"); // idempotent
+        tokio::time::sleep(Duration::from_millis(5_200)).await;
+        assert_eq!(p.test_anchor("A"), None, "released after the grace");
+        assert_eq!(p.test_free_count(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listener_returning_within_the_grace_cancels_the_release() {
+        let timing = TimingConfig { anchor_idle_grace_ms: 5_000, ..TimingConfig::default() };
+        let p = pool_with_timing(2, &timing);
+        channel(&p, "A", 1, 10);
+        p.listen("A", "@dark:hs");
+        let anchor = p.test_anchor("A").unwrap();
+        mark_speaker(&p, "A", 999);
+        p.unlisten("A", "@dark:hs");
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        p.listen("A", "@dark:hs");
+        tokio::time::sleep(Duration::from_millis(10_000)).await;
+        assert_eq!(p.test_anchor("A"), Some(anchor), "the cancelled timer must not fire");
+    }
+
+    #[tokio::test]
+    async fn call_end_keeps_the_anchor_while_a_listener_remains_and_drain_clears_it() {
+        let p = pool(2);
+        channel(&p, "A", 1, 10);
+        p.assign("A", "alice", "Alice");
+        p.listen("A", "@dark:hs");
+        let anchor = p.test_anchor("A").unwrap();
+        p.release_all("A");
+        assert_eq!(p.test_anchor("A"), Some(anchor), "listener still present → capture stays");
+        p.unregister_channel("A");
+        assert_eq!(p.test_free_count(), 2, "a drain returns to baseline regardless");
+    }
+
+    #[tokio::test]
+    async fn listener_waits_for_a_bot_and_gets_one_when_freed() {
+        let p = pool(1);
+        channel(&p, "A", 1, 10);
+        channel(&p, "B", 1, 20);
+        p.assign("B", "carol", "Carol"); // the only bot serves B
+        p.listen("A", "@dark:hs");
+        assert_eq!(p.test_anchor("A"), None, "no bot to spare, and an anchor is never stolen");
+        p.release("B", "carol"); // frees the bot → service_pending re-anchors A
+        assert!(p.test_anchor("A").is_some(), "the waiting listener's channel gets the freed bot");
     }
 
     /// Catalogue: anchor idle release. A capture-only anchor (Discord speakers

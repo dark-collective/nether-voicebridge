@@ -1,6 +1,6 @@
 # ADR 0003 — A paired person in the call is still a Matrix listener
 
-**Status:** Proposed (2026-10-06). **Deciders:** operator + Claude. **Amends:** ADR 0001 §2 (the lifecycle half of
+**Status:** Accepted (2026-10-07; operator chose the rule change over a per-pairing setting). **Deciders:** operator + Claude. **Amends:** ADR 0001 §2 (the lifecycle half of
 the presence rule).
 
 ## Context
@@ -25,7 +25,7 @@ ghosts play, and `M`'s Matrix client plays them too. All it really does is switc
 to be the only Matrix participant — the one case where `M` most needs it if their Discord half does not play audio to
 them (a companion client that only speaks, a muted desk client, a headless helper).
 
-## Decision (proposed)
+## Decision
 
 Split the two meanings of "human" that ADR 0001 merged:
 
@@ -73,3 +73,13 @@ Discord speaker → the speaker's ghost audio reaches the call.
 
 **Docs:** ADR 0001 gets a pointer to this ADR; the self-serve pairing section says the bridge keeps carrying the Discord
 side to you while you are paired.
+
+**Implementation (0.4.2):** `LinkBoard::matrix_listeners` / `matrix_listener_only`; the Matrix side drives call-active
+from listeners and calls `PlaybackRouter::listen` / `unlisten` on join, leave and pairing transitions (listen *before*
+the puppet's release, unlisten *after* a re-assign, so the anchor never lapses); the Discord pool keeps a per-channel
+listener set, acquires a capture-only anchor for a lone listener (`ensure_capture_anchor`, standby nickname) and keeps
+it through every release path while a listener is present.
+
+**Future (operator, 2026-10-07):** a companion client that speaks for its person may later also *capture* the Discord
+side for them, so no bridge bot is needed in the channel while they are the only Matrix participant. That needs a new,
+explicit contract between the bridge and such clients — a separate ADR.
