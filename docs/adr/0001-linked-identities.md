@@ -1,7 +1,7 @@
 # ADR 0001 — Linked identities, presence-based exclusion, and companion clients
 
 **Status:** Accepted (2026-10-01; terminology revised 2026-10-02 — decision unchanged).
-**Deciders:** operator + Claude. **Supersedes:** none. **Amended by:** ADR 0002 (§7 item 2).
+**Deciders:** operator + Claude. **Supersedes:** none. **Amended by:** ADR 0002 (§7 item 2), ADR 0003 (§2 lifecycle).
 
 ## Context
 
@@ -152,3 +152,6 @@ two new DM commands + one slash command.
 (ADR 0002).
 
 **Follow-ups:** ADR 0002; privacy-policy paragraph; docs/self-serve-bridging section.
+
+**Amended by ADR 0003** (2026-10-07): the Matrix half of a present pairing still counts as a *listener* — the
+bridge keeps carrying the Discord side to them — though not as a represented participant.

@@ -3,6 +3,24 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.2] - 2026-10-07
+
+**A paired person in the call keeps hearing the Discord side (ADR 0003).**
+
+### Fixed
+- **Discord audio stopped reaching a paired person.** While both halves of a pairing were present, the bridge
+  counted the person as nobody: with no other Matrix participant, the Discord capture bot left after its idle grace
+  and the Discord speakers' ghosts went silent. The Matrix half of a present pairing now counts as a **listener**:
+  "call active" and the capture anchor follow listeners, so the anchor stays — capture-only, standby nickname —
+  while the person is in the call. Puppets and ghosts are unchanged: still none for a present pair, and neither
+  half's audio is forwarded.
+- A capture-only anchor whose voice join failed stayed recorded as the channel's anchor; it is now cleared and,
+  if a listener needs capture, replaced.
+
+### Added
+- `PlaybackRouter::listen` / `unlisten` (default no-ops) and `LinkBoard::matrix_listeners` /
+  `matrix_listener_only`.
+
 ## [0.4.1] - 2026-10-01
 
 **Hotfix: a bridge-owned member's audio track no longer mints a puppet.**

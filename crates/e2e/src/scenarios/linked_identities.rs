@@ -40,6 +40,9 @@ const GHOST_ASSIGNED: &str = "ghost assigned";
 const NO_GHOST: &str = "voice member is bridge-owned"; // "... (paired/excluded) — no ghost"
 const GHOST_RETIRED: &str = "ghost retired"; // "ghost retired — member is now bridge-owned (...)"
 const GHOST_BACK: &str = "minting ghost"; // "member is no longer bridge-owned (...) — minting ghost"
+const ANCHOR_KEPT_FOR_LISTENER: &str = "keeping capture-only anchor for listeners without a puppet";
+const ANCHOR_ACQUIRED_FOR_LISTENER: &str = "capture-only anchor acquired for a listener";
+const ANCHOR_IDLE_LAPSED: &str = "capture-only anchor idle grace elapsed";
 
 async fn run(ctx: Arc<Ctx>) -> Result<()> {
     let cfg = &ctx.cfg;
@@ -121,7 +124,21 @@ async fn drive(
         .await_event(wait, since_now(NO_GHOST))
         .await
         .context("A: the paired Discord account should get no ghost")?;
-    eprintln!("   order A: both present — puppet released, no ghost; dropping the Discord half");
+    // ADR 0003: the paired person still LISTENS from Matrix — the capture anchor stays (capture-only) instead of
+    // leaving after its idle grace (the 2026-10-06 silence: nobody counted, anchor gone, ghosts mute).
+    bridge
+        .scraper
+        // Kept through the puppet's release, or — when the playback consumer released the puppet a moment before
+        // the pairing transition said "listen" — re-acquired for the listener. Either way: capture continues.
+        .await_event(wait, |e: &crate::logscrape::LogEvent| {
+            e.message.contains(ANCHOR_KEPT_FOR_LISTENER) || e.message.contains(ANCHOR_ACQUIRED_FOR_LISTENER)
+        })
+        .await
+        .context("A: the capture anchor should be kept (or acquired) for the paired listener")?;
+    tokio::time::sleep(Duration::from_secs(5)).await; // > the compressed anchor-idle grace (3 s)
+    let lapsed = bridge.scraper.events_matching(|e| e.message.contains(ANCHOR_IDLE_LAPSED));
+    anyhow::ensure!(lapsed.is_empty(), "A: the capture anchor left although the paired person was still listening");
+    eprintln!("   order A: both present — puppet released, no ghost, capture kept; dropping the Discord half");
 
     let _ = listener.stop().await;
     bridge

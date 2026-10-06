@@ -52,6 +52,16 @@ pub trait PlaybackRouter: Send + Sync {
     /// per-track [`release`](Self::release) so a torn-down call leaves no puppet
     /// stuck in the channel.
     fn release_all(&self);
+
+    /// A call member who gets **no** puppet but still **listens** from Matrix (ADR
+    /// 0003: the Matrix half of a present pairing). The Discord side keeps (or
+    /// acquires) a capture anchor while any such listener is present, so the Discord
+    /// speakers' audio keeps reaching the call. Idempotent; a no-op by default.
+    fn listen(&self, _key: &str) {}
+
+    /// The listener left (or became an ordinary, puppeted participant again).
+    /// Idempotent; a no-op for an unknown `key` and by default.
+    fn unlisten(&self, _key: &str) {}
 }
 
 /// A sink for one Discord speaker's mono audio (48 kHz, 20 ms frames as the
