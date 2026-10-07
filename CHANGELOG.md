@@ -3,6 +3,13 @@
 All notable changes to Nether Voice Bridge are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **More release downloads (x86_64):** a **fully static** binary tarball (`…-x86_64-linux-static.tar.gz`; no
+  runtime dependencies, runs on Alpine/musl and old glibc) and an **AppImage**, alongside the existing `.deb`,
+  `.rpm`, and tarball (still both arches). `SHA256SUMS` now covers every asset. See `docs/packaging.md`.
+
 ## [0.4.2] - 2026-10-07
 
 **A paired person in the call keeps hearing the Discord side (ADR 0003).**

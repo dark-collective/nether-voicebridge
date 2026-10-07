@@ -38,6 +38,43 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release --locked -p nether-voicebridge
 
+# ── Static binary (release asset only, not part of the image) ────────────────
+# Built only with `--target static` (the release workflow's static jobs export
+# it via `--output type=local`); the default target below never runs these.
+#
+# A fully static glibc executable: +crt-static, non-PIE (glibc's static-pie
+# startup crashes with this link), GNU ld instead of rust-lld, glib's whole
+# static dependency closure (webrtc-sys links glib/gobject/gio) in one group
+# with libc, and packaging/static/static-cc.sh forcing every lib to its .a.
+# Runs on musl (Alpine) and old-glibc hosts alike. glibc's NSS still applies
+# to getaddrinfo: the built-in `files`/`dns` sources work; other NSS modules
+# can't load from a static binary.
+FROM chef AS static-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-dev \
+    libffi-dev \
+    libpcre2-dev \
+    zlib1g-dev \
+    libselinux1-dev \
+    libsepol-dev \
+    libblkid-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY . .
+# The trailing checks fail the build unless the binary is truly static AND starts.
+RUN set -eux; \
+    triple="$(uname -m)-unknown-linux-gnu"; \
+    export RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static"; \
+    cargo rustc --release --locked -p nether-voicebridge --bin nether-voicebridge \
+      --target "$triple" -- \
+      -C linker=/build/packaging/static/static-cc.sh -C linker-features=-lld \
+      -C "link-args=-Wl,-Bstatic -Wl,--start-group -lgio-2.0 -lgobject-2.0 -lgmodule-2.0 -lglib-2.0 -lffi -lpcre2-8 -lz -lblkid -lselinux -lsepol -lstdc++ -lm -lpthread -ldl -lrt -lc -Wl,--end-group"; \
+    cp "target/$triple/release/nether-voicebridge" /nether-voicebridge; \
+    if readelf -d /nether-voicebridge | grep -q NEEDED; then echo "not static" >&2; exit 1; fi; \
+    cd /tmp && /nether-voicebridge 2>&1 | grep -q "no config.toml found"
+
+FROM scratch AS static
+COPY --from=static-builder /nether-voicebridge /nether-voicebridge
+
 # ── Stage 4: minimal runtime image ───────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 

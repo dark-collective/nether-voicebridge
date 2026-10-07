@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Nether Voice Bridge
+Comment=Bidirectional voice bridge between Discord and Matrix (Element Call)
+Exec=nether-voicebridge
+Icon=nether-voicebridge
+Terminal=true
+Categories=Network;Chat;AudioVideo;
+NoDisplay=true
