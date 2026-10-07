@@ -262,25 +262,25 @@ the packages yourself (`packaging/build-packages.sh`).
 ### Standalone binary (other distros)
 
 For distros without `.deb`/`.rpm` (Arch, Gentoo, NixOS, Alpine, …), each
-[release](https://nether.codes/nether/nether-voicebridge/releases) also ships,
-alongside a `SHA256SUMS` file:
+[release](https://nether.codes/nether/nether-voicebridge/releases) also ships, per
+arch (`x86_64` / `aarch64`), alongside a `SHA256SUMS` file:
 
-- `nether-voicebridge-<version>-x86_64-linux-static.tar.gz` — a **fully static**
-  binary with no runtime dependencies; runs on any x86_64 Linux, including
-  Alpine/musl and old glibc;
-- `nether-voicebridge-<version>-<arch>-linux.tar.gz` (`x86_64` / `aarch64`) — the
-  same dynamically linked binary as the Docker image (needs glibc ≥ 2.35 and
-  GCC ≥ 12's libstdc++);
-- `nether-voicebridge-<version>-x86_64.AppImage` — that binary as a single
+- `nether-voicebridge-<version>-<arch>-linux-static.tar.gz` — a **fully static**
+  binary with no runtime dependencies; runs on any Linux, including Alpine/musl
+  and old glibc;
+- `nether-voicebridge-<version>-<arch>-linux.tar.gz` — the same dynamically
+  linked binary as the Docker image (needs glibc ≥ 2.35 and GCC ≥ 12's libstdc++);
+- `nether-voicebridge-<version>-<arch>.AppImage` — that binary as a single
   `chmod +x`-and-run file.
 
 ```bash
 ver=<version>   # e.g. 0.5.0
+arch=x86_64     # or aarch64
 base=https://nether.codes/nether/nether-voicebridge/releases/download/v$ver
-curl -LO $base/nether-voicebridge-$ver-x86_64-linux-static.tar.gz
+curl -LO $base/nether-voicebridge-$ver-$arch-linux-static.tar.gz
 curl -LO $base/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing   # verify
-tar xzf nether-voicebridge-$ver-x86_64-linux-static.tar.gz
+tar xzf nether-voicebridge-$ver-$arch-linux-static.tar.gz
 ```
 
 > All of them need CA certificates (`ca-certificates`) for TLS. The static build

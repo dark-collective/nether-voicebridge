@@ -1,5 +1,8 @@
 # ── Stage 1: cargo-chef (shared build environment) ───────────────────────────
-FROM rust:1-bookworm AS chef
+# Rust pinned (not `rust:1`): a floating tag invalidates every cached layer —
+# including the ~20 min dependency build — whenever upstream moves it, and
+# keeps release builds reproducible. Bump deliberately.
+FROM rust:1.96.0-bookworm AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /build
 
@@ -59,11 +62,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsepol-dev \
     libblkid-dev \
     && rm -rf /var/lib/apt/lists/*
+# Same flags in both RUNs (cook + final) so the cached dependency layer is
+# reused; like `builder`, it's invalidated only by dependency changes.
+ENV STATIC_RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static"
+COPY --from=planner /build/recipe.json recipe.json
+COPY vendor vendor
+RUN RUSTFLAGS="$STATIC_RUSTFLAGS" cargo chef cook --release \
+      --target "$(uname -m)-unknown-linux-gnu" --recipe-path recipe.json
 COPY . .
 # The trailing checks fail the build unless the binary is truly static AND starts.
 RUN set -eux; \
     triple="$(uname -m)-unknown-linux-gnu"; \
-    export RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static"; \
+    export RUSTFLAGS="$STATIC_RUSTFLAGS"; \
     cargo rustc --release --locked -p nether-voicebridge --bin nether-voicebridge \
       --target "$triple" -- \
       -C linker=/build/packaging/static/static-cc.sh -C linker-features=-lld \
