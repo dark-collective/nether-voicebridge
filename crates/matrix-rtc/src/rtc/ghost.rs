@@ -115,6 +115,64 @@ const FRAME_CHANNEL_DEPTH: usize = 50;
 /// awaits ghost teardown inline.
 const GHOST_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often the ghost driver looks for orphaned ghost call memberships — ones
+/// whose ghost is gone but whose `m.call.member` is still in the room because the
+/// teardown leave PUT failed (a slow/erroring homeserver). Left alone, such an
+/// orphan shows the Discord user "in the call" until it expires (up to 4 h, and
+/// longer in clients that ignore `expires`). Live-observed 2026-10-07: a 03:17
+/// leave timed out and the ghost lingered in Light Voice all day. The sweep reads
+/// the bot's synced room state (no request unless something needs retracting).
+const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// One ghost-shaped `m.call.member` observed in room state, for
+/// [`orphan_ghost_memberships`].
+#[derive(Debug, Clone)]
+struct ObservedGhostMembership {
+    sender: String,
+    state_key: String,
+    /// `false` once every membership in the event has expired.
+    active: bool,
+}
+
+/// Which observed ghost memberships to retract: a current-prefix ghost with no
+/// live ghost in this pool, and the membership is either **expired** (harmless
+/// to clear, whoever wrote it) or **ours** — its state_key carries this store's
+/// device salt (`D{key}-{salt}`), so a second bridge on the same room (allowed,
+/// warn-only) never has its live ghosts swept. With no salt (no store) ownership
+/// can't be told apart, so only expired ones go. Pure — unit-tested.
+fn orphan_ghost_memberships(
+    observed: &[ObservedGhostMembership],
+    live_keys: &HashSet<String>,
+    ghost_prefix: &str,
+    salt: &str,
+) -> Vec<ObservedGhostMembership> {
+    observed
+        .iter()
+        .filter(|m| {
+            if !is_ghost_identity(&m.sender, ghost_prefix) {
+                return false;
+            }
+            let Some(key) = m
+                .sender
+                .strip_prefix('@')
+                .and_then(|r| r.split(':').next())
+                .and_then(|lp| lp.strip_prefix(ghost_prefix))
+            else {
+                return false;
+            };
+            if live_keys.contains(key) {
+                return false;
+            }
+            if !m.active {
+                return true;
+            }
+            !salt.is_empty()
+                && m.state_key == format!("_{}_{}_m.call", m.sender, ghost_device_id(key, salt))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Is this LiveKit participant identity one of our ghosts? Used by the bridge
 /// bot's subscriber to skip ghost tracks (echo prevention, constraint #5). The
 /// identity is `@{sender_localpart}_{id}:server[:device]`; the localpart is the
@@ -457,6 +515,69 @@ impl GhostPool {
         Ok(())
     }
 
+    /// Retract orphaned ghost memberships (see [`ORPHAN_SWEEP_INTERVAL`]). Called
+    /// from the driver with the keys of the ghosts it currently runs. Best-effort:
+    /// a failed retract is retried on the next tick.
+    async fn sweep_orphaned_ghosts(
+        &self,
+        client: &Client,
+        live_keys: &HashSet<String>,
+        seen: &mut HashSet<String>,
+    ) {
+        let Ok(room_id) = RoomId::parse(&self.cfg.room_id) else { return };
+        let Some(room) = client.get_room(&room_id) else { return };
+        let raws = match room.get_state_events_static::<CallMemberEventContent>().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(error = %e, "orphan ghost sweep: could not read call memberships");
+                return;
+            }
+        };
+        let observed: Vec<ObservedGhostMembership> = raws
+            .into_iter()
+            .filter_map(|raw| match raw.deserialize().ok()? {
+                SyncOrStrippedState::Sync(SyncStateEvent::Original(o)) => {
+                    if matches!(o.content, CallMemberEventContent::Empty(_)) {
+                        return None;
+                    }
+                    Some(ObservedGhostMembership {
+                        sender: o.sender.to_string(),
+                        state_key: o.state_key.as_ref().to_owned(),
+                        active: !o.content.active_memberships(Some(o.origin_server_ts)).is_empty(),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        let orphans = orphan_ghost_memberships(
+            &observed,
+            live_keys,
+            &self.cfg.ghost_localpart_prefix,
+            &self.cfg.ghost_device_salt,
+        );
+        let mut next: HashSet<String> = orphans.iter().map(|m| m.state_key.clone()).collect();
+        for m in orphans {
+            if !seen.contains(&m.state_key) {
+                continue;
+            }
+            match retract_membership_raw(&self.cfg, &m.sender, &m.state_key).await {
+                Ok(()) => {
+                    // Start over if sync still shows it: don't write it twice in a row.
+                    next.remove(&m.state_key);
+                    tracing::info!(
+                        ghost = %m.sender, expired = !m.active,
+                        "retracted orphaned ghost call membership (its ghost is gone)"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    ghost = %m.sender, error = format!("{e:#}"),
+                    "orphan ghost sweep: retract failed — retrying next tick"
+                ),
+            }
+        }
+        *seen = next;
+    }
+
     /// Drive the ghost lifecycle. Spawned/awaited from `lib::run` alongside the
     /// Matrix sync and RTC loops. Returns when the command channel closes.
     ///
@@ -503,6 +624,17 @@ impl GhostPool {
         let crypto_cache: GhostCryptoCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         // Per-ghost media key reused across respawns — see [`GhostKeyCache`].
         let key_cache: GhostKeyCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        // Orphaned-membership sweep (see [`ORPHAN_SWEEP_INTERVAL`]). Runs in this
+        // single-task driver so it is serialized with Assign/Release: it can never
+        // retract a key that is being (re)minted. An orphan must be seen on two
+        // consecutive ticks before it is retracted, so a leave that already landed
+        // but hasn't synced back yet isn't written twice.
+        let mut orphan_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + ORPHAN_SWEEP_INTERVAL,
+            ORPHAN_SWEEP_INTERVAL,
+        );
+        orphan_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut orphan_seen: HashSet<String> = HashSet::new();
 
         loop {
             let cmd = tokio::select! {
@@ -526,6 +658,11 @@ impl GhostPool {
                     Some(cmd) => cmd,
                     None => break,
                 },
+                _ = orphan_tick.tick() => {
+                    let live: HashSet<String> = ghosts.keys().cloned().collect();
+                    self.sweep_orphaned_ghosts(&client, &live, &mut orphan_seen).await;
+                    continue;
+                }
             };
             match cmd {
                 GhostCommand::Assign { key, display_name, avatar_url, frame_rx } => {
@@ -897,7 +1034,7 @@ async fn run_ghost(
                             let _ = h.await;
                         }
                         if let Err(e) = post_membership(&cfg, &ghost_mxid, &device_id, &focus, true).await {
-                            tracing::warn!(error = %e, "ghost post_membership(leave) failed");
+                            tracing::warn!(error = format!("{e:#}"), "ghost post_membership(leave) failed — the orphan sweep will retry");
                         }
                         tracing::info!("ghost retired (was presence-only)");
                         return;
@@ -946,7 +1083,7 @@ async fn run_ghost(
                     let _ = h.await;
                 }
                 if let Err(e) = post_membership(&cfg, &ghost_mxid, &device_id, &focus, true).await {
-                    tracing::warn!(error = %e, "ghost post_membership(leave) failed");
+                    tracing::warn!(error = format!("{e:#}"), "ghost post_membership(leave) failed — the orphan sweep will retry");
                 }
                 tracing::info!("ghost retired (cancelled before publish)");
                 return;
@@ -964,7 +1101,7 @@ async fn run_ghost(
                         let _ = h.await;
                     }
                     if let Err(e) = post_membership(&cfg, &ghost_mxid, &device_id, &focus, true).await {
-                        tracing::warn!(error = %e, "ghost post_membership(leave) failed");
+                        tracing::warn!(error = format!("{e:#}"), "ghost post_membership(leave) failed — the orphan sweep will retry");
                     }
                     return;
                 }
@@ -1107,7 +1244,7 @@ async fn run_ghost(
         // Retract call membership (best-effort; a no-op if we never joined). The
         // LiveKit room is closed by the event-drain task once `cancel` fires.
         if let Err(e) = post_membership(&cfg, &ghost_mxid, &device_id, &focus, true).await {
-            tracing::warn!(error = %e, "ghost post_membership(leave) failed");
+            tracing::warn!(error = format!("{e:#}"), "ghost post_membership(leave) failed — the orphan sweep will retry");
         }
         tracing::info!("ghost retired");
     }
@@ -2526,6 +2663,48 @@ mod tests {
         assert_eq!(ghost_device_id("42", "abc"), "D42-abc");
         // Empty salt (no store) → unchanged legacy bare id.
         assert_eq!(ghost_device_id("42", ""), "D42");
+    }
+
+    fn obs(sender: &str, state_key: &str, active: bool) -> ObservedGhostMembership {
+        ObservedGhostMembership { sender: sender.into(), state_key: state_key.into(), active }
+    }
+
+    #[test]
+    fn orphan_sweep_takes_only_our_dead_ghosts() {
+        let p = "nether-voicebridge_";
+        let live: HashSet<String> = ["111".to_owned()].into();
+        let observed = vec![
+            // Live ghost in this pool — never touched, even if expired.
+            obs("@nether-voicebridge_111:x", "_@nether-voicebridge_111:x_D111-salt_m.call", false),
+            // Ours (salted), ghost gone, still unexpired — the Merlin case.
+            obs("@nether-voicebridge_222:x", "_@nether-voicebridge_222:x_D222-salt_m.call", true),
+            // Another bridge's live ghost in the same room (different salt).
+            obs("@nether-voicebridge_333:x", "_@nether-voicebridge_333:x_D333-other_m.call", true),
+            // Expired, whoever wrote it.
+            obs("@nether-voicebridge_444:x", "_@nether-voicebridge_444:x_D444-other_m.call", false),
+            // The bridge bot and a real user are never ghosts.
+            obs("@nether-voicebridge_bot:x", "_@nether-voicebridge_bot:x_DEV_m.call", false),
+            obs("@dark:x", "_@dark:x_ABC_m.call", false),
+        ];
+        let got: Vec<String> = orphan_ghost_memberships(&observed, &live, p, "salt")
+            .into_iter()
+            .map(|m| m.sender)
+            .collect();
+        assert_eq!(got, ["@nether-voicebridge_222:x", "@nether-voicebridge_444:x"]);
+    }
+
+    #[test]
+    fn orphan_sweep_without_salt_only_takes_expired() {
+        let p = "nether-voicebridge_";
+        let observed = vec![
+            obs("@nether-voicebridge_222:x", "_@nether-voicebridge_222:x_D222_m.call", true),
+            obs("@nether-voicebridge_444:x", "_@nether-voicebridge_444:x_D444_m.call", false),
+        ];
+        let got: Vec<String> = orphan_ghost_memberships(&observed, &HashSet::new(), p, "")
+            .into_iter()
+            .map(|m| m.sender)
+            .collect();
+        assert_eq!(got, ["@nether-voicebridge_444:x"]);
     }
 
     #[tokio::test]
