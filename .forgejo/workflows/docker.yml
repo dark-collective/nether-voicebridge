@@ -282,9 +282,10 @@ jobs:
           NFPM_VERSION=2.46.3
           curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
             | tar -xz -C /usr/local/bin nfpm
-          # file(1): appimagetool shells out to it (build-appimage.sh fetches
-          # the pinned appimagetool + type2 runtimes itself).
-          apt-get update -qq && apt-get install -y -qq --no-install-recommends file
+          # file(1): appimagetool shells out to it; zsync: zsyncmake for the
+          # AppImages' self-update files (build-appimage.sh fetches the pinned
+          # appimagetool + type2 runtimes itself).
+          apt-get update -qq && apt-get install -y -qq --no-install-recommends file zsync
 
       # Auth so the pull below works regardless of package visibility (same
       # `dark` / REGISTRY_TOKEN credentials the image job pushed with).
@@ -321,6 +322,8 @@ jobs:
       - name: Build .deb/.rpm/tarball/AppImage for each architecture
         env:
           NVB_VERSION: ${{ steps.vars.outputs.version }}
+          PUBLIC_URL: ${{ github.server_url }}
+          ZSYNC_CHANNEL: ${{ github.server_url }}/api/packages/${{ github.repository_owner }}/generic/nether-voicebridge-appimage/latest
         run: |
           set -eu
           mkdir -p dist target/release
@@ -353,8 +356,16 @@ jobs:
             rm -rf "dist/${stage}"
 
             # AppImage: the same binary in a single self-mounting file, for
-            # users who want one download they can `chmod +x` and run.
-            packaging/build-appimage.sh target/release/nether-voicebridge "$uarch" "$NVB_VERSION" dist
+            # users who want one download they can `chmod +x` and run. It
+            # embeds zsync update information pointing at a fixed per-arch
+            # "channel" URL (Forgejo has no stable latest-release download
+            # URL, so the channel lives in the generic package registry; see
+            # the publish step), and the .zsync written next to it points back
+            # at this release's AppImage. AppImageUpdate then fetches only the
+            # blocks that changed between versions.
+            NVB_APPIMAGE_UPDATE_INFO="zsync|${ZSYNC_CHANNEL}/nether-voicebridge-${uarch}.AppImage.zsync" \
+            NVB_APPIMAGE_FILE_URL="${PUBLIC_URL}/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/nether-voicebridge-${NVB_VERSION}-${uarch}.AppImage" \
+              packaging/build-appimage.sh target/release/nether-voicebridge "$uarch" "$NVB_VERSION" dist
           done
           rm -f target/release/nether-voicebridge
           ls -l dist/
@@ -392,3 +403,24 @@ jobs:
           (cd dist && sha256sum *.deb *.rpm *.tar.gz *.AppImage > SHA256SUMS && cat SHA256SUMS)
           packaging/publish-release.sh dist/SHA256SUMS
           packaging/publish-release.sh --publish
+
+      # Move the AppImage update channel to this release: replace the
+      # per-arch .zsync under the generic package `nether-voicebridge-appimage`,
+      # version `latest` (files there can't be overwritten, so delete first).
+      # Stable tags only — prereleases never become what existing AppImages
+      # update to. Uses the same `dark` REGISTRY_TOKEN (write:package) as the
+      # image pushes, over the tailnet.
+      - name: Publish the AppImage update channel
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          PKG: http://${{ env.REGISTRY }}/api/packages/${{ github.repository_owner }}/generic/nether-voicebridge-appimage/latest
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          set -eu
+          for z in dist/*.AppImage.zsync; do
+            arch=$(basename "$z" .AppImage.zsync); arch=${arch##*-}
+            name="nether-voicebridge-${arch}.AppImage.zsync"
+            curl -sS -o /dev/null -u "dark:${TOKEN}" -X DELETE "${PKG}/${name}" || true
+            curl -fsS -u "dark:${TOKEN}" --upload-file "$z" "${PKG}/${name}"
+            echo "channel: ${name} <- $(basename "$z")"
+          done
