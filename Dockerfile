@@ -80,7 +80,7 @@ RUN set -eux; \
     cargo rustc --release --locked -p nether-voicebridge --bin nether-voicebridge \
       --target "$triple" -- \
       -C linker=/build/packaging/static/static-cc.sh $nolld \
-      -C "link-args=-Wl,-Bstatic -Wl,--start-group -lgio-2.0 -lgobject-2.0 -lgmodule-2.0 -lglib-2.0 -lffi -lpcre2-8 -lz -lblkid -lselinux -lsepol -lstdc++ -lm -lpthread -ldl -lrt -lc -Wl,--end-group"; \
+      -C "link-args=-Wl,-Bstatic -Wl,--start-group -lgio-2.0 -lgobject-2.0 -lgmodule-2.0 -lglib-2.0 -lffi -lpcre2-8 -lz -lblkid -lselinux -lsepol -lstdc++ -lgcc -lm -lpthread -ldl -lrt -lc -Wl,--end-group"; \
     cp "target/$triple/release/nether-voicebridge" /nether-voicebridge; \
     if readelf -d /nether-voicebridge | grep -q NEEDED; then echo "not static" >&2; exit 1; fi; \
     cd /tmp && /nether-voicebridge 2>&1 | grep -q "no config.toml found"
