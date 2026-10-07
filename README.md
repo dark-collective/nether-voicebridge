@@ -145,7 +145,7 @@ The full design and the phased build history live in:
 - [`docs/nether-voicebridge-architecture.md`](docs/nether-voicebridge-architecture.md) — architecture & rationale
 - [`docs/nether-voicebridge-build-plan.md`](docs/nether-voicebridge-build-plan.md) — phase-by-phase build plan
 - [`docs/docker-usage.md`](docs/docker-usage.md) — running under Docker + CI notes
-- [`docs/packaging.md`](docs/packaging.md) — `.deb`/`.rpm` packages + systemd service
+- [`docs/packaging.md`](docs/packaging.md) — `.deb`/`.rpm`, static binary, AppImage + systemd service
 
 ## Requirements
 
@@ -261,25 +261,31 @@ the packages yourself (`packaging/build-packages.sh`).
 
 ### Standalone binary (other distros)
 
-For distros without `.deb`/`.rpm` (Arch, Gentoo, NixOS, …), each
-[release](https://nether.codes/nether/nether-voicebridge/releases) also ships a
-self-contained tarball — the binary plus `config.example.toml`, the systemd unit,
-`LICENSE`, and this README — alongside a `SHA256SUMS` file:
+For distros without `.deb`/`.rpm` (Arch, Gentoo, NixOS, Alpine, …), each
+[release](https://nether.codes/nether/nether-voicebridge/releases) also ships, per
+arch (`x86_64` / `aarch64`), alongside a `SHA256SUMS` file:
+
+- `nether-voicebridge-<version>-<arch>-linux-static.tar.gz` — a **fully static**
+  binary with no runtime dependencies; runs on any Linux, including Alpine/musl
+  and old glibc;
+- `nether-voicebridge-<version>-<arch>-linux.tar.gz` — the same dynamically
+  linked binary as the Docker image (needs glibc ≥ 2.35 and GCC ≥ 12's libstdc++);
+- `nether-voicebridge-<version>-<arch>.AppImage` — that binary as a single
+  `chmod +x`-and-run file.
 
 ```bash
-ver=<version>   # e.g. 0.2.0
+ver=<version>   # e.g. 0.5.0
 arch=x86_64     # or aarch64
 base=https://nether.codes/nether/nether-voicebridge/releases/download/v$ver
-curl -LO $base/nether-voicebridge-$ver-$arch-linux.tar.gz
+curl -LO $base/nether-voicebridge-$ver-$arch-linux-static.tar.gz
 curl -LO $base/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing   # verify
-tar xzf nether-voicebridge-$ver-$arch-linux.tar.gz
+tar xzf nether-voicebridge-$ver-$arch-linux-static.tar.gz
 ```
 
-> The binary is built against **glibc 2.36** (dynamically linked to **libopus**),
-> so it needs your distro's `libopus` + `ca-certificates` and a glibc host — it
-> won't run on Alpine/musl or much older glibc. There, prefer the Docker image,
-> which carries its own runtime.
+> All of them need CA certificates (`ca-certificates`) for TLS. The static build
+> resolves hostnames via `/etc/hosts` + `/etc/resolv.conf` only (no NSS plugins).
+> See [`docs/packaging.md`](docs/packaging.md#standalone-binaries-tarball-static-tarball-appimage).
 
 ## Configuration notes
 

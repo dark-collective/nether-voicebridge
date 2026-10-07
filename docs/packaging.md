@@ -63,18 +63,40 @@ paths in `packaging/nfpm.yaml` are root-relative). It packages for the host's
 architecture (override with `NVB_ARCH=amd64|arm64`); CI builds both arches per
 release, each natively, mirroring the multi-arch Docker image.
 
-## Standalone binary tarball
+## Standalone binaries: tarball, static tarball, AppImage
 
-For distros without `.deb`/`.rpm`, each release also carries self-contained
-`nether-voicebridge-<version>-x86_64-linux.tar.gz` and `…-aarch64-linux.tar.gz`
-tarballs — the same glibc binaries the Docker images and packages use, bundled
-with `config.example.toml`, the systemd unit, `LICENSE`, and the README. A
-`SHA256SUMS` file covering every release asset (debs, rpms, tarballs) is attached
-too; verify with `sha256sum -c SHA256SUMS --ignore-missing`.
+For distros without `.deb`/`.rpm`, each release carries three more per-arch
+(`x86_64` / `aarch64`) downloads. All three bundle `config.example.toml`, the
+systemd unit, `LICENSE`, and the README (the AppImage under
+`usr/share/doc/nether-voicebridge/`):
 
-The tarballs are dynamically linked against **glibc 2.36 + libopus** — not
-static/musl builds, so they need those runtime libraries and a glibc host. The
-end-user install steps are in the README's "Standalone binary" section.
+| Asset | Binary | Needs on the host |
+|---|---|---|
+| `nether-voicebridge-<version>-<arch>-linux.tar.gz` | the same glibc binary as the Docker image and packages | glibc ≥ 2.35, libstdc++ from GCC ≥ 12 |
+| `nether-voicebridge-<version>-<arch>-linux-static.tar.gz` | **fully static** (no shared libraries, no ELF interpreter) | nothing; runs on Alpine/musl and old-glibc hosts (verified on Alpine 3 and CentOS 7) |
+| `nether-voicebridge-<version>-<arch>.AppImage` | the image's glibc binary in a single self-mounting file | same as the tarball, plus FUSE (or run it with `--appimage-extract-and-run`) |
+
+All of them need CA certificates (`ca-certificates`) for TLS to the homeserver and
+Discord. Libopus is compiled in, so no system libopus is needed. A `SHA256SUMS`
+file covering every release asset is attached too; verify with
+`sha256sum -c SHA256SUMS --ignore-missing`.
+
+**Static binary notes.** It's built separately from the image's binary (Dockerfile
+`static` target): glibc `+crt-static`, non-PIE, linked by GNU ld with glib's
+full static dependency closure (webrtc-sys links glib/gobject/gio), and
+`packaging/static/static-cc.sh` forcing every library to its `.a`. The build
+fails unless the result has no `NEEDED` entries and starts. Hostname lookups use
+glibc's built-in `files` and `dns` sources (`/etc/hosts`, `/etc/resolv.conf`);
+other NSS modules from `/etc/nsswitch.conf` (e.g. `resolve`, `mdns`) can't load
+into a static binary. It's ~98 MiB unpacked (~40 MB compressed).
+
+**AppImage notes.** `packaging/build-appimage.sh <binary> <arch> <version> <outdir>`
+wraps any built binary; it fetches appimagetool and the type2 runtime, both pinned
+by version and sha256, and needs `file(1)`. It's a CLI daemon packaged as an
+AppImage: run it from a terminal like the plain binary (`CONFIG_PATH` /
+`./config.toml` resolve against your working directory).
+
+The end-user install steps are in the README's "Standalone binary" section.
 
 ## CI
 
@@ -84,9 +106,16 @@ tag push the `image` (amd64) and `image-arm64` jobs build and push the per-arch
 Docker images (the sole compiles) and `manifest` merges them into the multi-arch
 tag; then the `packages` job — which `needs: manifest` and is tag-gated — pulls
 each arch image, copies the binary out of it (`/app/nether-voicebridge` →
-`target/release/`), runs `nfpm`, builds the standalone tarball, and after both
-arches generates `SHA256SUMS` and uploads all seven assets (2× `.deb`, 2× `.rpm`,
-2× `.tar.gz`, `SHA256SUMS`) to the Forgejo Release. It needs a repo Actions secret **`RELEASE_TOKEN`**
+`target/release/`), runs `nfpm`, builds the standalone tarball and the AppImage, and
+uploads them to the Forgejo Release. In parallel, `static` / `static-arm64`
+build the fully static binaries natively (Dockerfile `static` target — the one
+deliberate second compile, since it's a different binary) and upload the
+`-linux-static.tar.gz`s. On `workflow_dispatch` they only build and self-check,
+which verifies the static link on both arches without tagging. Finally
+`checksums` downloads every asset back and uploads `SHA256SUMS`: 13 assets per
+release (2× `.deb`, 2× `.rpm`, 4× `.tar.gz`, 2× `.AppImage`, `SHA256SUMS`).
+Uploads go through `packaging/publish-release.sh` (create-or-reuse the
+release, replace a same-named asset), so re-runs are idempotent. It needs a repo Actions secret **`RELEASE_TOKEN`**
 — a Forgejo token with `write:repository` scope (the Docker job's package-scoped
 `REGISTRY_TOKEN` can't create releases). Cutting a release is then just: bump the
 version in `[workspace.package]`, commit, and push a `v<version>` tag.
