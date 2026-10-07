@@ -5,6 +5,18 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-07
+
+**A Discord user who left no longer lingers in the Matrix call.**
+
+### Fixed
+- **Phantom Discord users in the call.** When a Discord user left, their ghost's `m.call.member` was retracted
+  with a single request; if the homeserver was slow or erroring, that request failed and the ghost stayed
+  listed in the call until its membership expired (up to 4 h — longer in clients that ignore expiry). Each
+  bridge now sweeps its room every minute and retracts call memberships of ghosts it no longer runs: its own
+  (matched by this store's ghost device salt, so a second bridge on the same room is never touched) and any
+  expired ghost membership. Leave failures now log the full error chain.
+
 ### Added
 - **More release downloads:** per arch (`x86_64` / `aarch64`), a **fully static** binary tarball
   (`…-linux-static.tar.gz`; no runtime dependencies, runs on Alpine/musl and old glibc) and an **AppImage**,
