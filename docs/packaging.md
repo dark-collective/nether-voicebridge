@@ -122,10 +122,9 @@ end), so re-runs are idempotent. On `workflow_dispatch` the image jobs build
 
 **Build caching.** Both image jobs keep their BuildKit layer cache between
 runs, so a release whose dependencies are unchanged (`Cargo.lock`; cargo-chef
-ignores our own version bumps) recompiles only our crates. amd64 builds on the
-runner daemon's own builder (`driver: docker`), whose cache persists; the
-arm64 host-mode runner exports the cache to `~/.cache/nvb-buildx/{image,static}`
-on the host. The Rust base image is pinned (`rust:1.96.0-bookworm`) because a
+ignores our own version bumps) recompiles only our crates. Both build on
+their runner host's Docker daemon's own builder (`driver: docker`), whose
+cache persists across jobs (no cache export/import step). The Rust base image is pinned (`rust:1.96.0-bookworm`) because a
 moving `rust:1` would invalidate everything; bump it deliberately.
 
 The workflow needs a repo Actions secret **`RELEASE_TOKEN`** — a Forgejo token
