@@ -53,6 +53,8 @@ fetch "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL
 fetch "https://github.com/AppImage/type2-runtime/releases/download/${RUNTIME_VERSION}/runtime-${arch}" \
   "$runtime" "$RUNTIME_SHA256"
 chmod +x "$tool"
+# Absolute paths: the appimagetool run below happens after a `cd "$outdir"`.
+tool=$(realpath "$tool") runtime=$(realpath "$runtime")
 
 appdir=$(mktemp -d)/nether-voicebridge.AppDir
 trap 'rm -rf "$(dirname "$appdir")"' EXIT
@@ -69,6 +71,6 @@ if [ -n "${NVB_APPIMAGE_UPDATE_INFO:-}" ]; then
   update=(-u "$NVB_APPIMAGE_UPDATE_INFO" --file-url "${NVB_APPIMAGE_FILE_URL:?NVB_APPIMAGE_FILE_URL is required with NVB_APPIMAGE_UPDATE_INFO}")
 fi
 # Run from $outdir so the .zsync lands next to the AppImage.
-(cd "$outdir" && ARCH="$arch" APPIMAGE_EXTRACT_AND_RUN=1 "$(realpath "$tool")" --no-appstream \
-  --runtime-file "$(realpath "$runtime")" "${update[@]}" "$appdir" "$(basename "$out")")
+(cd "$outdir" && ARCH="$arch" APPIMAGE_EXTRACT_AND_RUN=1 "$tool" --no-appstream \
+  --runtime-file "$runtime" "${update[@]}" "$appdir" "$(basename "$out")")
 ls -l "$out"*

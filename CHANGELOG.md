@@ -5,7 +5,15 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.4.3] - 2026-10-07
+## [0.4.4] - 2026-10-07
+
+Re-release of 0.4.3 (whose release packaging failed before publishing — no 0.4.3 downloads exist).
+
+### Fixed
+- **Release packaging:** the AppImage build resolved its tool paths after changing directory and failed;
+  they are now resolved up front.
+
+## [0.4.3] - 2026-10-07 [not published]
 
 **A Discord user who left no longer lingers in the Matrix call.**
 
