@@ -1,5 +1,8 @@
 # ── Stage 1: cargo-chef (shared build environment) ───────────────────────────
-FROM rust:1-bookworm AS chef
+# Rust pinned (not `rust:1`): a floating tag invalidates every cached layer —
+# including the ~20 min dependency build — whenever upstream moves it, and
+# keeps release builds reproducible. Bump deliberately.
+FROM rust:1.96.0-bookworm AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /build
 
@@ -43,7 +46,7 @@ RUN cargo build --release --locked -p nether-voicebridge
 # it via `--output type=local`); the default target below never runs these.
 #
 # A fully static glibc executable: +crt-static, non-PIE (glibc's static-pie
-# startup crashes with this link), GNU ld instead of rust-lld, glib's whole
+# startup crashes with this link), GNU ld (not rust-lld), glib's whole
 # static dependency closure (webrtc-sys links glib/gobject/gio) in one group
 # with libc, and packaging/static/static-cc.sh forcing every lib to its .a.
 # Runs on musl (Alpine) and old-glibc hosts alike. glibc's NSS still applies
@@ -59,15 +62,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsepol-dev \
     libblkid-dev \
     && rm -rf /var/lib/apt/lists/*
+# Same flags in both RUNs (cook + final) so the cached dependency layer is
+# reused; like `builder`, it's invalidated only by dependency changes.
+ENV STATIC_RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static"
+COPY --from=planner /build/recipe.json recipe.json
+COPY vendor vendor
+RUN RUSTFLAGS="$STATIC_RUSTFLAGS" cargo chef cook --release \
+      --target "$(uname -m)-unknown-linux-gnu" --recipe-path recipe.json
 COPY . .
 # The trailing checks fail the build unless the binary is truly static AND starts.
 RUN set -eux; \
     triple="$(uname -m)-unknown-linux-gnu"; \
-    export RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static"; \
+    export RUSTFLAGS="$STATIC_RUSTFLAGS"; \
+    # rust-lld is the default linker only on x86_64 (and the opt-out flag is
+    # unstable elsewhere); aarch64 already links with GNU ld.
+    nolld=""; [ "$(uname -m)" = x86_64 ] && nolld="-C linker-features=-lld"; \
     cargo rustc --release --locked -p nether-voicebridge --bin nether-voicebridge \
       --target "$triple" -- \
-      -C linker=/build/packaging/static/static-cc.sh -C linker-features=-lld \
-      -C "link-args=-Wl,-Bstatic -Wl,--start-group -lgio-2.0 -lgobject-2.0 -lgmodule-2.0 -lglib-2.0 -lffi -lpcre2-8 -lz -lblkid -lselinux -lsepol -lstdc++ -lm -lpthread -ldl -lrt -lc -Wl,--end-group"; \
+      -C linker=/build/packaging/static/static-cc.sh $nolld \
+      -C "link-args=-Wl,-Bstatic -Wl,--start-group -lgio-2.0 -lgobject-2.0 -lgmodule-2.0 -lglib-2.0 -lffi -lpcre2-8 -lz -lblkid -lselinux -lsepol -lstdc++ -lgcc -lm -lpthread -ldl -lrt -lc -Wl,--end-group"; \
     cp "target/$triple/release/nether-voicebridge" /nether-voicebridge; \
     if readelf -d /nether-voicebridge | grep -q NEEDED; then echo "not static" >&2; exit 1; fi; \
     cd /tmp && /nether-voicebridge 2>&1 | grep -q "no config.toml found"

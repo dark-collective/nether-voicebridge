@@ -65,17 +65,16 @@ release, each natively, mirroring the multi-arch Docker image.
 
 ## Standalone binaries: tarball, static tarball, AppImage
 
-For distros without `.deb`/`.rpm`, each release carries three more downloads
-(the plain tarball for `x86_64` and `aarch64`; the static tarball and AppImage
-for `x86_64` only, for now). All three bundle `config.example.toml`, the
+For distros without `.deb`/`.rpm`, each release carries three more per-arch
+(`x86_64` / `aarch64`) downloads. All three bundle `config.example.toml`, the
 systemd unit, `LICENSE`, and the README (the AppImage under
 `usr/share/doc/nether-voicebridge/`):
 
 | Asset | Binary | Needs on the host |
 |---|---|---|
 | `nether-voicebridge-<version>-<arch>-linux.tar.gz` | the same glibc binary as the Docker image and packages | glibc ≥ 2.35, libstdc++ from GCC ≥ 12 |
-| `nether-voicebridge-<version>-x86_64-linux-static.tar.gz` | **fully static** (no shared libraries, no ELF interpreter) | nothing; runs on Alpine/musl and old-glibc hosts (verified on Alpine 3 and CentOS 7) |
-| `nether-voicebridge-<version>-x86_64.AppImage` | the image's glibc binary in a single self-mounting file | same as the tarball, plus FUSE (or run it with `--appimage-extract-and-run`) |
+| `nether-voicebridge-<version>-<arch>-linux-static.tar.gz` | **fully static** (no shared libraries, no ELF interpreter) | nothing; runs on Alpine/musl and old-glibc hosts (verified on Alpine 3 and CentOS 7) |
+| `nether-voicebridge-<version>-<arch>.AppImage` | the image's glibc binary in a single self-mounting file | same as the tarball, plus FUSE (or run it with `--appimage-extract-and-run`) |
 
 All of them need CA certificates (`ca-certificates`) for TLS to the homeserver and
 Discord. Libopus is compiled in, so no system libopus is needed. A `SHA256SUMS`
@@ -101,22 +100,34 @@ The end-user install steps are in the README's "Standalone binary" section.
 
 ## CI
 
-`.forgejo/workflows/docker.yml` handles both the images and the packages, so the
-binary is compiled **once per (tag, arch)**, each natively (no QEMU). On a `v*`
-tag push the `image` (amd64) and `image-arm64` jobs build and push the per-arch
-Docker images (the sole compiles) and `manifest` merges them into the multi-arch
-tag; then the `packages` job — which `needs: manifest` and is tag-gated — pulls
-each arch image, copies the binary out of it (`/app/nether-voicebridge` →
-`target/release/`), runs `nfpm`, builds the standalone tarball and the AppImage, and
-uploads them to the Forgejo Release (the AppImage for x86_64 only). In
-parallel, `static` builds the fully static x86_64 binary (Dockerfile `static`
-target — the one deliberate second compile, since it's a different binary)
-and uploads the `-linux-static.tar.gz`. On `workflow_dispatch` it only builds
-and self-checks. Finally `checksums` downloads every asset back and uploads
-`SHA256SUMS`: 10 assets per release (2× `.deb`, 2× `.rpm`, 3× `.tar.gz`,
-1× `.AppImage`, `SHA256SUMS`).
-Uploads go through `packaging/publish-release.sh` (create-or-reuse the
-release, replace a same-named asset), so re-runs are idempotent. It needs a repo Actions secret **`RELEASE_TOKEN`**
-— a Forgejo token with `write:repository` scope (the Docker job's package-scoped
-`REGISTRY_TOKEN` can't create releases). Cutting a release is then just: bump the
-version in `[workspace.package]`, commit, and push a `v<version>` tag.
+`.forgejo/workflows/docker.yml` builds the images and every release asset. On a
+`v*` tag:
+
+1. **`image`** (amd64) and **`image-arm64`** build natively, in parallel: each
+   pushes its per-arch Docker image (the one compile the packages reuse), then
+   builds the fully static binary (Dockerfile `static` target, a deliberately
+   separate compile) and attaches its `-linux-static.tar.gz` to the Release,
+   which is created as a **draft** so nothing is public yet.
+2. **`manifest`** merges the two images into the multi-arch tag.
+3. **`packages`** pulls each arch image, copies the binary out
+   (`/app/nether-voicebridge` → `target/release/`), builds the `.deb`, `.rpm`,
+   tarball and AppImage per arch, uploads them, writes `SHA256SUMS` over all
+   assets, and **publishes** the release.
+
+That's 13 assets per release (2× `.deb`, 2× `.rpm`, 4× `.tar.gz`, 2×
+`.AppImage`, `SHA256SUMS`). Uploads go through `packaging/publish-release.sh`
+(create-or-reuse the draft, replace a same-named asset, `--publish` at the
+end), so re-runs are idempotent. On `workflow_dispatch` the image jobs build
+`:edge` images and the static binaries (self-checked) without releasing.
+
+**Build caching.** Both image jobs keep their BuildKit layer cache between
+runs, so a release whose dependencies are unchanged (`Cargo.lock`; cargo-chef
+ignores our own version bumps) recompiles only our crates. Both build on
+their runner host's Docker daemon's own builder (`driver: docker`), whose
+cache persists across jobs (no cache export/import step). The Rust base image is pinned (`rust:1.96.0-bookworm`) because a
+moving `rust:1` would invalidate everything; bump it deliberately.
+
+The workflow needs a repo Actions secret **`RELEASE_TOKEN`** — a Forgejo token
+with `write:repository` scope (the Docker job's package-scoped `REGISTRY_TOKEN`
+can't create releases). Cutting a release is then just: bump the version in
+`[workspace.package]`, commit, and push a `v<version>` tag.
