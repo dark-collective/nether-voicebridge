@@ -332,7 +332,11 @@ jobs:
 
             # AppImage: the same binary in a single self-mounting file, for
             # users who want one download they can `chmod +x` and run.
-            packaging/build-appimage.sh target/release/nether-voicebridge "$uarch" "$NVB_VERSION" dist
+            # x86_64 only for now (arm64 Linux desktop isn't a target yet;
+            # build-appimage.sh already supports aarch64).
+            if [ "$arch" = amd64 ]; then
+              packaging/build-appimage.sh target/release/nether-voicebridge "$uarch" "$NVB_VERSION" dist
+            fi
           done
           rm -f target/release/nether-voicebridge
           ls -l dist/
@@ -352,38 +356,17 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: packaging/publish-release.sh dist/*.deb dist/*.rpm dist/*.tar.gz dist/*.AppImage
 
-  # Fully static binaries (glibc +crt-static, no runtime deps at all — runs on
-  # Alpine/musl and old-glibc hosts). This is a genuinely different binary from
-  # the image's, so unlike the packages above it IS a second compile, one per
-  # arch, natively, via the Dockerfile's `static` target (which itself fails
-  # unless the result is static and starts). Runs in parallel with the image
-  # jobs. On workflow_dispatch it only builds + self-checks (a way to verify
-  # the static link on both arches before tagging); on a tag it also uploads
-  # nether-voicebridge-<version>-<arch>-linux-static.tar.gz to the Release.
+  # Fully static x86_64 binary (glibc +crt-static, no runtime deps at all —
+  # runs on Alpine/musl and old-glibc hosts). This is a genuinely different
+  # binary from the image's, so unlike the packages above it IS a second
+  # compile, via the Dockerfile's `static` target (which itself fails unless
+  # the result is static and starts). Runs in parallel with the image jobs.
+  # On workflow_dispatch it only builds + self-checks; on a tag it also uploads
+  # nether-voicebridge-<version>-x86_64-linux-static.tar.gz to the Release.
+  # x86_64 only for now: the Dockerfile target is arch-generic, so an arm64
+  # leg is a copy of this job on `runs-on: linux-arm64` once that's wanted.
   static:
     runs-on: docker
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build static binary
-        run: |
-          docker buildx build --target static --output type=local,dest=static-out .
-          ls -l static-out/
-
-      - name: Package and publish
-        if: github.ref_type == 'tag'
-        env:
-          API: http://${{ env.REGISTRY }}/api/v1/repos/${{ github.repository }}
-          TOKEN: ${{ secrets.RELEASE_TOKEN }}
-          TAG: ${{ github.ref_name }}
-        run: packaging/static/package-static.sh static-out/nether-voicebridge
-
-  static-arm64:
-    runs-on: linux-arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -409,7 +392,7 @@ jobs:
   # `sha256sum -c SHA256SUMS --ignore-missing` works in a download dir).
   checksums:
     runs-on: docker
-    needs: [packages, static, static-arm64]
+    needs: [packages, static]
     if: github.ref_type == 'tag'
     steps:
       - name: Checkout

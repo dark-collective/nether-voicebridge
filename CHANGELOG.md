@@ -6,9 +6,9 @@ adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-- **More release downloads:** per arch (`x86_64` / `aarch64`), a **fully static** binary tarball
-  (`…-linux-static.tar.gz`; no runtime dependencies, runs on Alpine/musl and old glibc) and an **AppImage**,
-  alongside the existing `.deb`, `.rpm`, and tarball. `SHA256SUMS` now covers every asset. See `docs/packaging.md`.
+- **More release downloads (x86_64):** a **fully static** binary tarball (`…-x86_64-linux-static.tar.gz`; no
+  runtime dependencies, runs on Alpine/musl and old glibc) and an **AppImage**, alongside the existing `.deb`,
+  `.rpm`, and tarball (still both arches). `SHA256SUMS` now covers every asset. See `docs/packaging.md`.
 
 ## [0.4.2] - 2026-10-07
 

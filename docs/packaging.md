@@ -65,16 +65,17 @@ release, each natively, mirroring the multi-arch Docker image.
 
 ## Standalone binaries: tarball, static tarball, AppImage
 
-For distros without `.deb`/`.rpm`, each release carries three more per-arch
-(`x86_64` / `aarch64`) downloads. All three bundle `config.example.toml`, the
+For distros without `.deb`/`.rpm`, each release carries three more downloads
+(the plain tarball for `x86_64` and `aarch64`; the static tarball and AppImage
+for `x86_64` only, for now). All three bundle `config.example.toml`, the
 systemd unit, `LICENSE`, and the README (the AppImage under
 `usr/share/doc/nether-voicebridge/`):
 
 | Asset | Binary | Needs on the host |
 |---|---|---|
 | `nether-voicebridge-<version>-<arch>-linux.tar.gz` | the same glibc binary as the Docker image and packages | glibc ≥ 2.35, libstdc++ from GCC ≥ 12 |
-| `nether-voicebridge-<version>-<arch>-linux-static.tar.gz` | **fully static** (no shared libraries, no ELF interpreter) | nothing; runs on Alpine/musl and old-glibc hosts (verified on Alpine 3 and CentOS 7) |
-| `nether-voicebridge-<version>-<arch>.AppImage` | the image's glibc binary in a single self-mounting file | same as the tarball, plus FUSE (or run it with `--appimage-extract-and-run`) |
+| `nether-voicebridge-<version>-x86_64-linux-static.tar.gz` | **fully static** (no shared libraries, no ELF interpreter) | nothing; runs on Alpine/musl and old-glibc hosts (verified on Alpine 3 and CentOS 7) |
+| `nether-voicebridge-<version>-x86_64.AppImage` | the image's glibc binary in a single self-mounting file | same as the tarball, plus FUSE (or run it with `--appimage-extract-and-run`) |
 
 All of them need CA certificates (`ca-certificates`) for TLS to the homeserver and
 Discord. Libopus is compiled in, so no system libopus is needed. A `SHA256SUMS`
@@ -107,13 +108,13 @@ Docker images (the sole compiles) and `manifest` merges them into the multi-arch
 tag; then the `packages` job — which `needs: manifest` and is tag-gated — pulls
 each arch image, copies the binary out of it (`/app/nether-voicebridge` →
 `target/release/`), runs `nfpm`, builds the standalone tarball and the AppImage, and
-uploads them to the Forgejo Release. In parallel, `static` / `static-arm64`
-build the fully static binaries natively (Dockerfile `static` target — the one
-deliberate second compile, since it's a different binary) and upload the
-`-linux-static.tar.gz`s. On `workflow_dispatch` they only build and self-check,
-which verifies the static link on both arches without tagging. Finally
-`checksums` downloads every asset back and uploads `SHA256SUMS`: 13 assets per
-release (2× `.deb`, 2× `.rpm`, 4× `.tar.gz`, 2× `.AppImage`, `SHA256SUMS`).
+uploads them to the Forgejo Release (the AppImage for x86_64 only). In
+parallel, `static` builds the fully static x86_64 binary (Dockerfile `static`
+target — the one deliberate second compile, since it's a different binary)
+and uploads the `-linux-static.tar.gz`. On `workflow_dispatch` it only builds
+and self-checks. Finally `checksums` downloads every asset back and uploads
+`SHA256SUMS`: 10 assets per release (2× `.deb`, 2× `.rpm`, 3× `.tar.gz`,
+1× `.AppImage`, `SHA256SUMS`).
 Uploads go through `packaging/publish-release.sh` (create-or-reuse the
 release, replace a same-named asset), so re-runs are idempotent. It needs a repo Actions secret **`RELEASE_TOKEN`**
 — a Forgejo token with `write:repository` scope (the Docker job's package-scoped
