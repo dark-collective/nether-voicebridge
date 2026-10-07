@@ -96,6 +96,18 @@ by version and sha256, and needs `file(1)`. It's a CLI daemon packaged as an
 AppImage: run it from a terminal like the plain binary (`CONFIG_PATH` /
 `./config.toml` resolve against your working directory).
 
+**AppImage updates (zsync).** Release AppImages embed update information, so
+AppImageUpdate / `appimageupdatetool`, Gear Lever, AppImageLauncher and similar
+tools can update them in place. The embedded URL is a fixed per-arch channel,
+`https://nether.codes/api/packages/nether/generic/nether-voicebridge-appimage/latest/nether-voicebridge-<arch>.AppImage.zsync`
+(Forgejo has no stable "latest release" download URL, so the channel lives in
+the generic package registry). Each stable release replaces it with a `.zsync`
+pointing at that release's AppImage; prereleases never move the channel. The
+delta saving is small: a recompiled binary differs almost everywhere, so an
+update still downloads most of the file. The benefit is the in-place update
+flow, not bandwidth. Local builds get update info only when you set
+`NVB_APPIMAGE_UPDATE_INFO` / `NVB_APPIMAGE_FILE_URL` (see the script header).
+
 The end-user install steps are in the README's "Standalone binary" section.
 
 ## CI
@@ -131,3 +143,7 @@ The workflow needs a repo Actions secret **`RELEASE_TOKEN`** — a Forgejo token
 with `write:repository` scope (the Docker job's package-scoped `REGISTRY_TOKEN`
 can't create releases). Cutting a release is then just: bump the version in
 `[workspace.package]`, commit, and push a `v<version>` tag.
+
+**Tag once master's CI run is green.** The amd64 runner runs one job at a
+time (`capacity: 1`, kept deliberately: e2e audio scenarios fail under host
+contention), so a tag pushed while CI or e2e is running queues behind it.

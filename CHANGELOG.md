@@ -9,6 +9,8 @@ adheres to [Semantic Versioning](https://semver.org/).
 - **More release downloads:** per arch (`x86_64` / `aarch64`), a **fully static** binary tarball
   (`…-linux-static.tar.gz`; no runtime dependencies, runs on Alpine/musl and old glibc) and an **AppImage**,
   alongside the existing `.deb`, `.rpm`, and tarball. `SHA256SUMS` now covers every asset. See `docs/packaging.md`.
+- **AppImage self-update (zsync):** release AppImages embed update information, so AppImageUpdate, Gear Lever,
+  AppImageLauncher, etc. can update them in place from the stable channel.
 
 ### Changed
 - **Faster releases:** release builds keep a BuildKit layer cache between runs (dependencies are rebuilt only

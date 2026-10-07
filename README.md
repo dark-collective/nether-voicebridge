@@ -271,7 +271,8 @@ arch (`x86_64` / `aarch64`), alongside a `SHA256SUMS` file:
 - `nether-voicebridge-<version>-<arch>-linux.tar.gz` — the same dynamically
   linked binary as the Docker image (needs glibc ≥ 2.35 and GCC ≥ 12's libstdc++);
 - `nether-voicebridge-<version>-<arch>.AppImage` — that binary as a single
-  `chmod +x`-and-run file.
+  `chmod +x`-and-run file; it self-updates via zsync with AppImageUpdate,
+  Gear Lever, AppImageLauncher, etc.
 
 ```bash
 ver=<version>   # e.g. 0.5.0

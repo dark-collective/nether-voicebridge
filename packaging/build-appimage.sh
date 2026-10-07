@@ -10,6 +10,13 @@
 # pinned type2 runtime handed to it), and it runs via extract-and-run, so no
 # FUSE is needed in CI containers.
 #
+# Self-update (zsync): set NVB_APPIMAGE_UPDATE_INFO (e.g. "zsync|<url of the
+# channel's .zsync>") to embed AppImage update information, and
+# NVB_APPIMAGE_FILE_URL to the URL this AppImage will be downloadable from.
+# appimagetool then also writes <AppImage>.zsync next to it (needs zsyncmake,
+# from the `zsync` package), which AppImageUpdate/appimageupdatetool use to
+# fetch only the changed blocks of a newer version.
+#
 # Tools are pinned by version AND sha256 (a moved/compromised upstream asset
 # fails the build instead of silently shipping). Downloads are cached in
 # $NVB_APPIMAGE_TOOLS (default: target/appimage-tools).
@@ -56,6 +63,12 @@ install -m 0644 packaging/appimage/nether-voicebridge.desktop packaging/appimage
 install -m 0644 config.example.toml LICENSE README.md "$appdir/usr/share/doc/nether-voicebridge/"
 
 out="$outdir/nether-voicebridge-${version}-${arch}.AppImage"
-ARCH="$arch" APPIMAGE_EXTRACT_AND_RUN=1 "$tool" --no-appstream \
-  --runtime-file "$runtime" "$appdir" "$out"
-ls -l "$out"
+update=()
+if [ -n "${NVB_APPIMAGE_UPDATE_INFO:-}" ]; then
+  command -v zsyncmake >/dev/null || { echo "build-appimage.sh: zsyncmake (zsync package) is required for update info" >&2; exit 1; }
+  update=(-u "$NVB_APPIMAGE_UPDATE_INFO" --file-url "${NVB_APPIMAGE_FILE_URL:?NVB_APPIMAGE_FILE_URL is required with NVB_APPIMAGE_UPDATE_INFO}")
+fi
+# Run from $outdir so the .zsync lands next to the AppImage.
+(cd "$outdir" && ARCH="$arch" APPIMAGE_EXTRACT_AND_RUN=1 "$(realpath "$tool")" --no-appstream \
+  --runtime-file "$(realpath "$runtime")" "${update[@]}" "$appdir" "$(basename "$out")")
+ls -l "$out"*
