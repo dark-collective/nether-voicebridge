@@ -387,14 +387,15 @@ jobs:
           packaging/publish-release.sh dist/*.deb dist/*.rpm dist/*.tar.gz dist/*.AppImage
 
           # The static tarballs were uploaded by the image jobs; fetch them
-          # back (attachment URLs rewritten to the tailnet host) so SHA256SUMS
-          # covers every asset. Bare names → `sha256sum -c` works in a
-          # download dir.
+          # back by attachment UUID over the tailnet host (an asset's
+          # browser_download_url is /releases/download/<tag>/<name>, which
+          # has no /attachments/ part) so SHA256SUMS covers every asset. Bare
+          # names → `sha256sum -c` works in a download dir.
           curl -fsS -H "Authorization: token ${TOKEN}" "${API}/releases/tags/${TAG}" \
             | python3 -c 'import sys,json
           for a in json.load(sys.stdin)["assets"]:
               if a["name"].endswith("-linux-static.tar.gz"):
-                  print(a["name"], "/attachments/" + a["browser_download_url"].rsplit("/attachments/", 1)[1])' \
+                  print(a["name"], "/attachments/" + a["uuid"])' \
             | while read -r name path; do
                 curl -fsSL -H "Authorization: token ${TOKEN}" -o "dist/${name}" "http://${REGISTRY}${path}"
               done
