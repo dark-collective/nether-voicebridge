@@ -2363,8 +2363,10 @@ async fn keep_membership_posted(
                     first = false;
                     break;
                 }
+                // `{e:#}`: the full chain, so a transport failure (connect /
+                // timeout) is distinguishable from an HTTP 403 in the journal.
                 Err(e) => tracing::warn!(
-                    error = %e,
+                    error = %format_args!("{e:#}"),
                     retry_in_s = backoff.as_secs(),
                     "ghost post_membership failed — retrying (room may need m.call.member at PL 0)"
                 ),
