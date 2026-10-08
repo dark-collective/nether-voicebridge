@@ -69,11 +69,27 @@ fi
 # RUST_LOG). Sustained storm = ~60+ lines/15min; normal = a handful/day.
 gwn=$(echo "$J" | grep -cE "serenity.*(Attempting to reconnect|auto-reconnect|session invalidation|Invalid session|Failed to resume|Restarting shard)" || true)
 [ "$gwn" -gt "${GW_STORM_ALERT:-20}" ] && ALERTS+=("🌪 Discord gateway churn: $gwn reconnect/invalid-session lines in 15 min — identify-storm risk (1000/day ⇒ Discord auto-resets the bot token). journalctl -u $UNIT | grep serenity")
-# Known failure signature: ghost 403 on m.call.member (runtime) or the #95
-# sweep's detection line = the room lost/never had the PL-0 override →
-# Discord→Matrix silently broken in that room.
-plmiss=$(echo "$J" | grep -E "post_membership failed|bridged room misconfigured" | grep -oP '(bridge\{name=|bridge=)\K[^}: ]+' | sort -u | paste -sd', ')
+# Known failure signature: the #95 sweep's detection line, or a ghost 403 on
+# m.call.member = the room lost/never had the PL-0 override → Discord→Matrix
+# silently broken in that room. A bare `post_membership failed` is NOT enough:
+# the ghost retries any error (2 s backoff), so a one-off transport blip that
+# recovers on the next attempt used to raise a false misconfig alert (10-08).
+plmiss=$( {
+    echo "$J" | grep "bridged room misconfigured" | grep -oP 'bridge=\K.*?(?= room=)'
+    echo "$J" | grep "ghost post_membership failed" | grep -E "error=.*(403 Forbidden|M_FORBIDDEN)" | grep -oP 'bridge\{name=\K[^}]+'
+} | sort -u | paste -sd', ')
 [ -n "$plmiss" ] && ALERTS+=("🔧 Room misconfigured — m.call.member needs PL 0: bridge(s) [$plmiss]. Discord speakers will NOT appear in the Matrix call there. Fix: start an Element Call in the room once, or /devtools → m.room.power_levels → events[\"org.matrix.msc3401.call.member\"]=0 (the Roles&Permissions UI shows \"Default\" either way — check the raw event).")
+# Any other cause only matters if it persists: a ghost whose LAST
+# ${GHOST_FAIL_STREAK:-3}+ membership attempts in the window all failed (no
+# posted/refreshed after them) is stuck out of the call.
+stuck=$(echo "$J" \
+    | sed -nE 's/.*bridge\{name=([^}]+)\}:ghost\{mxid=([^}]+)\}.*ghost post_membership failed.*/\1\t\2\tF/p
+               s/.*bridge\{name=([^}]+)\}:ghost\{mxid=([^}]+)\}.*ghost call membership (posted|refreshed).*/\1\t\2\tS/p' \
+    | awk -F'\t' -v n="${GHOST_FAIL_STREAK:-3}" '{k=$1"\t"$2; s[k] = ($3=="F") ? s[k]+1 : 0}
+          END {for (k in s) if (s[k] >= n) {split(k, a, "\t"); print a[1]}}' \
+    | sort -u | paste -sd', ')
+[ -n "$stuck" ] && ALERTS+=("👻 Ghost membership STUCK — repeated m.call.member post failures with no recovery: bridge(s) [$stuck]. Discord speakers there are missing from the Matrix call. Not a 403 (that alerts as misconfigured) — check the error= in: journalctl -u $UNIT | grep 'post_membership failed'
+$(echo "$J" | grep "ghost post_membership failed" | tail -1 | cut -c1-300)")
 alive=$(systemctl is-active "$UNIT")
 [ "$alive" != "active" ] && ALERTS+=("💀 $UNIT is $alive")
 

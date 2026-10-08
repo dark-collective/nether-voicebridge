@@ -245,6 +245,36 @@ run "$QUIET_J" "$(roster alive 0)"
 check "re-invite re-alerts" "DORMANT bot address" yes
 rm -f "$T/dormant.json"
 
+G='host nvb[1]: WARN bridge{name=Light Voice}:ghost{mxid=@g1:nether.im}: nvb_matrix_rtc::rtc::ghost: ghost post_membership failed — retrying (room may need m.call.member at PL 0)'
+OK='host nvb[1]: INFO bridge{name=Light Voice}:ghost{mxid=@g1:nether.im}: nvb_matrix_rtc::rtc::ghost: ghost call membership refreshed (expiry extended) sfu=https://lk'
+
+echo "== case 19: one transient failure, then recovery ⇒ silent (10-08 false alarm) =="
+run "Oct 08 00:09:25 $G error=PUT /rooms/.../state/m.call.member: error sending request retry_in_s=2
+Oct 08 00:09:27 $OK" "$(roster alive 0)"
+check "no misconfig alert" "Room misconfigured" no
+check "no stuck alert" "membership STUCK" no
+
+echo "== case 20: a ghost 403 ⇒ misconfig alert with the full bridge name =="
+run "Oct 08 00:09:25 $G error=put m.call.member failed: 403 Forbidden: {\"errcode\":\"M_FORBIDDEN\"} retry_in_s=2" "$(roster alive 0)"
+check "misconfig alert" "Room misconfigured" yes
+check "full bridge name" "[Light Voice]" yes
+
+echo "== case 20b: '403' inside a ghost mxid + a 502 is NOT a 403 (10-06 replay) =="
+run "Oct 06 03:58:00 host nvb[1]: WARN bridge{name=Light Movies}:ghost{mxid=@nvb_325541945285804033:nether.im}: nvb_matrix_rtc::rtc::ghost: ghost post_membership failed — retrying (room may need m.call.member at PL 0) error=put m.call.member failed: 502 Bad Gateway: error code: 502" "$(roster alive 0)"
+check "no misconfig alert" "Room misconfigured" no
+
+echo "== case 21: the #95 sweep line ⇒ misconfig alert =="
+run 'Oct 08 00:09:25 host nvb[1]: WARN nvb_matrix_rtc::mgmt: bridged room misconfigured: ghosts cannot post m.call.member — Discord→Matrix broken there bridge=Dark Voice room=!r:x required=50 ghost_pl=0' "$(roster alive 0)"
+check "sweep alert names the bridge" "[Dark Voice]" yes
+
+echo "== case 22: repeated non-403 failures, no recovery ⇒ stuck alert, not misconfig =="
+run "Oct 08 00:09:25 $OK
+Oct 08 00:10:00 $G error=PUT: timed out retry_in_s=2
+Oct 08 00:10:02 $G error=PUT: timed out retry_in_s=4
+Oct 08 00:10:06 $G error=PUT: timed out retry_in_s=8" "$(roster alive 0)"
+check "stuck alert" "membership STUCK" yes
+check "no misconfig claim" "Room misconfigured" no
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
