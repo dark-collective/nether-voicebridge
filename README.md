@@ -47,7 +47,7 @@ the matching channels on the [Discord server](https://discord.gg/BQYxEdu7s2). Sa
 
 ![A Matrix Element Call (left) and the bridged Discord voice channel (right) side
 by side: Discord speakers appear as named ghosts in the Element call, and Matrix
-speakers appear as named puppet bots in Discord.](docs/images/nether-voicebridge.png)
+speakers appear as named puppet bots in Discord.](docs/images/nether-voicebridge-2.png)
 
 *Left: an Element Call with the bridged participants. Right: the same conversation
 in the Discord voice channel — each side shows the other's speakers as their own
