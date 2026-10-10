@@ -1,0 +1,98 @@
+name: CI
+
+# GitHub-hosted copy of .forgejo/workflows/ci.yml (unit/integration tests +
+# clippy), run on the one-way GitHub mirror so the hermetic gate stops competing
+# with the live services for CPU on the self-hosted runner. Forgejo ignores this
+# directory while .forgejo/workflows exists, so nothing runs twice there.
+#
+# Deliberately inert beyond building: no secrets, read-only token, no PR or
+# issue triggers (the mirror is one-way; PRs live on Forgejo), and no step that
+# talks to anything but crates.io / the livekit libwebrtc download. The live E2E
+# harness needs the tailnet and stays on Forgejo (e2e.yml).
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# GitHub runners are isolated VMs, so (unlike the Forgejo `live-host` group) a
+# per-ref group is safe; a newer push to the same branch supersedes the old run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Debug info is most of target/ (~20 GB with it); the runner has ~14 GB free.
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      # Reclaim ~30 GB of preinstalled SDKs we never use, as headroom for the
+      # libwebrtc download + target/.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # Pinned to commit SHAs (v7.0.1 / v2.9.2): third-party code with repo access.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      # Same native deps as the Dockerfile / Forgejo CI (livekit needs clang/
+      # bindgen + protobuf; opus is linked dynamically). libglib2.0-dev: webrtc-sys
+      # links glib/gobject/gio; Forgejo's act image ships it, GitHub's doesn't.
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang libclang-dev libopus-dev \
+            pkg-config protobuf-compiler libssl-dev libglib2.0-dev
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version
+
+      - name: Install failure-annotation helper
+        run: |
+          mkdir -p "$HOME/bin"
+          cat > "$HOME/bin/ci_run" <<'SH'
+          #!/usr/bin/env bash
+          set -o pipefail
+          log=$(mktemp)
+          "$@" 2>&1 | tee "$log"
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            msg=$(grep -E '^(error|warning: unused|failures:|test .* FAILED|---- )|panicked' "$log" | tail -n 40)
+            [ -n "$msg" ] || msg=$(tail -n 40 "$log")
+            msg=${msg//'%'/'%25'}; msg=${msg//$'\r'/'%0D'}; msg=${msg//$'\n'/'%0A'}
+            echo "::error title=$1 $2 failed::$msg"
+          fi
+          exit "$status"
+          SH
+          chmod +x "$HOME/bin/ci_run"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+
+      # --locked: the songbird/livekit pins are load-bearing (CLAUDE.md
+      # constraint 7); CI must never resolve a floated lockfile.
+      # `ci_run` (below) mirrors a failure's last lines into an ::error::
+      # annotation: annotations are readable via the public API without a
+      # GitHub login, raw job logs are not.
+      - name: cargo test
+        run: ci_run cargo test --workspace --locked
+
+      - name: cargo clippy
+        run: ci_run cargo clippy --workspace --all-targets --locked -- -D warnings
