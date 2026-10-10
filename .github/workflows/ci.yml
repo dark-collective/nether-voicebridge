@@ -48,13 +48,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       # Same native deps as the Dockerfile / Forgejo CI (livekit needs clang/
-      # bindgen + protobuf; opus is linked dynamically).
+      # bindgen + protobuf; opus is linked dynamically). libglib2.0-dev: webrtc-sys
+      # links glib/gobject/gio; Forgejo's act image ships it, GitHub's doesn't.
       - name: Install native build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake clang libclang-dev libopus-dev \
-            pkg-config protobuf-compiler libssl-dev
+            pkg-config protobuf-compiler libssl-dev libglib2.0-dev
 
       - name: Install Rust toolchain
         run: |
