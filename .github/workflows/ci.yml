@@ -60,14 +60,38 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
+          rustc --version
+
+      - name: Install failure-annotation helper
+        run: |
+          mkdir -p "$HOME/bin"
+          cat > "$HOME/bin/ci_run" <<'SH'
+          #!/usr/bin/env bash
+          set -o pipefail
+          log=$(mktemp)
+          "$@" 2>&1 | tee "$log"
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            msg=$(grep -E '^(error|warning: unused|failures:|test .* FAILED|---- )|panicked' "$log" | tail -n 40)
+            [ -n "$msg" ] || msg=$(tail -n 40 "$log")
+            msg=${msg//'%'/'%25'}; msg=${msg//$'\r'/'%0D'}; msg=${msg//$'\n'/'%0A'}
+            echo "::error title=$1 $2 failed::$msg"
+          fi
+          exit "$status"
+          SH
+          chmod +x "$HOME/bin/ci_run"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       # --locked: the songbird/livekit pins are load-bearing (CLAUDE.md
       # constraint 7); CI must never resolve a floated lockfile.
+      # `ci_run` (below) mirrors a failure's last lines into an ::error::
+      # annotation: annotations are readable via the public API without a
+      # GitHub login, raw job logs are not.
       - name: cargo test
-        run: cargo test --workspace --locked
+        run: ci_run cargo test --workspace --locked
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: ci_run cargo clippy --workspace --all-targets --locked -- -D warnings
