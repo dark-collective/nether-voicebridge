@@ -107,5 +107,9 @@ nvb-matrix-rtc = { path = "crates/matrix-rtc" }
 # past 0.6.0 exists yet). Patch: StoredPacket carries the corrected payload
 # tail so the decode slice excludes the DAVE trailer (udp_rx/{mod,
 # playout_buffer,ssrc_state}.rs).
+# Second (diagnostic) patch: the "RTCP decryption failed" WARN names the sender
+# SSRC/Discord user, RTCP packet type and per-sender ok/failed counts, and is
+# rate-limited (1st, 2nd, 4th… then every 1000th failure per sender) — upstream
+# logs every failure with no context (~1/s per call, tripped nvb-watch 10-10).
 [patch.crates-io]
 songbird = { path = "vendor/songbird" }

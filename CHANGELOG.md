@@ -5,6 +5,11 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Logging:** the Discord-side "RTCP decryption failed" warning now names the sending participant
+  (SSRC and Discord user), the RTCP packet type and per-sender success/failure counts, and is
+  rate-limited instead of logging every packet (it was flooding the journal at ~1/s per call).
+
 ## [0.4.4] - 2026-10-07
 
 Re-release of 0.4.3 (whose release packaging failed before publishing — no 0.4.3 downloads exist).
