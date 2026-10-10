@@ -46,6 +46,9 @@ struct UdpRx {
     udp_socket: UdpSocket,
     dave_session: Arc<RwLock<Option<davey::DaveSession>>>,
     dave_protocol_version: Arc<AtomicU16>,
+    /// Per-sender-SSRC RTCP decrypt (ok, failed) counts — NVB patch, so the
+    /// failure warning names its source and stays log-rate-limited.
+    rtcp_stats: HashMap<u32, (u64, u64)>,
 }
 
 impl UdpRx {
@@ -302,10 +305,45 @@ impl UdpRx {
             },
             DemuxedMut::Rtcp(mut rtcp) => {
                 let packet_data = if self.config.decode_mode.should_decrypt() {
+                    // The RTCP header (V/P/RC, PT, length, sender SSRC) is
+                    // plaintext; read it before decrypt for the diagnostics below.
+                    let (pt, sender_ssrc, pkt_len) = {
+                        let raw = rtcp.packet();
+                        let pt = raw.get(1).copied().unwrap_or(0);
+                        let ssrc = raw
+                            .get(4..8)
+                            .map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+                        (pt, ssrc, raw.len())
+                    };
+
                     let out = self.cipher.decrypt_rtcp_in_place(&mut rtcp);
 
-                    if let Err(ref e) = out {
-                        warn!("RTCP decryption failed: {:?}", e);
+                    let stats = self.rtcp_stats.entry(sender_ssrc).or_insert((0, 0));
+                    match out {
+                        Ok(_) => stats.0 += 1,
+                        Err(ref e) => {
+                            stats.1 += 1;
+                            let (ok, failed) = *stats;
+                            // Log the 1st, 2nd, 4th, 8th… failure per sender, then
+                            // every 1000th — enough to identify it without flooding.
+                            if failed.is_power_of_two() || failed % 1000 == 0 {
+                                let user = self
+                                    .ssrc_signalling
+                                    .ssrc_user_map
+                                    .get(&sender_ssrc)
+                                    .map(|u| u.0);
+                                warn!(
+                                    ssrc = sender_ssrc,
+                                    ?user,
+                                    rtcp_pt = pt,
+                                    len = pkt_len,
+                                    failed,
+                                    ok,
+                                    error = ?e,
+                                    "RTCP decryption failed"
+                                );
+                            }
+                        },
                     }
 
                     out.ok()
@@ -362,6 +400,7 @@ pub(crate) async fn runner(
         udp_socket,
         dave_session,
         dave_protocol_version,
+        rtcp_stats: HashMap::new(),
     };
 
     state.run(&mut interconnect).await;
