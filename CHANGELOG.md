@@ -5,10 +5,18 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-10-10
+
+**Quieter, more useful Discord voice logs.**
+
 ### Changed
 - **Logging:** the Discord-side "RTCP decryption failed" warning now names the sending participant
   (SSRC and Discord user), the RTCP packet type and per-sender success/failure counts, and is
   rate-limited instead of logging every packet (it was flooding the journal at ~1/s per call).
+
+### Fixed
+- **Release packaging:** the SHA256SUMS step fetches the static tarballs by attachment URL (the
+  v0.4.4 release had to be finished by hand).
 
 ## [0.4.4] - 2026-10-07
 
