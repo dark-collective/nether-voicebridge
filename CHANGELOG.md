@@ -5,6 +5,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-10-11
+
+**Hanging up both halves of a paired account no longer flashes a ghost into the call.**
+
 ### Changed
 - **Paired accounts (ADR 0001):** when a paired person leaves the Matrix call while their own Discord account is still
   in the channel, the bridge now waits `[timing] paired_leave_grace_ms` (30 s) before giving that account a ghost. A
