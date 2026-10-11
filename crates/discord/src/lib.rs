@@ -199,6 +199,8 @@ struct VoiceReceiver {
     /// Count of speaker frames dropped because no ghost sink was resolvable yet
     /// (unknown SSRC→user, or the user has no ghost). Logged periodically.
     dropped: AtomicU64,
+    /// Frames from known speakers with no ghost sink (bridge-owned, or ghost pending).
+    unghosted: AtomicU64,
     /// Total VoiceTicks seen — logged periodically with speaking/silent sizes so
     /// we can tell "ticks stopped" (connection dead) from "ticks fire but all
     /// silent" (decode dead) when capture goes quiet.
@@ -235,6 +237,7 @@ impl VoiceReceiver {
             anchor,
             idx,
             dropped: AtomicU64::new(0),
+            unghosted: AtomicU64::new(0),
             ticks: AtomicU64::new(0),
             shape_warns: AtomicU64::new(0),
         }
@@ -242,7 +245,7 @@ impl VoiceReceiver {
 
     /// Push each present, non-excluded speaker's 20 ms mono frame to their ghost
     /// sink. Returns the number of speaker frames dropped for want of a ghost.
-    fn demux_tick(&self, tick: &songbird::events::context_data::VoiceTick) -> u64 {
+    fn demux_tick(&self, tick: &songbird::events::context_data::VoiceTick) -> Drops {
         self.demux_frames(
             tick.speaking
                 .iter()
@@ -253,14 +256,14 @@ impl VoiceReceiver {
     /// The per-frame demux body, seamed off `VoiceTick` (which is
     /// `non_exhaustive` and unconstructible in tests) so the capture/forward
     /// ordering below is unit-testable.
-    fn demux_frames<'p>(&self, frames: impl Iterator<Item = (u32, Option<&'p [i16]>)>) -> u64 {
+    fn demux_frames<'p>(&self, frames: impl Iterator<Item = (u32, Option<&'p [i16]>)>) -> Drops {
         // One read-lock each per tick; writers (puppet join/leave, speaker
         // announce, ghost assign) are all rare relative to the 50 Hz tick.
         let excluded = self.exclude.read().unwrap_or_else(PoisonError::into_inner);
         let ssrc_map = self.ssrc_map.read().unwrap_or_else(PoisonError::into_inner);
         let sinks = self.user_sinks.read().unwrap_or_else(PoisonError::into_inner);
         let optout = self.optout.read().unwrap_or_else(PoisonError::into_inner);
-        let mut dropped = 0u64;
+        let mut drops = Drops::default();
         for (ssrc, pcm) in frames {
             if excluded.contains(&ssrc) {
                 continue;
@@ -299,14 +302,27 @@ impl VoiceReceiver {
                     }
                     match sinks.get(uid) {
                         Some(sink) => sink.push(&audio::downmix_stereo_to_mono(pcm)),
-                        None => dropped += 1,
+                        // Known speaker without a ghost: a bridge-owned member (a paired
+                        // person's own account while they're in the call, a configured
+                        // exclusion) is never ghosted on purpose; otherwise its ghost is
+                        // still being minted.
+                        None => drops.unghosted += 1,
                     }
                 }
-                None => dropped += 1,
+                None => drops.unattributed += 1,
             }
         }
-        dropped
+        drops
     }
+}
+
+/// One tick's frames that did not reach a ghost.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Drops {
+    /// The SSRC isn't mapped to a Discord user yet (speaking update not seen).
+    unattributed: u64,
+    /// The user is known but has no ghost sink: bridge-owned, or ghost pending.
+    unghosted: u64,
 }
 
 #[async_trait]
@@ -331,11 +347,19 @@ impl SongbirdEventHandler for VoiceReceiver {
                 );
             }
 
-            let dropped = self.demux_tick(tick);
-            if dropped > 0 {
-                let total = self.dropped.fetch_add(dropped, Ordering::Relaxed) + dropped;
+            let drops = self.demux_tick(tick);
+            if drops.unattributed > 0 {
+                let total = self.dropped.fetch_add(drops.unattributed, Ordering::Relaxed) + drops.unattributed;
                 if total.is_multiple_of(50) {
-                    tracing::warn!(dropped = total, "speaker frames dropped — no ghost sink yet");
+                    tracing::warn!(dropped = total, "speaker frames dropped — speaker not attributed to a Discord user yet");
+                }
+            }
+            if drops.unghosted > 0 {
+                // Expected for bridge-owned members (a paired person speaking through their
+                // own Discord account): their audio deliberately never crosses. Debug only.
+                let total = self.unghosted.fetch_add(drops.unghosted, Ordering::Relaxed) + drops.unghosted;
+                if total.is_multiple_of(500) {
+                    tracing::debug!(dropped = total, "frames from speakers without a ghost (bridge-owned or ghost pending)");
                 }
             }
         }
@@ -489,7 +513,7 @@ mod playback_tests {
             0,
         );
         let frame = vec![0i16; STEREO_20MS_SAMPLES];
-        let dropped = rx.demux_frames(
+        let drops = rx.demux_frames(
             [
                 (990_001u32, Some(frame.as_slice())), // mapped + consenting → captured
                 (990_002, Some(frame.as_slice())),    // mapped + OPTED OUT → never captured
@@ -499,9 +523,10 @@ mod playback_tests {
             .into_iter(),
         );
         assert_eq!(sink.captured_ssrcs(), vec![990_001]);
-        // Dropped = the consenting speaker without a ghost sink yet (1) + the
-        // unmapped speaker (1); opted-out and excluded are deliberate non-drops.
-        assert_eq!(dropped, 2);
+        // The consenting speaker without a ghost sink yet (unghosted) and the
+        // unmapped speaker (unattributed); opted-out and excluded are deliberate
+        // non-drops.
+        assert_eq!(drops, Drops { unattributed: 1, unghosted: 1 });
         // Tidy the WAV the consenting speaker's tap created in CWD.
         let _ = std::fs::remove_file("capture_990001.wav");
     }

@@ -710,9 +710,23 @@ impl SharedPool {
                     tracing::warn!(user_id = uid, bridge, "member is no longer bridge-owned but no Discord context is cached yet — ghost deferred to its next voice event");
                     return;
                 };
-                tracing::info!(user_id = uid, bridge, "member is no longer bridge-owned (its Matrix half left the call) — minting ghost");
+                // ADR 0001 §5, the other direction: the person's Matrix half left the call
+                // while their own Discord account is still in the channel — usually about to
+                // leave too (a client hanging up both). Give it `paired_leave_grace` before
+                // ghosting it, so a person never flashes into the call as their own ghost.
+                tracing::info!(user_id = uid, bridge, grace_ms = self.paired_leave_grace.as_millis() as u64,
+                    "member is no longer bridge-owned (its Matrix half left the call) — ghost after the grace unless it leaves or returns");
                 let pool = self.clone();
-                tokio::spawn(async move { ensure_ghost(&pool, &ctx, &ch, uid, None).await });
+                let bridge = bridge.to_string();
+                tokio::spawn(async move {
+                    tokio::time::sleep(pool.paired_leave_grace).await;
+                    if !pool.presence_contains(&bridge, uid) || ch.links.discord_excluded(uid) {
+                        tracing::info!(user_id = uid, bridge = %bridge, "no ghost needed: the member left the channel or its Matrix half returned within the grace");
+                        return;
+                    }
+                    tracing::info!(user_id = uid, bridge = %bridge, "member still in the channel without its Matrix half — minting ghost");
+                    ensure_ghost(&pool, &ctx, &ch, uid, None).await
+                });
             }
             LinkEvent::MatrixExcluded(_) | LinkEvent::MatrixIncluded { .. } => {} // Matrix side's job
         }
