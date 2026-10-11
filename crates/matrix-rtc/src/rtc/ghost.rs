@@ -951,8 +951,8 @@ async fn run_ghost(
             tracing::warn!(error = %e, "ghost set_displayname failed (continuing)");
         }
         // Mirror the Discord avatar onto the ghost's Matrix profile (best-effort;
-        // never blocks the ghost going live). Re-set on each assign — cheap, and
-        // it tracks avatar changes across rejoins.
+        // never blocks the ghost going live). Checked on each assign so it tracks
+        // avatar changes across rejoins; unchanged avatars are not re-uploaded.
         if let Some(url) = avatar_url.as_deref() {
             if let Err(e) = set_avatar(&cfg, &ghost_mxid, url).await {
                 tracing::warn!(error = %e, "ghost set_avatar failed (continuing)");
@@ -2160,8 +2160,16 @@ async fn register_ghost(cfg: &GhostConfig, localpart: &str) -> Result<()> {
     Err(anyhow!("POST /register failed: {status}: {text}"))
 }
 
-/// Set the ghost's display name (masqueraded).
+/// Set the ghost's display name (masqueraded). A no-op when the profile already
+/// carries `name`: every profile PUT fans out as a fresh `m.room.member` event into
+/// every room the ghost has joined, so re-setting an unchanged name on each assign
+/// buried bridged rooms under thousands of "updated their profile" events.
 async fn set_displayname(cfg: &GhostConfig, ghost_mxid: &str, name: &str) -> Result<()> {
+    let current = get_profile_field(cfg, ghost_mxid, "displayname").await;
+    if current.ok().flatten().as_deref() == Some(name) {
+        tracing::debug!("ghost display name unchanged — not re-set");
+        return Ok(());
+    }
     let url = cs_url(
         &cfg.homeserver_url,
         &["profile", ghost_mxid, "displayname"],
@@ -2181,9 +2189,120 @@ async fn set_displayname(cfg: &GhostConfig, ghost_mxid: &str, name: &str) -> Res
     Ok(())
 }
 
+/// Read one field of the ghost's profile; `None` when it is unset (404).
+async fn get_profile_field(
+    cfg: &GhostConfig,
+    ghost_mxid: &str,
+    field: &str,
+) -> Result<Option<String>> {
+    let url = cs_url(
+        &cfg.homeserver_url,
+        &["profile", ghost_mxid, field],
+        Some(ghost_mxid),
+    )?;
+    let resp = cfg
+        .http
+        .get(url)
+        .bearer_auth(&cfg.as_token)
+        .send()
+        .await
+        .with_context(|| format!("GET /profile/{field}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(anyhow!("get {field} failed: {}", err_body(resp).await));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .with_context(|| format!("decoding /profile/{field}"))?;
+    Ok(body.get(field).and_then(|v| v.as_str()).map(str::to_owned))
+}
+
+/// Which `mxc://` URIs were uploaded for which Discord avatar URL — process-wide
+/// (ghost MXIDs are shared by every bridge on one appservice, so a per-bridge view
+/// would have two bridges re-uploading over each other) and persisted per store at
+/// `<store_path>/ghosts/avatars.json` so a restart doesn't re-upload either.
+/// A Discord avatar URL embeds the avatar hash, so it changes exactly when the
+/// picture does.
+#[derive(Default)]
+struct AvatarUploads {
+    by_url: HashMap<String, HashSet<String>>,
+    loaded_stores: HashSet<String>,
+}
+
+static AVATAR_UPLOADS: std::sync::LazyLock<tokio::sync::Mutex<AvatarUploads>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn avatar_uploads_path(store_path: &str) -> Option<std::path::PathBuf> {
+    (!store_path.is_empty())
+        .then(|| std::path::Path::new(store_path).join("ghosts").join("avatars.json"))
+}
+
+impl AvatarUploads {
+    /// Merge a store's persisted uploads in, once per store. A missing or
+    /// unreadable file just means "nothing known yet" (worst case: one re-upload).
+    fn load_store(&mut self, store_path: &str) {
+        if !self.loaded_stores.insert(store_path.to_owned()) {
+            return;
+        }
+        let Some(path) = avatar_uploads_path(store_path) else { return };
+        let Ok(bytes) = std::fs::read(&path) else { return };
+        match serde_json::from_slice::<HashMap<String, HashSet<String>>>(&bytes) {
+            Ok(map) => {
+                for (url, mxcs) in map {
+                    self.by_url.entry(url).or_default().extend(mxcs);
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "ignoring unreadable ghost avatar cache"
+            ),
+        }
+    }
+
+    fn knows(&self, discord_url: &str, mxc: &str) -> bool {
+        self.by_url.get(discord_url).is_some_and(|m| m.contains(mxc))
+    }
+
+    /// Record an upload and persist the (merged) map to `store_path`.
+    fn record(&mut self, store_path: &str, discord_url: &str, mxc: &str) {
+        self.by_url.entry(discord_url.to_owned()).or_default().insert(mxc.to_owned());
+        let Some(path) = avatar_uploads_path(store_path) else { return };
+        let write = || -> std::io::Result<()> {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, serde_json::to_vec(&self.by_url)?)?;
+            std::fs::rename(&tmp, &path)
+        };
+        if let Err(e) = write() {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "could not persist ghost avatar cache"
+            );
+        }
+    }
+}
+
 /// Mirror a Discord avatar onto the ghost: download it from Discord's CDN, upload
 /// it to the homeserver media repo (masqueraded), and set the ghost's avatar_url.
+/// Skipped when the profile already points at an upload of this same Discord
+/// avatar — a re-upload mints a new `mxc://`, i.e. an "updated their avatar"
+/// member event in every room the ghost is in, on every assign.
 async fn set_avatar(cfg: &GhostConfig, ghost_mxid: &str, discord_avatar_url: &str) -> Result<()> {
+    if let Ok(Some(current)) = get_profile_field(cfg, ghost_mxid, "avatar_url").await {
+        let mut uploads = AVATAR_UPLOADS.lock().await;
+        uploads.load_store(&cfg.store_path);
+        if uploads.knows(discord_avatar_url, &current) {
+            tracing::debug!("ghost avatar unchanged — not re-uploaded");
+            return Ok(());
+        }
+    }
     // 1. Download from the Discord CDN (public, no auth).
     let resp = cfg
         .http
@@ -2222,6 +2341,7 @@ async fn set_avatar(cfg: &GhostConfig, ghost_mxid: &str, discord_avatar_url: &st
     if !resp.status().is_success() {
         return Err(anyhow!("set avatar_url failed: {}", err_body(resp).await));
     }
+    AVATAR_UPLOADS.lock().await.record(&cfg.store_path, discord_avatar_url, &mxc);
     tracing::info!(mxc = %mxc, "ghost avatar set");
     Ok(())
 }
@@ -2629,6 +2749,34 @@ mod tests {
         assert!(is_bridge_excluded_identity("@nether-voicebridge_123:nether.im", pfx));
         assert!(is_bridge_excluded_identity("@discord_996161727068643380:nether.im", pfx));
         assert!(!is_bridge_excluded_identity("@dark:nether.im", pfx));
+    }
+
+    #[test]
+    fn avatar_uploads_persist_across_loads() {
+        let dir = std::env::temp_dir().join(format!("nvb-avatar-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.to_string_lossy().into_owned();
+        let url = "https://cdn.discordapp.com/avatars/1/abc.png?size=1024";
+
+        let mut a = AvatarUploads::default();
+        a.load_store(&store);
+        assert!(!a.knows(url, "mxc://nether.im/one"));
+        a.record(&store, url, "mxc://nether.im/one");
+        assert!(a.knows(url, "mxc://nether.im/one"));
+
+        // A fresh process (or another bridge's view) reloads it from the store.
+        let mut b = AvatarUploads::default();
+        b.load_store(&store);
+        assert!(b.knows(url, "mxc://nether.im/one"));
+        assert!(!b.knows(url, "mxc://nether.im/other"));
+        let changed = "https://cdn.discordapp.com/avatars/1/def.png?size=1024";
+        assert!(!b.knows(changed, "mxc://nether.im/one"));
+
+        // No store ⇒ in-memory only, never a write.
+        let mut c = AvatarUploads::default();
+        c.record("", url, "mxc://nether.im/two");
+        assert!(c.knows(url, "mxc://nether.im/two"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
