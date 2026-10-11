@@ -5,6 +5,14 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Paired accounts (ADR 0001):** when a paired person leaves the Matrix call while their own Discord account is still
+  in the channel, the bridge now waits `[timing] paired_leave_grace_ms` (30 s) before giving that account a ghost. A
+  person who hangs up both no longer flashes into the call as their own ghost for a few seconds.
+- **Logging:** audio from a Discord speaker the bridge deliberately doesn't ghost (a paired person speaking through
+  their own account, a configured exclusion) is no longer reported every second as a warning ("speaker frames
+  dropped — no ghost sink yet"). Frames from a speaker not yet matched to a Discord user still warn.
+
 ## [0.4.7] - 2026-10-11
 
 **A paired account's Discord session can drop and come back without a failover.**
