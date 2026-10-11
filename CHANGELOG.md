@@ -5,6 +5,15 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-10-11
+
+**No more Discord-side "RTCP decryption failed" warnings.**
+
+### Fixed
+- **Logging:** Discord voice control packets of a type the RTCP parser doesn't read (feedback, goodbye and
+  similar) arrived with no contents, so decrypting them always failed and logged a warning about once a second
+  per call. They're now skipped quietly; audio was never affected.
+
 ## [0.4.5] - 2026-10-10
 
 **Quieter, more useful Discord voice logs.**
