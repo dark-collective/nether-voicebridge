@@ -15,6 +15,7 @@ use crate::{
 use bytes::BytesMut;
 use discortp::{
     demux::{self, DemuxedMut},
+    rtcp::MutableRtcpPacket,
     rtp::RtpPacket,
 };
 use discortp::{MutablePacket, Packet};
@@ -304,7 +305,17 @@ impl UdpRx {
                 )));
             },
             DemuxedMut::Rtcp(mut rtcp) => {
-                let packet_data = if self.config.decode_mode.should_decrypt() {
+                // NVB patch: discortp only parses sender/receiver reports. Any
+                // other RTCP type (feedback, SDES, BYE, ...) comes back as
+                // `KnownType` with no bytes, so there is nothing to decrypt;
+                // trying to was the source of the per-packet WARN flood.
+                let bodyless = if let MutableRtcpPacket::KnownType(kind) = &rtcp {
+                    trace!(?kind, "RTCP packet type discortp doesn't parse; not decrypted");
+                    true
+                } else {
+                    false
+                };
+                let packet_data = if !bodyless && self.config.decode_mode.should_decrypt() {
                     // The RTCP header (V/P/RC, PT, length, sender SSRC) is
                     // plaintext; read it before decrypt for the diagnostics below.
                     let (pt, sender_ssrc, pkt_len) = {
