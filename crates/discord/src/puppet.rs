@@ -37,7 +37,7 @@
 //! never re-captures it.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -539,6 +539,12 @@ pub struct SharedPool {
     /// consumed once by the command bot's `ready` (same take-once shape as
     /// `PuppetSlot.cmd_rx`).
     notices: StdMutex<Option<mpsc::UnboundedReceiver<DiscordNotice>>>,
+    /// Deferred leaves of paired members whose Matrix half is in the call (ADR 0001
+    /// §5 grace): `(bridge, user)` → generation. A rejoin within
+    /// `paired_leave_grace` removes the entry, so the timer finds nothing to do.
+    pending_paired_leaves: StdMutex<HashMap<(Arc<str>, u64), u64>>,
+    pending_paired_seq: AtomicU64,
+    paired_leave_grace: Duration,
 }
 
 impl SharedPool {
@@ -608,6 +614,9 @@ impl SharedPool {
             optout_path: std::sync::OnceLock::new(),
             command_registered: AtomicBool::new(false),
             notices: StdMutex::new(None),
+            pending_paired_leaves: StdMutex::new(HashMap::new()),
+            pending_paired_seq: AtomicU64::new(0),
+            paired_leave_grace: timing.paired_leave_grace(),
         })
     }
 
@@ -2454,6 +2463,66 @@ impl SharedPool {
         self.rebalance(guard);
     }
 
+    /// A Discord member left `ch`'s voice channel (presence already cleared by the
+    /// caller's `note_presence(.., false)` edge): tell the pairing board, retire the
+    /// ghost, and release an anchor left idle.
+    fn process_presence_leave(&self, ch: &ChannelCtx, user_id: u64) {
+        ch.links.dispatch_all(ch.links.set_discord_present(user_id, false));
+        drop_ghost(ch, user_id);
+        self.maybe_release_idle_anchor(&ch.bridge);
+    }
+
+    /// A paired member's Discord session left while their Matrix half is in the
+    /// call: keep them present for `paired_leave_grace`, then process the leave
+    /// unless they came back (ADR 0001 §5 — a reconnect is not a failover, so no
+    /// puppet churn and no notice). Every pool bot sees the same voice state; the
+    /// first one schedules, the rest find it pending.
+    fn defer_paired_leave(self: &Arc<Self>, ch: &ChannelCtx, user_id: u64) {
+        let key = (Arc::clone(&ch.bridge), user_id);
+        let gen = {
+            let mut pending = self.pending_paired_leaves.lock().unwrap_or_else(PoisonError::into_inner);
+            if pending.contains_key(&key) {
+                return;
+            }
+            let gen = self.pending_paired_seq.fetch_add(1, Ordering::Relaxed);
+            pending.insert(key.clone(), gen);
+            gen
+        };
+        tracing::info!(user_id, bridge = %ch.bridge, grace_ms = self.paired_leave_grace.as_millis() as u64,
+            "paired member's Discord session left while its Matrix half is in the call — waiting for a reconnect");
+        let pool = Arc::clone(self);
+        let ch = ch.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(pool.paired_leave_grace).await;
+            let due = {
+                let mut pending = pool.pending_paired_leaves.lock().unwrap_or_else(PoisonError::into_inner);
+                if pending.get(&key) == Some(&gen) {
+                    pending.remove(&key);
+                    true
+                } else {
+                    false
+                }
+            };
+            if due && pool.note_presence(&ch.bridge, user_id, false) {
+                tracing::info!(user_id, bridge = %ch.bridge, "paired member did not return within the grace — processing the leave");
+                pool.process_presence_leave(&ch, user_id);
+            }
+        });
+    }
+
+    /// The member is (back) in the channel: a pending deferred leave is void.
+    fn cancel_paired_leave(&self, bridge: &Arc<str>, user_id: u64) {
+        let removed = self
+            .pending_paired_leaves
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(Arc::clone(bridge), user_id))
+            .is_some();
+        if removed {
+            tracing::info!(user_id, bridge = %bridge, "paired member's Discord session returned within the grace — no failover");
+        }
+    }
+
     /// Release a capture-only-held anchor once its channel is idle on BOTH sides:
     /// no playback puppet assigned AND no Discord speakers left. Called when the
     /// last Discord speaker leaves (see `drop_ghost`). No-op if there is no held
@@ -2812,6 +2881,7 @@ impl EventHandler for PuppetHandler {
         let muted = new.self_mute || new.mute;
         for ch in self.pool.channels_in_guild(guild_id) {
             if Some(ch.channel_id) == here {
+                self.pool.cancel_paired_leave(&ch.bridge, user_id);
                 if self.pool.note_presence(&ch.bridge, user_id, true) {
                     cache_ghost_ctx(&ch, &ctx);
                     // Linked identities (ADR 0001): record the arrival, let the
@@ -2825,12 +2895,15 @@ impl EventHandler for PuppetHandler {
                     }
                 }
                 ch.capture_router.set_muted(&user_id.to_string(), muted);
+            } else if self.pool.presence_contains(&ch.bridge, user_id) && ch.links.paired_half_present(user_id) {
+                // A paired person's own Discord session dropped while they are in the
+                // call: give it `paired_leave_grace` to come back before failing over.
+                self.pool.defer_paired_leave(&ch, user_id);
             } else if self.pool.note_presence(&ch.bridge, user_id, false) {
-                ch.links.dispatch_all(ch.links.set_discord_present(user_id, false));
-                drop_ghost(&ch, user_id);
                 // The last Discord speaker leaving may leave a capture-only anchor
-                // (one held with no playback puppet) idle — release it if so.
-                self.pool.maybe_release_idle_anchor(&ch.bridge);
+                // (one held with no playback puppet) idle — process_presence_leave
+                // releases it if so.
+                self.pool.process_presence_leave(&ch, user_id);
             }
         }
     }
@@ -5191,6 +5264,38 @@ mod tests {
             p.note_bot_guild(i, GuildId::new(1));
         }
         links
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paired_leave_waits_for_a_reconnect() {
+        // ADR 0001 §5: a paired person's own Discord session dropping while they
+        // are in the call is a failover only if it does not come back in time.
+        let p = pool(1);
+        let links = channel_with_links(&p, &[("@alice:hs", 555)]);
+        let ch = p.by_channel(GuildId::new(1), ChannelId::new(10)).expect("channel");
+        assert!(p.note_presence("A", 555, true));
+        links.set_discord_present(555, true);
+        links.set_matrix_present("@alice:hs", true);
+        assert!(links.paired_half_present(555));
+        assert!(links.matrix_excluded("@alice:hs"));
+
+        // Drops and returns within the grace: nothing happens.
+        p.defer_paired_leave(&ch, 555);
+        p.defer_paired_leave(&ch, 555); // a second pool bot seeing the same leave
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        p.cancel_paired_leave(&ch.bridge, 555);
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        assert!(p.presence_contains("A", 555), "a reconnect within the grace is not a leave");
+        assert!(links.matrix_excluded("@alice:hs"), "no puppet fallback");
+
+        // Drops for good: after the grace the leave is processed.
+        p.defer_paired_leave(&ch, 555);
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        assert!(p.presence_contains("A", 555), "still within the grace");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(!p.presence_contains("A", 555));
+        assert!(!links.matrix_excluded("@alice:hs"), "bridged through a puppet again");
     }
 
     #[test]

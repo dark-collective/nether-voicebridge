@@ -5,6 +5,14 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Paired accounts (ADR 0001):** when a paired person's own Discord session leaves the voice channel while they
+  are still in the Matrix call, the bridge now waits 30 s (`[timing] paired_leave_grace_ms`) before bridging them
+  through a puppet again and sending the "your Discord session left" DM. A reconnect within that time changes
+  nothing and sends no DM.
+- **Failover DM** names the room (its name when the management bot knows it) and links it, instead of showing the
+  bare room id.
+
 ## [0.4.6] - 2026-10-11
 
 **No more Discord-side "RTCP decryption failed" warnings.**
