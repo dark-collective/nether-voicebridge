@@ -5,6 +5,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-10-11
+
+**A paired account's Discord session can drop and come back without a failover.**
+
 ### Changed
 - **Paired accounts (ADR 0001):** when a paired person's own Discord session leaves the voice channel while they
   are still in the Matrix call, the bridge now waits 30 s (`[timing] paired_leave_grace_ms`) before bridging them
