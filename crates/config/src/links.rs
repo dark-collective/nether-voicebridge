@@ -178,6 +178,18 @@ impl LinkBoard {
         self.config_matrix.contains(mxid) || self.services.is_service(&self.room_id, mxid)
     }
 
+    /// Is Discord member `uid` present AND the half of a pairing whose Matrix
+    /// account is in the call right now — i.e. would its leaving hand that person
+    /// back to a puppet (the failover-notice case)? The Discord side defers such a
+    /// leave by `paired_leave_grace` so a reconnect is not a failover.
+    pub fn paired_half_present(&self, uid: u64) -> bool {
+        if self.config_discord.contains(&uid) {
+            return false;
+        }
+        let p = self.presence.lock().unwrap_or_else(PoisonError::into_inner);
+        p.discord.contains(&uid) && self.pairings.matrix_for_discord(uid).is_some_and(|m| p.matrix.contains(&m))
+    }
+
     /// Voice members present and NOT bridge-owned — the Discord "humans".
     pub fn discord_humans(&self) -> usize {
         let p = self.presence.lock().unwrap_or_else(PoisonError::into_inner);
@@ -449,6 +461,21 @@ mod tests {
         // Alice leaves the call: her Discord account needs its ghost back.
         assert_eq!(b.set_matrix_present(ALICE, false), vec![LinkEvent::DiscordIncluded(1)]);
         assert!(!b.discord_excluded(1));
+    }
+
+    #[test]
+    fn paired_half_present_only_while_both_halves_are_here() {
+        let b = board(&[(ALICE, 1)], &[], &[], &[]);
+        assert!(!b.paired_half_present(1), "not in the channel");
+        b.set_discord_present(1, true);
+        assert!(!b.paired_half_present(1), "Matrix half not in the call");
+        b.set_matrix_present(ALICE, true);
+        assert!(b.paired_half_present(1));
+        assert!(!b.paired_half_present(2), "unpaired member");
+        let c = board(&[(ALICE, 1)], &[], &[1], &[]);
+        c.set_discord_present(1, true);
+        c.set_matrix_present(ALICE, true);
+        assert!(!c.paired_half_present(1), "config-excluded regardless of pairing");
     }
 
     #[test]

@@ -243,6 +243,11 @@ pub struct TimingConfig {
     /// membership flaps don't churn one-time keys on every flap. Historical
     /// value 90 s.
     pub session_rotate_min_interval_ms: u64,
+    /// Grace before a paired member's Discord session leaving the channel takes
+    /// effect while their Matrix half is still in the call (ADR 0001 §5): a
+    /// reconnect within it neither falls back to a puppet nor sends the
+    /// failover notice. Historical value: none (immediate) before 0.4.7.
+    pub paired_leave_grace_ms: u64,
 }
 
 impl Default for TimingConfig {
@@ -259,6 +264,7 @@ impl Default for TimingConfig {
             bridge_restart_max_ms: 300_000,
             voice_health_sweep_ms: 15_000,
             session_rotate_min_interval_ms: 90_000,
+            paired_leave_grace_ms: 30_000,
         }
     }
 }
@@ -280,6 +286,7 @@ impl TimingConfig {
             bridge_restart_max_ms: 3_000,
             voice_health_sweep_ms: 1_000,
             session_rotate_min_interval_ms: 3_000,
+            paired_leave_grace_ms: 2_000,
         }
     }
 
@@ -327,6 +334,9 @@ impl TimingConfig {
     pub fn session_rotate_min_interval(&self) -> Duration {
         Duration::from_millis(self.session_rotate_min_interval_ms)
     }
+    pub fn paired_leave_grace(&self) -> Duration {
+        Duration::from_millis(self.paired_leave_grace_ms)
+    }
 }
 
 /// The raw `[timing]` block: per-key overrides, each optional. Kept separate
@@ -355,6 +365,8 @@ pub struct TimingOverrides {
     pub voice_health_sweep_ms: Option<u64>,
     #[serde(default)]
     pub session_rotate_min_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub paired_leave_grace_ms: Option<u64>,
 }
 
 impl TimingOverrides {
@@ -397,6 +409,7 @@ impl TimingOverrides {
         apply!(bridge_restart_max_ms);
         apply!(voice_health_sweep_ms);
         apply!(session_rotate_min_interval_ms);
+        apply!(paired_leave_grace_ms);
         Ok(t)
     }
 }

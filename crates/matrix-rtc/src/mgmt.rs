@@ -4452,7 +4452,7 @@ async fn deliver_link_notice(ctx: &BotCtx, client: &Client, n: crate::links_noti
     }
     let text = format!(
         "ℹ️ Your Discord session left the voice channel bridged to {} while you are still in its call, so you are being bridged through a bot puppet until it returns. (This notice is sent at most once every {} minutes.)",
-        n.room_id,
+        room_label(client, &n.room_id),
         LINK_NOTICE_COOLDOWN.as_secs() / 60
     );
     if let Err(e) = dm_user(client, &n.user, &text).await {
@@ -4463,6 +4463,20 @@ async fn deliver_link_notice(ctx: &BotCtx, client: &Client, n: crate::links_noti
         if let Err(e) = dm_user(client, d, &dtext).await {
             tracing::warn!(mxid = %d, error = %e, "failover notice DM to delegate failed");
         }
+    }
+}
+
+/// A room as people know it in a DM: its name when this client knows the room
+/// (else its id), plus a matrix.to link that opens it either way.
+fn room_label(client: &Client, room_id: &str) -> String {
+    let link = format!("https://matrix.to/#/{room_id}");
+    let name = matrix_sdk::ruma::RoomId::parse(room_id)
+        .ok()
+        .and_then(|rid| client.get_room(&rid))
+        .and_then(|r| r.name().or_else(|| r.canonical_alias().map(|a| a.to_string())));
+    match name {
+        Some(name) if !name.trim().is_empty() => format!("\"{}\" ({link})", name.trim()),
+        _ => link,
     }
 }
 
