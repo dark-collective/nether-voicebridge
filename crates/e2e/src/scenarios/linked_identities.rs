@@ -69,9 +69,21 @@ async fn run(ctx: Arc<Ctx>) -> Result<()> {
     .context("seeding pairings.toml")?;
 
     let tenants = tenant_entry(bridge_name, &cfg.room_a, &cfg.guild_id, &cfg.channel_a);
-    let bridge = BridgeUnderTest::start(cfg, ctx.profile, &tenants, &workdir)
-        .await
-        .context("starting bridge-under-test")?;
+    // The Matrix half is a membership-only phantom (never in the LiveKit roster): to the #25
+    // reaper that IS a stale membership. Since ADR 0003 the paired listener keeps a capture
+    // anchor, so the subscriber is connected and the compressed 3 s `reap_grace` retracts the
+    // phantom's m.call.member ~4 s after it joins — mid-choreography ("reaped phantom
+    // m.call.member" in the bridge log; every nightly red 10-07→10-12). Same fix as
+    // `steal_repromotion`; the reaper itself is covered by `reap_release`.
+    let bridge = BridgeUnderTest::start_with_timing(
+        cfg,
+        ctx.profile,
+        &tenants,
+        &workdir,
+        "reap_grace_ms = 300000\n",
+    )
+    .await
+    .context("starting bridge-under-test")?;
     if let Err(e) = bridge.await_ready(&[bridge_name], Duration::from_secs(120)).await {
         bridge.kill().await;
         return Err(e);
