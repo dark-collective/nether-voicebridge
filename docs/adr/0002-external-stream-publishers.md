@@ -1,6 +1,6 @@
 # ADR 0002 — External stream publishers: per-stream identities for media that does not come from the bridge
 
-**Status:** Proposed (2026-10-02). **Deciders:** operator + Claude. **Supersedes:** none.
+**Status:** Superseded by [ADR 0004](0004-companion-interface.md) (2026-10-12; proposed 2026-10-02). **Deciders:** operator + Claude. **Supersedes:** none.
 **Amends:** ADR 0001 §7 item 2 ("presenter slots": publish under the streamer's *ghost*) — that
 design is rejected below and replaced by this one.
 

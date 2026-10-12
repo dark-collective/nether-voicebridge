@@ -206,6 +206,8 @@ struct BotCtx {
     /// Linked identities (ADR 0001): the instance-wide pairing + service
     /// approval stores and the registry of live boards (for runtime reconcile).
     links: nvb_config::links::LinkShared,
+    /// The companion interface (ADR 0004), when `[companions] enabled`.
+    companions: Option<Arc<nvb_companion::CompanionHub>>,
     /// Pending pairing codes (`pair` → `/bridge pair <code>`), keyed by code.
     pending_pairs: StdMutex<HashMap<String, PendingPair>>,
     /// Last failover notice per person (ADR 0001 §5 rate limit).
@@ -1017,6 +1019,7 @@ pub async fn run(
     pool_io: PoolIo,
     shutdown: CancellationToken,
     links: nvb_config::links::LinkShared,
+    companions: Option<Arc<nvb_companion::CompanionHub>>,
 ) -> Result<()> {
     // Pair the device identity with the crypto store (#30) — same rule as the
     // bridge bot: a wiped/copied store must re-provision, never reuse the bare
@@ -1193,6 +1196,7 @@ pub async fn run(
             .then(|| Duration::from_secs(cfg.approval_timeout_secs)),
         pending: StdMutex::new(HashMap::new()),
         links,
+        companions,
         pending_pairs: StdMutex::new(HashMap::new()),
         link_notice_stamps: StdMutex::new(HashMap::new()),
         awaiting_invite: StdMutex::new(HashMap::new()),
@@ -2015,6 +2019,20 @@ enum Command {
     RelayList {
         room_id: String,
     },
+    /// `companion key create <room-id|self> <kinds…> [label]` (ADR 0004).
+    CompanionCreate {
+        scope: String,
+        kinds: Vec<String>,
+        label: String,
+    },
+    /// `companion key list [room-id|self]`.
+    CompanionList {
+        scope: Option<String>,
+    },
+    /// `companion key revoke <key-id>`.
+    CompanionRevoke {
+        id: String,
+    },
     /// Start the guided walkthrough (#102). Self-serve tier.
     Tutorial,
     /// Advance / end the walkthrough (#102) — meaningful only with an active
@@ -2051,13 +2069,15 @@ const REPORT_REASON_MAX: usize = 280;
 const DEFAULT_REPORTS: usize = 10;
 const MAX_REPORTS: usize = 50;
 
-const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridges (static + tenants) and whether they are running\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server] — bridge a Discord voice channel to a Matrix room\n  unlink <name> — remove a bridge created with link\n  ban <owner|guild|room> <value> — deny-list an owner MXID / Discord guild / Matrix room AND unlink every matching tenant\n  unban <owner|guild|room> <value> — remove a ban\n  bans — show the deny-lists\n  report <owner|guild|room> <value> [reason] — file an abuse report (recorded, not acted on)\n  reports [count] — show recent abuse reports, each with the `ban` to run\n  serve-allow <@mxid> / serve-remove <@mxid> — restrict the self-serve tier to an allowlist; serve-open reopens to everyone; serve-list shows it\n  status — puppet-pool guild footprint (Discord verification tripwire)\n  stats — per-bridge uptime + owner, and process memory\n  msg <@mxid> <text> — DM a user as the bridge bot\n  announce <text> — stage a DM to every bridge owner; `announce confirm` sends it\n  pair / unpair / pairings — link your Matrix account to your own Discord account (be yourself on both sides; no ghost, no puppet while both are present)\n  relay allow|deny|list <room-id> [@mxid] — approve a helper client's Matrix account as a service account in a room\n  tutorial — the self-serve guided walkthrough (next/stop drive it)\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridges (static + tenants) and whether they are running\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> [server] — bridge a Discord voice channel to a Matrix room\n  unlink <name> — remove a bridge created with link\n  ban <owner|guild|room> <value> — deny-list an owner MXID / Discord guild / Matrix room AND unlink every matching tenant\n  unban <owner|guild|room> <value> — remove a ban\n  bans — show the deny-lists\n  report <owner|guild|room> <value> [reason] — file an abuse report (recorded, not acted on)\n  reports [count] — show recent abuse reports, each with the `ban` to run\n  serve-allow <@mxid> / serve-remove <@mxid> — restrict the self-serve tier to an allowlist; serve-open reopens to everyone; serve-list shows it\n  status — puppet-pool guild footprint (Discord verification tripwire)\n  stats — per-bridge uptime + owner, and process memory\n  msg <@mxid> <text> — DM a user as the bridge bot\n  announce <text> — stage a DM to every bridge owner; `announce confirm` sends it\n  pair / unpair / pairings — link your Matrix account to your own Discord account (be yourself on both sides; no ghost, no puppet while both are present)\n  relay allow|deny|list <room-id> [@mxid] — approve a helper client's Matrix account as a service account in a room\n  companion key create|list|revoke — keys for companion tools (`companion` for details)\n  tutorial — the self-serve guided walkthrough (next/stop drive it)\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
 
 /// Help for self-serve users (#43): only the verbs they may run, plus the
 /// consent flow they will hit.
-const SELF_SERVE_HELP_TEXT: &str = "Voice bridge commands:\n  tutorial — guided step-by-step walkthrough (start here if you're new)\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> — bridge a Discord voice channel to a Matrix room. You must be a moderator of the Matrix room, and someone with Manage Server on the Discord side must approve the link with the `/bridge approve` command and the code you'll receive.\n  unlink <name> — remove a bridge you created\n  list — your bridges\n  report <owner|guild|room> <value> [reason] — report an abusive bridge for an operator to review\n  pair / unpair / pairings — link your Matrix account to your own Discord account so you are yourself on both sides (no ghost, no puppet while both are present)\n  relay allow|deny|list <room-id> [@mxid] — approve a helper client's Matrix account as a service account in a room you moderate\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
+const SELF_SERVE_HELP_TEXT: &str = "Voice bridge commands:\n  tutorial — guided step-by-step walkthrough (start here if you're new)\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> — bridge a Discord voice channel to a Matrix room. You must be a moderator of the Matrix room, and someone with Manage Server on the Discord side must approve the link with the `/bridge approve` command and the code you'll receive.\n  unlink <name> — remove a bridge you created\n  list — your bridges\n  report <owner|guild|room> <value> [reason] — report an abusive bridge for an operator to review\n  pair / unpair / pairings — link your Matrix account to your own Discord account so you are yourself on both sides (no ghost, no puppet while both are present)\n  relay allow|deny|list <room-id> [@mxid] — approve a helper client's Matrix account as a service account in a room you moderate\n  companion key create|list|revoke — keys for companion tools (`companion` for details)\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
 
 const PAIR_USAGE: &str = "Usage: `pair` — get a code, then run `/bridge pair code:<code>` on Discord as the account to link. `pair delegate <@mxid>` names a delegate account that acts for you (`pair delegate none` clears it). `unpair [discord-user-id]` removes one or all of your pairings. `pairings` lists them.";
+const COMPANION_USAGE: &str = "Usage: `companion key create <room-id|self> <kinds…> [label]` / `companion key list [room-id|self]` / `companion key revoke <key-id>` — keys for companion tools. Room keys (you need authority over the room): observe, stream:attach, stream:standalone. Self keys (your own pairings): stream:attach, listen:self.";
+
 const RELAY_USAGE: &str = "Usage: `relay allow <room-id> <@mxid>` / `relay deny <room-id> <@mxid>` / `relay list <room-id>` — approve a helper client's Matrix account as a service account in a room you have authority over (it gets no Discord puppet and is not counted as a participant).";
 
 const TUTORIAL_USAGE: &str =
@@ -2090,7 +2110,40 @@ fn allowed_for_self_serve(cmd: &Command) -> bool {
             | Command::RelayAllow { .. }
             | Command::RelayDeny { .. }
             | Command::RelayList { .. }
+            | Command::CompanionCreate { .. }
+            | Command::CompanionList { .. }
+            | Command::CompanionRevoke { .. }
     )
+}
+
+/// `companion key …` (ADR 0004). Kinds are the leading arguments that name a
+/// known kind; whatever follows is the label.
+fn parse_companion(args: &[String]) -> Parsed {
+    let usage = || Parsed::Usage(COMPANION_USAGE.to_string());
+    let Some((noun, rest)) = args.split_first() else { return usage() };
+    if !noun.eq_ignore_ascii_case("key") {
+        return usage();
+    }
+    match rest {
+        [verb, scope, tail @ ..] if verb == "create" => {
+            let n = tail
+                .iter()
+                .take_while(|a| nvb_config::companions::KINDS.contains(&a.to_ascii_lowercase().as_str()))
+                .count();
+            if n == 0 {
+                return usage();
+            }
+            Parsed::Cmd(Command::CompanionCreate {
+                scope: scope.clone(),
+                kinds: tail[..n].iter().map(|k| k.to_ascii_lowercase()).collect(),
+                label: tail[n..].join(" "),
+            })
+        }
+        [verb] if verb == "list" => Parsed::Cmd(Command::CompanionList { scope: None }),
+        [verb, scope] if verb == "list" => Parsed::Cmd(Command::CompanionList { scope: Some(scope.clone()) }),
+        [verb, id] if verb == "revoke" => Parsed::Cmd(Command::CompanionRevoke { id: id.clone() }),
+        _ => usage(),
+    }
 }
 
 /// Parse one message body. The verb is case-insensitive; arguments support
@@ -2203,6 +2256,7 @@ fn parse_command(body: &str) -> Parsed {
             [verb, room_id] if verb == "list" => Parsed::Cmd(Command::RelayList { room_id: room_id.clone() }),
             _ => Parsed::Usage(RELAY_USAGE.to_string()),
         },
+        "companion" => parse_companion(args),
         "msg" => match args {
             [mxid, text @ ..] if !text.is_empty() => Parsed::Cmd(Command::Msg {
                 mxid: mxid.clone(),
@@ -2310,6 +2364,11 @@ async fn handle_command(ctx: &BotCtx, room: &Room, sender: &str, cmd: Command) {
         Command::RelayAllow { room_id, mxid } => handle_relay(ctx, room, sender, &room_id, Some(&mxid), true).await,
         Command::RelayDeny { room_id, mxid } => handle_relay(ctx, room, sender, &room_id, Some(&mxid), false).await,
         Command::RelayList { room_id } => handle_relay(ctx, room, sender, &room_id, None, false).await,
+        Command::CompanionCreate { scope, kinds, label } => {
+            handle_companion_create(ctx, room, sender, &scope, &kinds, &label).await
+        }
+        Command::CompanionList { scope } => handle_companion_list(ctx, room, sender, scope.as_deref()).await,
+        Command::CompanionRevoke { id } => handle_companion_revoke(ctx, room, sender, &id).await,
         Command::Tutorial => handle_tutorial_start(ctx, room).await,
         Command::TutorialNext => handle_tutorial_next(ctx, room).await,
         Command::TutorialStop => handle_tutorial_stop(ctx, room).await,
@@ -3706,6 +3765,8 @@ async fn handle_unlink(ctx: &BotCtx, room: &Room, sender: &str, name: &str) {
     // unlink disclosure notice (#64). Best-effort.
     let notice_channel =
         nvb_config::tenant_discord_channel(&ctx.tenants_path, name).ok().flatten();
+    // Its room's companion keys die with the link (ADR 0004 §3).
+    let unlinked_room = nvb_config::tenant_room_id(&ctx.tenants_path, name).ok().flatten();
     let prior = match nvb_config::remove_tenant_entry(&ctx.tenants_path, name) {
         Ok(p) => p,
         Err(e) => {
@@ -3718,6 +3779,11 @@ async fn handle_unlink(ctx: &BotCtx, room: &Room, sender: &str, name: &str) {
             audit(ctx, sender, "unlink_ok", serde_json::json!({
                 "name": name, "was_running": summary.removed.iter().any(|l| l == name),
             }));
+            if let (Some(hub), Some(room_id)) = (&ctx.companions, unlinked_room.as_deref()) {
+                if let Err(e) = hub.revoke_room(room_id, sender) {
+                    tracing::warn!(error = %e, room_id, "could not revoke the unlinked room's companion keys");
+                }
+            }
             ctx.send_notice(
                 notice_channel.as_deref(),
                 UNLINK_NOTICE_TEXT,
@@ -4379,6 +4445,138 @@ async fn handle_relay(ctx: &BotCtx, room: &Room, sender: &str, room_id: &str, mx
     }
 }
 
+/// Operator, or authority over `room_id` (a moderator of it, or — without the
+/// room-authority requirement — the owner of its bridge). Same rule as `relay`.
+async fn has_room_authority(ctx: &BotCtx, room_id: &str, sender: &str) -> bool {
+    if ctx.is_operator(sender) {
+        return true;
+    }
+    if ctx.require_room_authority {
+        matches!(read_sender_authority(ctx, room_id, sender).await, Ok(a) if a.ok())
+    } else {
+        tenant_owner_of_room(ctx, room_id).as_deref() == Some(sender)
+    }
+}
+
+const COMPANIONS_OFF: &str = "Companion tools are not enabled on this bridge instance.";
+
+fn describe_companion_key(hub: &nvb_companion::CompanionHub, k: &nvb_config::companions::CompanionKey) -> String {
+    let leases = hub.lease_count(&k.id);
+    format!(
+        "  `{}` — {} — {}{} — issued by {}{}",
+        k.id,
+        k.scope.describe(),
+        k.kinds.join(", "),
+        if k.label.is_empty() { String::new() } else { format!(" — \"{}\"", k.label) },
+        k.issuer,
+        if leases > 0 { format!(" — {leases} live lease(s)") } else { String::new() },
+    )
+}
+
+async fn handle_companion_create(ctx: &BotCtx, room: &Room, sender: &str, scope: &str, kinds: &[String], label: &str) {
+    use nvb_config::companions::KeyScope;
+    let Some(hub) = &ctx.companions else {
+        reply(room, COMPANIONS_OFF).await;
+        return;
+    };
+    let scope = if scope.eq_ignore_ascii_case("self") {
+        if ctx.links.pairings.discords_for_matrix(sender).is_empty() {
+            reply(room, "A self key acts for your own pairings, and you have none — `pair` first.").await;
+            return;
+        }
+        KeyScope::SelfScope
+    } else if scope.starts_with('!') {
+        if !has_room_authority(ctx, scope, sender).await {
+            reply(room, "You need authority over that room (a moderator of it, or the owner of its bridge) to issue companion keys for it.").await;
+            return;
+        }
+        if ctx.links.registry.board_for_room(scope).is_none() {
+            reply(room, &format!("{scope} is not bridged here (or its bridge is not running).")).await;
+            return;
+        }
+        KeyScope::Room(scope.to_string())
+    } else {
+        reply(room, &format!("'{scope}' is neither a room id (!opaque:server) nor `self`.")).await;
+        return;
+    };
+    match hub.create_key(sender, scope, kinds, label) {
+        Ok((key, token)) => {
+            reply(room, &format!(
+                "✅ Companion key `{}` for {} ({}). The token below is shown once — put it in the companion tool; `companion key revoke {}` ends it and its leases.\n\n`{token}`",
+                key.id,
+                key.scope.describe(),
+                key.kinds.join(", "),
+                key.id,
+            ))
+            .await;
+        }
+        Err(e) => reply(room, &format!("Cannot create the key: {e}")).await,
+    }
+}
+
+async fn handle_companion_list(ctx: &BotCtx, room: &Room, sender: &str, scope: Option<&str>) {
+    use nvb_config::companions::KeyScope;
+    let Some(hub) = &ctx.companions else {
+        reply(room, COMPANIONS_OFF).await;
+        return;
+    };
+    let operator = ctx.is_operator(sender);
+    let keys: Vec<_> = match scope {
+        Some(r) if r.starts_with('!') => {
+            if !has_room_authority(ctx, r, sender).await {
+                reply(room, "You need authority over that room to list its companion keys.").await;
+                return;
+            }
+            hub.list_keys().into_iter().filter(|k| k.scope.room_id() == Some(r)).collect()
+        }
+        Some(s) if s.eq_ignore_ascii_case("self") => hub
+            .list_keys()
+            .into_iter()
+            .filter(|k| k.scope == KeyScope::SelfScope && k.issuer == sender)
+            .collect(),
+        Some(other) => {
+            reply(room, &format!("'{other}' is neither a room id (!opaque:server) nor `self`.")).await;
+            return;
+        }
+        None => hub.list_keys().into_iter().filter(|k| operator || k.issuer == sender).collect(),
+    };
+    if keys.is_empty() {
+        reply(room, "No companion keys.").await;
+        return;
+    }
+    let mut out = String::from("Companion keys:\n");
+    for k in &keys {
+        out.push_str(&describe_companion_key(hub, k));
+        out.push('\n');
+    }
+    reply(room, out.trim_end()).await;
+}
+
+async fn handle_companion_revoke(ctx: &BotCtx, room: &Room, sender: &str, id: &str) {
+    let Some(hub) = &ctx.companions else {
+        reply(room, COMPANIONS_OFF).await;
+        return;
+    };
+    let Some(key) = hub.get_key(id) else {
+        reply(room, &format!("No companion key `{id}`.")).await;
+        return;
+    };
+    let allowed = key.issuer == sender
+        || match key.scope.room_id() {
+            Some(r) => has_room_authority(ctx, r, sender).await,
+            None => ctx.is_operator(sender),
+        };
+    if !allowed {
+        reply(room, "Only the key's issuer, an authority over its room, or an operator can revoke it.").await;
+        return;
+    }
+    match hub.revoke_key(id, sender) {
+        Ok(Some(_)) => reply(room, &format!("✅ Companion key `{id}` revoked; its leases have ended.")).await,
+        Ok(None) => reply(room, &format!("No companion key `{id}`.")).await,
+        Err(e) => reply(room, &format!("Cannot write the companions file: {e}")).await,
+    }
+}
+
 /// Owner (tenant creator) of the bridge whose room is `room_id`, if any.
 fn tenant_owner_of_room(ctx: &BotCtx, room_id: &str) -> Option<String> {
     nvb_config::tenant_owner_for_room(&ctx.tenants_path, room_id)
@@ -4860,6 +5058,23 @@ mod tests {
         );
         assert_eq!(parse_command("relay list !r:hs"), Parsed::Cmd(Command::RelayList { room_id: "!r:hs".into() }));
         assert!(matches!(parse_command("relay frobnicate !r:hs"), Parsed::Usage(_)));
+        assert_eq!(
+            parse_command("companion key create !r:hs observe Stream:Attach my tool"),
+            Parsed::Cmd(Command::CompanionCreate {
+                scope: "!r:hs".into(),
+                kinds: vec!["observe".into(), "stream:attach".into()],
+                label: "my tool".into(),
+            })
+        );
+        assert!(matches!(parse_command("companion key create !r:hs widget"), Parsed::Usage(_)));
+        assert_eq!(parse_command("companion key list"), Parsed::Cmd(Command::CompanionList { scope: None }));
+        assert_eq!(
+            parse_command("companion key list self"),
+            Parsed::Cmd(Command::CompanionList { scope: Some("self".into()) })
+        );
+        assert_eq!(parse_command("companion key revoke abc"), Parsed::Cmd(Command::CompanionRevoke { id: "abc".into() }));
+        assert!(matches!(parse_command("companion"), Parsed::Usage(_)));
+        assert!(allowed_for_self_serve(&Command::CompanionList { scope: None }));
         assert!(allowed_for_self_serve(&Command::Pair));
         assert!(allowed_for_self_serve(&Command::RelayAllow { room_id: String::new(), mxid: String::new() }));
         assert_eq!(parse_command("status"), Parsed::Cmd(Command::Status));
@@ -5880,6 +6095,7 @@ mod tests {
             approval_ttl: Some(ttl),
             pending: StdMutex::new(HashMap::new()),
             links: nvb_config::links::LinkShared::in_memory(),
+            companions: None,
             pending_pairs: StdMutex::new(HashMap::new()),
             link_notice_stamps: StdMutex::new(HashMap::new()),
             awaiting_invite: StdMutex::new(HashMap::new()),

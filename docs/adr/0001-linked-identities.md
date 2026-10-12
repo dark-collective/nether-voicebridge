@@ -1,6 +1,6 @@
 # ADR 0001 — Linked identities, presence-based exclusion, and companion clients
 
-**Status:** Accepted (2026-10-01; terminology revised 2026-10-02 — decision unchanged).
+**Status:** Accepted (2026-10-01; terminology revised 2026-10-02, wording clarified 2026-10-12 — decision unchanged).
 **Deciders:** operator + Claude. **Supersedes:** none. **Amended by:** ADR 0002 (§7 item 2), ADR 0003 (§2 lifecycle).
 
 ## Context
@@ -9,22 +9,22 @@ The bridge represents every Matrix call participant on Discord as a puppet bot a
 voice member on Matrix as a ghost. That is right for people who exist on only one side. It is wrong
 for a person who is present on **both** sides at once:
 
-- a user who is in the Discord voice channel with their own account (from a desk, a phone, or a
-  thin client) *and* in the Matrix call with their own account gets a ghost of themselves on Matrix
+- a user who is in the Discord voice channel with their own account (in the Discord app on a desk
+  or a phone) *and* in the Matrix call with their own account gets a ghost of themselves on Matrix
   and a puppet of themselves on Discord, and hears themselves twice;
-- a **companion client** — any user-run program signed in as a person on Discord and/or Matrix
-  (a second device, a thin client, a desktop helper) — has exactly this shape, and may bring one
-  extra Matrix account of its own into the call.
+- a **companion client** — a program a person runs for themselves next to their usual apps (a
+  second device, a desktop helper) — can put that person in both places at once in the same way,
+  and may bring one extra Matrix account of its own into the call.
 
-Live test 2026-10-01: a companion client's Discord account was ghosted and its Matrix account was
-puppeted, so its audio was replayed back into Discord (fixed separately in #142). The bridge needs a
+Live test 2026-10-01: a person present on both sides at once was ghosted on Matrix and puppeted on
+Discord, so their audio was replayed back into Discord (fixed separately in #142). The bridge needs a
 first-class notion of "these two accounts are one person".
 
 Constraints that shape the decision:
 
-1. **The hosted bridge never holds Discord user tokens.** Running user accounts from the bridge's
-   host correlates them with the bot pool; a ban there takes the service down for everyone.
-   Anything signed in as a user runs on that user's own device, under their own responsibility.
+1. **The bridge is a Discord bot application and nothing else.** It never holds a Discord user
+   token and never acts as a person's account; it sees what bots see and speaks through its own
+   bots. Each person's Discord account is used by that person, in their own Discord app.
 2. **Only the bridge is an appservice.** Ghosts and puppets are created by the bridge alone. A
    companion client never needs appservice powers; it is an ordinary client of each platform.
 3. **No stale state.** A persistent per-account flag (e.g. "opted out") goes wrong the moment the
@@ -71,7 +71,7 @@ Otherwise both are ordinary participants. The rule is re-evaluated on every pres
 either side. Consequences by construction:
 
 - `M` alone in the call → puppet as today. `D` alone in the channel → ghost as today.
-- A client carrying `D` drops → `D` leaves the channel within seconds → `M` gets a puppet again,
+- `D`'s Discord app drops → `D` leaves the channel within seconds → `M` gets a puppet again,
   automatically. Nothing to clean up.
 - A person can never be a hidden listener: exclusion requires them to be visible on *both* sides as
   themselves.
@@ -119,7 +119,7 @@ their media:
 
 1. **identity**: pairing + service-account approval (this ADR);
 2. **external stream publishing**: see ADR 0002, which replaces the "presenter slot" idea first
-   sketched here.
+   sketched here (both superseded by ADR 0004, the companion interface).
 
 Everything a client does on either platform is the client's own business, under its user's
 responsibility.
@@ -135,8 +135,8 @@ responsibility.
 - **Client-declared leases with heartbeats.** The client announces "present in room X as account Y"
   and renews it. Works, but it is redundant with presence (the account being in the channel *is* the
   lease), adds a protocol, and still needs pairing for anti-griefing. Rejected.
-- **Hosted double-puppeting (the bridge runs user accounts, mautrix-style).** Best UX, but violates
-  constraint 1: puts the bot pool at risk. Rejected for the hosted instance.
+- **Double-puppeting (the bridge acts as each person's own account, as some Matrix bridges do).**
+  Best UX, but violates constraint 1: the bridge is a bot application only. Rejected.
 
 ## Consequences
 

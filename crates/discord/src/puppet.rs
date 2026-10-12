@@ -662,6 +662,7 @@ impl SharedPool {
                 .remove(&user_id)
                 .is_some();
             if removed {
+                ch.links.note_ghost(user_id, None);
                 ch.capture_router.release(&user_id.to_string());
                 tracing::info!(user_id, bridge = %ch.bridge, "ghost retired — user opted out of bridging");
             }
@@ -1055,6 +1056,7 @@ impl SharedPool {
                 .remove(&user_id)
                 .is_some();
             if removed {
+                ch.links.note_ghost(user_id, None);
                 ch.capture_router.release(&user_id.to_string());
                 tracing::warn!(user_id, bridge = %ch.bridge, "retracted echo ghost minted for our own puppet bot before its ready (startup race)");
             }
@@ -2909,6 +2911,7 @@ impl EventHandler for PuppetHandler {
                     }
                 }
                 ch.capture_router.set_muted(&user_id.to_string(), muted);
+                ch.links.set_discord_streaming(user_id, new.self_stream.unwrap_or(false));
             } else if self.pool.presence_contains(&ch.bridge, user_id) && ch.links.paired_half_present(user_id) {
                 // A paired person's own Discord session dropped while they are in the
                 // call: give it `paired_leave_grace` to come back before failing over.
@@ -2951,6 +2954,7 @@ impl EventHandler for PuppetHandler {
                 // bot connected (their toggle won't arrive as a voice_state_update).
                 ch.capture_router
                     .set_muted(&user_id.to_string(), vs.self_mute || vs.mute);
+                ch.links.set_discord_streaming(user_id, vs.self_stream.unwrap_or(false));
             }
         }
         if self.pool.bot_has_session_in(self.idx, guild.id) {
@@ -3448,6 +3452,9 @@ async fn ensure_ghost(
             .capture_router
             .assign(&user_id.to_string(), &name, avatar_url.as_deref());
         sinks.insert(user_id, sink);
+        // Under the same lock as the insert, so a racing retire cannot be
+        // overtaken by this note (companion observation, ADR 0004 §6).
+        channel.links.note_ghost(user_id, Some(&name));
     }
     tracing::info!(bridge = %channel.bridge, user_id, display_name = %name, "Discord user present — ghost assigned");
 }
@@ -3461,6 +3468,7 @@ fn drop_ghost(channel: &ChannelCtx, user_id: u64) -> bool {
         if sinks.remove(&user_id).is_none() {
             return false; // wasn't a tracked speaker
         }
+        channel.links.note_ghost(user_id, None);
         sinks.is_empty()
     };
     channel.capture_router.release(&user_id.to_string());
@@ -3835,19 +3843,20 @@ async fn puppet_become_anchor(
     // Seed ghosts for everyone already in the voice channel — voice_state_update
     // only fires on later changes. Read the cached voice states (populated via the
     // GUILD_VOICE_STATES intent); ensure_ghost is idempotent.
-    let present: Vec<u64> = match ctx.cache.guild(channel.guild_id) {
+    let present: Vec<(u64, bool)> = match ctx.cache.guild(channel.guild_id) {
         Some(guild) => guild
             .voice_states
             .iter()
             .filter(|(_, vs)| vs.channel_id == Some(channel.channel_id))
-            .map(|(uid, _)| uid.get())
+            .map(|(uid, vs)| (uid.get(), vs.self_stream.unwrap_or(false)))
             .collect(),
         None => Vec::new(),
     };
     if !present.is_empty() {
         tracing::info!(count = present.len(), bridge = %channel.bridge, "seeding ghosts for existing voice members");
     }
-    for uid in present {
+    for (uid, streaming) in present {
+        channel.links.set_discord_streaming(uid, streaming);
         // #70 F2-3: mirror the guild_create seeding path — record presence,
         // gate the ghost on the observed edge. A runtime-registered channel
         // (#45 link flow) starts with an EMPTY presence set and gets no

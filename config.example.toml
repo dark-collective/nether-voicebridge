@@ -115,6 +115,25 @@
 # #                                  # (#94) free-text notice appended to the DM
 # #                                  # greeting and `help` — beta disclaimer etc.
 
+# ── Companion interface (optional) ───────────────────────────────────────────
+# Companion interface (off by default): an HTTP listener at /_nvb/v1 through
+# which companion tools, holding a key issued in the management DM
+# (`companion key create …`), get time-bounded leases. This release serves the
+# `observe` lease: a server-sent-events stream of the room's represented Discord
+# members (ghost, display name, Discord's streaming flag), whether the call is
+# active and its listener count. The listener speaks plain HTTP — put it behind
+# your TLS reverse proxy and route /_nvb/ to it.
+# [companions]
+# enabled = true
+# listen = "127.0.0.1:8787"
+# max_lease_hours = 6           # a lease not renewed within this ends
+# sse_grace_secs = 30           # a lease without its event stream ends after this
+# sse_keepalive_secs = 25       # keep-alive comments (proxies cut quiet streams at ~100 s)
+# max_leases_per_key = 4
+# lease_requests_per_minute = 10
+# auth_failures_per_minute = 20 # per client address, then 429
+# client_ip_header = "CF-Connecting-IP"   # only when every request comes through that proxy
+
 # ── Admission limits (optional) ──────────────────────────────────────────────
 # Hard caps for a hosted deployment (#47). Every field is optional; an absent
 # field (or the whole absent section) means unlimited — the default behavior.

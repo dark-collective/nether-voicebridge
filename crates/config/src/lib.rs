@@ -9,6 +9,7 @@ pub mod links;
 mod optout;
 pub mod pairings;
 pub mod relays;
+pub mod companions;
 mod self_serve;
 mod tenants;
 mod tenants_edit;
@@ -24,7 +25,7 @@ pub use optout::{
 pub use tenants::{TenantsFile, list_tenant_names, load_tenants, tenant_owner_for_room, tenants_path};
 pub use tenants_edit::{
     NewTenant, PriorContent, add_tenant_entry, remove_tenant_entries_matching,
-    remove_tenant_entry, restore_tenants_file, tenant_discord_channel, tenant_guilds,
+    remove_tenant_entry, restore_tenants_file, tenant_discord_channel, tenant_room_id, tenant_guilds,
     tenant_owners, tenant_rooms,
 };
 
@@ -90,6 +91,11 @@ pub struct Config {
     /// pre-limits behavior. Absent section ⇒ all unlimited.
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// The companion interface (ADR 0004): an authenticated HTTP listener that
+    /// hands keyed companion tools time-bounded leases. TOML `[companions]`
+    /// maps here; absent (or `enabled = false`) means no listener runs.
+    #[serde(default)]
+    pub companions: CompanionsConfig,
     /// Raw `[timing]` overrides as written in the TOML (each key optional).
     /// Resolved into `timing` at load time together with the `NVB_TIMING` env
     /// preset; consumers read the resolved `timing`, never this.
@@ -101,6 +107,82 @@ pub struct Config {
     /// behavior is unchanged unless timing is deliberately configured.
     #[serde(skip)]
     pub timing: TimingConfig,
+}
+
+/// The `[companions]` block (ADR 0004). Off by default: nothing listens unless an
+/// operator enables it, and the listener is meant to sit behind a TLS reverse
+/// proxy (it speaks plain HTTP).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompanionsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Socket address of the plain-HTTP listener (`/_nvb/v1`).
+    #[serde(default = "default_companions_listen")]
+    pub listen: String,
+    /// A lease not renewed within this many hours ends.
+    #[serde(default = "default_max_lease_hours")]
+    pub max_lease_hours: u64,
+    /// How long a lease survives without its event stream connected (never
+    /// connected yet, or dropped) before it ends.
+    #[serde(default = "default_sse_grace_secs")]
+    pub sse_grace_secs: u64,
+    /// Seconds between SSE keep-alive comments. Proxies such as Cloudflare cut a
+    /// quiet response after ~100 s; 25 s keeps well clear of that.
+    #[serde(default = "default_sse_keepalive_secs")]
+    pub sse_keepalive_secs: u64,
+    /// Concurrent leases one key may hold.
+    #[serde(default = "default_leases_per_key")]
+    pub max_leases_per_key: usize,
+    /// Lease requests one key may make per minute.
+    #[serde(default = "default_lease_requests_per_minute")]
+    pub lease_requests_per_minute: u32,
+    /// Failed authentications one client address may make per minute before it
+    /// is answered 429.
+    #[serde(default = "default_auth_failures_per_minute")]
+    pub auth_failures_per_minute: u32,
+    /// Request header carrying the real client address when the listener sits
+    /// behind a proxy (e.g. `CF-Connecting-IP`). Unset ⇒ the TCP peer address.
+    /// Only set it when every request comes through that proxy.
+    #[serde(default)]
+    pub client_ip_header: Option<String>,
+}
+
+fn default_companions_listen() -> String {
+    "127.0.0.1:8787".into()
+}
+fn default_max_lease_hours() -> u64 {
+    6
+}
+fn default_sse_grace_secs() -> u64 {
+    30
+}
+fn default_sse_keepalive_secs() -> u64 {
+    25
+}
+fn default_leases_per_key() -> usize {
+    4
+}
+fn default_lease_requests_per_minute() -> u32 {
+    10
+}
+fn default_auth_failures_per_minute() -> u32 {
+    20
+}
+
+impl Default for CompanionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: default_companions_listen(),
+            max_lease_hours: default_max_lease_hours(),
+            sse_grace_secs: default_sse_grace_secs(),
+            sse_keepalive_secs: default_sse_keepalive_secs(),
+            max_leases_per_key: default_leases_per_key(),
+            lease_requests_per_minute: default_lease_requests_per_minute(),
+            auth_failures_per_minute: default_auth_failures_per_minute(),
+            client_ip_header: None,
+        }
+    }
 }
 
 /// The `[limits]` block: operator-wide admission budgets (#47). These are
@@ -1425,6 +1507,7 @@ impl Config {
             // management bot and admission limits are config-file features.
             management: None,
             limits: LimitsConfig::default(),
+            companions: CompanionsConfig::default(),
             timing_raw: TimingOverrides::default(),
             // Env-var mode has no `[timing]` keys; the `NVB_TIMING` preset
             // still applies (the harness reaches for it in both modes).
@@ -1513,6 +1596,21 @@ impl Config {
                     other = j,
                     "duplicate Discord token in [puppets] pool"
                 );
+            }
+        }
+
+        if self.companions.enabled {
+            let c = &self.companions;
+            if c.listen.parse::<std::net::SocketAddr>().is_err() {
+                return Err(ConfigError::Validation(format!(
+                    "[companions] listen = \"{}\" is not a socket address (e.g. 127.0.0.1:8787)",
+                    c.listen
+                )));
+            }
+            if c.max_lease_hours == 0 || c.sse_keepalive_secs == 0 || c.max_leases_per_key == 0 {
+                return Err(ConfigError::Validation(
+                    "[companions] max_lease_hours, sse_keepalive_secs and max_leases_per_key must be > 0".into(),
+                ));
             }
         }
 
