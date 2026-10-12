@@ -1,7 +1,8 @@
 # ── Stage 1: cargo-chef (shared build environment) ───────────────────────────
 # Rust pinned (not `rust:1`): a floating tag invalidates every cached layer —
 # including the ~20 min dependency build — whenever upstream moves it, and
-# keeps release builds reproducible. Bump deliberately.
+# keeps release builds reproducible. Bump deliberately, together with
+# rust-toolchain.toml (CI fails if the two differ).
 FROM rust:1.96.0-bookworm AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /build

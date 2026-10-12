@@ -57,10 +57,14 @@ jobs:
             build-essential cmake clang libclang-dev libopus-dev \
             pkg-config protobuf-compiler libssl-dev libglib2.0-dev
 
+      # The version pinned in rust-toolchain.toml, which must match the release
+      # Dockerfile's base image so CI lints/tests the compiler that ships.
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal --component clippy
-          rustup default stable
+          ver=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          grep -q "^FROM rust:${ver}-" Dockerfile \
+            || { echo "::error::Dockerfile FROM rust:<ver> does not match rust-toolchain.toml ($ver)"; exit 1; }
+          rustup toolchain install "$ver" --profile minimal --component clippy
           rustc --version
 
       - name: Install failure-annotation helper
@@ -73,6 +77,7 @@ jobs:
           "$@" 2>&1 | tee "$log"
           status=$?
           if [ "$status" -ne 0 ]; then
+            sed -i 's/\x1b\[[0-9;]*m//g' "$log"   # drop colour codes
             msg=$(grep -E '^(error|warning: unused|failures:|test .* FAILED|---- )|panicked' "$log" | tail -n 40)
             [ -n "$msg" ] || msg=$(tail -n 40 "$log")
             msg=${msg//'%'/'%25'}; msg=${msg//$'\r'/'%0D'}; msg=${msg//$'\n'/'%0A'}

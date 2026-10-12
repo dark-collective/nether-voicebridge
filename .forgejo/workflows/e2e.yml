@@ -84,7 +84,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-${{ hashFiles('Cargo.lock') }}
+          key: ci-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             ci-
 
@@ -94,6 +94,10 @@ jobs:
             curl -sSf https://sh.rustup.rs \
               | sh -s -- -y --profile minimal --default-toolchain stable
           fi
+          # The version pinned in rust-toolchain.toml (no-op when cached).
+          "$HOME/.cargo/bin/rustup" toolchain install \
+            "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" \
+            --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build bridge + harness

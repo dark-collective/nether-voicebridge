@@ -1,0 +1,7 @@
+# The one Rust version for CI and releases. The Dockerfile's `FROM rust:<ver>`
+# must match (CI checks it). Bump both together, deliberately: a new release
+# brings new clippy lints, and the release image's dependency cache rebuilds.
+# No `components` here: the rust image would then download clippy mid-build;
+# CI installs clippy itself.
+[toolchain]
+channel = "1.96.0"
