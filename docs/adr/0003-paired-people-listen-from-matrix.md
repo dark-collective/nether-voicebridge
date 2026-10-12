@@ -83,3 +83,5 @@ it through every release path while a listener is present.
 **Future (operator, 2026-10-07):** a companion client that speaks for its person may later also *capture* the Discord
 side for them, so no bridge bot is needed in the channel while they are the only Matrix participant. That needs a new,
 explicit contract between the bridge and such clients — a separate ADR.
+
+**Follow-up (ADR 0004, 2026-10-12):** the "future" case is answered by the companion interface's `listen:self` lease.
