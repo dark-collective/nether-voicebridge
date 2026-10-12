@@ -11,6 +11,7 @@ name: E2E (live)
 # default-branch push that touched THIS file — a source-only merge does NOT
 # refresh it. After merging a fix the nightly must pick up, bump this file
 # (a comment edit suffices) so the schedule re-registers on current master.
+# (last bump: 2026-10-12, linked_identity_exclusion fix.)
 on:
   workflow_dispatch:
     inputs:
