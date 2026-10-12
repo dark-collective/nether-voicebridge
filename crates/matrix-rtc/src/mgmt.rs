@@ -5059,14 +5059,14 @@ mod tests {
         assert_eq!(parse_command("relay list !r:hs"), Parsed::Cmd(Command::RelayList { room_id: "!r:hs".into() }));
         assert!(matches!(parse_command("relay frobnicate !r:hs"), Parsed::Usage(_)));
         assert_eq!(
-            parse_command("companion key create !r:hs observe Stream:Attach my relay"),
+            parse_command("companion key create !r:hs observe Stream:Attach my tool"),
             Parsed::Cmd(Command::CompanionCreate {
                 scope: "!r:hs".into(),
                 kinds: vec!["observe".into(), "stream:attach".into()],
-                label: "my relay".into(),
+                label: "my tool".into(),
             })
         );
-        assert!(matches!(parse_command("companion key create !r:hs relay"), Parsed::Usage(_)));
+        assert!(matches!(parse_command("companion key create !r:hs widget"), Parsed::Usage(_)));
         assert_eq!(parse_command("companion key list"), Parsed::Cmd(Command::CompanionList { scope: None }));
         assert_eq!(
             parse_command("companion key list self"),
