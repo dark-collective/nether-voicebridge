@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 nvb-config = { workspace = true }
+nvb-companion = { workspace = true }
 nvb-audio = { workspace = true }
 nvb-discord = { workspace = true }
 nvb-matrix-rtc = { workspace = true }

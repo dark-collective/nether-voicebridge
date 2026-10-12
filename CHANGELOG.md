@@ -5,6 +5,16 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Companion interface, phase 1 (off by default):** `[companions]` starts an HTTP listener at `/_nvb/v1` for
+  companion tools. Keys are issued, listed and revoked in the management DM (`companion key create|list|revoke`;
+  room keys need authority over the room, self keys act for your own pairings; only a hash of each key is stored, in
+  `companions.toml`). A key holder can open an `observe` lease: a server-sent-events stream of the room's represented
+  Discord members (ghost, display name, whether Discord reports them streaming), whether the call is active, and its
+  listener count. Leases are time-bounded, end when their event stream stays closed for `sse_grace_secs`, end at once
+  when their key is revoked or the room is unlinked, and every open/renew/end is recorded in `audit.jsonl`. Other
+  lease kinds can already be issued on keys and answer `kind_unavailable` until they are served.
+
 ## [0.4.8] - 2026-10-11
 
 **Hanging up both halves of a paired account no longer flashes a ghost into the call.**

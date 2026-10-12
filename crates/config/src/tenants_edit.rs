@@ -234,6 +234,20 @@ pub fn tenant_discord_channel(path: &str, name: &str) -> Result<Option<String>, 
     Ok(chan)
 }
 
+/// The Matrix `room_id` on the `[[bridge]]` entry named `name` (`None` = no
+/// such entry). Read-only; `unlink` revokes the room's companion keys with it.
+pub fn tenant_room_id(path: &str, name: &str) -> Result<Option<String>, ConfigError> {
+    let prior = read_prior(path)?;
+    let doc = parse_doc(prior.as_deref())?;
+    let Some(idx) = find_entry(&doc, name) else { return Ok(None) };
+    Ok(doc["bridge"]
+        .as_array_of_tables()
+        .and_then(|arr| arr.get(idx))
+        .and_then(|t| t.get("room_id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned))
+}
+
 /// Roll the tenants file back to `prior` (the return value of a mutation):
 /// rewrite the old content, or delete the file if it did not exist before.
 pub fn restore_tenants_file(path: &str, prior: PriorContent) -> Result<(), ConfigError> {

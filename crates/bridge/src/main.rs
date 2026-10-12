@@ -131,6 +131,7 @@ async fn main() -> Result<()> {
         management,
         limits,
         timing,
+        companions,
         ..
     } = cfg;
 
@@ -235,6 +236,30 @@ async fn main() -> Result<()> {
         }
     };
     let mgmt_links = links.clone();
+
+    // Companion interface (ADR 0004): off unless `[companions] enabled`. A
+    // listener that cannot start (bad store, port taken) is logged and the
+    // bridge runs without it — companions are optional, bridging is not.
+    let companion_hub = if companions.enabled {
+        match nvb_companion::CompanionHub::open(companions, &data_dir, links.clone()) {
+            Ok(hub) => {
+                let serve_hub = hub.clone();
+                let shutdown = pool_shutdown.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = nvb_companion::http::serve(serve_hub, shutdown).await {
+                        tracing::error!(error = %e, "companion listener failed to start — companions unavailable");
+                    }
+                });
+                Some(hub)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "companions store unreadable — companion listener NOT started");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut supervisor = Supervisor::new(
         pool,
         pool_shutdown.clone(),
@@ -284,6 +309,7 @@ async fn main() -> Result<()> {
                 mgmt_pool_io,
                 shutdown,
                 mgmt_links,
+                companion_hub,
             )
             .await
             {

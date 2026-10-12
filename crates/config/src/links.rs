@@ -17,7 +17,8 @@
 //! exactly which identities changed status, so each side can retire or (re)create
 //! ghosts/puppets. Pure, synchronous, no I/O: the lifecycle code owns the effects.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use crate::pairings::PairingStore;
@@ -49,6 +50,29 @@ struct Presence {
 /// events to the Matrix side. A board without one just drops events.
 pub type LinkDispatch = Box<dyn Fn(LinkEvent) + Send + Sync>;
 
+/// A Discord member the bridge represents on Matrix as a ghost right now — what
+/// an `observe` companion may learn about them (ADR 0004 §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepresentedMember {
+    pub discord_user_id: u64,
+    /// The ghost's MXID, once the Matrix side has published its naming.
+    pub ghost_mxid: Option<String>,
+    pub display_name: String,
+    /// Discord reports the member is streaming to the channel (`self_stream`).
+    pub streaming: bool,
+}
+
+/// What the board tracks purely for companions: which members have a ghost (the
+/// Discord side reports every create/retire, so opt-outs, bots and paired
+/// members are never in it) and who is streaming.
+#[derive(Debug, Default)]
+struct Observation {
+    ghosts: BTreeMap<u64, String>,
+    streaming: HashSet<u64>,
+    /// (ghost localpart prefix, server name), set by the Matrix side.
+    ghost_naming: Option<(String, String)>,
+}
+
 pub struct LinkBoard {
     room_id: String,
     pairings: Arc<PairingStore>,
@@ -57,6 +81,9 @@ pub struct LinkBoard {
     config_matrix: HashSet<String>,
     presence: Mutex<Presence>,
     dispatch: Mutex<Option<LinkDispatch>>,
+    observation: Mutex<Observation>,
+    /// Bumped on every change a companion could observe; readers poll it.
+    revision: AtomicU64,
 }
 
 impl std::fmt::Debug for LinkBoard {
@@ -81,6 +108,8 @@ impl LinkBoard {
             config_matrix: config_matrix.into_iter().collect(),
             presence: Mutex::new(Presence::default()),
             dispatch: Mutex::new(None),
+            observation: Mutex::new(Observation::default()),
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -208,6 +237,10 @@ impl LinkBoard {
         if !changed {
             return Vec::new();
         }
+        if !present {
+            self.observation.lock().unwrap_or_else(PoisonError::into_inner).streaming.remove(&uid);
+        }
+        self.bump();
         let mut events = Vec::new();
         if let Some(m) = self.pairings.matrix_for_discord(uid) {
             if p.matrix.contains(&m) {
@@ -249,6 +282,7 @@ impl LinkBoard {
         if !changed {
             return Vec::new();
         }
+        self.bump();
         let mut events = Vec::new();
         for d in self.pairings.discords_for_matrix(mxid) {
             if !p.discord.contains(&d) || self.config_discord.contains(&d) {
@@ -264,6 +298,8 @@ impl LinkBoard {
     /// `was` must be the statuses captured *before* the store changed, via
     /// [`LinkBoard::snapshot_statuses`].
     pub fn diff_statuses(&self, was: &StatusSnapshot) -> Vec<LinkEvent> {
+        // A store change can move the listener count without any event.
+        self.bump();
         let p = self.presence.lock().unwrap_or_else(PoisonError::into_inner);
         let mut events = Vec::new();
         for d in &p.discord {
@@ -285,6 +321,72 @@ impl LinkBoard {
             }
         }
         events
+    }
+
+    // ── companion observation (ADR 0004 §6) ────────────────────────────────────
+
+    fn bump(&self) {
+        self.revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Changes whenever anything [`represented`](Self::represented),
+    /// [`matrix_listeners`](Self::matrix_listeners) or
+    /// [`paired_present`](Self::paired_present) report may have changed.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
+    }
+
+    /// The Discord side minted (`Some(display name)`) or retired (`None`) this
+    /// member's ghost.
+    pub fn note_ghost(&self, uid: u64, display_name: Option<&str>) {
+        let mut o = self.observation.lock().unwrap_or_else(PoisonError::into_inner);
+        let changed = match display_name {
+            Some(n) => o.ghosts.insert(uid, n.to_string()).as_deref() != Some(n),
+            None => o.ghosts.remove(&uid).is_some(),
+        };
+        drop(o);
+        if changed {
+            self.bump();
+        }
+    }
+
+    /// Discord's streaming flag for a member in the channel.
+    pub fn set_discord_streaming(&self, uid: u64, streaming: bool) {
+        let mut o = self.observation.lock().unwrap_or_else(PoisonError::into_inner);
+        let changed = if streaming { o.streaming.insert(uid) } else { o.streaming.remove(&uid) };
+        drop(o);
+        if changed {
+            self.bump();
+        }
+    }
+
+    /// The Matrix side publishes how ghost MXIDs are formed:
+    /// `@<prefix><discord id>:<server>`.
+    pub fn set_ghost_naming(&self, prefix: &str, server: &str) {
+        self.observation.lock().unwrap_or_else(PoisonError::into_inner).ghost_naming =
+            Some((prefix.to_string(), server.to_string()));
+        self.bump();
+    }
+
+    /// Members represented by a ghost right now, by Discord id.
+    pub fn represented(&self) -> Vec<RepresentedMember> {
+        let o = self.observation.lock().unwrap_or_else(PoisonError::into_inner);
+        o.ghosts
+            .iter()
+            .map(|(uid, name)| RepresentedMember {
+                discord_user_id: *uid,
+                ghost_mxid: o.ghost_naming.as_ref().map(|(p, s)| format!("@{p}{uid}:{s}")),
+                display_name: name.clone(),
+                streaming: o.streaming.contains(uid),
+            })
+            .collect()
+    }
+
+    /// Is `mxid` in the call while one of its paired Discord accounts is in the
+    /// channel (the person is present on both sides as themselves)?
+    pub fn paired_present(&self, mxid: &str) -> bool {
+        let p = self.presence.lock().unwrap_or_else(PoisonError::into_inner);
+        p.matrix.contains(mxid) && self.pairings.discords_for_matrix(mxid).iter().any(|d| p.discord.contains(d))
     }
 
     pub fn snapshot_statuses(&self) -> StatusSnapshot {
@@ -317,6 +419,16 @@ impl LinkRegistry {
 
     pub fn unregister(&self, label: &str) {
         self.boards.write().unwrap_or_else(PoisonError::into_inner).retain(|(l, _)| l != label);
+    }
+
+    /// The live board bridging `room_id`, if a bridge for it is running.
+    pub fn board_for_room(&self, room_id: &str) -> Option<Arc<LinkBoard>> {
+        self.boards
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(_, b)| b.room_id() == room_id)
+            .map(|(_, b)| b.clone())
     }
 
     pub fn boards(&self) -> Vec<Arc<LinkBoard>> {
@@ -590,5 +702,47 @@ mod tests {
         let ev = b.diff_statuses(&before);
         assert!(ev.contains(&LinkEvent::DiscordIncluded(1)));
         assert!(ev.contains(&LinkEvent::MatrixIncluded { user: ALICE.into(), discord_half_vanished: false }));
+    }
+
+    #[test]
+    fn observation_tracks_ghosts_streaming_and_revision() {
+        let b = board(&[(ALICE, 1)], &[], &[], &[]);
+        let r0 = b.revision();
+        b.set_discord_present(7, true);
+        b.note_ghost(7, Some("Seven"));
+        b.set_discord_streaming(7, true);
+        assert!(b.revision() > r0);
+        assert_eq!(
+            b.represented(),
+            vec![RepresentedMember { discord_user_id: 7, ghost_mxid: None, display_name: "Seven".into(), streaming: true }]
+        );
+        b.set_ghost_naming("nvb_", "hs");
+        assert_eq!(b.represented()[0].ghost_mxid.as_deref(), Some("@nvb_7:hs"));
+        // An unchanged update does not bump.
+        let r1 = b.revision();
+        b.note_ghost(7, Some("Seven"));
+        b.set_discord_streaming(7, true);
+        assert_eq!(b.revision(), r1);
+        // Leaving clears the streaming flag; retiring the ghost removes the member.
+        b.set_discord_present(7, false);
+        b.note_ghost(7, None);
+        assert!(b.represented().is_empty());
+        b.set_discord_present(7, true);
+        b.note_ghost(7, Some("Seven"));
+        assert!(!b.represented()[0].streaming);
+        // paired_present needs both halves.
+        b.set_matrix_present(ALICE, true);
+        assert!(!b.paired_present(ALICE));
+        b.set_discord_present(1, true);
+        assert!(b.paired_present(ALICE));
+    }
+
+    #[test]
+    fn registry_finds_a_board_by_room() {
+        let reg = LinkRegistry::new();
+        let b = Arc::new(board(&[], &[], &[], &[]));
+        reg.register("x", b.clone());
+        assert!(reg.board_for_room(ROOM).is_some_and(|f| Arc::ptr_eq(&f, &b)));
+        assert!(reg.board_for_room("!nope:hs").is_none());
     }
 }

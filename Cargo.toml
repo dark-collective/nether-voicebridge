@@ -5,6 +5,7 @@ members = [
     "crates/audio",
     "crates/discord",
     "crates/matrix-rtc",
+    "crates/companion",
     "crates/bridge",
     "crates/e2e",
 ]
@@ -15,6 +16,7 @@ default-members = [
     "crates/audio",
     "crates/discord",
     "crates/matrix-rtc",
+    "crates/companion",
     "crates/bridge",
 ]
 
@@ -99,6 +101,7 @@ nvb-config = { path = "crates/config" }
 nvb-audio = { path = "crates/audio" }
 nvb-discord = { path = "crates/discord" }
 nvb-matrix-rtc = { path = "crates/matrix-rtc" }
+nvb-companion = { path = "crates/companion" }
 
 # songbird 0.6.0 + the DAVE-supplemental-trailer decode fix (#36): upstream
 # feeds the 12-16 trailing non-audio bytes of every DAVE-decrypted packet to

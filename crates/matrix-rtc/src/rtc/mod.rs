@@ -152,6 +152,9 @@ pub(crate) async fn run(
     // Bridge-bot identity, used to post/retract call membership when E2EE is on.
     let bot_user_id: OwnedUserId = mx_cfg.bot_user_id.parse()?;
     let device_id: OwnedDeviceId = mx_cfg.device_id.as_str().into();
+    // Companions observing this room learn ghosts by MXID (ADR 0004 §6); ghosts
+    // live on the bot's server (`GhostPool::new` uses the same).
+    links.set_ghost_naming(&ghost_prefix, bot_user_id.server_name().as_str());
 
     // Register a handler to receive peers' media keys via to-device events.
     // With e2e on (encrypted room) EC/Commet send these Olm-encrypted and the SDK

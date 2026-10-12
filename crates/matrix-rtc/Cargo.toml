@@ -17,6 +17,7 @@ testkit = []
 [dependencies]
 nvb-audio = { workspace = true }
 nvb-config = { workspace = true }
+nvb-companion = { workspace = true }
 serde = { workspace = true }
 matrix-sdk = { workspace = true }
 matrix-sdk-crypto = { workspace = true }
