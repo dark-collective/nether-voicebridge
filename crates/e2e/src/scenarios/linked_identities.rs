@@ -33,7 +33,7 @@ pub static LINKED_IDENTITY_EXCLUSION: ScenarioDef = ScenarioDef {
 
 // Log anchors (substrings; the exact em-dashes never round-trip through here).
 const ASSIGNING_PUPPET: &str = "assigning puppet";
-const JOINED_NO_PUPPET: &str = "bridge-owned (paired Discord account present"; // "member joined — bridge-owned (...) — no puppet"
+const JOINED_NO_PUPPET: &str = "paired Discord account present"; // "member joined — paired Discord account present — no puppet, listening"
 const RELEASING_PUPPET: &str = "member is now bridge-owned"; // "... — releasing puppet"
 const PUPPET_BACK: &str = "member is no longer bridge-owned"; // "... — assigning puppet"
 const GHOST_ASSIGNED: &str = "ghost assigned";
