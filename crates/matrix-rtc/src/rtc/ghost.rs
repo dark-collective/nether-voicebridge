@@ -63,9 +63,11 @@ use matrix_sdk::{
 use reqwest::Url;
 use std::borrow::Cow;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
+
+use nvb_companion::stream::{AttachError, AttachReply, StreamGrant, StreamProvider, StreamTransport};
 
 use nvb_audio::jitter::JitterBuffer;
 use nvb_audio::routing::{CaptureRouter, CaptureSink};
@@ -143,6 +145,7 @@ struct ObservedGhostMembership {
 fn orphan_ghost_memberships(
     observed: &[ObservedGhostMembership],
     live_keys: &HashSet<String>,
+    live_streams: &HashSet<String>,
     ghost_prefix: &str,
     salt: &str,
 ) -> Vec<ObservedGhostMembership> {
@@ -160,14 +163,22 @@ fn orphan_ghost_memberships(
             else {
                 return false;
             };
-            if live_keys.contains(key) {
+            // A ghost has its voice device (`D…`) and, while a companion stream is attached, a stream device
+            // (`S…`, ADR 0004): each is live only while its own owner is.
+            let device = m
+                .state_key
+                .strip_prefix(&format!("_{}_", m.sender))
+                .and_then(|r| r.strip_suffix("_m.call"))
+                .unwrap_or("");
+            let stream = device.starts_with('S');
+            if (stream && live_streams.contains(key)) || (!stream && live_keys.contains(key)) {
                 return false;
             }
             if !m.active {
                 return true;
             }
-            !salt.is_empty()
-                && m.state_key == format!("_{}_{}_m.call", m.sender, ghost_device_id(key, salt))
+            let ours = if stream { stream_device_id(key, salt) } else { ghost_device_id(key, salt) };
+            !salt.is_empty() && m.state_key == format!("_{}_{}_m.call", m.sender, ours)
         })
         .cloned()
         .collect()
@@ -283,6 +294,18 @@ enum GhostCommand {
     Release { key: String },
     /// Retire every ghost (call teardown).
     ReleaseAll,
+    /// Attach a companion stream device to the ghost for `key` (ADR 0004 §5) until `cancel` fires.
+    AttachStream {
+        key: String,
+        cancel: CancellationToken,
+        reply: oneshot::Sender<Result<StreamGrant, AttachError>>,
+    },
+}
+
+/// A running stream device (ADR 0004 §5), held by the driver like a ghost.
+struct StreamHandle {
+    cancel: CancellationToken,
+    join: tokio::task::JoinHandle<()>,
 }
 
 /// A running ghost's control handle, held by the driver. `cancel` signals the
@@ -522,6 +545,7 @@ impl GhostPool {
         &self,
         client: &Client,
         live_keys: &HashSet<String>,
+        live_streams: &HashSet<String>,
         seen: &mut HashSet<String>,
     ) {
         let Ok(room_id) = RoomId::parse(&self.cfg.room_id) else { return };
@@ -552,6 +576,7 @@ impl GhostPool {
         let orphans = orphan_ghost_memberships(
             &observed,
             live_keys,
+            live_streams,
             &self.cfg.ghost_localpart_prefix,
             &self.cfg.ghost_device_salt,
         );
@@ -618,6 +643,8 @@ impl GhostPool {
         // are present).
         let mut focus: Option<LivekitFocusInfo> = None;
         let mut ghosts: HashMap<String, GhostHandle> = HashMap::new();
+        // Companion stream devices (ADR 0004), keyed like ghosts; one per ghost at most.
+        let mut streams: HashMap<String, StreamHandle> = HashMap::new();
         // Per-ghost crypto reused across rejoins for this bridge's process lifetime
         // (keeps the Olm device stable so a rejoiner stays audible) — see
         // [`GhostCryptoCache`].
@@ -643,6 +670,7 @@ impl GhostPool {
                     // Drain every ghost to baseline: cancel + await teardown so all
                     // `post_membership(leave)` PUTs land before the driver returns.
                     tracing::info!(count = ghosts.len(), "ghost pool draining (shutdown)");
+                    drain_streams(&mut streams).await;
                     let draining: Vec<_> = ghosts.drain().collect();
                     for (_key, handle) in &draining {
                         handle.cancel.cancel();
@@ -659,8 +687,10 @@ impl GhostPool {
                     None => break,
                 },
                 _ = orphan_tick.tick() => {
+                    streams.retain(|_, h| !h.join.is_finished());
                     let live: HashSet<String> = ghosts.keys().cloned().collect();
-                    self.sweep_orphaned_ghosts(&client, &live, &mut orphan_seen).await;
+                    let live_streams: HashSet<String> = streams.keys().cloned().collect();
+                    self.sweep_orphaned_ghosts(&client, &live, &live_streams, &mut orphan_seen).await;
                     continue;
                 }
             };
@@ -730,12 +760,17 @@ impl GhostPool {
                     // land before the entry is forgotten (the driver is the sole
                     // owner; blocking it briefly on a control-plane release is
                     // fine and keeps releases ordered).
+                    if let Some(s) = streams.remove(&key) {
+                        s.cancel.cancel();
+                        let _ = s.join.await;
+                    }
                     if let Some(handle) = ghosts.remove(&key) {
                         handle.cancel.cancel();
                         let _ = handle.join.await;
                     }
                 }
                 GhostCommand::ReleaseAll => {
+                    drain_streams(&mut streams).await;
                     let draining: Vec<_> = ghosts.drain().collect();
                     for (_key, handle) in &draining {
                         handle.cancel.cancel();
@@ -746,6 +781,46 @@ impl GhostPool {
                         draining.into_iter().map(|(_key, handle)| handle.join),
                     )
                     .await;
+                }
+                GhostCommand::AttachStream { key, cancel, reply } => {
+                    streams.retain(|_, h| !h.join.is_finished());
+                    if !ghosts.contains_key(&key) {
+                        let _ = reply.send(Err("not_represented"));
+                        continue;
+                    }
+                    if streams.contains_key(&key) {
+                        let _ = reply.send(Err("already_attached"));
+                        continue;
+                    }
+                    if focus.is_none() {
+                        match well_known::discover_livekit_focus(&self.cfg.http, &self.cfg.well_known_base_url, &self.cfg.room_id).await {
+                            Ok(f) => focus = Some(f),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "stream device: focus discovery failed");
+                                let _ = reply.send(Err("sfu_unavailable"));
+                                continue;
+                            }
+                        }
+                    }
+                    let mut cfg = self.cfg.clone();
+                    cfg.media_e2ee = media_e2ee;
+                    cfg.key_transport = key_transport;
+                    let Some(default_focus) = focus.clone() else { continue };
+                    let join = tokio::spawn(
+                        run_stream_device(
+                            cfg,
+                            default_focus,
+                            client.clone(),
+                            members_gen_rx.clone(),
+                            call_focus_rx.clone(),
+                            key.clone(),
+                            cancel.clone(),
+                            crypto_cache.clone(),
+                            reply,
+                        )
+                        .instrument(tracing::info_span!(parent: None, "bridge", name = %bridge)),
+                    );
+                    streams.insert(key, StreamHandle { cancel, join });
                 }
             }
         }
@@ -857,6 +932,15 @@ fn ghost_device_id(key: &str, salt: &str) -> String {
         format!("D{key}")
     } else {
         format!("D{key}-{salt}")
+    }
+}
+
+/// A ghost's companion stream device (ADR 0004 §5): `S{key}-{salt}`, the same store salt as its voice device.
+fn stream_device_id(key: &str, salt: &str) -> String {
+    if salt.is_empty() {
+        format!("S{key}")
+    } else {
+        format!("S{key}-{salt}")
     }
 }
 
@@ -1250,6 +1334,177 @@ async fn run_ghost(
     }
     .instrument(span)
     .await;
+}
+
+/// Cancel every stream device and await their teardown (each retracts its membership on the way out).
+async fn drain_streams(streams: &mut HashMap<String, StreamHandle>) {
+    let draining: Vec<_> = streams.drain().collect();
+    for (_key, h) in &draining {
+        h.cancel.cancel();
+    }
+    futures_util::future::join_all(draining.into_iter().map(|(_key, h)| h.join)).await;
+}
+
+/// How often a stream device's LiveKit token is replaced (lk-jwt tokens live one hour).
+const STREAM_TOKEN_REFRESH: Duration = Duration::from_secs(50 * 60);
+
+/// OpenID as the ghost → lk-jwt for the stream device → the transport a companion connects with.
+async fn fetch_stream_transport(
+    cfg: &GhostConfig,
+    focus: &LivekitFocusInfo,
+    ghost_mxid: &str,
+    device_id: &str,
+) -> Result<StreamTransport> {
+    let openid_token = fetch_openid_token(cfg, ghost_mxid).await?;
+    let jwt = lk_jwt::fetch_livekit_token(
+        &cfg.http,
+        cfg.lk_jwt_url.as_deref().unwrap_or(&focus.service_url),
+        &cfg.room_id,
+        device_id,
+        &openid_token,
+    )
+    .await?;
+    let (identity, _room) = decode_jwt_claims(&jwt.jwt)?;
+    let fetched_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(StreamTransport { sfu_url: cfg.lk_url.clone().unwrap_or(jwt.url), jwt: jwt.jwt, identity, fetched_at })
+}
+
+/// A companion stream device on a ghost (ADR 0004 §5): the bridge does the Matrix half — the device's LiveKit token
+/// (refreshed, re-fetched on the elected SFU when the election moves), its media key and key distribution (the
+/// ghost's own Olm device sends it under the stream device's claimed device id), and its call membership, posted
+/// once the companion reports its track live and kept until the lease ends. The companion publishes; the bridge
+/// never touches the media.
+#[allow(clippy::too_many_arguments)]
+async fn run_stream_device(
+    cfg: GhostConfig,
+    default_focus: LivekitFocusInfo,
+    client: Client,
+    members_gen_rx: watch::Receiver<u64>,
+    mut call_focus_rx: watch::Receiver<Option<LivekitFocusInfo>>,
+    key: String,
+    cancel: CancellationToken,
+    crypto_cache: GhostCryptoCache,
+    reply: oneshot::Sender<Result<StreamGrant, AttachError>>,
+) {
+    let ghost_mxid = format!("@{}{key}:{}", cfg.ghost_localpart_prefix, cfg.server_name);
+    let localpart = format!("{}{key}", cfg.ghost_localpart_prefix);
+    let device_id = stream_device_id(&key, &cfg.ghost_device_salt);
+    // A fresh key per lease: the stream device is a new participant every time.
+    let media_key = cfg.media_e2ee.then(keys::generate_key);
+    let span = tracing::info_span!("stream", mxid = %ghost_mxid, device = %device_id);
+    async {
+        // The ghost is live (the driver checked); joining again is idempotent and covers a ghost still mid-join.
+        if let Err(e) = join_room(&cfg, &ghost_mxid).await {
+            tracing::warn!(error = %format_args!("{e:#}"), "stream device: ghost not joined");
+            let _ = reply.send(Err("ghost_unavailable"));
+            return;
+        }
+        let mut focus = elected_focus_or(&client, &cfg, &default_focus).await;
+        let transport = match fetch_stream_transport(&cfg, &focus, &ghost_mxid, &device_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %format_args!("{e:#}"), sfu = %focus.service_url, "stream device: no LiveKit token");
+                let _ = reply.send(Err("sfu_unavailable"));
+                return;
+            }
+        };
+        let (transport_tx, transport_rx) = watch::channel(Some(transport));
+        if let Some(k) = media_key {
+            tracing::info!(key_fp = %keys::key_fp(&k), "stream device media key generated");
+            tokio::spawn(
+                distribute_key_task(
+                    cfg.clone(),
+                    localpart.clone(),
+                    ghost_mxid.clone(),
+                    device_id.clone(),
+                    k,
+                    members_gen_rx,
+                    cancel.clone(),
+                    crypto_cache,
+                )
+                .instrument(tracing::Span::current()),
+            );
+        }
+        let live = Arc::new(Notify::new());
+        let grant = StreamGrant {
+            ghost_mxid: ghost_mxid.clone(),
+            device_id: device_id.clone(),
+            e2ee: media_key.is_some(),
+            key: media_key,
+            transport: transport_rx,
+            live: live.clone(),
+        };
+        if reply.send(Ok(grant)).is_err() {
+            return; // the requester gave up; nothing was posted
+        }
+        tracing::info!(sfu = %focus.service_url, "stream device attached — waiting for the companion's track");
+        let created_ts = Some(MilliSecondsSinceUnixEpoch::now());
+        let mut membership: Option<tokio::task::JoinHandle<()>> = None;
+        let mut refresh = tokio::time::interval_at(tokio::time::Instant::now() + STREAM_TOKEN_REFRESH, STREAM_TOKEN_REFRESH);
+        let mut focus_open = true;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = live.notified(), if membership.is_none() => {
+                    membership = Some(tokio::spawn(
+                        keep_membership_posted(cfg.clone(), ghost_mxid.clone(), device_id.clone(), focus.clone(), created_ts, cancel.clone())
+                            .instrument(tracing::Span::current()),
+                    ));
+                    tracing::info!("stream device live — membership posting");
+                }
+                _ = refresh.tick() => match fetch_stream_transport(&cfg, &focus, &ghost_mxid, &device_id).await {
+                    Ok(t) => { transport_tx.send_replace(Some(t)); }
+                    Err(e) => tracing::warn!(error = %format_args!("{e:#}"), "stream device token refresh failed — retrying at the next tick"),
+                },
+                r = call_focus_rx.changed(), if focus_open => {
+                    if r.is_err() { focus_open = false; continue; }
+                    let new_focus = elected_focus_or(&client, &cfg, &default_focus).await;
+                    if super::focus::normalize_service_url(&new_focus.service_url)
+                        == super::focus::normalize_service_url(&focus.service_url)
+                    {
+                        continue;
+                    }
+                    tracing::info!(from = %focus.service_url, to = %new_focus.service_url, "call-focus election moved — moving the stream device");
+                    focus = new_focus;
+                    match fetch_stream_transport(&cfg, &focus, &ghost_mxid, &device_id).await {
+                        Ok(t) => { transport_tx.send_replace(Some(t)); }
+                        Err(e) => tracing::warn!(error = %format_args!("{e:#}"), "stream device: no token on the new SFU"),
+                    }
+                    if let Some(h) = membership.take() {
+                        h.abort();
+                        membership = Some(tokio::spawn(
+                            keep_membership_posted(cfg.clone(), ghost_mxid.clone(), device_id.clone(), focus.clone(), created_ts, cancel.clone())
+                                .instrument(tracing::Span::current()),
+                        ));
+                    }
+                }
+            }
+        }
+        // `cancel` has fired: the keeper settles; await it so a post in flight lands before the leave.
+        if let Some(h) = membership.take() {
+            let _ = h.await;
+            if let Err(e) = post_membership(&cfg, &ghost_mxid, &device_id, &focus, true).await {
+                tracing::warn!(error = format!("{e:#}"), "stream device leave failed — the orphan sweep will retry");
+            }
+        }
+        transport_tx.send_replace(None);
+        tracing::info!("stream device detached");
+    }
+    .instrument(span)
+    .await;
+}
+
+impl StreamProvider for GhostPool {
+    fn attach(&self, discord_user_id: u64, cancel: CancellationToken) -> AttachReply {
+        let (reply, rx) = oneshot::channel();
+        // A stopped driver drops `reply`; the hub reads that as "bridge not running".
+        let _ = self.cmd_tx.send(GhostCommand::AttachStream { key: discord_user_id.to_string(), cancel, reply });
+        rx
+    }
 }
 
 /// Why the ghost's audio pump stopped — drives `run_ghost`'s retire-vs-reconnect
@@ -2836,7 +3091,7 @@ mod tests {
             obs("@nether-voicebridge_bot:x", "_@nether-voicebridge_bot:x_DEV_m.call", false),
             obs("@dark:x", "_@dark:x_ABC_m.call", false),
         ];
-        let got: Vec<String> = orphan_ghost_memberships(&observed, &live, p, "salt")
+        let got: Vec<String> = orphan_ghost_memberships(&observed, &live, &HashSet::new(), p, "salt")
             .into_iter()
             .map(|m| m.sender)
             .collect();
@@ -2850,7 +3105,7 @@ mod tests {
             obs("@nether-voicebridge_222:x", "_@nether-voicebridge_222:x_D222_m.call", true),
             obs("@nether-voicebridge_444:x", "_@nether-voicebridge_444:x_D444_m.call", false),
         ];
-        let got: Vec<String> = orphan_ghost_memberships(&observed, &HashSet::new(), p, "")
+        let got: Vec<String> = orphan_ghost_memberships(&observed, &HashSet::new(), &HashSet::new(), p, "")
             .into_iter()
             .map(|m| m.sender)
             .collect();

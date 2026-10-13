@@ -8,6 +8,7 @@ pub mod audit;
 pub mod http;
 pub mod hub;
 pub mod observe;
+pub mod stream;
 pub mod token;
 
 pub use hub::CompanionHub;

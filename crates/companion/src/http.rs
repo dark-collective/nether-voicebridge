@@ -152,6 +152,14 @@ struct LeaseRequest {
     kind: String,
     #[serde(default)]
     room_id: Option<String>,
+    /// `stream:attach`: whose ghost the stream is attached to.
+    #[serde(default)]
+    participant: Option<ParticipantRef>,
+}
+
+#[derive(Deserialize)]
+struct ParticipantRef {
+    discord_user_id: String,
 }
 
 async fn handle(
@@ -188,6 +196,10 @@ async fn handle(
     match (req.method().clone(), segs.as_slice()) {
         (Method::POST, ["leases"]) => open_lease(&hub, &key, req).await,
         (Method::GET, ["leases", id, "events"]) => events(&hub, &key, id, shutdown),
+        (Method::POST, ["leases", id, "live"]) => match hub.stream_live(&key, id) {
+            Ok(()) => json(StatusCode::OK, serde_json::json!({ "live": true })),
+            Err(r) => refusal(r),
+        },
         (Method::POST, ["leases", id, "renew"]) => match hub.renew(&key, id) {
             Ok(at) => json(StatusCode::OK, serde_json::json!({ "expires_at": at })),
             Err(r) => refusal(r),
@@ -196,7 +208,7 @@ async fn handle(
             Ok(()) => json(StatusCode::OK, serde_json::json!({ "released": true })),
             Err(r) => refusal(r),
         },
-        (_, ["leases"]) | (_, ["leases", _]) | (_, ["leases", _, "events" | "renew"]) => method_not_allowed(),
+        (_, ["leases"]) | (_, ["leases", _]) | (_, ["leases", _, "events" | "renew" | "live"]) => method_not_allowed(),
         _ => error(StatusCode::NOT_FOUND, "not_found", "unknown path"),
     }
 }
@@ -242,6 +254,15 @@ async fn open_lease(hub: &CompanionHub, key: &CompanionKey, req: Request<Incomin
         Ok(r) => r,
         Err(e) => return error(StatusCode::BAD_REQUEST, "bad_request", &format!("invalid JSON body: {e}")),
     };
+    if lr.kind == "stream:attach" {
+        let Some(uid) = lr.participant.as_ref().and_then(|p| p.discord_user_id.parse::<u64>().ok()) else {
+            return error(StatusCode::BAD_REQUEST, "bad_request", "stream:attach needs participant.discord_user_id");
+        };
+        return match hub.open_stream_lease(key, lr.room_id.as_deref(), uid).await {
+            Ok(g) => json(StatusCode::CREATED, stream_grant_json(&g.shared)),
+            Err(r) => refusal(r),
+        };
+    }
     match hub.open_lease(key, &lr.kind, lr.room_id.as_deref()) {
         Ok(g) => {
             let l = &g.shared;
@@ -255,6 +276,35 @@ async fn open_lease(hub: &CompanionHub, key: &CompanionKey, req: Request<Incomin
         }
         Err(r) => refusal(r),
     }
+}
+
+/// The 201 body of a `stream:attach` lease: where to connect, with which key, and what may be published.
+fn stream_grant_json(l: &LeaseShared) -> serde_json::Value {
+    use base64::Engine;
+    let Some(s) = l.stream.as_ref() else { return serde_json::json!({}) };
+    let t = s.grant.transport.borrow().clone();
+    serde_json::json!({
+        "lease_id": l.id,
+        "kind": l.kind,
+        "room_id": l.room_id,
+        "expires_at": l.expires_at(),
+        "events_url": format!("{API_PREFIX}/leases/{}/events", l.id),
+        "live_url": format!("{API_PREFIX}/leases/{}/live", l.id),
+        "consent": s.basis,
+        "participant": { "discord_user_id": s.discord_user_id.to_string(), "ghost_mxid": s.grant.ghost_mxid, "device_id": s.grant.device_id },
+        "transport": t.map(|t| transport_json(&t)),
+        "media": {
+            "e2ee": s.grant.e2ee,
+            "key_b64": s.grant.key.map(|k| base64::engine::general_purpose::STANDARD.encode(k)),
+            "key_index": 0,
+            "key_provider": { "key_derivation": "HKDF", "ratchet_salt": "LKFrameEncryptionKey", "ratchet_window_size": 16, "encryption": "AES-GCM" },
+        },
+        "allowed_sources": ["screen_share", "screen_share_audio"],
+    })
+}
+
+fn transport_json(t: &crate::stream::StreamTransport) -> serde_json::Value {
+    serde_json::json!({ "sfu_url": t.sfu_url, "jwt": t.jwt, "identity": t.identity, "fetched_at": t.fetched_at })
 }
 
 fn events(hub: &Arc<CompanionHub>, key: &CompanionKey, lease_id: &str, shutdown: CancellationToken) -> Response<NvbBody> {
@@ -283,9 +333,10 @@ async fn event_loop(hub: Arc<CompanionHub>, lease: Arc<LeaseShared>, tx: mpsc::S
     let mut ka = tokio::time::interval_at(tokio::time::Instant::now() + keepalive, keepalive);
     let mut poll = tokio::time::interval(OBSERVE_POLL);
     let mut expires = lease.expires_at();
-    let mut seen: Option<(usize, u64)> = None;
+    let mut seen: Option<(usize, u64, Vec<u64>)> = None;
     let mut last: Option<Snapshot> = None;
     let observing = lease.kind == "observe";
+    let mut transport_rx = lease.stream.as_ref().map(|s| s.grant.transport.clone());
 
     let opening = serde_json::json!({
         "lease_id": lease.id, "kind": lease.kind, "room_id": lease.room_id, "expires_at": expires,
@@ -313,6 +364,15 @@ async fn event_loop(hub: Arc<CompanionHub>, lease: Arc<LeaseShared>, tx: mpsc::S
                     }
                 }
             }
+            r = async { match transport_rx.as_mut() { Some(rx) => rx.changed().await.is_ok(), None => std::future::pending().await } } => {
+                if !r { transport_rx = None; continue; }
+                let t = transport_rx.as_mut().and_then(|rx| rx.borrow_and_update().clone());
+                if let Some(t) = t {
+                    if tx.send(sse("transport", &transport_json(&t))).await.is_err() {
+                        return;
+                    }
+                }
+            }
             _ = ka.tick() => {
                 if tx.send(Bytes::from_static(b": keep-alive\n\n")).await.is_err() {
                     return;
@@ -321,12 +381,16 @@ async fn event_loop(hub: Arc<CompanionHub>, lease: Arc<LeaseShared>, tx: mpsc::S
             _ = poll.tick(), if observing => {
                 let registry = &hub.links().registry;
                 let board = registry.board_for_room(&lease.room_id);
-                let stamp = board.as_ref().map(|b| (Arc::as_ptr(b) as usize, b.revision())).unwrap_or((0, 0));
+                let attached = hub.attached_in(&lease.room_id);
+                let mut att: Vec<u64> = attached.iter().copied().collect();
+                att.sort_unstable();
+                let (ptr, rev) = board.as_ref().map(|b| (Arc::as_ptr(b) as usize, b.revision())).unwrap_or((0, 0));
+                let stamp = (ptr, rev, att);
                 if last.is_some() && seen == Some(stamp) {
                     continue;
                 }
                 seen = Some(stamp);
-                let snap = Snapshot::take(registry, &lease.room_id, &lease.issuer);
+                let snap = Snapshot::take(registry, &lease.room_id, &lease.issuer, &attached);
                 for (name, data) in snap.events_since(last.as_ref()) {
                     if tx.send(sse(name, &data)).await.is_err() {
                         return;
