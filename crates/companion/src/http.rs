@@ -386,7 +386,7 @@ async fn event_loop(hub: Arc<CompanionHub>, lease: Arc<LeaseShared>, tx: mpsc::S
                 att.sort_unstable();
                 let (ptr, rev) = board.as_ref().map(|b| (Arc::as_ptr(b) as usize, b.revision())).unwrap_or((0, 0));
                 let stamp = (ptr, rev, att);
-                if last.is_some() && seen == Some(stamp) {
+                if last.is_some() && seen.as_ref() == Some(&stamp) {
                     continue;
                 }
                 seen = Some(stamp);
