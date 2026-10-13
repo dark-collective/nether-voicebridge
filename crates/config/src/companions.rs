@@ -77,10 +77,22 @@ impl CompanionKey {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// A Discord member's personal consent for one key (ADR 0004 §4b): `/bridge companion allow <key-id>`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CompanionGrant {
+    /// Discord user id, as a string like every id in the config.
+    pub discord_user: String,
+    pub key_id: String,
+    #[serde(default)]
+    pub created: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct CompanionsFile {
     #[serde(default, rename = "key")]
     pub keys: Vec<CompanionKey>,
+    #[serde(default, rename = "grant")]
+    pub grants: Vec<CompanionGrant>,
 }
 
 /// Canonical location: `<data_dir>/companions.toml`.
@@ -128,30 +140,29 @@ pub fn validate_kinds(scope: &KeyScope, kinds: &[String]) -> Result<Vec<String>,
 #[derive(Debug)]
 pub struct CompanionKeys {
     path: Option<String>,
-    inner: RwLock<Vec<CompanionKey>>,
+    inner: RwLock<CompanionsFile>,
 }
 
 impl CompanionKeys {
     pub fn open(path: String) -> Result<Self, ConfigError> {
         let file = load_companions(&path)?;
-        Ok(Self { path: Some(path), inner: RwLock::new(file.keys) })
+        Ok(Self { path: Some(path), inner: RwLock::new(file) })
     }
 
     pub fn in_memory() -> Self {
-        Self { path: None, inner: RwLock::new(Vec::new()) }
+        Self { path: None, inner: RwLock::new(CompanionsFile::default()) }
     }
 
-    fn persist(&self, keys: &[CompanionKey]) -> Result<(), ConfigError> {
+    fn persist(&self, file: &CompanionsFile) -> Result<(), ConfigError> {
         let Some(path) = &self.path else { return Ok(()) };
-        let file = CompanionsFile { keys: keys.to_vec() };
-        let content = toml::to_string_pretty(&file)
+        let content = toml::to_string_pretty(file)
             .map_err(|e| ConfigError::Validation(format!("serializing companions: {e}")))?;
         write_atomic(path, &content)
     }
 
     /// Mutate a copy, persist it, then publish it — under the write lock so two
     /// writers cannot interleave.
-    fn edit<R>(&self, f: impl FnOnce(&mut Vec<CompanionKey>) -> R) -> Result<R, ConfigError> {
+    fn edit<R>(&self, f: impl FnOnce(&mut CompanionsFile) -> R) -> Result<R, ConfigError> {
         let mut g = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let mut next = g.clone();
         let r = f(&mut next);
@@ -163,36 +174,90 @@ impl CompanionKeys {
     }
 
     pub fn add(&self, key: CompanionKey) -> Result<(), ConfigError> {
-        self.edit(|v| {
-            v.retain(|k| k.id != key.id);
-            v.push(key);
+        self.edit(|f| {
+            f.keys.retain(|k| k.id != key.id);
+            f.keys.push(key);
         })
     }
 
-    /// Remove one key; returns it if it existed.
+    /// Remove one key (and every personal grant for it); returns it if it existed.
     pub fn remove(&self, id: &str) -> Result<Option<CompanionKey>, ConfigError> {
-        self.edit(|v| {
-            let pos = v.iter().position(|k| k.id == id)?;
-            Some(v.remove(pos))
+        self.edit(|f| {
+            let pos = f.keys.iter().position(|k| k.id == id)?;
+            f.grants.retain(|g| g.key_id != id);
+            Some(f.keys.remove(pos))
         })
     }
 
-    /// Remove every key scoped to `room_id` (its bridge was unlinked); returns them.
+    /// Remove every key scoped to `room_id` (its bridge was unlinked) and their grants; returns the keys.
     pub fn remove_room(&self, room_id: &str) -> Result<Vec<CompanionKey>, ConfigError> {
-        self.edit(|v| {
+        self.edit(|f| {
             let (gone, keep): (Vec<_>, Vec<_>) =
-                v.drain(..).partition(|k| k.scope.room_id() == Some(room_id));
-            *v = keep;
+                f.keys.drain(..).partition(|k| k.scope.room_id() == Some(room_id));
+            f.keys = keep;
+            f.grants.retain(|g| !gone.iter().any(|k| k.id == g.key_id));
             gone
         })
     }
 
     pub fn get(&self, id: &str) -> Option<CompanionKey> {
-        self.inner.read().unwrap_or_else(PoisonError::into_inner).iter().find(|k| k.id == id).cloned()
+        self.inner.read().unwrap_or_else(PoisonError::into_inner).keys.iter().find(|k| k.id == id).cloned()
     }
 
     pub fn list(&self) -> Vec<CompanionKey> {
-        self.inner.read().unwrap_or_else(PoisonError::into_inner).clone()
+        self.inner.read().unwrap_or_else(PoisonError::into_inner).keys.clone()
+    }
+
+    // ── personal grants (ADR 0004 §4b) ─────────────────────────────────────────
+
+    /// Record that Discord member `uid` agrees to streams attached by key `key_id`. False if it already existed.
+    pub fn allow(&self, uid: u64, key_id: &str, created: i64) -> Result<bool, ConfigError> {
+        let uid = uid.to_string();
+        self.edit(|f| {
+            if f.grants.iter().any(|g| g.discord_user == uid && g.key_id == key_id) {
+                return false;
+            }
+            f.grants.push(CompanionGrant { discord_user: uid, key_id: key_id.to_string(), created });
+            true
+        })
+    }
+
+    /// Withdraw one grant. False if there was none.
+    pub fn deny(&self, uid: u64, key_id: &str) -> Result<bool, ConfigError> {
+        let uid = uid.to_string();
+        self.edit(|f| {
+            let before = f.grants.len();
+            f.grants.retain(|g| !(g.discord_user == uid && g.key_id == key_id));
+            f.grants.len() != before
+        })
+    }
+
+    /// Withdraw every grant of a member (`/bridge optout`). Returns how many.
+    pub fn deny_all(&self, uid: u64) -> Result<usize, ConfigError> {
+        let uid = uid.to_string();
+        self.edit(|f| {
+            let before = f.grants.len();
+            f.grants.retain(|g| g.discord_user != uid);
+            before - f.grants.len()
+        })
+    }
+
+    pub fn has_grant(&self, uid: u64, key_id: &str) -> bool {
+        let uid = uid.to_string();
+        self.inner.read().unwrap_or_else(PoisonError::into_inner).grants.iter().any(|g| g.discord_user == uid && g.key_id == key_id)
+    }
+
+    /// The keys a member has allowed.
+    pub fn grants_of(&self, uid: u64) -> Vec<String> {
+        let uid = uid.to_string();
+        self.inner
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .grants
+            .iter()
+            .filter(|g| g.discord_user == uid)
+            .map(|g| g.key_id.clone())
+            .collect()
     }
 }
 
@@ -210,6 +275,27 @@ mod tests {
             label: String::new(),
             created: 1,
         }
+    }
+
+    #[test]
+    fn grants_follow_their_key_and_their_member() {
+        let s = CompanionKeys::in_memory();
+        s.add(key("k1", KeyScope::Room("!r:hs".into()))).unwrap();
+        s.add(key("k2", KeyScope::Room("!other:hs".into()))).unwrap();
+        assert!(s.allow(7, "k1", 1).unwrap());
+        assert!(!s.allow(7, "k1", 2).unwrap());
+        assert!(s.allow(7, "k2", 1).unwrap());
+        assert!(s.allow(8, "k1", 1).unwrap());
+        assert!(s.has_grant(7, "k1"));
+        assert_eq!(s.grants_of(7), vec!["k1", "k2"]);
+        assert!(s.deny(7, "k2").unwrap());
+        assert!(!s.deny(7, "k2").unwrap());
+        // Removing a key removes its grants; opting out removes a member's.
+        s.remove("k1").unwrap();
+        assert!(!s.has_grant(8, "k1"));
+        s.allow(7, "k2", 1).unwrap();
+        assert_eq!(s.deny_all(7).unwrap(), 1);
+        assert!(s.grants_of(7).is_empty());
     }
 
     #[test]

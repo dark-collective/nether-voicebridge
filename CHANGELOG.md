@@ -23,6 +23,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   ends when the member stops being represented, the flag stays off for 60 s, the call has no listener for 60 s, or the
   device publishes anything but a screen share (the bridge's subscriber reports it). Up to 4 attached streams per
   room; the startup and periodic orphan sweeps clear stale stream-device memberships.
+- **`/bridge companion allow|deny|list` (Discord, ephemeral):** a member can allow one companion key to show their stream
+  also when they are not streaming on Discord, withdraw it (an attached stream ends within seconds), and list what they
+  allowed. `/bridge optout` withdraws every such permission. Stored with the keys in `companions.toml`.
 
 ## [0.4.8] - 2026-10-11
 

@@ -67,7 +67,8 @@ pub struct LeaseShared {
 #[derive(Debug, Clone)]
 pub struct StreamAttachment {
     pub discord_user_id: u64,
-    /// Why the represented person counts as agreeing (ADR 0004 §4): "streaming_flag" or "own_pairing".
+    /// Why the represented person counts as agreeing (ADR 0004 §4): "streaming_flag", "personal_grant" or
+    /// "own_pairing".
     pub basis: &'static str,
     pub grant: StreamGrant,
     /// Fires the stream device's teardown.
@@ -141,6 +142,11 @@ impl CompanionHub {
         audit_path: String,
     ) -> Arc<Self> {
         Arc::new(Self { cfg, keys, links, audit_path, state: Mutex::new(HubState::default()) })
+    }
+
+    /// The key and grant store (shared with the Discord side's `/bridge companion` commands).
+    pub fn keys(&self) -> &Arc<CompanionKeys> {
+        &self.keys
     }
 
     pub fn config(&self) -> &CompanionsConfig {
@@ -427,6 +433,10 @@ impl CompanionHub {
                     ends.push((id.clone(), "not_represented"));
                     continue;
                 };
+                if s.basis == "personal_grant" && !self.keys.has_grant(s.discord_user_id, &l.key_id) {
+                    ends.push((id.clone(), "consent_withdrawn"));
+                    continue;
+                }
                 if s.basis == "streaming_flag" {
                     if member.streaming {
                         l.flag_off_since = None;
@@ -500,10 +510,12 @@ impl CompanionHub {
             && self.links.pairings.matrix_for_discord(discord_user_id).as_deref() == Some(key.issuer.as_str());
         let basis = if own {
             "own_pairing"
+        } else if matches!(key.scope, KeyScope::Room(_)) && self.keys.has_grant(discord_user_id, &key.id) {
+            "personal_grant"
         } else if matches!(key.scope, KeyScope::Room(_)) && member.streaming {
             "streaming_flag"
         } else {
-            return Err(Refusal::new(409, "not_consented", "the person is not streaming on Discord (and this is not their own key)"));
+            return Err(Refusal::new(409, "not_consented", "the person is not streaming on Discord, has not allowed this key (/bridge companion allow), and this is not their own key"));
         };
         {
             let st = self.state();
@@ -802,6 +814,29 @@ mod tests {
         h.sweep(t0 + FLAG_GRACE + Duration::from_secs(1));
         assert_eq!(g.shared.ended().as_deref(), Some("consent_withdrawn"));
         assert!(fake.cancels.lock().unwrap()[0].is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_personal_grant_is_consent_until_withdrawn() {
+        let room = "!stream-hub-test3:hs";
+        let (h, links) = hub(CompanionsConfig::default());
+        let board = links.board_for(room, &[], &[]);
+        links.registry.register("b", board.clone());
+        let _reg = crate::stream::register_provider(room, Arc::new(FakeProvider { cancels: Mutex::new(Vec::new()) }));
+        let (k, _) = h.create_key("@mod:hs", KeyScope::Room(room.into()), &["stream:attach".into()], "").unwrap();
+        board.set_discord_present(5, true);
+        board.note_ghost(5, Some("Five"));
+        board.set_matrix_present("@viewer:hs", true);
+        assert_eq!(h.open_stream_lease(&k, None, 5).await.unwrap_err().reason, "not_consented");
+        h.keys.allow(5, &k.id, 0).unwrap();
+        let g = h.open_stream_lease(&k, None, 5).await.unwrap();
+        assert_eq!(g.shared.stream.as_ref().unwrap().basis, "personal_grant");
+        let _sse = h.attach_stream(&k, &g.shared.id).unwrap();
+        h.sweep(Instant::now());
+        assert!(g.shared.ended().is_none());
+        h.keys.deny(5, &k.id).unwrap();
+        h.sweep(Instant::now());
+        assert_eq!(g.shared.ended().as_deref(), Some("consent_withdrawn"));
     }
 
     #[tokio::test]

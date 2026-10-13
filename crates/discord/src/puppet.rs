@@ -533,6 +533,8 @@ pub struct SharedPool {
     optout_set: OptoutSet,
     /// Path of the persisted opt-out list; unset (tests) disables the commands.
     optout_path: std::sync::OnceLock<String>,
+    /// Companion keys and personal grants (ADR 0004 §4b), when `[companions]` is enabled.
+    companion_keys: std::sync::OnceLock<Arc<nvb_config::companions::CompanionKeys>>,
     /// `ready` refires on reconnect; register the `/bridge` command once.
     command_registered: AtomicBool,
     /// Disclosure notices pushed by the management bot (#64 unlink side),
@@ -612,6 +614,7 @@ impl SharedPool {
             anchor_idle_grace: timing.anchor_idle_grace(),
             optout_set: Arc::new(RwLock::new(HashSet::new())),
             optout_path: std::sync::OnceLock::new(),
+            companion_keys: std::sync::OnceLock::new(),
             command_registered: AtomicBool::new(false),
             notices: StdMutex::new(None),
             pending_paired_leaves: StdMutex::new(HashMap::new()),
@@ -646,6 +649,11 @@ impl SharedPool {
         }
         let _ = self.optout_path.set(path);
         Ok(())
+    }
+
+    /// Arm `/bridge companion allow|deny|list` (ADR 0004 §4b) on the instance's companion store.
+    pub fn enable_companion_grants(&self, keys: Arc<nvb_config::companions::CompanionKeys>) {
+        let _ = self.companion_keys.set(keys);
     }
 
     /// Apply a fresh opt-out to the live state (#63): retire the user's ghost
@@ -3012,11 +3020,12 @@ impl EventHandler for PuppetHandler {
             Some(BridgeSub::Unpair) => {
                 handle_pair_command(&ctx, &cmd, guild_id, None, &self.pool).await
             }
+            Some(BridgeSub::Companion(c)) => handle_companion_command(&ctx, &cmd, &self.pool, c).await,
             None => {
                 respond_ephemeral(
                     &ctx,
                     &cmd,
-                    "Usage: `/bridge approve code:<code>`, `/bridge optout`, `/bridge optin`, `/bridge pair code:<code>`, or `/bridge unpair`",
+                    "Usage: `/bridge approve code:<code>`, `/bridge optout`, `/bridge optin`, `/bridge pair code:<code>`, `/bridge unpair`, or `/bridge companion allow|deny key:<key-id>` / `/bridge companion list`",
                 )
                 .await
             }
@@ -3200,6 +3209,11 @@ async fn handle_optout_command(
         }
     }
     if opting_out {
+        if let Some(keys) = pool.companion_keys.get() {
+            if let Err(e) = keys.deny_all(user_id) {
+                tracing::warn!(user_id, error = %e, "could not withdraw the user's companion grants on opt-out");
+            }
+        }
         pool.apply_optout(user_id);
         tracing::info!(user_id, user = %cmd.user.name, changed, "user opted out of bridging");
         respond_ephemeral(
@@ -3275,7 +3289,36 @@ async fn register_bridge_command(ctx: &Context) -> Result<()> {
                 CommandOptionType::SubCommand,
                 "unpair",
                 "Remove the link between this Discord account and a Matrix account",
-            )),
+            ))
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::SubCommandGroup,
+                    "companion",
+                    "Companion tools that may show your streams in bridged Matrix calls",
+                )
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::SubCommand,
+                        "allow",
+                        "Let this companion tool show your stream in the bridged call, even when you are not streaming on Discord",
+                    )
+                    .add_sub_option(
+                        CreateCommandOption::new(CommandOptionType::String, "key", "The companion key id (from whoever runs the tool)")
+                            .required(true),
+                    ),
+                )
+                .add_sub_option(
+                    CreateCommandOption::new(CommandOptionType::SubCommand, "deny", "Withdraw a permission you gave a companion tool")
+                        .add_sub_option(
+                            CreateCommandOption::new(CommandOptionType::String, "key", "The companion key id").required(true),
+                        ),
+                )
+                .add_sub_option(CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "list",
+                    "The companion tools you have allowed",
+                )),
+            ),
     )
     .await
     .map(|_| ())
@@ -3290,6 +3333,15 @@ enum BridgeSub {
     Optin,
     Pair { code: String },
     Unpair,
+    Companion(CompanionSub),
+}
+
+/// `/bridge companion …` (ADR 0004 §4b).
+#[derive(Debug, PartialEq)]
+enum CompanionSub {
+    Allow { key: String },
+    Deny { key: String },
+    List,
 }
 
 /// Pull the subcommand (and its arguments) out of a `/bridge` invocation.
@@ -3327,8 +3379,81 @@ fn bridge_subcommand(data: &CommandData) -> Option<BridgeSub> {
             Some(BridgeSub::Pair { code })
         }
         ("unpair", _) => Some(BridgeSub::Unpair),
+        ("companion", CommandDataOptionValue::SubCommandGroup(subs)) => {
+            let sub = subs.first()?;
+            let key = || match &sub.value {
+                CommandDataOptionValue::SubCommand(args) => args.iter().find_map(|a| match (&*a.name, &a.value) {
+                    ("key", CommandDataOptionValue::String(v)) if !v.trim().is_empty() => Some(v.trim().to_string()),
+                    _ => None,
+                }),
+                _ => None,
+            };
+            match sub.name.as_str() {
+                "allow" => Some(BridgeSub::Companion(CompanionSub::Allow { key: key()? })),
+                "deny" => Some(BridgeSub::Companion(CompanionSub::Deny { key: key()? })),
+                "list" => Some(BridgeSub::Companion(CompanionSub::List)),
+                _ => None,
+            }
+        }
         _ => None,
     }
+}
+
+/// `/bridge companion allow|deny|list`: a member's own consent for one companion key (ADR 0004 §4b). Ephemeral;
+/// open to everyone (it only affects the invoker). The key must exist and be able to attach streams.
+async fn handle_companion_command(ctx: &Context, cmd: &CommandInteraction, pool: &Arc<SharedPool>, sub: CompanionSub) {
+    let Some(keys) = pool.companion_keys.get() else {
+        respond_ephemeral(ctx, cmd, "Companion tools are not enabled on this bridge instance.").await;
+        return;
+    };
+    let uid = cmd.user.id.get();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let text = match sub {
+        CompanionSub::Allow { key } => match keys.get(&key) {
+            Some(k) if k.allows("stream:attach") && k.scope.room_id().is_some() => match keys.allow(uid, &key, now) {
+                Ok(true) => {
+                    tracing::info!(user_id = uid, key_id = %key, "companion grant added");
+                    format!("✅ Companion key `{key}` (\"{}\", for {}) may show your stream in that bridged call, also when you are not streaming on Discord. `/bridge companion deny key:{key}` withdraws it; `/bridge optout` withdraws everything.", k.label, k.scope.describe())
+                }
+                Ok(false) => format!("You already allowed `{key}`."),
+                Err(e) => {
+                    tracing::warn!(error = %e, "companion grant write failed");
+                    "Could not save that — try again later or contact the operator.".to_string()
+                }
+            },
+            _ => format!("There is no companion key `{key}` that can show streams on this instance."),
+        },
+        CompanionSub::Deny { key } => match keys.deny(uid, &key) {
+            Ok(true) => {
+                tracing::info!(user_id = uid, key_id = %key, "companion grant withdrawn");
+                format!("✅ `{key}` may no longer show your stream (a stream it shows now ends within seconds).")
+            }
+            Ok(false) => format!("You had not allowed `{key}`."),
+            Err(e) => {
+                tracing::warn!(error = %e, "companion grant write failed");
+                "Could not save that — try again later or contact the operator.".to_string()
+            }
+        },
+        CompanionSub::List => {
+            let ids = keys.grants_of(uid);
+            if ids.is_empty() {
+                "You have not allowed any companion tool. Without a permission, a tool can only show your stream while you stream on Discord yourself.".to_string()
+            } else {
+                let mut out = String::from("Companion tools you allowed:\n");
+                for id in ids {
+                    match keys.get(&id) {
+                        Some(k) => out.push_str(&format!("• `{id}` — \"{}\", {}\n", k.label, k.scope.describe())),
+                        None => out.push_str(&format!("• `{id}` (key no longer exists)\n")),
+                    }
+                }
+                out
+            }
+        }
+    };
+    respond_ephemeral(ctx, cmd, &text).await;
 }
 
 /// Immediate ephemeral reply to a slash-command interaction (best-effort).
