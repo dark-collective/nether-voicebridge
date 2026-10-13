@@ -243,6 +243,8 @@ async fn main() -> Result<()> {
     let companion_hub = if companions.enabled {
         match nvb_companion::CompanionHub::open(companions, &data_dir, links.clone()) {
             Ok(hub) => {
+                // `/bridge companion allow|deny|list` edits the same key/grant store the hub reads.
+                pool.enable_companion_grants(hub.keys().clone());
                 let serve_hub = hub.clone();
                 let shutdown = pool_shutdown.clone();
                 tokio::spawn(async move {

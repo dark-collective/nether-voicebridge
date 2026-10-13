@@ -180,6 +180,9 @@ pub async fn run(
         tracing::warn!(error = %e, "stale-ghost sweep failed (continuing)");
     }
 
+    // Companion stream devices (ADR 0004 §5): this bridge serves `stream:attach` leases for its room while it runs.
+    let _stream_provider = nvb_companion::stream::register_provider(&matrix_cfg.room_id, ghost_pool.clone());
+
     // The call-active watch is fed by the sync loop (sender) and consumed by the
     // RTC loop AND the ghost pool: a ghost connects/publishes (and delivers its
     // E2EE key) as soon as a Matrix human is present, so audio is ready before the

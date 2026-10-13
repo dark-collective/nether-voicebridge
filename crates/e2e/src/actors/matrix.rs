@@ -227,3 +227,22 @@ impl MatrixListener {
         self.handle.stop().await
     }
 }
+
+/// A Matrix user in the call who counts the screen-share video it receives (companion streams, ADR 0004).
+pub struct MatrixWatcher {
+    handle: testkit::TestWatcherHandle,
+}
+
+impl MatrixWatcher {
+    pub async fn join(cfg: &E2eConfig, room_id: &str, media_e2ee: bool, localpart: &str, display_name: &str) -> Result<Self> {
+        let tcfg = call_config(cfg, room_id, media_e2ee)?;
+        let user = TestUser::new(localpart, display_name)?;
+        let handle = testkit::join_and_watch(&tcfg, &user).await.context("matrix watcher join_and_watch")?;
+        Ok(Self { handle })
+    }
+
+    /// Leave and return every screen-share track seen (identity, source, decoded frames).
+    pub async fn stop(self) -> Result<Vec<testkit::VideoSeen>> {
+        self.handle.stop().await
+    }
+}

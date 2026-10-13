@@ -620,6 +620,16 @@ async fn handle_room_events(
                 // #142: don't even pull screen-share media from the SFU.
                 if is_screenshare_source(&publication) {
                     publication.set_subscribed(false);
+                } else {
+                    // A companion stream device (ADR 0004 §5.5) may publish a screen share only: a microphone or
+                    // camera under a ghost's name revokes its lease.
+                    let identity = participant.identity().to_string();
+                    if nvb_companion::stream::is_stream_device_identity(&identity)
+                        && super::ghost::is_bridge_excluded_identity(&identity, &ghost_prefix)
+                    {
+                        tracing::warn!(identity = %identity, source = ?publication.source(), "companion stream device published a disallowed source — revoking its lease");
+                        nvb_companion::stream::report_disallowed_publication(&identity);
+                    }
                 }
             }
             RoomEvent::Disconnected { reason } => {

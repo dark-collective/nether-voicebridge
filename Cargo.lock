@@ -3698,6 +3698,7 @@ dependencies = [
  "libc",
  "matrix-sdk",
  "nvb-audio",
+ "nvb-companion",
  "nvb-config",
  "nvb-matrix-rtc",
  "reqwest 0.12.28",

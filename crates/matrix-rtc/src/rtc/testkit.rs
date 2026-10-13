@@ -1197,3 +1197,190 @@ mod tests {
         assert_ne!(a, b, "two mints must differ");
     }
 }
+
+// ─── Companion stream (ADR 0004 §5) ──────────────────────────────────────────────
+
+/// One screen-share video track a watcher received: the publisher's identity, its source, and how many frames
+/// decoded.
+#[derive(Debug, Clone)]
+pub struct VideoSeen {
+    pub identity: String,
+    pub source: String,
+    pub frames: u64,
+}
+
+/// A live video watcher. [`stop`](Self::stop) leaves and returns what it saw.
+pub struct TestWatcherHandle {
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<Vec<VideoSeen>>,
+}
+
+impl TestWatcherHandle {
+    pub async fn stop(self) -> Result<Vec<VideoSeen>> {
+        self.cancel.cancel();
+        self.task.await.context("watcher task panicked")
+    }
+}
+
+/// Join the call as a **video watcher**: post `m.call.member`, connect with auto-subscribe, and count the decoded
+/// frames of every subscribed screen-share video track. Plaintext media only (an encrypted room's frames don't
+/// decode here; the subscription itself is still recorded, with `frames` near 0).
+pub async fn join_and_watch(cfg: &TestCallConfig, user: &TestUser) -> Result<TestWatcherHandle> {
+    use livekit::webrtc::video_stream::native::NativeVideoStream;
+    let mxid = user.mxid(&cfg.server_name);
+    let gcfg = build_ghost_config(cfg, &mxid)?;
+    admit(&gcfg, user, &mxid).await?;
+    let focus = well_known::discover_livekit_focus(&gcfg.http, &gcfg.well_known_base_url, &gcfg.room_id)
+        .await
+        .context("discovering LiveKit focus")?;
+    let device_id = mint_call_device_id();
+    post_membership_join(&gcfg, &mxid, &device_id, &focus).await?;
+    let openid = fetch_openid_token(&gcfg, &mxid).await?;
+    let jwt = lk_jwt::fetch_livekit_token(&gcfg.http, &focus.service_url, &gcfg.room_id, &device_id, &openid).await?;
+    let (room, mut events) = Room::connect(&jwt.url, &jwt.jwt, RoomOptions::default())
+        .await
+        .context("watcher LiveKit Room::connect")?;
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            let seen: Arc<StdMutex<Vec<VideoSeen>>> = Arc::new(StdMutex::new(Vec::new()));
+            let mut counters: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    ev = events.recv() => match ev {
+                        Some(RoomEvent::TrackSubscribed { track, publication, participant }) => {
+                            let RemoteTrack::Video(video) = track else { continue };
+                            let identity = participant.identity().to_string();
+                            let source = format!("{:?}", publication.source());
+                            tracing::info!(identity = %identity, source = %source, "test watcher subscribed to a video track");
+                            let idx = {
+                                let mut s = seen.lock().unwrap_or_else(PoisonError::into_inner);
+                                s.push(VideoSeen { identity, source, frames: 0 });
+                                s.len() - 1
+                            };
+                            let seen = seen.clone();
+                            let ct = cancel.child_token();
+                            counters.push(tokio::spawn(async move {
+                                let mut stream = NativeVideoStream::new(video.rtc_track());
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        _ = ct.cancelled() => break,
+                                        f = stream.next() => match f {
+                                            Some(_) => seen.lock().unwrap_or_else(PoisonError::into_inner)[idx].frames += 1,
+                                            None => break,
+                                        },
+                                    }
+                                }
+                            }));
+                        }
+                        Some(_) => {}
+                        None => break,
+                    },
+                }
+            }
+            for c in counters {
+                let _ = c.await;
+            }
+            let _ = room.close().await;
+            retract_membership(&gcfg, &mxid, &device_id, &focus).await;
+            let mut out = seen.lock().unwrap_or_else(PoisonError::into_inner);
+            std::mem::take(&mut *out)
+        }
+    });
+    Ok(TestWatcherHandle { cancel, task })
+}
+
+/// A test companion publishing a moving test pattern as a screen share.
+pub struct TestScreenHandle {
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TestScreenHandle {
+    pub async fn stop(self) {
+        self.cancel.cancel();
+        let _ = self.task.await;
+    }
+}
+
+/// Connect with a lease's transport and publish a 320×180, 15 fps test pattern with source Screenshare (what a
+/// companion does after `POST /leases`). With `key` (an encrypted room), frames are encrypted under it at index 0
+/// with Element Call's HKDF settings, exactly as the lease's `media.key_provider` describes.
+pub async fn publish_test_screen(sfu_url: &str, jwt: &str, key: Option<[u8; 16]>) -> Result<TestScreenHandle> {
+    use livekit::id::ParticipantIdentity;
+    use livekit::options::TrackPublishOptions;
+    use livekit::track::{LocalTrack, LocalVideoTrack, TrackSource};
+    use livekit::webrtc::video_frame::{I420Buffer, VideoFrame, VideoRotation};
+    use livekit::webrtc::video_source::native::NativeVideoSource;
+    use livekit::webrtc::video_source::{RtcVideoSource, VideoResolution};
+
+    let (identity, _) = decode_jwt_claims(jwt)?;
+    let mut opts = RoomOptions::default();
+    opts.auto_subscribe = false;
+    if let Some(k) = key {
+        let kp = KeyProvider::new(KeyProviderOptions {
+            ratchet_window_size: 16,
+            ratchet_salt: b"LKFrameEncryptionKey".to_vec(),
+            failure_tolerance: -1,
+            key_ring_size: 256,
+            key_derivation_algorithm: KeyDerivationAlgorithm::HKDF,
+        });
+        if !kp.set_key(&ParticipantIdentity::from(identity.clone()), 0, k.to_vec()) {
+            bail!("could not install the stream key");
+        }
+        opts.encryption = Some(E2eeOptions { encryption_type: EncryptionType::Gcm, key_provider: kp });
+    }
+    let (room, _events) = Room::connect(sfu_url, jwt, opts).await.context("test companion Room::connect")?;
+    if key.is_some() {
+        room.e2ee_manager().set_enabled(true);
+    }
+    let (w, h) = (320u32, 180u32);
+    let source = NativeVideoSource::new(VideoResolution { width: w, height: h }, true);
+    let track = LocalVideoTrack::create_video_track("screen", RtcVideoSource::Native(source.clone()));
+    room.local_participant()
+        .publish_track(LocalTrack::Video(track), TrackPublishOptions { source: TrackSource::Screenshare, ..Default::default() })
+        .await
+        .context("test companion publishing its screen share")?;
+    tracing::info!(identity = %identity, "test companion screen share published");
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(66));
+            let mut n: u32 = 0;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = tick.tick() => {
+                        let mut buf = I420Buffer::new(w, h);
+                        // A moving gradient: every frame differs, so the encoder never idles.
+                        let (sy, su, sv) = buf.strides();
+                        let (y, u, v) = buf.data_mut();
+                        for row in 0..h as usize {
+                            for col in 0..w as usize {
+                                y[row * sy as usize + col] = ((col as u32 + n * 4) % 256) as u8;
+                            }
+                        }
+                        for row in 0..(h as usize / 2) {
+                            for col in 0..(w as usize / 2) {
+                                u[row * su as usize + col] = 128;
+                                v[row * sv as usize + col] = ((row as u32 + n) % 256) as u8;
+                            }
+                        }
+                        let mut frame = VideoFrame::new(VideoRotation::VideoRotation0, buf);
+                        frame.timestamp_us = i64::from(n) * 66_000;
+                        source.capture_frame(&frame);
+                        n = n.wrapping_add(1);
+                    }
+                }
+            }
+            let _ = room.close().await;
+        }
+    });
+    Ok(TestScreenHandle { cancel, task })
+}

@@ -14,6 +14,18 @@ adheres to [Semantic Versioning](https://semver.org/).
   listener count. Leases are time-bounded, end when their event stream stays closed for `sse_grace_secs`, end at once
   when their key is revoked or the room is unlinked, and every open/renew/end is recorded in `audit.jsonl`. Other
   lease kinds can already be issued on keys and answer `kind_unavailable` until they are served.
+- **Companion interface: `stream:attach` (phase 2).** A key holder can attach a stream to the ghost of a Discord member
+  the bridge represents, so the stream shows in the Matrix call as that person's own presentation. The bridge runs a
+  second device on the ghost (`S…`): its LiveKit token (refreshed, and re-issued on the elected SFU when the call moves),
+  its media key in encrypted rooms (sent by the ghost's own Olm device), and its call membership, posted once the
+  companion reports its track live (`POST /leases/{id}/live`). Consent is Discord's own streaming flag, or the
+  member's own pairing for a self key; a member present as themselves is refused (`represented_by_self`). The lease
+  ends when the member stops being represented, the flag stays off for 60 s, the call has no listener for 60 s, or the
+  device publishes anything but a screen share (the bridge's subscriber reports it). Up to 4 attached streams per
+  room; the startup and periodic orphan sweeps clear stale stream-device memberships.
+- **`/bridge companion allow|deny|list` (Discord, ephemeral):** a member can allow one companion key to show their stream
+  also when they are not streaming on Discord, withdraw it (an attached stream ends within seconds), and list what they
+  allowed. `/bridge optout` withdraws every such permission. Stored with the keys in `companions.toml`.
 
 ## [0.4.8] - 2026-10-11
 

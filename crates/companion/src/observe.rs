@@ -12,8 +12,7 @@ pub struct Participant {
     pub ghost_mxid: Option<String>,
     pub display_name: String,
     pub streaming: bool,
-    /// Whether a stream lease is attached to this ghost (always false until
-    /// `stream:attach` exists).
+    /// Whether a `stream:attach` lease is attached to this ghost.
     pub attached: bool,
 }
 
@@ -29,7 +28,7 @@ pub struct Snapshot {
 impl Snapshot {
     /// The room as the bridge sees it now. A room whose bridge is not running
     /// reads as empty and inactive.
-    pub fn take(registry: &LinkRegistry, room_id: &str, issuer: &str) -> Self {
+    pub fn take(registry: &LinkRegistry, room_id: &str, issuer: &str, attached: &std::collections::HashSet<u64>) -> Self {
         let Some(board) = registry.board_for_room(room_id) else {
             return Self {
                 participants: Vec::new(),
@@ -48,7 +47,7 @@ impl Snapshot {
                     ghost_mxid: m.ghost_mxid,
                     display_name: m.display_name,
                     streaming: m.streaming,
-                    attached: false,
+                    attached: attached.contains(&m.discord_user_id),
                 })
                 .collect(),
             call_active: listeners > 0,
@@ -94,7 +93,7 @@ mod tests {
         shared.registry.register("b", board.clone());
         board.set_ghost_naming("nvb_", "hs");
 
-        let s0 = Snapshot::take(&shared.registry, ROOM, "@me:hs");
+        let s0 = Snapshot::take(&shared.registry, ROOM, "@me:hs", &Default::default());
         assert!(!s0.call_active);
         let first = s0.events_since(None);
         assert_eq!(
@@ -106,7 +105,7 @@ mod tests {
         board.set_discord_present(7, true);
         board.note_ghost(7, Some("Seven"));
         board.set_discord_streaming(7, true);
-        let s1 = Snapshot::take(&shared.registry, ROOM, "@me:hs");
+        let s1 = Snapshot::take(&shared.registry, ROOM, "@me:hs", &Default::default());
         let ev = s1.events_since(Some(&s0));
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].0, "participants");
@@ -116,14 +115,14 @@ mod tests {
 
         board.set_matrix_present("@me:hs", true);
         board.set_discord_present(1, true);
-        let s2 = Snapshot::take(&shared.registry, ROOM, "@me:hs");
+        let s2 = Snapshot::take(&shared.registry, ROOM, "@me:hs", &Default::default());
         let names: Vec<_> = s2.events_since(Some(&s1)).into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, vec!["call_active", "listeners", "pairing_present"]);
         assert_eq!(s2.listeners, 1);
 
         // A config-issued key gets no pairing_present; an unknown room is empty.
-        assert!(Snapshot::take(&shared.registry, ROOM, "config").pairing_present.is_none());
-        let none = Snapshot::take(&shared.registry, "!gone:hs", "@me:hs");
+        assert!(Snapshot::take(&shared.registry, ROOM, "config", &Default::default()).pairing_present.is_none());
+        let none = Snapshot::take(&shared.registry, "!gone:hs", "@me:hs", &Default::default());
         assert!(none.participants.is_empty() && !none.call_active);
     }
 }

@@ -17,6 +17,7 @@ path = "src/main.rs"
 # `default-members`).
 [dependencies]
 nvb-config = { workspace = true }
+nvb-companion = { workspace = true }
 nvb-audio = { workspace = true }
 # The D2 fake-Matrix-participant seam. `testkit` is additive-only (a
 # feature-gated module; no production code path changes), but note cargo's
