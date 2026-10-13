@@ -1264,7 +1264,7 @@ pub async fn join_and_watch(cfg: &TestCallConfig, user: &TestUser) -> Result<Tes
                             let seen = seen.clone();
                             let ct = cancel.child_token();
                             counters.push(tokio::spawn(async move {
-                                let mut stream = NativeVideoStream::new(video.rtc_track(), None);
+                                let mut stream = NativeVideoStream::new(video.rtc_track());
                                 loop {
                                     tokio::select! {
                                         biased;
