@@ -1,0 +1,30 @@
+name: Mirror redirect
+
+# The GitHub repo is a one-way push mirror of nether.codes (Forgejo ignores this
+# directory while .forgejo/workflows exists). A PR opened here would be
+# overwritten by the next mirror push and never reach the maintainers, so this
+# answers it with a pointer to nether.codes and closes it.
+#
+# pull_request_target runs in the base repo's context but this job never checks
+# out or runs the PR's code; it only calls the API with the scoped token.
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  redirect:
+    if: github.repository == 'dark-collective/nether-voicebridge'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Point to nether.codes and close
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr comment "$PR" --body "Thanks for the contribution! This GitHub repository is a read-only mirror of **[nether.codes/nether/nether-voicebridge](https://nether.codes/nether/nether-voicebridge)**, and pull requests opened here can't be merged (the next mirror sync overwrites the branch). Please open it there instead: fork on nether.codes and open a [pull request](https://nether.codes/nether/nether-voicebridge/pulls). You can sign in with your GitHub account. Issues and discussion live there too; see [CONTRIBUTING.md](https://nether.codes/nether/nether-voicebridge/src/branch/master/CONTRIBUTING.md)."
+          gh pr close "$PR"

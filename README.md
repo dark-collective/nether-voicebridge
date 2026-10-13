@@ -17,6 +17,13 @@ channel↔room pairs at once.
 > space [`#nether-voicebridge:nether.im`](https://matrix.to/#/%23nether-voicebridge:nether.im)
 > or on the [Discord server](https://discord.gg/BQYxEdu7s2).
 
+> [!NOTE]
+> **The home of this project is [nether.codes/nether/nether-voicebridge](https://nether.codes/nether/nether-voicebridge).**
+> If you're reading this on GitHub, you're looking at a read-only mirror: please
+> open issues and pull requests on nether.codes instead (you can sign in there
+> with your GitHub account). Pull requests opened on the mirror are closed
+> automatically with a pointer back here.
+
 ## Two ways to get a bridge
 
 **Use the hosted instance (recommended).** We run a public instance on
