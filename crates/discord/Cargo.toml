@@ -28,3 +28,5 @@ base64 = { workspace = true }
 # with Ctrl-C handling.
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+# bridge_command_fits_discord_limits: the registered definition as JSON.
+serde_json = { workspace = true }
