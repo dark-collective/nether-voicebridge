@@ -3300,7 +3300,7 @@ async fn register_bridge_command(ctx: &Context) -> Result<()> {
                     CreateCommandOption::new(
                         CommandOptionType::SubCommand,
                         "allow",
-                        "Let this companion tool show your stream in the bridged call, even when you are not streaming on Discord",
+                        "Let a companion tool show your stream in the bridged call, even when not streaming on Discord",
                     )
                     .add_sub_option(
                         CreateCommandOption::new(CommandOptionType::String, "key", "The companion key id (from whoever runs the tool)")
