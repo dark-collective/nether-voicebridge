@@ -3240,89 +3240,91 @@ async fn handle_optout_command(
 /// `handle_approve_command`. Guild-only. Registration is an upsert, so a
 /// changed definition converges on restart.
 async fn register_bridge_command(ctx: &Context) -> Result<()> {
-    ApplicationCommand::create_global_command(
-        &ctx.http,
-        CreateCommand::new("bridge")
-            .description("Nether voice bridge")
-            .contexts(vec![InteractionContext::Guild])
-            .add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::SubCommand,
-                    "approve",
-                    "Approve a pending Matrix-Discord voice bridge link (Manage Server only)",
-                )
-                .add_sub_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "code",
-                        "The approval code from the Matrix management bot",
-                    )
-                    .required(true),
-                ),
+    ApplicationCommand::create_global_command(&ctx.http, bridge_command())
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow!("registering the /bridge command: {e}"))
+}
+
+/// The `/bridge` command definition (see [`register_bridge_command`]).
+fn bridge_command() -> CreateCommand {
+    CreateCommand::new("bridge")
+        .description("Nether voice bridge")
+        .contexts(vec![InteractionContext::Guild])
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "approve",
+                "Approve a pending Matrix-Discord voice bridge link (Manage Server only)",
             )
-            .add_option(CreateCommandOption::new(
-                CommandOptionType::SubCommand,
-                "optout",
-                "Opt out of voice bridging: never relay my voice or show me in bridged calls",
-            ))
-            .add_option(CreateCommandOption::new(
-                CommandOptionType::SubCommand,
-                "optin",
-                "Opt back into voice bridging",
-            ))
-            .add_option(
+            .add_sub_option(
                 CreateCommandOption::new(
-                    CommandOptionType::SubCommand,
-                    "pair",
-                    "Link this Discord account to your Matrix account (code from the Matrix management bot)",
+                    CommandOptionType::String,
+                    "code",
+                    "The approval code from the Matrix management bot",
                 )
-                .add_sub_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "code",
-                        "The pairing code the Matrix management bot sent you",
-                    )
-                    .required(true),
-                ),
-            )
-            .add_option(CreateCommandOption::new(
-                CommandOptionType::SubCommand,
-                "unpair",
-                "Remove the link between this Discord account and a Matrix account",
-            ))
-            .add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::SubCommandGroup,
-                    "companion",
-                    "Companion tools that may show your streams in bridged Matrix calls",
-                )
-                .add_sub_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::SubCommand,
-                        "allow",
-                        "Let this companion tool show your stream in the bridged call, even when you are not streaming on Discord",
-                    )
-                    .add_sub_option(
-                        CreateCommandOption::new(CommandOptionType::String, "key", "The companion key id (from whoever runs the tool)")
-                            .required(true),
-                    ),
-                )
-                .add_sub_option(
-                    CreateCommandOption::new(CommandOptionType::SubCommand, "deny", "Withdraw a permission you gave a companion tool")
-                        .add_sub_option(
-                            CreateCommandOption::new(CommandOptionType::String, "key", "The companion key id").required(true),
-                        ),
-                )
-                .add_sub_option(CreateCommandOption::new(
-                    CommandOptionType::SubCommand,
-                    "list",
-                    "The companion tools you have allowed",
-                )),
+                .required(true),
             ),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|e| anyhow!("registering the /bridge command: {e}"))
+        )
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "optout",
+            "Opt out of voice bridging: never relay my voice or show me in bridged calls",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "optin",
+            "Opt back into voice bridging",
+        ))
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "pair",
+                "Link this Discord account to your Matrix account (code from the Matrix management bot)",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "code",
+                    "The pairing code the Matrix management bot sent you",
+                )
+                .required(true),
+            ),
+        )
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "unpair",
+            "Remove the link between this Discord account and a Matrix account",
+        ))
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommandGroup,
+                "companion",
+                "Companion tools that may show your streams in bridged Matrix calls",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "allow",
+                    "Let a companion tool show your stream in the bridged call, even when not streaming on Discord",
+                )
+                .add_sub_option(
+                    CreateCommandOption::new(CommandOptionType::String, "key", "The companion key id (from whoever runs the tool)")
+                        .required(true),
+                ),
+            )
+            .add_sub_option(
+                CreateCommandOption::new(CommandOptionType::SubCommand, "deny", "Withdraw a permission you gave a companion tool")
+                    .add_sub_option(
+                        CreateCommandOption::new(CommandOptionType::String, "key", "The companion key id").required(true),
+                    ),
+            )
+            .add_sub_option(CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "list",
+                "The companion tools you have allowed",
+            )),
+        )
 }
 
 /// A parsed `/bridge` invocation.
@@ -4514,6 +4516,26 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// Discord rejects the whole registration if any name or description is out of range (a 104-character
+    /// description once left /bridge unregistered everywhere).
+    #[test]
+    fn bridge_command_fits_discord_limits() {
+        fn walk(v: &serde_json::Value, path: &str) {
+            if let Some(d) = v.get("description").and_then(|d| d.as_str()) {
+                assert!((1..=100).contains(&d.chars().count()), "{path}: description is {} chars: {d}", d.chars().count());
+            }
+            if let Some(n) = v.get("name").and_then(|n| n.as_str()) {
+                assert!((1..=32).contains(&n.chars().count()), "{path}: name {n} is out of range");
+            }
+            for (i, o) in v.get("options").and_then(|o| o.as_array()).into_iter().flatten().enumerate() {
+                walk(o, &format!("{path}.options.{i}"));
+            }
+        }
+        let v = serde_json::to_value(super::bridge_command()).expect("serializable");
+        assert!(v.get("options").and_then(|o| o.as_array()).is_some_and(|o| !o.is_empty()));
+        walk(&v, "bridge");
+    }
+
     use super::*;
     use nvb_audio::routing::CaptureSink as GhostSink;
 
