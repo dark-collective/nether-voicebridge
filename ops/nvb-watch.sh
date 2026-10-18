@@ -289,7 +289,7 @@ if [ -n "$e2e_json" ]; then
     fi
 fi
 
-# ── 3c. master CI (#131 follow-up) ─────────────────────────────────────────
+# ── master CI (#131 follow-up) ─────────────────────────────────────────────
 # The hermetic gate (tests + clippy -D warnings) sat RED on master for 19
 # days (ad53ccd 07-26 → 08-14) unnoticed: this guardrail watched only
 # e2e.yml. One structural difference from the nightly: a nightly re-alerts
