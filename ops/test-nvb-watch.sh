@@ -35,6 +35,8 @@ for a in "\$@"; do
     case "\$a" in
         *'"msgtype"'*) printf '%s\n---\n' "\$a" >> "$T/posts.txt" ;;
         *actions/tasks*) [ -f "$T/api.json" ] && cat "$T/api.json" ;;
+        # Master CI (#131) on the GitHub mirror: canned runs at \$T/gh.json
+        *api.github.com/*/ci.yml/runs*) [ -f "$T/gh.json" ] && cat "$T/gh.json" ;;
         # Dormant-MXID canary (#96): canned sync staged at \$T/dormant.json
         # (absent ⇒ empty reply, section 3a skips — most cases).
         */sync?user_id=*) [ -f "$T/dormant.json" ] && cat "$T/dormant.json" ;;
@@ -156,17 +158,16 @@ echo "== case 9: digest carries bridges=N/M =="
 DIGEST_DATE=1970-01-01 run "Aug 14 01:00 host nvb[1]: INFO bridge{name=Light Voice}: ok" "$(roster alive 0)"
 check "digest states bridge liveness" "bridges=2/2" yes
 
-ci_api() { # ci_api(run_number, status) — a master ci.yml run, no e2e runs
-    cat > "$T/api.json" <<EOF
+ci_api() { # ci_api(run_number, conclusion) — the newest GitHub master ci.yml run
+    cat > "$T/gh.json" <<EOF
 {"workflow_runs":[
- {"run_number":$1,"workflow_id":"ci.yml","status":"$2","event":"push","head_branch":"master","run_started_at":"2026-08-14T12:00:00Z"},
- {"run_number":99,"workflow_id":"ci.yml","status":"failure","event":"push","head_branch":"some-branch","run_started_at":"2026-08-14T13:00:00Z"}
+ {"run_number":$1,"status":"completed","conclusion":"$2","head_branch":"master","html_url":"https://github.com/x/y/actions/runs/$1"}
 ]}
 EOF
 }
 QUIET_J="Aug 14 12:00 host nvb[1]: INFO bridge{name=Light Voice}: ok"
 
-echo "== case 12: master CI failure ⇒ one alert (branch reds ignored) =="
+echo "== case 12: master CI failure ⇒ one alert =="
 rm -f "$T/state/ci.lastrun" "$T/state/ci.red.date"
 ci_api 77 failure
 run "$QUIET_J" "$(roster alive 0)"
@@ -188,7 +189,14 @@ check "green-again notice" "CI #78 is GREEN again" yes
 ci_api 79 success
 run "$QUIET_J" "$(roster alive 0)"
 check "no notice per ordinary green push" "GREEN again" no
-rm -f "$T/api.json"
+echo "== case 15b: an in-progress run neither alerts nor latches =="
+cat > "$T/gh.json" <<EOF
+{"workflow_runs":[{"run_number":80,"status":"in_progress","conclusion":null,"head_branch":"master"}]}
+EOF
+run "$QUIET_J" "$(roster alive 0)"
+check "no alert while running" "CI" no
+if grep -q '^79 success$' "$T/state/ci.lastrun"; then PASS=$((PASS+1)); echo "  PASS  in-progress run not latched"; else FAIL=$((FAIL+1)); echo "  FAIL  in-progress run not latched"; fi
+rm -f "$T/gh.json"
 
 e2e_api() { # e2e_api(run_number, status) — a scheduled e2e.yml run (started now, so not "stale")
     cat > "$T/api.json" <<EOF

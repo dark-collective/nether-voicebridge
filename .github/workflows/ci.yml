@@ -1,9 +1,10 @@
 name: CI
 
-# GitHub-hosted copy of .forgejo/workflows/ci.yml (unit/integration tests +
-# clippy), run on the one-way GitHub mirror so the hermetic gate stops competing
-# with the live services for CPU on the self-hosted runner. Forgejo ignores this
-# directory while .forgejo/workflows exists, so nothing runs twice there.
+# THE hermetic gate (unit/integration tests + clippy), run on the one-way GitHub
+# mirror so it doesn't compete with the live services for CPU on the self-hosted
+# runner. Since 2026-10-18 this is the only copy (the Forgejo ci.yml was removed
+# to free the shared runner); ops/nvb-watch.sh alerts on a red master run here.
+# Forgejo ignores this directory while .forgejo/workflows exists.
 #
 # Deliberately inert beyond building: no secrets, read-only token, no PR or
 # issue triggers (the mirror is one-way; PRs live on Forgejo), and no step that

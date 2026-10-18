@@ -33,7 +33,7 @@ It checks, per window:
 | **Bridge down** (#131) | `bridges.json` roster + journal latch | 🧟 any configured bridge not `alive` — **re-alerted daily** until it recovers; ✅ when it comes back |
 | Roster stale (#131) | `bridges.json` `updated` stamp | 🕰 roster older than `ROSTER_STALE_SECS` (default 300 s) — the supervisor loop itself may be wedged |
 | e2e nightly red | Actions API (`e2e.yml` scheduled runs) | 🌙❌ new failing run (once per run); 🌙✅ green again; 🌙⏰ no scheduled run in >30 h (dead cron) |
-| **CI red on master** (#131) | Actions API (`ci.yml`, master only) | 🔨❌ new failing run, then **daily re-alert while red** — master CI only runs on a push, so without the reminder a standing red alerts exactly once (it sat red 19 days unnoticed, 07-26→08-14); 🔨✅ green again after a red |
+| **CI red on master** (#131) | GitHub mirror's public Actions API (`.github/workflows/ci.yml`, master only; the Forgejo copy was removed 2026-10-18) | 🔨❌ new failing run, then **daily re-alert while red** — master CI only runs on a push, so without the reminder a standing red alerts exactly once (it sat red 19 days unnoticed, 07-26→08-14); 🔨✅ green again after a red |
 | Egress anomaly | `ss` on the bridge PID | 🔌 TCP count outside envelope; 👁 any remote endpoint not in the allow-set (Cloudflare/Discord edge, homeserver, private ranges, `EXTRA_ALLOW_HOSTS`, plus every SFU / lk-jwt host the bridge itself logged connecting to in the last 24 h — multi-SFU calls legitimately reach other homeservers' LiveKit, e.g. `matrix-org.livekit.cloud`) |
 | Verification gate (#117) | Discord API, once daily with the digest | ⚠ any puppet bot's guild count ≥ `TRIPWIRE` (default 60; Discord's hard cap is 100 servers/app) — start the App Verification paperwork early |
 

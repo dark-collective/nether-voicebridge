@@ -4,7 +4,8 @@ name: E2E (live)
 # against the standing Discord guild + Matrix rooms with dedicated harness bots.
 # NOT a per-PR gate: external services (Discord/Matrix/LiveKit) make it
 # inherently flaky, so a red run is a triage ticket, never a merge block — the
-# per-PR hermetic gate is ci.yml. Public ids are inlined (they're already in
+# per-PR hermetic gate is .github/workflows/ci.yml (GitHub mirror only since
+# 2026-10-18 — the Forgejo copy was removed to free the shared runner). Public ids are inlined (they're already in
 # the committed e2e.example.toml); only the bot/appservice tokens are secrets.
 #
 # NOTE: Forgejo pins the nightly schedule to the commit_sha of the last
@@ -36,7 +37,7 @@ on:
   # the live environment — the checks we used to dispatch by hand before every
   # merge request. Docs-only diffs skip via the paths filter; audio scenarios
   # stay nightly-only (host-load sensitivity). The shared `live-host`
-  # concurrency group below serializes these with nightlies and CI builds.
+  # concurrency group below serializes these with the nightlies.
   push:
     branches:
       - 'feat/**'
@@ -50,11 +51,11 @@ on:
       - 'Cargo.lock'
       - '.forgejo/workflows/e2e.yml'
 
-# One live run at a time, AND never alongside a CI build. The harness and CI share
-# a physical host, and overlapping CPU-heavy work garbles the audio timing scores
-# (#38 note). The `live-host` group is shared with ci.yml so Forgejo serializes
-# {any CI run, this harness} to one at a time; cancel-in-progress stays false so a
-# queued CI push waits for the harness rather than cancelling it.
+# One live run at a time. Overlapping CPU-heavy work on the runner host garbles the
+# audio timing scores (#38 note). The `live-host` group used to be shared with a
+# Forgejo ci.yml (removed 2026-10-18; CI runs on GitHub now) and still serializes
+# harness runs; cancel-in-progress stays false so a queued run waits rather than
+# cancelling a running one.
 concurrency:
   group: live-host
   cancel-in-progress: false
@@ -66,7 +67,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Same native deps as ci.yml (livekit: cmake/clang/bindgen + protobuf;
+      # Same native deps as the CI build (livekit: cmake/clang/bindgen + protobuf;
       # opus dynamically linked).
       - name: Install native build dependencies
         run: |
@@ -75,8 +76,9 @@ jobs:
             build-essential cmake clang libclang-dev libopus-dev \
             pkg-config protobuf-compiler libssl-dev
 
-      # Share ci.yml's cache key so target/ (incl. the libwebrtc download and an
-      # already-compiled bridge) is warm.
+      # Cache key `ci-…` predates the Forgejo ci.yml's removal (it used to warm
+      # it); e2e now saves it itself on a miss, keeping target/ (incl. the
+      # libwebrtc download and an already-compiled bridge) warm.
       - name: Cache toolchain + cargo + target
         uses: actions/cache@v4
         with:

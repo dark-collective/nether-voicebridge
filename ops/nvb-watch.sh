@@ -243,7 +243,6 @@ fi
 # the public Actions API and alert on a NEW failing run (state-tracked → at
 # most one alert per nightly, not every 15 min) or a stale suite (no scheduled
 # run in >30h = the 08:30 cron silently stopped firing). Read-only; no token.
-# The same response also feeds the master-CI check further down (#131).
 E2E_STATE="$STATE_DIR/e2e.lastrun"
 E2E_DIGEST=""
 CI_DIGEST=""
@@ -288,44 +287,50 @@ if [ -n "$e2e_json" ]; then
             fi
         fi
     fi
+fi
 
-    # ── ci.yml on master (#131 follow-up) ────────────────────────────────────
-    # The hermetic gate (tests + clippy -D warnings) sat RED on master for 19
-    # days (ad53ccd 07-26 → 08-14) unnoticed: this guardrail watched only
-    # e2e.yml. Same API response, no extra call. One structural difference from
-    # the nightly: a nightly re-alerts by itself (a NEW failing run number
-    # appears every day), but master CI only runs on a push — a standing red
-    # would alert exactly once, ever. That one-shot shape is precisely what hid
-    # the #130 outage, so while master stays red this re-alerts DAILY.
-    CI_STATE="$STATE_DIR/ci.lastrun"
-    CI_RED_STAMP="$STATE_DIR/ci.red.date"
-    latest_ci=$(printf '%s' "$e2e_json" | jq -r '
-        [.workflow_runs[]? | select(.workflow_id=="ci.yml" and .head_branch=="master")]
-        | sort_by(.run_started_at) | last
-        | if . == null then empty else "\(.run_number) \(.status)" end' 2>/dev/null)
-    if [ -n "$latest_ci" ]; then
-        ci_rn=${latest_ci%% *}
-        ci_st=${latest_ci##* }
-        ci_prev=$(cat "$CI_STATE" 2>/dev/null || echo "")
-        CI_DIGEST="| ci:#$ci_rn $ci_st"
-        ci_url="https://nether.codes/nether/nether-voicebridge/actions/runs/$ci_rn"
-        if [ "$latest_ci" != "$ci_prev" ]; then
-            case "$ci_st" in
-                failure)
-                    ALERTS+=("🔨❌ CI #$ci_rn FAILED on master — the hermetic gate (tests + clippy) is RED and every branch will inherit it. Triage: $ci_url")
-                    echo "$(date +%F)" > "$CI_RED_STAMP" ;;
-                success)
-                    # Green-again only after a latched red — master CI runs on
-                    # every merge, so a ✅ per green push would be pure noise.
-                    case "$ci_prev" in *failure) ALERTS+=("🔨✅ CI #$ci_rn is GREEN again on master.") ;; esac
-                    rm -f "$CI_RED_STAMP" ;;
-            esac
-            # Only latch a terminal conclusion so an in-progress run re-checks.
-            case "$ci_st" in success|failure|cancelled) echo "$latest_ci" > "$CI_STATE" ;; esac
-        elif [ "$ci_st" = "failure" ] && [ "$(cat "$CI_RED_STAMP" 2>/dev/null)" != "$(date +%F)" ]; then
-            ALERTS+=("🔨❌ CI on master is STILL RED (#$ci_rn) — daily reminder; no new push has fixed it. Triage: $ci_url")
-            echo "$(date +%F)" > "$CI_RED_STAMP"
-        fi
+# ── 3c. master CI (#131 follow-up) ─────────────────────────────────────────
+# The hermetic gate (tests + clippy -D warnings) sat RED on master for 19
+# days (ad53ccd 07-26 → 08-14) unnoticed: this guardrail watched only
+# e2e.yml. One structural difference from the nightly: a nightly re-alerts
+# by itself (a NEW failing run number appears every day), but master CI
+# only runs on a push — a standing red would alert exactly once, ever.
+# That one-shot shape is precisely what hid the #130 outage, so while
+# master stays red this re-alerts DAILY.
+# Since 2026-10-18 the gate runs ONLY on the GitHub mirror (.github/
+# workflows/ci.yml; the Forgejo copy was removed to free the shared
+# runner), so read its public runs API — no token, 4 calls/h of the 60/h
+# anonymous limit. Outside the Forgejo block so a Forgejo outage can't hide it.
+CI_STATE="$STATE_DIR/ci.lastrun"
+CI_RED_STAMP="$STATE_DIR/ci.red.date"
+ci_json=$(curl -sL -m 20 -A "nvb-watch/1.0" \
+    "https://api.github.com/repos/dark-collective/nether-voicebridge/actions/workflows/ci.yml/runs?branch=master&per_page=1" 2>/dev/null)
+# status is queued/in_progress until done, then the conclusion decides.
+latest_ci=$(printf '%s' "$ci_json" | jq -r '
+    .workflow_runs[0]? // empty
+    | "\(.run_number) \(if .status == "completed" then .conclusion else .status end)"' 2>/dev/null)
+if [ -n "$latest_ci" ]; then
+    ci_rn=${latest_ci%% *}
+    ci_st=${latest_ci##* }
+    ci_prev=$(cat "$CI_STATE" 2>/dev/null || echo "")
+    CI_DIGEST="| ci:#$ci_rn $ci_st"
+    ci_url=$(printf '%s' "$ci_json" | jq -r '.workflow_runs[0].html_url // empty' 2>/dev/null)
+    if [ "$latest_ci" != "$ci_prev" ]; then
+        case "$ci_st" in
+            failure)
+                ALERTS+=("🔨❌ CI #$ci_rn FAILED on master — the hermetic gate (tests + clippy) is RED and every branch will inherit it. Triage: $ci_url")
+                echo "$(date +%F)" > "$CI_RED_STAMP" ;;
+            success)
+                # Green-again only after a latched red — master CI runs on
+                # every merge, so a ✅ per green push would be pure noise.
+                case "$ci_prev" in *failure) ALERTS+=("🔨✅ CI #$ci_rn is GREEN again on master.") ;; esac
+                rm -f "$CI_RED_STAMP" ;;
+        esac
+        # Only latch a terminal conclusion so an in-progress run re-checks.
+        case "$ci_st" in success|failure|cancelled) echo "$latest_ci" > "$CI_STATE" ;; esac
+    elif [ "$ci_st" = "failure" ] && [ "$(cat "$CI_RED_STAMP" 2>/dev/null)" != "$(date +%F)" ]; then
+        ALERTS+=("🔨❌ CI on master is STILL RED (#$ci_rn) — daily reminder; no new push has fixed it. Triage: $ci_url")
+        echo "$(date +%F)" > "$CI_RED_STAMP"
     fi
 fi
 
