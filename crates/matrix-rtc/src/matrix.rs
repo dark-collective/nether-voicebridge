@@ -1673,7 +1673,9 @@ mod tests {
         assert_ne!(a, b, "same-instant sends must still get distinct txn ids");
     }
 
-    use super::{resolve_affected_user, resolve_ghost_device_salt, resolve_store_device_id};
+    use super::{
+        resolve_affected_user, resolve_ghost_device_salt, resolve_store_device_id, room_ban_reason,
+    };
     use matrix_sdk::ruma::OwnedUserId;
     use std::fs;
     use std::path::PathBuf;
