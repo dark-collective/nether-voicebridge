@@ -23,6 +23,9 @@ pub enum BridgeState {
     Restarting,
     /// Configured but not running at all — the state that used to be invisible.
     Down,
+    /// Stopped for good because its Matrix room is unavailable (banned); not
+    /// restarted until its config changes or the process restarts.
+    Parked,
 }
 
 impl BridgeState {
@@ -31,6 +34,7 @@ impl BridgeState {
             BridgeState::Alive => "alive",
             BridgeState::Restarting => "restarting",
             BridgeState::Down => "down",
+            BridgeState::Parked => "parked",
         }
     }
 }

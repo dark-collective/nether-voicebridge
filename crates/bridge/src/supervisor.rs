@@ -100,6 +100,19 @@ pub enum BridgeOutcome {
     /// A clean return, or a cancellation-driven teardown. Never restarted —
     /// cancellation is always something we asked for.
     Ended,
+    /// The bridged room can never be joined as things stand (it is banned —
+    /// [`nvb_matrix_rtc::RoomUnavailable`]). Parked, not restarted: a backoff
+    /// loop would only repeat the same 403 and page ops every 15 minutes.
+    Unavailable,
+}
+
+/// A bridge parked after [`BridgeOutcome::Unavailable`]. It stays down until
+/// its tenant entry changes or disappears (reconcile), or the process restarts.
+struct ParkedBridge {
+    cfg: BridgeConfig,
+    origin: Origin,
+    /// Unix seconds when it was parked (the roster's `since`).
+    since: u64,
 }
 
 /// Where a bridge came from — static `config.toml` bridges are never touched by
@@ -186,6 +199,8 @@ pub struct Supervisor {
     /// Consecutive failures per bridge label, driving the restart backoff.
     /// Cleared once a bridge has been up longer than `bridge_restart_max`.
     restart_failures: HashMap<String, u32>,
+    /// Bridges parked because their room is permanently unavailable.
+    parked: HashMap<String, ParkedBridge>,
     ctx: TenantsCtx,
     /// Once the operator shutdown begins, completions must not respawn pending
     /// replacements — a fresh bridge mid-drain would hang the drain.
@@ -204,6 +219,7 @@ impl Supervisor {
             running: HashMap::new(),
             bridges: FuturesUnordered::new(),
             restart_failures: HashMap::new(),
+            parked: HashMap::new(),
             ctx,
             shutting_down: false,
             control_rx: None,
@@ -248,6 +264,7 @@ impl Supervisor {
         start_delay: Duration,
     ) -> Result<()> {
         let bridge = Arc::new(bridge);
+        self.parked.remove(&*label);
 
         // Optional WAV capture (Phase 3 debugging artifact), off unless configured.
         let capture_sink: Option<Arc<CaptureSink>> =
@@ -360,6 +377,11 @@ impl Supervisor {
                             tracing::warn!("bridge exited cleanly (no reconnect yet)");
                             outcome = BridgeOutcome::Ended;
                         }
+                        // Already logged once, at ERROR, where it was detected.
+                        Err(e) if e.downcast_ref::<nvb_matrix_rtc::RoomUnavailable>().is_some() => {
+                            tracing::warn!(error = %e, "bridge parked — its room is unavailable; not restarting");
+                            outcome = BridgeOutcome::Unavailable;
+                        }
                         Err(e) => {
                             tracing::error!(error = %e, "bridge failed");
                             outcome = BridgeOutcome::Failed;
@@ -419,8 +441,18 @@ impl Supervisor {
                 consecutive_failures: self.restart_failures.get(label).copied().unwrap_or(0),
             })
             .collect();
+        entries.extend(self.parked.iter().map(|(label, p)| roster::RosterEntry {
+            name: label.clone(),
+            origin: match p.origin {
+                Origin::Static => "static",
+                Origin::Tenant => "tenant",
+            },
+            state: roster::BridgeState::Parked,
+            since: p.since,
+            consecutive_failures: 0,
+        }));
         for label in &self.ctx.static_labels {
-            if !self.running.contains_key(label) {
+            if !self.running.contains_key(label) && !self.parked.contains_key(label) {
                 entries.push(roster::RosterEntry {
                     name: label.clone(),
                     origin: "static",
@@ -515,6 +547,16 @@ impl Supervisor {
             return;
         }
 
+        if outcome == BridgeOutcome::Unavailable && !self.shutting_down && !rb.operator_stopped {
+            self.restart_failures.remove(label);
+            self.parked.insert(label.to_string(), ParkedBridge {
+                cfg: (*rb.cfg).clone(),
+                origin: rb.origin,
+                since: roster::now_secs(),
+            });
+            return;
+        }
+
         // A bridge that FAILED (error return or panic) gets restarted with
         // backoff (#130). Before this, any failure — including a transient
         // `/sync` blip misread as fatal auth, or a startup login 502 after a
@@ -580,6 +622,7 @@ impl Supervisor {
             .filter(|(_, rb)| rb.origin == Origin::Tenant)
             .map(|(l, rb)| (l.clone(), rb.effective_cfg().clone()))
             .collect();
+        let desired = self.settle_parked_tenants(desired);
         let plan = diff_tenants(&running, desired);
         let mut summary = ReconcileSummary {
             unchanged: running.len() - plan.remove.len() - plan.replace.len(),
@@ -643,6 +686,31 @@ impl Supervisor {
             }
         }
         Ok(summary)
+    }
+
+    /// Keep parked tenants parked across reloads. A reload is triggered by any
+    /// link/unlink, so treating a parked tenant as a fresh "add" would replay
+    /// its 403 every time. An unchanged entry stays parked; a removed one is
+    /// forgotten; a changed one (say, a new room) is handed back for a spawn.
+    fn settle_parked_tenants(&mut self, desired: Vec<BridgeConfig>) -> Vec<BridgeConfig> {
+        let names: HashSet<String> =
+            desired.iter().map(|d| d.name.clone().unwrap_or_default()).collect();
+        self.parked
+            .retain(|label, p| p.origin != Origin::Tenant || names.contains(label));
+        desired
+            .into_iter()
+            .filter(|d| {
+                let name = d.name.clone().unwrap_or_default();
+                let keep_parked = self
+                    .parked
+                    .get(&name)
+                    .is_some_and(|p| p.origin == Origin::Tenant && p.cfg == *d);
+                if keep_parked {
+                    tracing::info!(bridge = %name, "tenant still parked (room unavailable) — not respawning");
+                }
+                !keep_parked
+            })
+            .collect()
     }
 
     /// Serve one control-plane request (#4).
@@ -1446,5 +1514,49 @@ mod tests {
         let entries = sup.roster_entries();
         assert_eq!(entries[0].state, roster::BridgeState::Restarting);
         assert_eq!(entries[0].consecutive_failures, 1);
+    }
+    /// 2026-10-19: a tenant whose room had been deleted + banned on the
+    /// homeserver retried its join on backoff forever, one ERROR per attempt.
+    /// A banned room must park the bridge — no restart, visible in the roster.
+    #[test]
+    fn an_unavailable_room_parks_the_bridge_instead_of_restarting() {
+        let mut sup = sup_with_running("b", false);
+        sup.restart_failures.insert("b".to_string(), 2);
+        sup.on_bridge_complete("b", BridgeOutcome::Unavailable);
+        assert!(!sup.running.contains_key("b"), "a parked bridge must not be respawned");
+        assert!(sup.parked.contains_key("b"));
+        assert_eq!(sup.restart_failures.get("b"), None);
+        let entries = sup.roster_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].state, roster::BridgeState::Parked);
+    }
+
+    #[test]
+    fn an_operator_stop_of_an_unavailable_bridge_does_not_park_it() {
+        let mut sup = sup_with_running("b", true);
+        sup.on_bridge_complete("b", BridgeOutcome::Unavailable);
+        assert!(!sup.running.contains_key("b"));
+        assert!(!sup.parked.contains_key("b"));
+    }
+
+    /// Any link/unlink triggers a reload; a parked tenant must not replay its
+    /// 403 on each one. Unchanged ⇒ stays parked; changed ⇒ spawned again;
+    /// gone from tenants.toml ⇒ forgotten.
+    #[test]
+    fn reload_keeps_an_unchanged_parked_tenant_parked() {
+        let mut sup = sup_with_running("other", false);
+        for (name, room) in [("same", "!gone:x"), ("moved", "!gone2:x"), ("removed", "!gone3:x")] {
+            sup.parked.insert(name.to_string(), ParkedBridge {
+                cfg: tenant(name, room),
+                origin: Origin::Tenant,
+                since: 0,
+            });
+        }
+        let desired = vec![tenant("same", "!gone:x"), tenant("moved", "!new:x")];
+        let left = sup.settle_parked_tenants(desired);
+        let names: Vec<_> = left.iter().map(|d| d.name.clone().unwrap_or_default()).collect();
+        assert_eq!(names, vec!["moved".to_string()], "only the changed tenant is handed back");
+        assert!(sup.parked.contains_key("same"));
+        assert!(!sup.parked.contains_key("removed"), "a removed tenant is forgotten");
     }
 }
