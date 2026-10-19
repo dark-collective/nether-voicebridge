@@ -58,7 +58,12 @@ silent. Since v0.3.2 the supervisor publishes `<data_dir>/bridges.json`:
               "since":1754990000,"consecutive_failures":0}]}
 ```
 
-`state` is `alive`, `restarting` (serving a restart backoff) or `down`. The
+`state` is `alive`, `restarting` (serving a restart backoff), `down`, or
+`parked` — the bridge's Matrix room is banned (a homeserver room ban, or the bot
+banned from it), so it logged one ERROR and stopped instead of retrying the
+same 403 forever. A parked bridge stays parked across tenant reloads until its
+entry changes or is unlinked (or the process restarts). The fix is almost
+always `unlink <name>`, since the room is gone. The
 watcher alerts on anything not `alive`, on a stale `updated` stamp, and — for
 builds without the roster — on a journal latch over
 `channel unregistered from puppet pool`, cleared only by a bridge log line that
@@ -109,6 +114,25 @@ Weekly (or after any alert):
   flips from open to allowlist), `serve-open` to reopen, `serve-list` to show.
 - **See recent abuse reports with ready-made ban commands:** `reports`.
 - The audit trail records all of the above with your MXID as the actor.
+
+### Removing a user from the homeserver
+
+Do this **before** deleting or banning their rooms on the homeserver. A tenant
+whose room disappears underneath it keeps running until the next restart, then
+parks with an ERROR (and a 🧟 alert every day until it is unlinked).
+
+1. Find everything they linked:
+   `jq -c 'select(.actor | test("^@name:")) | select(.event=="link_ok") | .detail' audit.jsonl`
+   (match on the localpart; people often have accounts on several homeservers).
+   Note each `room_id` and `guild_id`.
+2. `ban owner @name:server` for **every** account they use. Each ban also
+   unlinks every tenant that account owns.
+3. `ban guild <id>` for Discord guilds that are theirs, and `ban room <id>` for
+   their Matrix rooms. A ban guards against a **re-link** even from an account
+   you didn't know about. It also unlinks any tenant on that guild or room,
+   whoever owns it.
+4. `list` — confirm nothing of theirs is left.
+5. Only now delete or ban the rooms on the homeserver.
 
 ## Backups
 

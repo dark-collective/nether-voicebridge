@@ -605,9 +605,18 @@ pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Cli
         Ok(Err(e)) => {
             // Branch on the response's status, not on the error text — a room id
             // or URL containing "403" must not fake a permission problem (#130).
-            let forbidden = e
-                .downcast_ref::<AppserviceHttpError>()
-                .is_some_and(|h| h.status == reqwest::StatusCode::FORBIDDEN);
+            let http = e.downcast_ref::<AppserviceHttpError>();
+            let forbidden = http.is_some_and(|h| h.status == reqwest::StatusCode::FORBIDDEN);
+            // A banned room (homeserver room ban, or the bot banned from it) won't
+            // come back on a retry: hand the supervisor a typed error so it parks
+            // the bridge instead of restarting it forever.
+            if let Some(reason) = http.and_then(|h| room_ban_reason(h.status, &h.body)) {
+                tracing::error!(
+                    room_id = %room_id, reason,
+                    "Matrix room is banned — the bridge cannot join it; unlink the bridge (or lift the ban, then reload)"
+                );
+                return Err(RoomUnavailable { room_id: room_id.to_string(), reason }.into());
+            }
             if forbidden {
                 tracing::error!(
                     room_id = %room_id, error = %e,
@@ -870,6 +879,42 @@ impl std::fmt::Display for AppserviceHttpError {
 }
 
 impl std::error::Error for AppserviceHttpError {}
+
+/// The bridged room can't be joined and retrying won't change that: the room
+/// is banned on the homeserver (e.g. an admin `rooms moderation ban-room`
+/// after deleting it) or the bot is banned from it. The supervisor parks a
+/// bridge that fails with this instead of restarting it with backoff.
+#[derive(Debug)]
+pub struct RoomUnavailable {
+    pub room_id: String,
+    /// The homeserver's own `error` text.
+    pub reason: String,
+}
+
+impl std::fmt::Display for RoomUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "room {} is unavailable: {}", self.room_id, self.reason)
+    }
+}
+
+impl std::error::Error for RoomUnavailable {}
+
+/// Classify a failed join: `Some(reason)` when the response is a 403
+/// `M_FORBIDDEN` whose message says the room (or the bot) is banned. Tuwunel
+/// says "This room is banned on this homeserver."; Synapse "You are banned
+/// from this room". Any other 403 (an uninvited restricted room) stays
+/// retryable — an invite can still fix it.
+pub(crate) fn room_ban_reason(status: reqwest::StatusCode, body: &str) -> Option<String> {
+    if status != reqwest::StatusCode::FORBIDDEN {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("errcode")?.as_str()? != "M_FORBIDDEN" {
+        return None;
+    }
+    let msg = v.get("error")?.as_str()?;
+    msg.to_ascii_lowercase().contains("banned").then(|| msg.to_string())
+}
 
 /// Open a **plaintext** direct room with `target` as the bot and post `text`
 /// into it — over the raw appservice-asserted client API, never through the
@@ -1628,7 +1673,9 @@ mod tests {
         assert_ne!(a, b, "same-instant sends must still get distinct txn ids");
     }
 
-    use super::{resolve_affected_user, resolve_ghost_device_salt, resolve_store_device_id};
+    use super::{
+        resolve_affected_user, resolve_ghost_device_salt, resolve_store_device_id, room_ban_reason,
+    };
     use matrix_sdk::ruma::OwnedUserId;
     use std::fs;
     use std::path::PathBuf;
@@ -1655,6 +1702,26 @@ mod tests {
 
     fn uid(s: &str) -> OwnedUserId {
         OwnedUserId::try_from(s).unwrap()
+    }
+
+    #[test]
+    fn room_ban_reason_only_matches_banned_403s() {
+        use reqwest::StatusCode;
+        let tuwunel = r#"{"errcode":"M_FORBIDDEN","error":"M_FORBIDDEN: This room is banned on this homeserver."}"#;
+        let synapse = r#"{"errcode":"M_FORBIDDEN","error":"You are banned from this room"}"#;
+        assert_eq!(
+            room_ban_reason(StatusCode::FORBIDDEN, tuwunel).as_deref(),
+            Some("M_FORBIDDEN: This room is banned on this homeserver.")
+        );
+        assert!(room_ban_reason(StatusCode::FORBIDDEN, synapse).is_some());
+        // An uninvited restricted room is still retryable (an invite fixes it).
+        let restricted = r#"{"errcode":"M_FORBIDDEN","error":"You are not invited to this room."}"#;
+        assert_eq!(room_ban_reason(StatusCode::FORBIDDEN, restricted), None);
+        // Only a 403 M_FORBIDDEN counts; a proxy error page never does.
+        assert_eq!(room_ban_reason(StatusCode::BAD_GATEWAY, tuwunel), None);
+        assert_eq!(room_ban_reason(StatusCode::FORBIDDEN, "<html>banned</html>"), None);
+        let other = r#"{"errcode":"M_UNKNOWN","error":"banned"}"#;
+        assert_eq!(room_ban_reason(StatusCode::FORBIDDEN, other), None);
     }
 
     /// Participant set with one modern per-device entry and one legacy entry.
