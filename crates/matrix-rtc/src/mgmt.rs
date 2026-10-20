@@ -179,10 +179,10 @@ struct BotCtx {
     /// concurrent commands interleaving those steps could drop an edit or roll
     /// back the wrong prior content.
     mutate_lock: tokio::sync::Mutex<()>,
-    /// Per-operator cooldown between state-changing commands (`[limits]
-    /// mgmt_cooldown_secs`, #47). `None` ⇒ unlimited.
+    /// Per-sender cooldown between state-changing commands (`[limits]
+    /// mgmt_cooldown_secs`, #47); operators are exempt. `None` ⇒ unlimited.
     cooldown: Option<Duration>,
-    /// Last state-change attempt per operator MXID, for the cooldown gate.
+    /// Last state-change attempt per sender MXID, for the cooldown gate.
     mutate_stamps: StdMutex<HashMap<String, Instant>>,
     /// Last accepted-invite time per inviter MXID, for the per-sender invite
     /// cooldown (#89a) — reuses the `cooldown` duration (`mgmt_cooldown_secs`).
@@ -803,8 +803,14 @@ impl BotCtx {
     /// is still cooling down (nothing stamped); `None` ⇒ allowed, and this
     /// attempt is stamped. Stamped on *attempts* that reach a state change
     /// (past the cheap shape checks), successful or not — the budget guards
-    /// spawn/teardown work, not outcomes.
+    /// spawn/teardown work, not outcomes. Operators (the `[management] allow`
+    /// list) are exempt, like every other per-sender limit: the cooldown exists
+    /// to stop untrusted senders thrashing spawn/teardown, and it otherwise
+    /// throttles an operator working through a batch of `ban`s or `unlink`s.
     fn mutate_cooldown(&self, sender: &str) -> Option<u64> {
+        if self.is_operator(sender) {
+            return None;
+        }
         let cooldown = self.cooldown?;
         let mut stamps = self
             .mutate_stamps
@@ -5531,6 +5537,22 @@ mod tests {
         let body =
             std::fs::read_to_string(format!("{}/audit.jsonl", dir.to_str().unwrap())).unwrap();
         assert_eq!(body.lines().count(), 1, "only the first report is audited");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 2026-10-20: the operator's batch of `ban`s hit the 30 s cooldown. The
+    /// cooldown guards against untrusted senders; operators skip it.
+    #[test]
+    fn mutate_cooldown_exempts_operators_only() {
+        let dir = test_data_dir();
+        let (mut ctx, _rx) = approval_ctx(&dir, Duration::from_secs(600));
+        ctx.cooldown = Some(Duration::from_secs(30));
+        ctx.allow.insert("@op:x".to_string());
+        for _ in 0..3 {
+            assert_eq!(ctx.mutate_cooldown("@op:x"), None, "operators are never gated");
+        }
+        assert_eq!(ctx.mutate_cooldown("@user:x"), None, "first attempt passes");
+        assert!(ctx.mutate_cooldown("@user:x").is_some(), "second is gated");
         std::fs::remove_dir_all(&dir).ok();
     }
 

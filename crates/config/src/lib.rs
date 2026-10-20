@@ -202,9 +202,10 @@ pub struct LimitsConfig {
     /// Bounds the super-linear Olm key-distribution cost per room.
     #[serde(default)]
     pub max_ghosts_per_bridge: Option<usize>,
-    /// Per-operator (MXID) cooldown in seconds between state-changing
-    /// management-bot commands (`link` / `unlink`), so spawn/teardown can't be
-    /// thrashed. `list`/`help` are exempt.
+    /// Per-sender (MXID) cooldown in seconds between state-changing
+    /// management-bot commands (`link` / `unlink` / `ban` …), so spawn/teardown
+    /// can't be thrashed. `list`/`help` and operators (`[management] allow`)
+    /// are exempt.
     #[serde(default)]
     pub mgmt_cooldown_secs: Option<u64>,
     /// Maximum tenants a single non-operator owner (MXID) may have at once

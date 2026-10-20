@@ -143,7 +143,7 @@
 #                               # boot / SIGHUP / `link` reject a set beyond this
 # max_ghosts_per_bridge = 16    # concurrent bridged Discord speakers per bridge; at the cap
 #                               # a NEW speaker is not bridged (WARN) until a slot frees
-# mgmt_cooldown_secs = 30       # per-operator cooldown between `link`/`unlink` commands
+# mgmt_cooldown_secs = 30       # per-sender cooldown between `link`/`unlink` commands (operators exempt)
 # max_tenants_per_owner = 2     # bridges one self-serve user may own at once (#43;
 #                               # counts pending approvals too; operators exempt)
 # max_tenants_per_guild = 3     # bridges that may target one Discord guild (#77 anti-Sybil;

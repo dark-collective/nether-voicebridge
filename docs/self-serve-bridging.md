@@ -149,9 +149,9 @@ each speaker appears on the far side as their own named participant.
 Instances cap self-serve usage (all operator-configured, so exact numbers
 vary). The `nether.im` instance currently sets:
 
-- **2 bridges per account** (pending approvals count toward it) and **3 per
+- **5 bridges per account** (pending approvals count toward it) and **6 per
   Discord server**;
-- a **30-second cooldown** between commands that change something, and **5
+- a **10-second cooldown** between commands that change something, and **15
   `link` attempts per hour** (plus a global rate limit shared by everyone);
 - the **approval code expires after 10 minutes** — if the Discord side missed
   the window, just run `link` again for a fresh code.
@@ -162,9 +162,9 @@ the rate limits) when to retry.
 Two limits are about call size rather than commands, and they **don't produce
 an error message** — worth knowing so they don't look like breakage:
 
-- **Discord speakers per Matrix call:** each bridge relays up to **16**
+- **Discord speakers per Matrix call:** each bridge relays up to **24**
   concurrent Discord speakers into the Element Call (each as their own named
-  ghost). A 17th simultaneous speaker is **not relayed at all** until a slot
+  ghost). A 25th simultaneous speaker is **not relayed at all** until a slot
   frees (someone leaves or goes quiet long enough to be released) — they're
   fine on the Discord side, just absent from Matrix.
 - **Named Matrix speakers per Discord channel:** the shared pool of **7**
