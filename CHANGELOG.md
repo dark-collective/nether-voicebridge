@@ -27,6 +27,24 @@ adheres to [Semantic Versioning](https://semver.org/).
   also when they are not streaming on Discord, withdraw it (an attached stream ends within seconds), and list what they
   allowed. `/bridge optout` withdraws every such permission. Stored with the keys in `companions.toml`.
 
+## [0.4.11] - 2026-10-20
+
+### Fixed
+- **A bridge whose Matrix room is banned no longer retries forever.** When the homeserver refuses the join with a
+  403 saying the room (or the bot) is banned, the bridge logs one ERROR and is *parked*: no restart, roster state
+  `parked` in `bridges.json` (so the ops watcher keeps reporting it until it is unlinked). Tenant reloads leave an
+  unchanged parked bridge parked; a changed entry is started again. Other 403s (an uninvited restricted room) still
+  retry, since an invite can fix them.
+
+### Changed
+- **Operators skip `[limits] mgmt_cooldown_secs`.** The `[management] allow` list was already exempt from every other
+  per-sender limit; the command cooldown now matches, so a batch of `ban`/`unlink` commands isn't throttled.
+  Non-operators are still gated.
+
+### Docs
+- Operations runbook: the `parked` roster state, and a "Removing a user from the homeserver" checklist (ban every
+  account, guild and room *before* deleting their rooms).
+
 ## [0.4.8] - 2026-10-11
 
 **Hanging up both halves of a paired account no longer flashes a ghost into the call.**
