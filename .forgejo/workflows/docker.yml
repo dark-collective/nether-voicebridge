@@ -40,8 +40,11 @@ jobs:
   # Cargo.lock — persists across releases and a typical release recompiles just
   # our own crates. The daemon already lists the tailnet registry under
   # insecure-registries, so the push needs no buildkit HTTP override.
+  # nvb-docker = the trusted runner registered to THIS repo only, with the
+  # host's Docker socket and tailnet access (2026-10-23 runner lockdown).
+  # The org-wide `docker` runner is a sandbox: no socket, public internet only.
   image:
-    runs-on: docker
+    runs-on: nvb-docker
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -195,7 +198,7 @@ jobs:
   # of the pulling host's architecture. Doesn't rebuild anything — needs only
   # registry auth and both single-arch images to already exist.
   manifest:
-    runs-on: docker
+    runs-on: nvb-docker
     needs: [image, image-arm64]
     steps:
       - name: Set up Docker Buildx
@@ -268,7 +271,7 @@ jobs:
   # shipped in the Docker images (#29) — no second `cargo build` here (the
   # static binaries, a different build by nature, come from the image jobs).
   packages:
-    runs-on: docker
+    runs-on: nvb-docker
     needs: [manifest]
     if: github.ref_type == 'tag'
     steps:
