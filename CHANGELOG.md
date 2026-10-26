@@ -27,6 +27,15 @@ adheres to [Semantic Versioning](https://semver.org/).
   also when they are not streaming on Discord, withdraw it (an attached stream ends within seconds), and list what they
   allowed. `/bridge optout` withdraws every such permission. Stored with the keys in `companions.toml`.
 
+## [0.4.12] - 2026-10-26
+
+### Fixed
+- **Companion listener at boot:** when `[companions] listen` names an address that isn't up yet (a VPN/tailnet
+  interface still coming up) or is taken, the listener now retries with backoff (1 s → 30 s) instead of staying down
+  until the next restart.
+- **Puppets could stay in voice after a nickname rate limit:** nickname edits no longer run on the puppet's own loop,
+  so a 429 on a nickname change can't hold up the puppet leaving the channel.
+
 ## [0.4.11] - 2026-10-20
 
 ### Fixed
