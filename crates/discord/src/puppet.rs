@@ -58,7 +58,7 @@ use songbird::{
     tracks::TrackHandle,
     CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler, SerenityInit,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use nvb_audio::mixer::PlaybackMixer;
@@ -102,6 +102,11 @@ const OVERFLOW_LABEL: &str = "Overflow";
 /// polled this long after the leaves are queued so the frames go out. Bounded
 /// well under the supervisor's teardown timeout.
 const VOICE_LEAVE_FLUSH_GRACE: Duration = Duration::from_millis(1000);
+
+/// How long the shutdown drain waits for each bot's nickname resets to land
+/// (they run off the command loop, see `NickWriter`). Bounded well under the
+/// supervisor's teardown timeout.
+const NICK_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Discord's hard cap on guild nicknames (Unicode characters).
 const NICKNAME_MAX_CHARS: usize = 32;
@@ -3680,6 +3685,75 @@ impl GuildConn {
     }
 }
 
+/// One bot's per-guild nickname writer. Nickname edits are cosmetic REST calls
+/// that Discord rate-limits per guild, and serenity waits out a 429 inside the
+/// call (live-observed: ~67 s) — awaited on the command loop, that held the
+/// bot in voice long after its participant left. So the loop only records the
+/// wanted nickname (`None` = reset); a task per guild applies the latest one.
+struct NickWriter {
+    http: Arc<serenity::http::Http>,
+    idx: usize,
+    guilds: HashMap<GuildId, (watch::Sender<Option<String>>, tokio::task::JoinHandle<()>)>,
+}
+
+impl NickWriter {
+    fn new(http: Arc<serenity::http::Http>, idx: usize) -> Self {
+        Self { http, idx, guilds: HashMap::new() }
+    }
+
+    /// Ask for `nick` in `guild`; never waits on Discord. A value still queued
+    /// when a newer one arrives is skipped.
+    fn set(&mut self, guild: GuildId, nick: Option<String>) {
+        if let Some((tx, _)) = self.guilds.get(&guild) {
+            tx.send_replace(nick);
+            return;
+        }
+        let (tx, rx) = watch::channel(nick);
+        let task = tokio::spawn(nick_worker(self.http.clone(), self.idx, guild, rx));
+        self.guilds.insert(guild, (tx, task));
+    }
+
+    /// Shutdown: let every guild's last wanted nickname (the leave's reset)
+    /// land, waiting at most `within` so a rate-limited guild can't stall the
+    /// drain. A nickname left behind is cleared by the next startup's reset.
+    async fn flush(&mut self, within: Duration) {
+        let tasks: Vec<_> = self.guilds.drain().map(|(_, (_tx, task))| task).collect();
+        if tokio::time::timeout(within, futures_util::future::join_all(tasks)).await.is_err() {
+            tracing::warn!(idx = self.idx, "puppet nickname reset still pending at shutdown — the next startup clears it");
+        }
+    }
+}
+
+/// Apply the latest wanted nickname until the [`NickWriter`] is dropped, then
+/// apply the final value (a leave's reset) once more if it hasn't been.
+async fn nick_worker(
+    http: Arc<serenity::http::Http>,
+    idx: usize,
+    guild: GuildId,
+    mut rx: watch::Receiver<Option<String>>,
+) {
+    let mut applied: Option<Option<String>> = None;
+    loop {
+        let want = rx.borrow_and_update().clone();
+        if applied.as_ref() != Some(&want) {
+            match guild.edit_nickname(&http, want.as_deref()).await {
+                Ok(()) => tracing::debug!(idx, guild = guild.get(), nick = ?want, "puppet nickname applied"),
+                Err(e) => tracing::warn!(idx, guild = guild.get(), nick = ?want, error = %e, "failed to set puppet nickname"),
+            }
+            applied = Some(want);
+        }
+        if rx.changed().await.is_err() {
+            let last = rx.borrow().clone();
+            if applied.as_ref() != Some(&last) {
+                if let Err(e) = guild.edit_nickname(&http, last.as_deref()).await {
+                    tracing::warn!(idx, guild = guild.get(), error = %e, "failed to set puppet nickname");
+                }
+            }
+            return;
+        }
+    }
+}
+
 /// Drain commands for one puppet, driving its voice connections. The loop is
 /// channel-agnostic: each `Assign` carries the channel context, stored per
 /// guild in `active`; guild-qualified commands act on that guild's engagement.
@@ -3693,6 +3767,7 @@ async fn puppet_command_loop(
 ) {
     // One live engagement per guild (at most one voice Call per guild per bot).
     let mut active: HashMap<GuildId, GuildConn> = HashMap::new();
+    let mut nicks = NickWriter::new(ctx.http.clone(), idx);
     // Monotonic join generation shared across this bot's guilds; each (re)join
     // stamps its conn, so a stale `DriverDropped` is recognisable per guild.
     let mut epoch: u64 = 0;
@@ -3748,6 +3823,7 @@ async fn puppet_command_loop(
                     &ctx,
                     &mixer,
                     &current_ssrc,
+                    &mut nicks,
                     &nickname_prefix,
                     &display_name,
                     epoch,
@@ -3816,11 +3892,8 @@ async fn puppet_command_loop(
             PuppetCommand::SetNickname { guild, name } => {
                 if active.contains_key(&guild) {
                     let nick = build_nickname(&nickname_prefix, &name);
-                    if let Err(e) = guild.edit_nickname(&ctx.http, Some(nick.as_str())).await {
-                        tracing::warn!(idx, error = %e, "failed to relabel puppet nickname");
-                    } else {
-                        tracing::info!(idx, nick = %nick, "puppet relabeled");
-                    }
+                    tracing::info!(idx, nick = %nick, "puppet relabeled");
+                    nicks.set(guild, Some(nick));
                 }
             }
             PuppetCommand::SetStandbyNickname { guild } => {
@@ -3828,24 +3901,22 @@ async fn puppet_command_loop(
                     // The label is configured whole — no prefix; reuse
                     // build_nickname only for its safe char truncation.
                     let nick = build_nickname("", &pool.standby_nickname);
-                    if let Err(e) = guild.edit_nickname(&ctx.http, Some(nick.as_str())).await {
-                        tracing::warn!(idx, error = %e, "failed to set standby nickname");
-                    } else {
-                        tracing::info!(idx, nick = %nick, "puppet relabeled (standby)");
-                    }
+                    tracing::info!(idx, nick = %nick, "puppet relabeled (standby)");
+                    nicks.set(guild, Some(nick));
                 }
             }
             PuppetCommand::Release { guild } => {
                 if let Some(mut conn) = active.remove(&guild) {
                     conn.cancel_gates();
-                    puppet_leave(&ctx, idx, &conn.chan, &conn.current_ssrc).await;
+                    puppet_leave(&ctx, idx, &conn.chan, &conn.current_ssrc, &mut nicks).await;
                 }
             }
             PuppetCommand::ReleaseAndAck { done } => {
                 for (_guild, mut conn) in active.drain() {
                     conn.cancel_gates();
-                    puppet_leave(&ctx, idx, &conn.chan, &conn.current_ssrc).await;
+                    puppet_leave(&ctx, idx, &conn.chan, &conn.current_ssrc, &mut nicks).await;
                 }
+                nicks.flush(NICK_FLUSH_TIMEOUT).await;
                 let _ = done.send(());
             }
             // An unexpected voice drop (event-driven) or a reconcile probe finding
@@ -3899,6 +3970,7 @@ async fn puppet_command_loop(
                             idx,
                             &mixer,
                             &ssrc,
+                            &mut nicks,
                             &nickname_prefix,
                             &pool,
                             &chan,
@@ -4081,6 +4153,7 @@ async fn puppet_join(
     ctx: &Context,
     mixer: &Arc<PlaybackMixer>,
     current_ssrc: &Arc<StdMutex<Option<u32>>>,
+    nicks: &mut NickWriter,
     nickname_prefix: &str,
     display_name: &str,
     epoch: u64,
@@ -4180,10 +4253,7 @@ async fn puppet_join(
         }
     };
 
-    let nick = build_nickname(nickname_prefix, display_name);
-    if let Err(e) = channel.guild_id.edit_nickname(&ctx.http, Some(nick.as_str())).await {
-        tracing::warn!(idx, error = %e, "failed to set puppet nickname");
-    }
+    nicks.set(channel.guild_id, Some(build_nickname(nickname_prefix, display_name)));
     tracing::info!(idx, bridge = %channel.bridge, display_name, "puppet joined voice and assigned");
     handle
 }
@@ -4193,15 +4263,14 @@ async fn puppet_leave(
     idx: usize,
     channel: &ChannelCtx,
     current_ssrc: &Arc<StdMutex<Option<u32>>>,
+    nicks: &mut NickWriter,
 ) {
-    if let Err(e) = channel.guild_id.edit_nickname(&ctx.http, None).await {
-        tracing::warn!(idx, error = %e, "failed to reset puppet nickname");
-    }
     if let Some(manager) = songbird::get(ctx).await {
         if let Err(e) = manager.remove(channel.guild_id).await {
             tracing::warn!(idx, error = %e, "puppet failed to leave voice channel");
         }
     }
+    nicks.set(channel.guild_id, None);
     // Stop excluding our (now-gone) SSRC so a recycled SSRC isn't wrongly muted.
     let ssrc = current_ssrc.lock().unwrap_or_else(PoisonError::into_inner).take();
     if let Some(s) = ssrc {
@@ -4229,6 +4298,7 @@ async fn rejoin_puppet(
     idx: usize,
     mixer: &Arc<PlaybackMixer>,
     current_ssrc: &Arc<StdMutex<Option<u32>>>,
+    nicks: &mut NickWriter,
     nickname_prefix: &str,
     pool: &Arc<SharedPool>,
     chan: &ChannelCtx,
@@ -4267,6 +4337,7 @@ async fn rejoin_puppet(
         ctx,
         mixer,
         current_ssrc,
+        nicks,
         nickname_prefix,
         &display_name,
         epoch,
