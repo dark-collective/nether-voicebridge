@@ -127,7 +127,8 @@ async fn drive_isolation(
     // One async block that OWNS both speakers (so `leave(self)` can consume them
     // inline for the teardown-independence step) and only BORROWS the listeners
     // (so `la`/`lc` survive to `stop()` after). On an error path a not-yet-left
-    // speaker is dropped; the next run's `sweep_test_memberships` clears it.
+    // speaker is dropped, which cancels its testkit task (LiveKit closed,
+    // membership retracted) so a retry doesn't run beside a stale copy.
     let outcome: Result<(u64, u64)> = async {
         // Listeners join voice + start recording BEFORE the puppets arrive, so
         // each is present to catch the puppet's SpeakingStateUpdate (the SSRC→

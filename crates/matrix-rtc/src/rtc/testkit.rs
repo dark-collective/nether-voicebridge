@@ -65,7 +65,7 @@ use matrix_sdk::ruma::events::call::member::CallMemberEventContent;
 use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedUserId, UInt};
 use matrix_sdk::{Client, SessionMeta};
 use tokio::sync::{mpsc, watch, Notify};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::Instrument;
 
 use nvb_config::KeyTransport as KeyTransportMode;
@@ -258,6 +258,11 @@ pub struct TestCallHandle {
     mxid: String,
     device_id: String,
     cancel: CancellationToken,
+    /// Cancels the participant task if the handle is dropped without
+    /// `leave_clean`/`kill` (a scenario bailing mid-way). Without it the task
+    /// kept publishing on LiveKit for the rest of the suite, and a retried
+    /// scenario then ran with two copies of the same speaker in the room.
+    _cancel_on_drop: DropGuard,
     /// Whether teardown retracts the membership. `kill()` clears it — the
     /// stale-member injector.
     retract: Arc<AtomicBool>,
@@ -483,6 +488,7 @@ pub async fn join_and_publish(
         Ok(TestCallHandle {
             mxid: mxid.clone(),
             device_id,
+            _cancel_on_drop: cancel.clone().drop_guard(),
             cancel,
             retract,
             mute_tx,
@@ -560,6 +566,7 @@ pub async fn join_presence(
         Ok(TestCallHandle {
             mxid: mxid.clone(),
             device_id,
+            _cancel_on_drop: cancel.clone().drop_guard(),
             cancel,
             retract,
             mute_tx,
@@ -587,6 +594,8 @@ pub struct TestListenerHandle {
     mxid: String,
     device_id: String,
     cancel: CancellationToken,
+    /// Same as [`TestCallHandle`]'s: a dropped listener stops and leaves.
+    _cancel_on_drop: DropGuard,
     retract: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<Vec<TrackRecording>>,
 }
@@ -705,6 +714,7 @@ pub async fn join_and_subscribe(
         Ok(TestListenerHandle {
             mxid: mxid.clone(),
             device_id,
+            _cancel_on_drop: cancel.clone().drop_guard(),
             cancel,
             retract,
             task,
@@ -1031,6 +1041,7 @@ pub async fn join_and_subscribe_decrypting(
         Ok(TestListenerHandle {
             mxid: mxid.clone(),
             device_id,
+            _cancel_on_drop: cancel.clone().drop_guard(),
             cancel,
             retract,
             task,
