@@ -238,8 +238,9 @@ async fn main() -> Result<()> {
     let mgmt_links = links.clone();
 
     // Companion interface (ADR 0004): off unless `[companions] enabled`. A
-    // listener that cannot start (bad store, port taken) is logged and the
-    // bridge runs without it — companions are optional, bridging is not.
+    // listener that cannot start (bad store, bad address) is logged and the
+    // bridge runs without it — companions are optional, bridging is not. An
+    // address that isn't up yet (tailnet at boot) or is taken is retried.
     let companion_hub = if companions.enabled {
         match nvb_companion::CompanionHub::open(companions, &data_dir, links.clone()) {
             Ok(hub) => {
