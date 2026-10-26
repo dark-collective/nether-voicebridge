@@ -124,7 +124,7 @@ async fn bind_with_retry(addr: SocketAddr, shutdown: &CancellationToken) -> std:
             Err(e) if matches!(e.kind(), AddrNotAvailable | AddrInUse) => {
                 attempts += 1;
                 // Loud once, then about every 5 minutes (the delay caps at 30 s).
-                if attempts == 1 || attempts % 10 == 0 {
+                if attempts == 1 || attempts.is_multiple_of(10) {
                     tracing::warn!(%addr, error = %e, attempts, "companion listener can't bind yet — retrying");
                 }
                 tokio::select! {
