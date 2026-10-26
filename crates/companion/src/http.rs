@@ -98,9 +98,44 @@ pub async fn serve(hub: Arc<CompanionHub>, shutdown: CancellationToken) -> std::
         .listen
         .parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let listener = TcpListener::bind(addr).await?;
+    let Some(listener) = bind_with_retry(addr, &shutdown).await? else { return Ok(()) };
     serve_on(listener, hub, shutdown).await;
     Ok(())
+}
+
+/// Bind `addr`, retrying while the address isn't there yet or is still taken.
+/// At boot the bridge can start before the interface carrying `listen` (a
+/// VPN/tailnet address) is up: the first bind then fails with
+/// `AddrNotAvailable`, and giving up there left companions off until the next
+/// restart. Other errors (permissions, a malformed address) fail at once.
+/// `None` = shut down while waiting.
+async fn bind_with_retry(addr: SocketAddr, shutdown: &CancellationToken) -> std::io::Result<Option<TcpListener>> {
+    use std::io::ErrorKind::{AddrInUse, AddrNotAvailable};
+    let mut delay = std::time::Duration::from_secs(1);
+    let mut attempts: u32 = 0;
+    loop {
+        match TcpListener::bind(addr).await {
+            Ok(l) => {
+                if attempts > 0 {
+                    tracing::info!(%addr, attempts, "companion listener bound after retrying");
+                }
+                return Ok(Some(l));
+            }
+            Err(e) if matches!(e.kind(), AddrNotAvailable | AddrInUse) => {
+                attempts += 1;
+                // Loud once, then about every 5 minutes (the delay caps at 30 s).
+                if attempts == 1 || attempts.is_multiple_of(10) {
+                    tracing::warn!(%addr, error = %e, attempts, "companion listener can't bind yet — retrying");
+                }
+                tokio::select! {
+                    _ = shutdown.cancelled() => return Ok(None),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                delay = (delay * 2).min(std::time::Duration::from_secs(30));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Serve on an already-bound listener (tests bind port 0).
@@ -513,5 +548,36 @@ mod tests {
         hub.revoke_key(&key.id, "@mod:hs").unwrap();
         read_until(&mut s, &mut got, "event: revoked\ndata: {\"reason\":\"key_revoked\"}").await;
         sd.cancel();
+    }
+
+    #[tokio::test]
+    async fn bind_retries_until_the_address_is_free() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = taken.local_addr().unwrap();
+        let sd = CancellationToken::new();
+        let waiter = tokio::spawn({
+            let sd = sd.clone();
+            async move { bind_with_retry(addr, &sd).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!waiter.is_finished(), "must keep retrying while the port is taken");
+        drop(taken);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), waiter).await.unwrap().unwrap().unwrap();
+        assert_eq!(got.unwrap().local_addr().unwrap(), addr);
+    }
+
+    #[tokio::test]
+    async fn bind_retry_stops_on_shutdown() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = taken.local_addr().unwrap();
+        let sd = CancellationToken::new();
+        let waiter = tokio::spawn({
+            let sd = sd.clone();
+            async move { bind_with_retry(addr, &sd).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        sd.cancel();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), waiter).await.unwrap().unwrap().unwrap();
+        assert!(got.is_none());
     }
 }
