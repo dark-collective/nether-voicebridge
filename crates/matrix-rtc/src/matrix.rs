@@ -42,6 +42,11 @@ type ParticipantSet = Arc<Mutex<HashSet<(OwnedUserId, String)>>>;
 /// A reappear cancels it; a fresh leave replaces it (one timer per MXID).
 type PendingLeaves = Arc<Mutex<HashMap<OwnedUserId, CancellationToken>>>;
 
+/// Pending paired-arrival graces (ADR 0003, Consequences): MXID -> cancel handle
+/// for its in-flight timer. The *outcome* is owned by whoever wins
+/// [`LinkBoard::end_arrival_grace`]; the handle only stops an idle timer early.
+type PendingArrivals = Arc<Mutex<HashMap<OwnedUserId, CancellationToken>>>;
+
 /// Default Matrix display name for the bridge bot (the visible roster participant
 /// in an E2EE call). Overridable per deployment via `matrix.bot_display_name`.
 const DEFAULT_DISPLAY_NAME: &str = "Nether Voice Bridge";
@@ -111,6 +116,8 @@ async fn apply_member_event(
     members_gen_tx: &watch::Sender<u64>,
     pending_leaves: &PendingLeaves,
     leave_grace: Duration,
+    pending_arrivals: &PendingArrivals,
+    arrival_grace: Duration,
     shutdown: &CancellationToken,
     bridge: &Arc<str>,
     room: &Room,
@@ -216,6 +223,60 @@ async fn apply_member_event(
             }
             return;
         }
+        // Paired arrival grace (ADR 0003, Consequences): a paired member whose Discord
+        // half is not in the channel yet usually has it arriving in seconds (a
+        // companion client / second device). Assigning a puppet now means a bot
+        // joining Discord under their name, then renaming to standby and lingering
+        // when the half arrives — visible churn. Instead they only LISTEN (the
+        // anchor joins in standby, never under their name) until the half arrives
+        // (MatrixExcluded ends the grace), the timer expires, or they speak
+        // (`rtc::session` playback consumer) — the latter two assign the puppet.
+        if !arrival_grace.is_zero() && links.paired_half_absent(user_id.as_str()) {
+            tracing::info!(
+                mxid = %user_id,
+                grace_ms = arrival_grace.as_millis() as u64,
+                "member joined — paired Discord account not in the channel yet — listening, arrival grace started"
+            );
+            links.begin_arrival_grace(user_id.as_str());
+            router.listen(user_id.as_str());
+            let token = CancellationToken::new();
+            if let Some(old) = pending_arrivals.lock().await.insert(user_id.clone(), token.clone()) {
+                old.cancel();
+            }
+            let router = router.clone();
+            let pending_arrivals = pending_arrivals.clone();
+            let shutdown = shutdown.clone();
+            let links = links.clone();
+            let room = room.clone();
+            let mxid = user_id.clone();
+            let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
+            tokio::spawn(
+                async move {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => return, // teardown owns final release
+                        _ = token.cancelled() => return,    // half arrived / leave took effect
+                        _ = tokio::time::sleep(arrival_grace) => {}
+                    }
+                    pending_arrivals.lock().await.remove(&mxid);
+                    if !links.end_arrival_grace(mxid.as_str()) {
+                        return; // already ended (first voiced frame, half arrived, leave)
+                    }
+                    // Authoritative re-check: still in the call (a debounced leave only
+                    // clears board presence once effective) and still not bridge-owned.
+                    if !links.matrix_present(mxid.as_str()) || links.matrix_excluded(mxid.as_str()) {
+                        tracing::info!(mxid = %mxid, "arrival grace elapsed — member gone or paired half present — no puppet");
+                        return;
+                    }
+                    let name = resolve_member_name(&room, &mxid).await;
+                    tracing::info!(mxid = %mxid, display_name = %name, "arrival grace elapsed — paired Discord account never came — assigning puppet");
+                    router.assign(mxid.as_str(), &name);
+                    router.unlisten(mxid.as_str()); // after the assign: the anchor never lapses
+                }
+                .instrument(span),
+            );
+            return;
+        }
         let name = resolve_member_name(room, &user_id).await;
         tracing::info!(mxid = %user_id, display_name = %name, "member joined — assigning puppet");
         router.assign(user_id.as_str(), &name);
@@ -238,6 +299,7 @@ async fn apply_member_event(
         let call_active_tx = call_active_tx.clone();
         let shutdown = shutdown.clone();
         let links = links.clone();
+        let pending_arrivals = pending_arrivals.clone();
         let mxid = user_id.clone();
         let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
         tokio::spawn(
@@ -258,6 +320,11 @@ async fn apply_member_event(
                     tracing::info!(mxid = %mxid, "leave grace elapsed — releasing puppet");
                     router.release(mxid.as_str());
                     router.unlisten(mxid.as_str());
+                    // A pending arrival grace ends with the leave (the board clears its
+                    // claim in `set_matrix_present(false)`; this just stops the timer).
+                    if let Some(t) = pending_arrivals.lock().await.remove(&mxid) {
+                        t.cancel();
+                    }
                     // Linked identities: the leave is now effective — a paired Discord
                     // member still in the channel gets its ghost back (Discord side).
                     links.dispatch_all(links.set_matrix_present(mxid.as_str(), false));
@@ -1186,6 +1253,7 @@ pub(crate) async fn run(
     cfg: &MatrixConfig,
     media_e2ee: bool,
     leave_grace: Duration,
+    arrival_grace: Duration,
     call_active_tx: watch::Sender<bool>,
     members_gen_tx: watch::Sender<u64>,
     router: Arc<dyn PlaybackRouter>,
@@ -1198,6 +1266,7 @@ pub(crate) async fn run(
     let room_id = RoomId::parse(&cfg.room_id)?;
     let participants: ParticipantSet = Arc::new(Mutex::new(HashSet::new()));
     let pending_leaves: PendingLeaves = Arc::new(Mutex::new(HashMap::new()));
+    let pending_arrivals: PendingArrivals = Arc::new(Mutex::new(HashMap::new()));
 
     // Linked identities (ADR 0001): Matrix-side transitions caused by Discord
     // presence changes. A paired Discord account arriving makes its Matrix half
@@ -1210,6 +1279,7 @@ pub(crate) async fn run(
         let client = client.clone();
         let room_id = room_id.clone();
         let links = links.clone();
+        let pending_arrivals = pending_arrivals.clone();
         let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
         tokio::spawn(
             async move {
@@ -1221,6 +1291,21 @@ pub(crate) async fn run(
                     };
                     match ev {
                         LinkEvent::MatrixExcluded(mxid) => {
+                            // The paired half arrived during the arrival grace: the grace did
+                            // its job — no puppet was ever assigned; it just keeps listening.
+                            if links.end_arrival_grace(&mxid) {
+                                if let Ok(uid) = mxid.parse::<OwnedUserId>() {
+                                    if let Some(t) = pending_arrivals.lock().await.remove(&uid) {
+                                        t.cancel();
+                                    }
+                                }
+                                tracing::info!(mxid = %mxid, "paired Discord account arrived within the arrival grace — no puppet, still listening");
+                                router.listen(&mxid); // idempotent; already listening
+                                // A no-op normally; covers a playback consumer that assigned
+                                // before the membership started the grace.
+                                router.release(&mxid);
+                                continue;
+                            }
                             tracing::info!(mxid = %mxid, "member is now bridge-owned (its paired Discord account joined the channel) — releasing puppet, still listening");
                             // Listen FIRST so the pool keeps the capture anchor through the
                             // puppet's release (ADR 0003).
@@ -1232,6 +1317,8 @@ pub(crate) async fn run(
                             if !present || links.matrix_excluded(&user) {
                                 continue;
                             }
+                            // A pairing removed mid-grace: ordinary now, the grace is moot.
+                            links.end_arrival_grace(&user);
                             let name = match (client.get_room(&room_id), user.parse::<OwnedUserId>()) {
                                 (Some(room), Ok(uid)) => resolve_member_name(&room, &uid).await,
                                 _ => user.clone(),
@@ -1266,6 +1353,7 @@ pub(crate) async fn run(
     {
         let participants = participants.clone();
         let pending_leaves = pending_leaves.clone();
+        let pending_arrivals = pending_arrivals.clone();
         let bot_user_id = bot_user_id.clone();
         let call_active_tx = call_active_tx.clone();
         let members_gen_tx = members_gen_tx.clone();
@@ -1279,6 +1367,7 @@ pub(crate) async fn run(
         client.add_room_event_handler(&room_id, move |ev: SyncCallMemberEvent, room: Room| {
             let participants = participants.clone();
             let pending_leaves = pending_leaves.clone();
+            let pending_arrivals = pending_arrivals.clone();
             let bot_user_id = bot_user_id.clone();
             let call_active_tx = call_active_tx.clone();
             let members_gen_tx = members_gen_tx.clone();
@@ -1305,6 +1394,8 @@ pub(crate) async fn run(
                     &members_gen_tx,
                     &pending_leaves,
                     leave_grace,
+                    &pending_arrivals,
+                    arrival_grace,
                     &shutdown,
                     &bridge,
                     &room,
@@ -1343,6 +1434,8 @@ pub(crate) async fn run(
                 &members_gen_tx,
                 &pending_leaves,
                 leave_grace,
+                &pending_arrivals,
+                arrival_grace,
                 &shutdown,
                 &bridge,
                 &room,

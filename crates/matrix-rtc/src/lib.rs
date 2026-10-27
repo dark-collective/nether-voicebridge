@@ -228,6 +228,7 @@ pub async fn run(
                 matrix_cfg,
                 media_e2ee,
                 timing.leave_grace(),
+                timing.paired_arrival_grace(),
                 call_active_tx,
                 members_gen_tx,
                 router.clone(),

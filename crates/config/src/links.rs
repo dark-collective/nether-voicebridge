@@ -84,6 +84,11 @@ pub struct LinkBoard {
     observation: Mutex<Observation>,
     /// Bumped on every change a companion could observe; readers poll it.
     revision: AtomicU64,
+    /// Call members in their "paired arrival grace" (ADR 0003): joined the call
+    /// while their Discord half was absent, so they only listen until the grace
+    /// ends (half arrives, timer expires, or they speak). Whoever removes an
+    /// entry ([`end_arrival_grace`](Self::end_arrival_grace)) owns the effect.
+    arrival_grace: Mutex<HashSet<String>>,
 }
 
 impl std::fmt::Debug for LinkBoard {
@@ -110,6 +115,7 @@ impl LinkBoard {
             dispatch: Mutex::new(None),
             observation: Mutex::new(Observation::default()),
             revision: AtomicU64::new(0),
+            arrival_grace: Mutex::new(HashSet::new()),
         }
     }
 
@@ -219,6 +225,46 @@ impl LinkBoard {
         p.discord.contains(&uid) && self.pairings.matrix_for_discord(uid).is_some_and(|m| p.matrix.contains(&m))
     }
 
+    /// Is call member `mxid` present, a person (not a service account or
+    /// config-excluded), with at least one pairing — and NONE of its paired Discord
+    /// accounts in the channel yet? The "paired arrival grace" gate: such a member
+    /// is likely about to be joined by their Discord half, so the Matrix side holds
+    /// off on a puppet (ADR 0003, Consequences).
+    pub fn paired_half_absent(&self, mxid: &str) -> bool {
+        if self.never_listens(mxid) {
+            return false;
+        }
+        let p = self.presence.lock().unwrap_or_else(PoisonError::into_inner);
+        if !p.matrix.contains(mxid) {
+            return false;
+        }
+        let discords = self.pairings.discords_for_matrix(mxid);
+        !discords.is_empty() && !discords.iter().any(|d| p.discord.contains(d))
+    }
+
+    /// Is call member `mxid` in the call (as far as the board knows — a debounced
+    /// leave only clears it once it takes effect)?
+    pub fn matrix_present(&self, mxid: &str) -> bool {
+        self.presence.lock().unwrap_or_else(PoisonError::into_inner).matrix.contains(mxid)
+    }
+
+    /// Start `mxid`'s paired arrival grace (idempotent).
+    pub fn begin_arrival_grace(&self, mxid: &str) {
+        self.arrival_grace.lock().unwrap_or_else(PoisonError::into_inner).insert(mxid.to_string());
+    }
+
+    /// Is `mxid` in its paired arrival grace (no puppet yet, listening only)?
+    pub fn in_arrival_grace(&self, mxid: &str) -> bool {
+        self.arrival_grace.lock().unwrap_or_else(PoisonError::into_inner).contains(mxid)
+    }
+
+    /// End `mxid`'s arrival grace. Returns true for exactly ONE caller per grace —
+    /// the one that should apply the outcome (timer expiry, first voiced frame,
+    /// Discord half arriving); everyone else gets false and does nothing.
+    pub fn end_arrival_grace(&self, mxid: &str) -> bool {
+        self.arrival_grace.lock().unwrap_or_else(PoisonError::into_inner).remove(mxid)
+    }
+
     /// Voice members present and NOT bridge-owned — the Discord "humans".
     pub fn discord_humans(&self) -> usize {
         let p = self.presence.lock().unwrap_or_else(PoisonError::into_inner);
@@ -281,6 +327,10 @@ impl LinkBoard {
         let changed = if present { p.matrix.insert(mxid.to_string()) } else { p.matrix.remove(mxid) };
         if !changed {
             return Vec::new();
+        }
+        if !present {
+            // A leave that took effect ends any arrival grace with no outcome.
+            self.arrival_grace.lock().unwrap_or_else(PoisonError::into_inner).remove(mxid);
         }
         self.bump();
         let mut events = Vec::new();
@@ -538,6 +588,47 @@ mod tests {
         b.set_matrix_present(ALICE, false);
         assert!(!b.matrix_listener_only(ALICE), "absent members are nothing");
         assert_eq!(b.matrix_listeners(), 0);
+    }
+
+    /// Paired arrival grace gate: present, paired, no paired Discord account in the
+    /// channel. Unpaired members, service/config-excluded accounts and a complete
+    /// pair never qualify.
+    #[test]
+    fn paired_half_absent_gates_the_arrival_grace() {
+        let b = board(&[(ALICE, 1), (ALICE, 2), ("@bob:hs", 3)], &["@helper:hs"], &[], &["@cfg:hs"]);
+        assert!(!b.paired_half_absent(ALICE), "not in the call yet");
+        b.set_matrix_present(ALICE, true);
+        assert!(b.paired_half_absent(ALICE), "paired, no Discord half in the channel");
+        b.set_discord_present(2, true);
+        assert!(!b.paired_half_absent(ALICE), "any paired Discord account present ends it");
+        b.set_discord_present(2, false);
+        assert!(b.paired_half_absent(ALICE));
+        b.set_discord_present(3, true); // someone else's Discord half
+        assert!(b.paired_half_absent(ALICE));
+        b.set_matrix_present("@carol:hs", true);
+        assert!(!b.paired_half_absent("@carol:hs"), "unpaired members get a puppet right away");
+        b.set_matrix_present("@helper:hs", true);
+        b.set_matrix_present("@cfg:hs", true);
+        assert!(!b.paired_half_absent("@helper:hs"));
+        assert!(!b.paired_half_absent("@cfg:hs"));
+    }
+
+    /// The grace has exactly one owner of its outcome; an effective leave clears it.
+    #[test]
+    fn arrival_grace_is_claimed_once_and_cleared_by_a_leave() {
+        let b = board(&[(ALICE, 1)], &[], &[], &[]);
+        b.set_matrix_present(ALICE, true);
+        assert!(!b.in_arrival_grace(ALICE));
+        b.begin_arrival_grace(ALICE);
+        assert!(b.in_arrival_grace(ALICE));
+        assert!(b.end_arrival_grace(ALICE), "first claimant (e.g. first voiced frame) wins");
+        assert!(!b.end_arrival_grace(ALICE), "the timer arriving second does nothing");
+        assert!(!b.in_arrival_grace(ALICE));
+        b.begin_arrival_grace(ALICE);
+        b.set_matrix_present(ALICE, false);
+        assert!(!b.in_arrival_grace(ALICE), "a leave that took effect ends the grace");
+        assert!(!b.end_arrival_grace(ALICE));
+        assert!(!b.matrix_present(ALICE));
     }
 
     #[test]

@@ -57,6 +57,7 @@ pub fn all() -> Vec<&'static ScenarioDef> {
         &lifecycle::REAP_RELEASE,
         &lifecycle::LEAVE_GRACE_DEBOUNCE,
         &linked_identities::LINKED_IDENTITY_EXCLUSION,
+        &linked_identities::LINKED_ARRIVAL_GRACE,
         &companion::COMPANION_STREAM_ATTACH,
         &overflow_fcfs::OVERFLOW_FCFS_PROMOTION,
         &multi_bridge_isolation::MULTI_BRIDGE_ISOLATION,

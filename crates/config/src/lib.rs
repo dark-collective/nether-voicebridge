@@ -331,6 +331,13 @@ pub struct TimingConfig {
     /// reconnect within it neither falls back to a puppet nor sends the
     /// failover notice. Historical value: none (immediate) before 0.4.7.
     pub paired_leave_grace_ms: u64,
+    /// Grace after a paired member joins the Matrix call while their Discord
+    /// half is NOT in the channel (ADR 0001/0003 "paired arrival grace"): the
+    /// member only listens (capture anchor in standby, never under their name)
+    /// so a Discord half arriving within it causes no puppet join/rename/leave
+    /// churn. Expiry (or their first voiced frame) assigns the puppet.
+    /// Historical value: none (immediate) before 0.4.14.
+    pub paired_arrival_grace_ms: u64,
 }
 
 impl Default for TimingConfig {
@@ -348,6 +355,7 @@ impl Default for TimingConfig {
             voice_health_sweep_ms: 15_000,
             session_rotate_min_interval_ms: 90_000,
             paired_leave_grace_ms: 30_000,
+            paired_arrival_grace_ms: 30_000,
         }
     }
 }
@@ -370,6 +378,7 @@ impl TimingConfig {
             voice_health_sweep_ms: 1_000,
             session_rotate_min_interval_ms: 3_000,
             paired_leave_grace_ms: 2_000,
+            paired_arrival_grace_ms: 2_000,
         }
     }
 
@@ -420,6 +429,9 @@ impl TimingConfig {
     pub fn paired_leave_grace(&self) -> Duration {
         Duration::from_millis(self.paired_leave_grace_ms)
     }
+    pub fn paired_arrival_grace(&self) -> Duration {
+        Duration::from_millis(self.paired_arrival_grace_ms)
+    }
 }
 
 /// The raw `[timing]` block: per-key overrides, each optional. Kept separate
@@ -450,6 +462,8 @@ pub struct TimingOverrides {
     pub session_rotate_min_interval_ms: Option<u64>,
     #[serde(default)]
     pub paired_leave_grace_ms: Option<u64>,
+    #[serde(default)]
+    pub paired_arrival_grace_ms: Option<u64>,
 }
 
 impl TimingOverrides {
@@ -493,6 +507,7 @@ impl TimingOverrides {
         apply!(voice_health_sweep_ms);
         apply!(session_rotate_min_interval_ms);
         apply!(paired_leave_grace_ms);
+        apply!(paired_arrival_grace_ms);
         Ok(t)
     }
 }
