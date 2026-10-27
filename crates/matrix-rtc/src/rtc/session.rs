@@ -293,6 +293,10 @@ async fn playback_consumer(
     let mut sink: Option<Arc<dyn ParticipantSink>> = None;
     if links.matrix_excluded(key) {
         tracing::info!(track = %key, "playback consumer: member is bridge-owned — no puppet, frames dropped until that changes");
+    } else if links.in_arrival_grace(key) {
+        // Paired arrival grace (matrix::apply_member_event): no puppet yet; their
+        // first voiced frame ends the grace early (below).
+        tracing::info!(track = %key, "playback consumer: member in paired arrival grace — no puppet until it ends or they speak");
     } else {
         sink = Some(router.assign(key, &display_name));
         // Seed the puppet's mute state right after assign (avoids racing a separate
@@ -315,7 +319,8 @@ async fn playback_consumer(
             frame = stream.next() => match frame {
                 Some(f) => {
                     frames += 1;
-                    peak_db = peak_db.max(nvb_audio::rms_dbfs(&f.data));
+                    let frame_db = nvb_audio::rms_dbfs(&f.data);
+                    peak_db = peak_db.max(frame_db);
                     if frames == 1 {
                         tracing::info!(
                             track = %key,
@@ -339,9 +344,28 @@ async fn playback_consumer(
                             tracing::info!(track = %key, "playback consumer: member became bridge-owned — releasing puppet");
                             router.release(key);
                             sink = None;
-                        } else if !excluded && sink.is_none() {
+                        } else if !excluded && sink.is_none() && !links.in_arrival_grace(key) {
                             tracing::info!(track = %key, "playback consumer: member is ordinary again — assigning puppet");
                             sink = Some(router.assign(key, &display_name));
+                        }
+                    }
+                    // Paired arrival grace: the member's first voiced frame ends it at
+                    // once — they are talking to the Discord side, so they need their
+                    // puppet now, not when the timer runs out. Only checked while we
+                    // hold no sink and the frame is speech (cheap otherwise). Exactly
+                    // one claimant wins `end_arrival_grace` (vs. the timer / the
+                    // Discord half arriving), so this never double-assigns.
+                    if sink.is_none()
+                        && frame_db > nvb_audio::mixer::SPEAKING_FLOOR_DBFS
+                        && links.end_arrival_grace(key)
+                    {
+                        if links.matrix_excluded(key) {
+                            // The half arrived in the same instant: stay listen-only.
+                            tracing::info!(track = %key, "arrival grace: speech, but the paired Discord account is present — no puppet");
+                        } else {
+                            tracing::info!(track = %key, level_db = format_args!("{:.1}", frame_db), "arrival grace ended by speech — assigning puppet");
+                            sink = Some(router.assign(key, &display_name));
+                            router.unlisten(key); // after the assign: the anchor never lapses
                         }
                     }
                     if let Some(sink) = &sink {

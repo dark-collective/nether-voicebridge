@@ -155,3 +155,6 @@ two new DM commands + one slash command.
 
 **Amended by ADR 0003** (2026-10-07): the Matrix half of a present pairing still counts as a *listener* — the
 bridge keeps carrying the Discord side to them — though not as a represented participant.
+
+**Amended by ADR 0003** (2026-10-27, paired arrival grace): `M` arriving without `D` only listens for a short grace
+before getting its puppet, so `D` following moments later causes no puppet churn.

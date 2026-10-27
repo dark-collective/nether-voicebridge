@@ -44,7 +44,8 @@ const SAMPLE_RATE: u32 = 48_000;
 /// Read by the Discord-side speaking gate (via [`PlaybackMixer::loud_frames`]) to
 /// pause/resume the puppet's track so its Discord "speaking" ring tracks real
 /// audio instead of staying permanently green.
-const SPEAKING_FLOOR_DBFS: f32 = -50.0;
+/// Also the "they spoke" gate that ends a paired arrival grace (matrix-rtc).
+pub const SPEAKING_FLOOR_DBFS: f32 = -50.0;
 
 /// A set of per-participant jitter buffers that mix down to one mono stream.
 ///

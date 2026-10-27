@@ -176,6 +176,7 @@
 # voice_health_sweep_ms = 15000 # silent-voice-death probe cadence
 # session_rotate_min_interval_ms = 90000  # min spacing between ghost Olm session rotations (#52)
 # paired_leave_grace_ms = 30000  # a paired member's Discord session may drop and return this long before the puppet fallback + notice (ADR 0001)
+# paired_arrival_grace_ms = 30000  # a paired member joining the call without their Discord half only listens (standby anchor) this long before getting a puppet; speaking ends it early (ADR 0003)
 
 [puppets]
 # One entry per puppet bot — each is a SEPARATE Discord application with its own

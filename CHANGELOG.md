@@ -27,6 +27,15 @@ adheres to [Semantic Versioning](https://semver.org/).
   also when they are not streaming on Discord, withdraw it (an attached stream ends within seconds), and list what they
   allowed. `/bridge optout` withdraws every such permission. Stored with the keys in `companions.toml`.
 
+## [0.4.14] - 2026-10-27
+
+### Changed
+- **No puppet churn when a paired person's Discord session follows them into the call:** a paired Matrix user who joins
+  the call while none of their paired Discord accounts is in the channel now only listens for
+  `[timing] paired_arrival_grace_ms` (default 30 s) — the capture bot joins in standby, never under their name. If
+  their Discord account arrives within it, no puppet is ever assigned (before, a bot joined Discord as them, then
+  renamed to standby and lingered). If it doesn't, or if they speak first, they get their puppet as before (ADR 0003).
+
 ## [0.4.13] - 2026-10-27
 
 ### Fixed

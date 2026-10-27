@@ -85,3 +85,14 @@ side for them, so no bridge bot is needed in the channel while they are the only
 explicit contract between the bridge and such clients — a separate ADR.
 
 **Follow-up (ADR 0004, 2026-10-12):** the "future" case is answered by the companion interface's `listen:self` lease.
+
+**Amendment — paired arrival grace (operator, 2026-10-27; 0.4.14):** when `M` joins the call while none of its paired
+Discord accounts is in the channel, the bridge used to assign a puppet at once (ADR 0001 §2: `M` alone is ordinary).
+A companion setup's `D` typically follows within seconds, so a bot joined Discord under the person's name, then
+renamed to standby and lingered as the anchor — visible churn. Now `M` first only *listens* for
+`[timing] paired_arrival_grace_ms` (default 30 s): the anchor joins in standby (never under their name) and they hear
+Discord as above. `D` arriving ends the grace with no puppet ever assigned; the grace expiring, or `M`'s first voiced
+frame (they are talking to Discord), assigns the puppet (assign *before* unlisten, so the anchor never lapses). Phase 1
+gates on the pairing alone; a later phase may use a companion's lease as the signal. Cost: a paired person who joins
+without `D` and stays silent is heard on Discord only after the grace. Tests: `links.rs` unit tests; e2e
+`linked_arrival_grace`.
