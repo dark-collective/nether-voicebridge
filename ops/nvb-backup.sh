@@ -1,7 +1,9 @@
 #!/bin/bash
 # nvb-backup — daily snapshot of the bridge's admin/config state.
 # Crypto stores are deliberately EXCLUDED: losing one just re-provisions a
-# fresh device (peer-safe, #30). The archive contains tokens → mode 600.
+# fresh device (peer-safe, #30). The cross-signing key (#150) is INCLUDED:
+# without it no new bot device can be signed short of resetting the identity.
+# The archive contains tokens → mode 600.
 # See docs/operations-runbook.md in the nether-voicebridge repo.
 set -eu
 . "${NVB_OPS_CONF:-/opt/nvb-ops/nvb-ops.conf}"
@@ -14,7 +16,8 @@ for f in /etc/nether-voicebridge/config.toml \
          /var/lib/nether-voicebridge/self_serve_allow.toml \
          /var/lib/nether-voicebridge/audit.jsonl \
          /var/lib/nether-voicebridge/audit.jsonl.1 \
-         /opt/nvb-ops/nvb-ops.conf; do
+         /opt/nvb-ops/nvb-ops.conf \
+         /var/lib/nether-voicebridge/cross-signing/*.key; do
     [ -f "$f" ] && files+=("$f")
 done
 tar czf "$out" --absolute-names "${files[@]}"
