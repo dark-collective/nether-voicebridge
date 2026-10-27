@@ -133,7 +133,7 @@ use matrix_sdk::{
     deserialized_responses::SyncOrStrippedState,
     event_handler::Ctx,
     ruma::{
-        OwnedUserId, UserId,
+        OwnedRoomId, OwnedUserId, UserId,
         events::room::member::{
             MembershipState, RoomMemberEventContent, StrippedRoomMemberEvent,
         },
@@ -277,6 +277,10 @@ struct BotCtx {
     /// outbound explanations to [`NON_DIRECT_EXPLAIN_COOLDOWN`] — a spammer
     /// must not be able to farm outbound DMs off invite rejections.
     explain_stamps: StdMutex<HashMap<String, Instant>>,
+    /// The DM room each person last sent the bot a message in (#150) —
+    /// [`dm_room_for`]'s first choice, so bot→user notices land where the
+    /// person is actually talking to the bot instead of in a fresh room.
+    last_dm: StdMutex<HashMap<String, OwnedRoomId>>,
     /// Active `tutorial` walkthroughs (#102): room id → (last step SENT, last
     /// activity). Advanced by `next`, ended by `stop` or the final step;
     /// stale entries are pruned lazily against [`TUTORIAL_IDLE_TTL`].
@@ -742,6 +746,7 @@ async fn check_room_call_power(ctx: &BotCtx, client: &Client, statuses: &[Bridge
         reply(&room, &notice).await;
         if let Some(owner) = &b.owner {
             if let Err(e) = dm_user(
+                ctx,
                 client,
                 owner,
                 &format!("Heads-up about your bridge '{}' ({}):\n{notice}", b.label, b.room_id),
@@ -1146,6 +1151,10 @@ pub async fn run(
         }
     }
 
+    // #150: sign this device with the shared bot account's cross-signing
+    // identity, so DMs with the bot show no unverified-device warning.
+    crate::cross_signing::ensure_device_cross_signed(&client).await;
+
     // Best-effort profile. The account is shared with the bridges (same
     // appservice bot user, whose E2EE bridges set their own display name via
     // apply_bot_profile), so only touch it when the operator explicitly
@@ -1224,6 +1233,7 @@ pub async fn run(
         notify_stamps: StdMutex::new(HashMap::new()),
         invite_inflight: StdMutex::new(HashSet::new()),
         explain_stamps: StdMutex::new(HashMap::new()),
+        last_dm: StdMutex::new(HashMap::new()),
         tutorial_state: StdMutex::new(HashMap::new()),
         notice_tx: pool_io.notice_tx,
     });
@@ -1357,6 +1367,11 @@ pub async fn run(
                 tracing::debug!(sender = %ev.sender, "ignoring message from non-self-serve user");
                 return;
             }
+            // #150: later bot→user notices go to the DM this person uses.
+            ctx.last_dm
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(sender.to_owned(), room.room_id().to_owned());
             match parse_command(&text.body) {
                 Parsed::Cmd(cmd) => {
                     // Self-serve tier (#43): non-operators get the scoped
@@ -4264,11 +4279,110 @@ fn explain_non_direct_reject(ctx: &BotCtx, inviter: String) {
     });
 }
 
-/// DM `text` to `mxid` as the bot, reusing an existing direct room when the
-/// SDK knows one (#94). Extracted so `msg` and `announce` share the path.
-async fn dm_user(client: &Client, mxid: &str, text: &str) -> Result<(), String> {
+/// One existing room the bot could DM a person in, as [`pick_dm_room`] ranks it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DmCandidate {
+    /// The person last messaged the bot in this room (`BotCtx::last_dm`).
+    last_spoke: bool,
+    /// The bot's own `m.direct` lists this room for the person.
+    marked_direct: bool,
+    /// The person is joined (not just invited — a pending invite the bot
+    /// sent earlier still counts, so repeat notices don't pile up rooms).
+    target_joined: bool,
+    encrypted: bool,
+    /// Timestamp (ms) of the room's latest event, when the SDK has one.
+    latest_ts: Option<u64>,
+}
+
+/// Index of the best existing DM room (#150): the room the person last spoke
+/// in, then one `m.direct` lists, preferring rooms they've joined, encrypted
+/// over plaintext (a #101 explanation room is plaintext), then the newest.
+fn pick_dm_room(candidates: &[DmCandidate]) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, c)| {
+            (c.last_spoke, c.marked_direct, c.target_joined, c.encrypted, c.latest_ts)
+        })
+        .map(|(i, _)| i)
+}
+
+/// The room to DM `uid` in (#150): reuse an existing direct room with them and
+/// only create one when there is none. Before this, every notice called
+/// `create_dm`, which ALWAYS creates a room — one person ended up with three
+/// DMs (the pair-code reply, the pairing confirmation, a failover notice).
+///
+/// Candidates are the bot's joined rooms with at most two members where `uid`
+/// is joined or invited. A room counts if the person last spoke there, if
+/// `m.direct` lists it, or — for a DM the person opened, which the raw
+/// appservice join never added to `m.direct` — if it is a two-member room
+/// with no name or alias that isn't a tenant's bridged room. A reused room
+/// missing from `m.direct` is added, so the next lookup finds it directly.
+async fn dm_room_for(ctx: &BotCtx, client: &Client, uid: &UserId) -> Result<Room, String> {
+    use matrix_sdk::ruma::events::direct::DirectUserIdentifier;
+    let last = ctx
+        .last_dm
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(uid.as_str())
+        .cloned();
+    let mut rooms = Vec::new();
+    let mut candidates = Vec::new();
+    for room in client.joined_rooms() {
+        let members = room.joined_members_count();
+        if !is_command_room(members) {
+            continue;
+        }
+        let target_joined = match room.get_member_no_sync(uid).await {
+            Ok(Some(m)) => match m.membership() {
+                MembershipState::Join => true,
+                MembershipState::Invite => false,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let targets = room.direct_targets();
+        let marked_direct =
+            targets.len() == 1 && targets.contains(<&DirectUserIdentifier>::from(uid));
+        let last_spoke = last.as_deref() == Some(room.room_id());
+        if !marked_direct && !last_spoke {
+            let unnamed = room.name().is_none() && room.canonical_alias().is_none();
+            if !(target_joined && members == 2 && unnamed)
+                || tenant_owner_of_room(ctx, room.room_id().as_str()).is_some()
+            {
+                continue;
+            }
+        }
+        candidates.push(DmCandidate {
+            last_spoke,
+            marked_direct,
+            target_joined,
+            encrypted: room.encryption_state().is_encrypted(),
+            latest_ts: room.latest_event_timestamp().map(|t| u64::from(t.0)),
+        });
+        rooms.push(room);
+    }
+    if let Some(i) = pick_dm_room(&candidates) {
+        let room = rooms.swap_remove(i);
+        if !candidates[i].marked_direct {
+            // Best-effort: the room is still the right one if this fails.
+            if let Err(e) = client.account().mark_as_dm(room.room_id(), &[uid.to_owned()]).await {
+                tracing::debug!(room_id = %room.room_id(), target_user = %uid, error = %e, "could not add the reused DM to m.direct (#150)");
+            }
+        }
+        tracing::debug!(room_id = %room.room_id(), target_user = %uid, "reusing the existing DM (#150)");
+        return Ok(room);
+    }
+    let room = client.create_dm(uid).await.map_err(|e| e.to_string())?;
+    tracing::info!(room_id = %room.room_id(), target_user = %uid, "no DM with this user yet — created one (#150)");
+    Ok(room)
+}
+
+/// DM `text` to `mxid` as the bot, in the existing direct room when there is
+/// one ([`dm_room_for`], #150). Shared by `msg`, `announce` and every notice.
+async fn dm_user(ctx: &BotCtx, client: &Client, mxid: &str, text: &str) -> Result<(), String> {
     let uid = UserId::parse(mxid).map_err(|e| e.to_string())?;
-    let dm = client.create_dm(&uid).await.map_err(|e| e.to_string())?;
+    let dm = dm_room_for(ctx, client, &uid).await?;
     // #97 residual, #100 mode 2: in an encrypted DM the SDK computes megolm
     // recipients from its LOCAL member list, which lags a fresh `create_dm` —
     // sending immediately shares the room key with nobody, and the recipient
@@ -4600,7 +4714,7 @@ async fn handle_discord_pair(ctx: &BotCtx, client: &Client, req: DiscordPair) {
             Some(m) => match links.registry.reconcile_after(|| links.pairings.remove(&m, req.discord_user_id)) {
                 Ok(_) => {
                     audit(ctx, &req.invoker, "discord_unpair", serde_json::json!({ "matrix_user": m, "discord_user_id": req.discord_user_id.to_string() }));
-                    let _ = dm_user(client, &m, &format!("Your pairing with Discord user {} was removed from the Discord side ({}).", req.discord_user_id, req.invoker)).await;
+                    let _ = dm_user(ctx, client, &m, &format!("Your pairing with Discord user {} was removed from the Discord side ({}).", req.discord_user_id, req.invoker)).await;
                     format!("✅ Unpaired from `{m}`. You are bridged as an ordinary Discord member again.")
                 }
                 Err(e) => format!("Cannot write the pairings file: {e}"),
@@ -4629,7 +4743,7 @@ async fn handle_discord_pair(ctx: &BotCtx, client: &Client, req: DiscordPair) {
     let text = match res {
         Ok(()) => {
             audit(ctx, &req.invoker, "pair", serde_json::json!({ "matrix_user": m, "discord_user_id": req.discord_user_id.to_string(), "guild_id": req.guild_id.to_string() }));
-            let _ = dm_user(client, &m, &format!("✅ Paired with Discord user {} ({}). While that account is in a bridged voice channel and you are in the room's call, you are one person to the bridge: no ghost, no puppet. `pairings` lists your pairings; `unpair` removes them.", req.discord_user_id, req.invoker)).await;
+            let _ = dm_user(ctx, client, &m, &format!("✅ Paired with Discord user {} ({}). While that account is in a bridged voice channel and you are in the room's call, you are one person to the bridge: no ghost, no puppet. `pairings` lists your pairings; `unpair` removes them.", req.discord_user_id, req.invoker)).await;
             format!("✅ This Discord account is now paired with `{m}`.")
         }
         Err(nvb_config::pairings::PairErrorOrIo::Pair(nvb_config::pairings::PairError::DiscordTakenBy(other))) => {
@@ -4659,12 +4773,12 @@ async fn deliver_link_notice(ctx: &BotCtx, client: &Client, n: crate::links_noti
         room_label(client, &n.room_id),
         LINK_NOTICE_COOLDOWN.as_secs() / 60
     );
-    if let Err(e) = dm_user(client, &n.user, &text).await {
+    if let Err(e) = dm_user(ctx, client, &n.user, &text).await {
         tracing::warn!(mxid = %n.user, error = %e, "failover notice DM failed");
     }
     for d in &n.delegates {
         let dtext = format!("ℹ️ {}: {}", n.user, text.trim_start_matches("ℹ️ "));
-        if let Err(e) = dm_user(client, d, &dtext).await {
+        if let Err(e) = dm_user(ctx, client, d, &dtext).await {
             tracing::warn!(mxid = %d, error = %e, "failover notice DM to delegate failed");
         }
     }
@@ -4691,7 +4805,7 @@ async fn handle_msg(ctx: &BotCtx, room: &Room, sender: &str, mxid: &str, text: &
         return;
     }
     let body = format!("📣 Message from the bridge operator:\n{text}");
-    match dm_user(&room.client(), mxid, &body).await {
+    match dm_user(ctx, &room.client(), mxid, &body).await {
         Ok(()) => {
             audit(ctx, sender, "operator_msg", serde_json::json!({ "to": mxid }));
             reply(room, &format!("✅ Sent to {mxid}.")).await;
@@ -4773,7 +4887,7 @@ async fn handle_announce_confirm(ctx: &BotCtx, room: &Room, sender: &str) {
     let client = room.client();
     let (mut sent, mut failed) = (0usize, Vec::new());
     for r in &recipients {
-        match dm_user(&client, r, &body).await {
+        match dm_user(ctx, &client, r, &body).await {
             Ok(()) => sent += 1,
             Err(e) => failed.push(format!("{r} ({e})")),
         }
@@ -5650,6 +5764,35 @@ mod tests {
         assert!(tutorial_step_text(&ctx, 0).is_none());
     }
 
+    fn dm(last_spoke: bool, marked_direct: bool, target_joined: bool, encrypted: bool, latest_ts: Option<u64>) -> DmCandidate {
+        DmCandidate { last_spoke, marked_direct, target_joined, encrypted, latest_ts }
+    }
+
+    #[test]
+    fn pick_dm_room_none_without_candidates() {
+        assert_eq!(pick_dm_room(&[]), None);
+    }
+
+    #[test]
+    fn pick_dm_room_prefers_where_the_user_last_spoke() {
+        // #150: the room the person talks to the bot in beats an m.direct
+        // room the bot created for an earlier notice, even a newer one.
+        let c = [dm(false, true, true, true, Some(900)), dm(true, false, true, true, Some(100))];
+        assert_eq!(pick_dm_room(&c), Some(1));
+    }
+
+    #[test]
+    fn pick_dm_room_prefers_m_direct_then_joined_then_encrypted_then_newest() {
+        let c = [dm(false, false, true, true, Some(900)), dm(false, true, false, true, Some(1))];
+        assert_eq!(pick_dm_room(&c), Some(1), "m.direct beats an unlisted room");
+        let c = [dm(false, true, false, true, Some(900)), dm(false, true, true, true, Some(1))];
+        assert_eq!(pick_dm_room(&c), Some(1), "joined beats a pending invite");
+        let c = [dm(false, true, true, false, Some(900)), dm(false, true, true, true, Some(1))];
+        assert_eq!(pick_dm_room(&c), Some(1), "encrypted beats a plaintext room");
+        let c = [dm(false, true, true, true, Some(1)), dm(false, true, true, true, Some(900)), dm(false, true, true, true, None)];
+        assert_eq!(pick_dm_room(&c), Some(1), "newest wins a tie");
+    }
+
     /// #101: the once-per-ttl stamp claims, suppresses, and re-claims after
     /// expiry — the outbound-DM rate limit on rejection explanations.
     #[test]
@@ -6139,6 +6282,7 @@ mod tests {
             notify_stamps: StdMutex::new(HashMap::new()),
             invite_inflight: StdMutex::new(HashSet::new()),
             explain_stamps: StdMutex::new(HashMap::new()),
+            last_dm: StdMutex::new(HashMap::new()),
             tutorial_state: StdMutex::new(HashMap::new()),
             notice_tx: None,
         };

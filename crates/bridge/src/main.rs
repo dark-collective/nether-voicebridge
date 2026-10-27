@@ -123,6 +123,9 @@ async fn main() -> Result<()> {
         static_keys.reserve_management(m);
     }
 
+    // #150: every bot client's device is cross-signed from key files here.
+    nvb_matrix_rtc::cross_signing::set_key_dir(&cfg.data_dir);
+
     let nvb_config::Config {
         puppets,
         bridges,
