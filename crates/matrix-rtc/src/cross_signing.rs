@@ -82,10 +82,7 @@ async fn ensure_inner(client: &Client, dir: &Path) -> Result<()> {
     let user_id = client.user_id().context("client has no user id")?.to_owned();
     let path = key_path(dir, user_id.as_str());
 
-    if let Some(s) = enc.cross_signing_status().await
-        && s.has_master
-        && s.has_self_signing
-    {
+    if enc.cross_signing_status().await.is_some_and(|s| s.has_master && s.has_self_signing) {
         // This store already holds the private keys; just make sure the
         // device itself carries the signature.
         return sign_own_device(client).await;
