@@ -27,6 +27,18 @@ adheres to [Semantic Versioning](https://semver.org/).
   also when they are not streaming on Discord, withdraw it (an attached stream ends within seconds), and list what they
   allowed. `/bridge optout` withdraws every such permission. Stored with the keys in `companions.toml`.
 
+## [0.4.13] - 2026-10-27
+
+### Fixed
+- **The bot opened a new DM for every notice:** `msg`, `announce`, pairing, failover/leave and link notices now go to
+  the DM the user already has with the bot (the room they last talked in, else the one in `m.direct`). A new room is
+  only opened when none exists.
+- **"Unverified devices" warning in DMs with the bot:** the bot account now has a cross-signing identity and every one
+  of its devices is signed by it. The first device creates the identity and keeps the private keys in the account's
+  secret storage; its key is written to `<data_dir>/cross-signing/<bot>.key` (0600, back it up). Other devices,
+  including re-provisioned stores, import from there. An account that already has an identity but no key file is
+  left alone with a warning.
+
 ## [0.4.12] - 2026-10-26
 
 ### Fixed
