@@ -16,6 +16,7 @@ pub mod lifecycle;
 pub mod linked_identities;
 pub mod link_invite_only;
 pub mod mgmt_dm_e2ee;
+pub mod mgmt_dm_reuse;
 pub mod mgmt_self_serve;
 pub mod room_misconfig;
 pub mod moderation;
@@ -32,6 +33,7 @@ pub fn all() -> Vec<&'static ScenarioDef> {
         &smoke::SMOKE_OPEN_CLOSE,
         &mgmt_self_serve::MGMT_SELF_SERVE_LINK,
         &mgmt_dm_e2ee::MGMT_DM_E2EE,
+        &mgmt_dm_reuse::MGMT_DM_REUSE,
         &invite_lifecycle::MGMT_INVITE_OFFLINE,
         &invite_lifecycle::MGMT_DM_PENDING_REAP,
         &link_invite_only::MGMT_LINK_INVITE_ONLY,
