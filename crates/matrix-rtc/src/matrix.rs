@@ -648,6 +648,10 @@ pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Cli
         }
     }
 
+    // #150: the device keys are uploaded now — sign this device with the bot
+    // account's cross-signing identity (creating it on first run).
+    crate::cross_signing::ensure_device_cross_signed(&client).await;
+
     Ok(client)
 }
 

@@ -21,6 +21,7 @@
 //! driven — mirroring how the Discord `PuppetPool` is shared.
 
 mod auth_error;
+pub mod cross_signing;
 mod device_prune;
 mod matrix;
 pub mod links_notice;
