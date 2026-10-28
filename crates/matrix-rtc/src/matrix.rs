@@ -616,9 +616,15 @@ pub(crate) async fn build_client(cfg: &MatrixConfig, bridge: &str) -> Result<Cli
     // unconditionally is harmless for an unencrypted room (just state + a device
     // identity) and required for an encrypted one (Olm keys/OTKs must survive
     // restarts so the SDK can decrypt the media keys EC/Commet send).
+    // History sharing on invite (MSC4268, default-on in matrix-sdk 0.18) is
+    // turned off: it runs before every `invite_user_by_id` once the bot has a
+    // cross-signing identity (0.4.13), fails for ghosts (no identity of their
+    // own), and its error aborts the invite itself — so a new ghost could never
+    // enter an invite-only/restricted room. Ghosts don't need message history.
     let builder = Client::builder()
         .homeserver_url(&cfg.homeserver_url)
-        .sqlite_store(&cfg.store_path, None);
+        .sqlite_store(&cfg.store_path, None)
+        .with_enable_share_history_on_invite(false);
     let client = builder.build().await?;
 
     let bot_user_id: OwnedUserId = cfg.bot_user_id.parse()?;

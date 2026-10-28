@@ -1050,7 +1050,7 @@ async fn run_ghost(
         // if the room really was restricted, it fails there with a clear 403.
         if let Err(e) = invite_ghost(&client, &cfg.room_id, &ghost_mxid).await {
             tracing::warn!(
-                error = %e,
+                error = format!("{e:#}"),
                 bot = %cfg.bot_user_id,
                 room = %cfg.room_id,
                 "ghost invite failed — trying join anyway (restricted rooms need the bot to have invite power)"
@@ -1058,7 +1058,7 @@ async fn run_ghost(
         }
         // 3. Join the room (required before posting m.call.member).
         if let Err(e) = join_room(&cfg, &ghost_mxid).await {
-            tracing::error!(error = %e, "ghost join_room failed — skipping");
+            tracing::error!(error = format!("{e:#}"), "ghost join_room failed — skipping");
             return;
         }
         // 3b. E2EE only: warm the crypto client + start key distribution NOW — on

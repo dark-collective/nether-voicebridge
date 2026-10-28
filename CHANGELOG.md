@@ -27,6 +27,15 @@ adheres to [Semantic Versioning](https://semver.org/).
   also when they are not streaming on Discord, withdraw it (an attached stream ends within seconds), and list what they
   allowed. `/bridge optout` withdraws every such permission. Stored with the keys in `companions.toml`.
 
+### Fixed
+- **New Discord speakers couldn't join invite-only or restricted rooms (regression in 0.4.13):** once the bot account
+  got a cross-signing identity, matrix-sdk's history sharing on invite (MSC4268, on by default) started running before
+  every ghost invite. It fails for ghosts, and its error aborted the invite itself, so a ghost the room hadn't seen
+  before was rejected with `403 M_FORBIDDEN "Event is not authorized."` and never appeared in the call. Ghosts already
+  in the room and public rooms were unaffected. History sharing on invite is now off for the bridge and management
+  bots (ghosts don't need message history). The `ghost invite failed` and `ghost join_room failed` logs now include
+  the full error chain, including the homeserver's answer.
+
 ## [0.4.14] - 2026-10-27
 
 ### Changed
