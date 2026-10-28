@@ -1044,9 +1044,12 @@ pub async fn run(
         .parse()
         .with_context(|| format!("parsing management bot_user_id '{}'", cfg.bot_user_id))?;
 
+    // No history sharing on invite: see `matrix.rs::build_client` — once the bot
+    // is cross-signed, a failed share aborts the invite itself.
     let client = Client::builder()
         .homeserver_url(&cfg.homeserver_url)
         .sqlite_store(&cfg.store_path, None)
+        .with_enable_share_history_on_invite(false)
         .build()
         .await
         .context("building management-bot client")?;
