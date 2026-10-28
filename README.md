@@ -196,6 +196,14 @@ docker compose logs -f
 ```
 
 ### Environment Variables
+
+Environment variables configure **exactly one fixed bridge** and are used only
+when no config file is mounted. That mode has no management bot, so it can't do
+self-service linking. For a self-service deployment (bridges created by DMing
+the bot, stored in `tenants.toml`), mount a `config.toml` instead with a
+`[server.<name>]` profile, a `[management]` block and **no** `[[bridge]]`
+blocks. See the *Management bot* section of `config.example.toml`.
+
 | Variable | Required | Default | Notes |
 |---|---|---|---|
 | `NETHER_PUPPET_TOKENS` | ✓ | | Comma-separated Discord bot tokens |
@@ -204,7 +212,8 @@ docker compose logs -f
 | `NETHER_MATRIX_HOMESERVER_URL` | ✓ | | |
 | `NETHER_MATRIX_ROOM_ID` | ✓ | | Internal room ID (`!abc:nether.im`) |
 | `NETHER_MATRIX_BOT_USER_ID` | one of¹ | | Full bot MXID |
-| `NETHER_MATRIX_SENDER_LOCALPART` | one of¹ | | Bot localpart; derives MXID from homeserver domain |
+| `NETHER_MATRIX_SENDER_LOCALPART` | one of¹ | | Bot localpart; derives MXID from `NETHER_MATRIX_DOMAIN` |
+| `NETHER_MATRIX_DOMAIN` | | *(host of `HOMESERVER_URL`)* | Public Matrix domain (server name), e.g. `example.org`. Used for the derived bot MXID and for `.well-known` (MatrixRTC/LiveKit) discovery. Set it whenever `HOMESERVER_URL` isn't on that domain, e.g. `https://matrix.example.org` or an internal `http://synapse:8008` |
 | `NETHER_MATRIX_DEVICE_ID` | | *(auto-derived)* | Derived from the bridge name when unset |
 | `NETHER_MATRIX_APPSERVICE_ID` | ✓ | | |
 | `NETHER_MATRIX_APPSERVICE_TOKEN` | ✓ | | |
@@ -221,7 +230,8 @@ docker compose logs -f
 
 ¹ At least one of `BOT_USER_ID` or `SENDER_LOCALPART` is required. When only
 `SENDER_LOCALPART` is set, the bot MXID is derived as
-`@{localpart}_bot:{homeserver}` (the `_bot` suffix avoids the appservice's bare
+`@{localpart}_bot:{domain}`, where `{domain}` is `NETHER_MATRIX_DOMAIN` or, when that
+is unset, the host of `HOMESERVER_URL` (the `_bot` suffix avoids the appservice's bare
 sender user, which Synapse blocks from sync). `SENDER_LOCALPART` is also the stem
 of the ghost MXIDs (`@{localpart}_<id>`), so it must equal the stem of your
 appservice users-namespace regex — set the regex to `@{localpart}_.*` so it covers

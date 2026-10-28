@@ -14,11 +14,20 @@ Fill in `config.toml` with your credentials. See the comments in `config.example
 
 You do **not** need to set `store_path`. The image sets `NVB_DATA_DIR=/app/data`, so any bridge that omits `matrix.store_path` gets `/app/data/<bridge>` automatically — landing on the persistent volume (below) with a distinct path per bridge. Only set `store_path` explicitly if you want a custom location.
 
-`matrix_domain` (or `NETHER_MATRIX_DOMAIN`) is an optional field that lets you
-explicitly set the Matrix domain used to construct user IDs (e.g. `nether.im`).
-When omitted, the bridge derives it from `homeserver_url`. Set it when those two
-differ — for example, when `homeserver_url` points to an internal address rather
-than the public domain.
+`matrix_domain` (or `NETHER_MATRIX_DOMAIN`) is an optional field that sets the
+public Matrix domain (server name, e.g. `nether.im`). The bridge uses it to build
+the bot's user ID from `sender_localpart`, and to fetch
+`https://<domain>/.well-known/matrix/client` for MatrixRTC/LiveKit discovery.
+When omitted, the bridge uses the host of `homeserver_url` for both. Set it
+whenever the two differ, e.g. `homeserver_url = "https://matrix.example.org"`
+for server name `example.org`, or an internal container address such as
+`http://synapse:8008`. Otherwise the bot ID lands outside the appservice
+namespace (`M_EXCLUSIVE`) and LiveKit discovery fails.
+
+Environment variables (`NETHER_*`) only configure a single fixed bridge, used
+when no config file is mounted, and that mode has no management bot. For
+self-service linking, mount a `config.toml` with a `[server.<name>]` profile, a
+`[management]` block and no `[[bridge]]` blocks.
 
 ### 2. Build the image
 
