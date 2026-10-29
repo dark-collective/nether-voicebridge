@@ -1310,7 +1310,7 @@ async fn departure_grace_elapsed(d: DepartureCtx) {
         Some(room) => resolve_member_name(&room, &d.mxid).await,
         None => user.to_owned(),
     };
-    tracing::info!(mxid = %user, display_name = %name, "departure grace elapsed — member stayed in the call — assigning puppet");
+    tracing::info!(mxid = %user, display_name = %name, "departure grace elapsed — member is no longer bridge-owned and stayed in the call — assigning puppet");
     d.router.assign(user, &name);
     d.router.unlisten(user); // after the assign: the anchor never lapses
     crate::links_notice::emit(&d.links, user);
