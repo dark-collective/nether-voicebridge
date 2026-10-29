@@ -185,7 +185,7 @@ async fn state_content(room: &matrix_sdk::Room, event_type: &str, state_key: &st
 
 async fn advertise_once(room: &matrix_sdk::Room, bot: &UserId, want: &serde_json::Value) -> anyhow::Result<()> {
     use nvb_companion::selfcall::{API_MEMBER_FIELD, API_STATE_EVENT};
-    if room.can_user_send_state(bot, API_STATE_EVENT.into()).await? {
+    if room.power_levels().await?.user_can_send_state(bot, API_STATE_EVENT.into()) {
         if state_content(room, API_STATE_EVENT, bot.as_str()).await.as_ref() != Some(want) {
             room.send_state_event_raw(API_STATE_EVENT, bot.as_str(), want.clone()).await?;
             tracing::info!("advertised the companion API in room state");

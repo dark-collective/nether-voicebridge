@@ -838,6 +838,12 @@ pub struct SelfStream {
     pub facts: Arc<dyn RoomFacts>,
 }
 
+impl std::fmt::Debug for SelfStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelfStream").field("key_id", &self.key_id).field("room_id", &self.room_id).finish_non_exhaustive()
+    }
+}
+
 impl SelfStream {
     pub fn hub(&self) -> &Arc<CompanionHub> {
         &self.hub

@@ -10,6 +10,7 @@
 
 pub mod audio;
 pub mod companion;
+pub mod self_call;
 pub mod federation;
 pub mod invite_lifecycle;
 pub mod lifecycle;
@@ -59,6 +60,7 @@ pub fn all() -> Vec<&'static ScenarioDef> {
         &linked_identities::LINKED_IDENTITY_EXCLUSION,
         &linked_identities::LINKED_ARRIVAL_GRACE,
         &companion::COMPANION_STREAM_ATTACH,
+        &self_call::SELF_CALL_DATA,
         &overflow_fcfs::OVERFLOW_FCFS_PROMOTION,
         &multi_bridge_isolation::MULTI_BRIDGE_ISOLATION,
         &steal_repromotion::STEAL_RELEASE_REPROMOTION,
