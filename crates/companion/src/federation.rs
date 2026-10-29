@@ -533,7 +533,7 @@ mod tests {
         m.extend_from_slice(&[0, 33, 0, 1]);
         // Answer: name = pointer to the question.
         m.extend_from_slice(&[0xc0, qname_at as u8, 0, 33, 0, 1, 0, 0, 0x0e, 0x10]);
-        let mut rdata = vec![0, 10, 0, 5, 0x21, 0x10];
+        let mut rdata = vec![0, 10, 0, 5, 0x21, 0x00]; // priority 10, weight 5, port 8448
         rdata.push(6);
         rdata.extend_from_slice(b"matrix");
         // "example.org" by pointer into the question (offset of "example").
