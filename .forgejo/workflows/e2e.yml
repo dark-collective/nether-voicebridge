@@ -12,7 +12,7 @@ name: E2E (live)
 # default-branch push that touched THIS file — a source-only merge does NOT
 # refresh it. After merging a fix the nightly must pick up, bump this file
 # (a comment edit suffices) so the schedule re-registers on current master.
-# (last bump: 2026-10-26, multi_bridge_isolation retry-leak + nickname fix.)
+# (last bump: 2026-10-29, skip push runs when GitHub CI is already red.)
 on:
   workflow_dispatch:
     inputs:
@@ -67,9 +67,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Pushes only: skip the live run when the GitHub mirror's hermetic gate
+      # (.github/workflows/ci.yml) has already gone red for this commit, so a
+      # commit that doesn't compile or fails its unit tests doesn't hold the
+      # shared runner. Checked again after the build (GitHub usually finishes
+      # by then). Only a definite red skips; pending/unknown (mirror lag, API
+      # limits) runs exactly as before. Nightly and dispatched runs never skip.
+      - name: GitHub CI check (before build)
+        id: gh_pre
+        if: github.event_name == 'push'
+        run: |
+          state=$(sh .forgejo/scripts/github-ci-state.sh "${{ github.sha }}")
+          echo "GitHub CI for ${{ github.sha }}: $state"
+          if [ "$state" = red ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping the live run: GitHub CI is red for this commit."
+          fi
+
       # Same native deps as the CI build (livekit: cmake/clang/bindgen + protobuf;
       # opus dynamically linked).
       - name: Install native build dependencies
+        if: steps.gh_pre.outputs.skip != 'true'
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
@@ -80,6 +98,7 @@ jobs:
       # it); e2e now saves it itself on a miss, keeping target/ (incl. the
       # libwebrtc download and an already-compiled bridge) warm.
       - name: Cache toolchain + cargo + target
+        if: steps.gh_pre.outputs.skip != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -92,6 +111,7 @@ jobs:
             ci-
 
       - name: Install Rust toolchain
+        if: steps.gh_pre.outputs.skip != 'true'
         run: |
           if ! [ -x "$HOME/.cargo/bin/cargo" ]; then
             curl -sSf https://sh.rustup.rs \
@@ -104,9 +124,22 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build bridge + harness
+        if: steps.gh_pre.outputs.skip != 'true'
         run: cargo build --locked -p nether-voicebridge -p nvb-e2e
 
+      - name: GitHub CI check (after build)
+        id: gh_post
+        if: github.event_name == 'push' && steps.gh_pre.outputs.skip != 'true'
+        run: |
+          state=$(sh .forgejo/scripts/github-ci-state.sh "${{ github.sha }}")
+          echo "GitHub CI for ${{ github.sha }}: $state"
+          if [ "$state" = red ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping the live run: GitHub CI is red for this commit."
+          fi
+
       - name: Run scenarios
+        if: steps.gh_pre.outputs.skip != 'true' && steps.gh_post.outputs.skip != 'true'
         env:
           # Public standing-environment ids (also in e2e.example.toml).
           NVB_E2E_HOMESERVER_URL: https://nether.im
