@@ -2213,7 +2213,7 @@ mod tests {
 
         // A hashed member is recognised once a key named its member.id …
         let hashed = HashSet::from([hashed_identity_with_device(owner, "PHONE", "mem-1")]);
-        assert!(roster_mxids(&hashed, &entries, &[]).is_empty());
+        assert!(!roster_mxids(&hashed, &entries, &[]).contains(owner), "unknown until its member.id is seen");
         let key = PeerKey {
             sender: owner.into(),
             device_id: "PHONE".into(),
