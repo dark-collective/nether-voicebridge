@@ -27,6 +27,24 @@ adheres to [Semantic Versioning](https://semver.org/).
   also when they are not streaming on Discord, withdraw it (an attached stream ends within seconds), and list what they
   allowed. `/bridge optout` withdraws every such permission. Stored with the keys in `companions.toml`.
 
+- **Your own call data for your own tools (ADR 0005, `[companions] self_enroll`, opt-in):** a device of your own Matrix
+  account — a recorder, a broadcast-software source, a second client that only listens — can enroll once
+  (`POST /_nvb/v1/self/enroll` with an OpenID token, verified on your homeserver's federation API), confirm it with the
+  code the management bot DMs you (`companion key approve <code>`, within 10 minutes; your client can answer it for
+  you — a replayed OpenID token alone gets nothing; the DM names the key id, and a second enrollment of a device
+  while one waits is refused), and then follow `GET /_nvb/v1/self/events` while you are
+  in a bridged call: your own call state and SFUs, your own media key in encrypted rooms, and whether your paired Discord
+  account is in the channel. Never anyone else's key, never media. With `public_url` set, each bridge advertises its API
+  in the room (`im.nether.voicebridge.api`). Up to 5 devices per account; a new connection replaces a device's old
+  stream. Enrolled listen-only devices don't keep a crashed client's call membership alive (the reaper ignores them),
+  and the reaper now recognizes MSC4195 hashed identities once their key arrived, and every device of a legacy
+  multi-device call membership.
+
+### Changed
+- **Paired departure grace:** when a paired person's Discord half leaves, their Matrix half listens for
+  `paired_departure_grace_ms` (default 5 s, and while their own leave is pending) before getting a puppet, so no bot
+  flashes in under their name as they leave. Set it to 0 for the previous behavior.
+
 ### Fixed
 - **New Discord speakers couldn't join invite-only or restricted rooms (regression in 0.4.13):** once the bot account
   got a cross-signing identity, matrix-sdk's history sharing on invite (MSC4268, on by default) started running before

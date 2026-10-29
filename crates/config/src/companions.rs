@@ -26,6 +26,31 @@ pub const ROOM_KINDS: &[&str] = &["observe", "stream:attach", "stream:standalone
 /// Kinds a self-scoped key may carry (the issuer's own pairings).
 pub const SELF_KINDS: &[&str] = &["stream:attach", "listen:self"];
 
+/// The one kind of a **device-bound** self key (ADR 0005): the issuer's own call
+/// data (`/_nvb/v1/self/events`) for one listen-only device of their own account.
+/// Minted only by `/_nvb/v1/self/enroll`, never from the management DM, so it is
+/// deliberately not in [`KINDS`] and [`validate_kinds`] refuses it.
+pub const SELF_CALL_KIND: &str = "self:call";
+
+/// Active device keys one issuer may hold (ADR 0005); approving one more
+/// evicts the issuer's oldest. Pending (unapproved) enrollments are capped
+/// separately at the same number and never evict an active key.
+pub const MAX_DEVICE_KEYS_PER_ISSUER: usize = 5;
+
+/// An enrollment waiting for its owner's confirmation in the management DM
+/// (ADR 0005 §2). Until confirmed the key opens nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PendingApproval {
+    /// Lowercase hex SHA-256 of the confirmation code (normalized uppercase).
+    pub code_sha256: String,
+    /// Unix epoch seconds after which the enrollment is void.
+    pub expires: i64,
+    /// The DM room the code was sent to; only a reply there counts. `None`
+    /// until the message has gone out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dm_room: Option<String>,
+}
+
 /// A key's scope.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", content = "room_id", rename_all = "lowercase")]
@@ -67,6 +92,15 @@ pub struct CompanionKey {
     /// Unix epoch seconds.
     #[serde(default)]
     pub created: i64,
+    /// A device-bound self key (ADR 0005): the issuer's listen-only device this
+    /// key belongs to. Such a key needs no pairing and dies on unlink, revoke or
+    /// re-enrollment of the same device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// A device key not yet confirmed by its owner (ADR 0005 §2). Before the
+    /// scope so the sub-tables follow the plain values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingApproval>,
     /// Last, so it serializes as a sub-table after the plain values.
     pub scope: KeyScope,
 }
@@ -74,6 +108,16 @@ pub struct CompanionKey {
 impl CompanionKey {
     pub fn allows(&self, kind: &str) -> bool {
         self.kinds.iter().any(|k| k == kind)
+    }
+
+    /// Is this a device-bound self key (`/self/enroll`)?
+    pub fn is_device_key(&self) -> bool {
+        self.device.is_some() && self.scope == KeyScope::SelfScope
+    }
+
+    /// A device key confirmed by its owner (or any other key: only device keys can be pending).
+    pub fn is_active(&self) -> bool {
+        self.pending.is_none()
     }
 }
 
@@ -135,6 +179,20 @@ pub fn validate_kinds(scope: &KeyScope, kinds: &[String]) -> Result<Vec<String>,
     Ok(KINDS.iter().filter(|k| kinds.iter().any(|r| r == *k)).map(|k| k.to_string()).collect())
 }
 
+/// Remove the oldest keys matching `which` until at most `keep` remain; returns them.
+fn evict_oldest(keys: &mut Vec<CompanionKey>, which: impl Fn(&CompanionKey) -> bool, keep: usize) -> Vec<CompanionKey> {
+    let mut gone = Vec::new();
+    while keys.iter().filter(|k| which(k)).count() > keep {
+        // Oldest first; among equal timestamps, the earliest stored.
+        let Some(pos) = keys.iter().enumerate().filter(|(_, k)| which(k)).min_by_key(|(i, k)| (k.created, *i)).map(|(i, _)| i)
+        else {
+            break;
+        };
+        gone.push(keys.remove(pos));
+    }
+    gone
+}
+
 /// In-memory mirror of the companions file. Writes go through the file first so
 /// a crash cannot fork the two.
 #[derive(Debug)]
@@ -194,6 +252,77 @@ impl CompanionKeys {
         self.edit(|f| {
             let (gone, keep): (Vec<_>, Vec<_>) =
                 f.keys.drain(..).partition(|k| k.scope.room_id() == Some(room_id));
+            f.keys = keep;
+            f.grants.retain(|g| !gone.iter().any(|k| k.id == g.key_id));
+            gone
+        })
+    }
+
+    /// Store a new, **pending** device-bound key (an enrollment awaiting its
+    /// owner's confirmation). Refused (`Ok(None)`, nothing stored) while another
+    /// enrollment of the same `(issuer, device)` is still pending at `now`: the
+    /// first one stands until it is confirmed or expires, so a racing second
+    /// enrollment can't swap its own code in under the owner's DM. An *expired*
+    /// pending key of that device is replaced. An active key is never touched
+    /// here (it is replaced on confirmation, so a replayed sign-in token can't
+    /// knock out a working device); the issuer's oldest pending key beyond
+    /// [`MAX_DEVICE_KEYS_PER_ISSUER`] is evicted. Returns the keys removed.
+    pub fn add_pending_device_key(&self, key: CompanionKey, now: i64) -> Result<Option<Vec<CompanionKey>>, ConfigError> {
+        self.edit(|f| {
+            let same = |k: &CompanionKey| k.issuer == key.issuer && k.is_device_key() && !k.is_active();
+            let live = |k: &CompanionKey| k.pending.as_ref().is_some_and(|p| p.expires > now);
+            if f.keys.iter().any(|k| same(k) && k.device == key.device && live(k)) {
+                return None;
+            }
+            let (mut gone, keep): (Vec<_>, Vec<_>) =
+                f.keys.drain(..).partition(|k| k.id == key.id || (same(k) && k.device == key.device));
+            f.keys = keep;
+            gone.extend(evict_oldest(&mut f.keys, same, MAX_DEVICE_KEYS_PER_ISSUER - 1));
+            f.keys.push(key);
+            f.grants.retain(|g| !gone.iter().any(|k| k.id == g.key_id));
+            Some(gone)
+        })
+    }
+
+    /// Confirm pending device key `id`: it becomes active, replacing the issuer's
+    /// other key for the same device and evicting the issuer's oldest active
+    /// device key beyond [`MAX_DEVICE_KEYS_PER_ISSUER`]. Returns the activated
+    /// key and the keys removed; `None` if `id` is not a pending device key.
+    pub fn activate_device_key(&self, id: &str) -> Result<Option<(CompanionKey, Vec<CompanionKey>)>, ConfigError> {
+        self.edit(|f| {
+            let pos = f.keys.iter().position(|k| k.id == id && k.is_device_key() && !k.is_active())?;
+            let mut key = f.keys.remove(pos);
+            key.pending = None;
+            let same = |k: &CompanionKey| k.issuer == key.issuer && k.is_device_key() && k.is_active();
+            let (mut gone, keep): (Vec<_>, Vec<_>) = f.keys.drain(..).partition(|k| same(k) && k.device == key.device);
+            f.keys = keep;
+            gone.extend(evict_oldest(&mut f.keys, same, MAX_DEVICE_KEYS_PER_ISSUER - 1));
+            f.keys.push(key.clone());
+            f.grants.retain(|g| !gone.iter().any(|k| k.id == g.key_id));
+            Some((key, gone))
+        })
+    }
+
+    /// Record where a pending key's confirmation code was sent. False if the key
+    /// is gone or no longer pending.
+    pub fn set_pending_dm(&self, id: &str, dm_room: &str) -> Result<bool, ConfigError> {
+        self.edit(|f| match f.keys.iter_mut().find(|k| k.id == id).and_then(|k| k.pending.as_mut()) {
+            Some(p) => {
+                p.dm_room = Some(dm_room.to_string());
+                true
+            }
+            None => false,
+        })
+    }
+
+    /// Drop pending keys whose confirmation window closed. Returns them.
+    pub fn remove_expired_pending(&self, now: i64) -> Result<Vec<CompanionKey>, ConfigError> {
+        if !self.list().iter().any(|k| k.pending.as_ref().is_some_and(|p| p.expires <= now)) {
+            return Ok(Vec::new());
+        }
+        self.edit(|f| {
+            let (gone, keep): (Vec<_>, Vec<_>) =
+                f.keys.drain(..).partition(|k| k.pending.as_ref().is_some_and(|p| p.expires <= now));
             f.keys = keep;
             f.grants.retain(|g| !gone.iter().any(|k| k.id == g.key_id));
             gone
@@ -274,7 +403,98 @@ mod tests {
             kinds: vec!["observe".into()],
             label: String::new(),
             created: 1,
+            device: None,
+            pending: None,
         }
+    }
+
+    #[test]
+    fn device_keys_are_pending_until_confirmed_then_replace_per_issuer_and_device() {
+        let dir = std::env::temp_dir().join(format!("nvb-companions-dev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = companions_path(dir.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let s = CompanionKeys::open(path.clone()).unwrap();
+        let dev = |id: &str, issuer: &str, device: &str, created: i64| CompanionKey {
+            issuer: issuer.into(),
+            kinds: vec![SELF_CALL_KIND.into()],
+            device: Some(device.into()),
+            created,
+            pending: Some(PendingApproval { code_sha256: "00".into(), expires: 100, dm_room: None }),
+            ..key(id, KeyScope::SelfScope)
+        };
+        let ids = |s: &CompanionKeys| {
+            let mut v: Vec<String> = s.list().into_iter().map(|k| k.id).collect();
+            v.sort();
+            v
+        };
+        assert!(s.add_pending_device_key(dev("d1", "@a:hs", "DEV", 1), 0).unwrap().unwrap().is_empty());
+        assert!(s.activate_device_key("d1").unwrap().unwrap().1.is_empty());
+        assert!(s.get("d1").unwrap().is_active());
+        // A new enrollment of the same device is pending and leaves the active key alone…
+        assert!(s.add_pending_device_key(dev("d2", "@a:hs", "DEV", 2), 0).unwrap().unwrap().is_empty());
+        assert!(s.get("d1").unwrap().is_active() && !s.get("d2").unwrap().is_active());
+        // …a second one for that device is refused while the first is pending (the first stands)…
+        assert!(s.add_pending_device_key(dev("d3", "@a:hs", "DEV", 3), 99).unwrap().is_none());
+        assert!(s.get("d3").is_none() && s.get("d2").is_some());
+        // …and replaces it once it expired…
+        let gone = s.add_pending_device_key(dev("d3", "@a:hs", "DEV", 3), 100).unwrap().unwrap();
+        assert_eq!(gone.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(), vec!["d2"]);
+        // …and confirming it replaces the active key.
+        assert!(s.set_pending_dm("d3", "!dm:hs").unwrap());
+        assert_eq!(s.get("d3").unwrap().pending.unwrap().dm_room.as_deref(), Some("!dm:hs"));
+        let (k, gone) = s.activate_device_key("d3").unwrap().unwrap();
+        assert!(k.is_active());
+        assert_eq!(gone.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(), vec!["d1"]);
+        assert!(s.activate_device_key("d3").unwrap().is_none(), "already active");
+        // Other issuers and pairing-scoped self keys are untouched.
+        s.add_pending_device_key(dev("b1", "@b:hs", "DEV", 4), 0).unwrap().unwrap();
+        s.add(key("p1", KeyScope::SelfScope)).unwrap();
+        assert_eq!(ids(&s), vec!["b1", "d3", "p1"]);
+
+        // Expired pending keys are swept; active ones never.
+        assert!(s.remove_expired_pending(99).unwrap().is_empty());
+        assert_eq!(s.remove_expired_pending(100).unwrap().iter().map(|k| k.id.as_str()).collect::<Vec<_>>(), vec!["b1"]);
+        assert_eq!(ids(&s), vec!["d3", "p1"]);
+
+        // Round trip.
+        let again = CompanionKeys::open(path).unwrap();
+        assert_eq!(ids(&again), vec!["d3", "p1"]);
+        assert_eq!(again.get("d3").unwrap().device.as_deref(), Some("DEV"));
+        assert!(again.get("d3").unwrap().is_device_key() && again.get("d3").unwrap().is_active());
+        assert!(!again.get("p1").unwrap().is_device_key());
+        // Never mintable from the management DM.
+        assert!(validate_kinds(&KeyScope::SelfScope, &[SELF_CALL_KIND.into()]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn device_keys_per_issuer_are_capped_oldest_first_and_pending_never_evicts_active() {
+        let s = CompanionKeys::in_memory();
+        let dev = |id: &str, device: &str, created: i64| CompanionKey {
+            issuer: "@a:hs".into(),
+            kinds: vec![SELF_CALL_KIND.into()],
+            device: Some(device.into()),
+            created,
+            pending: Some(PendingApproval { code_sha256: "00".into(), expires: 1_000, dm_room: None }),
+            ..key(id, KeyScope::SelfScope)
+        };
+        for i in 0..MAX_DEVICE_KEYS_PER_ISSUER as i64 {
+            s.add_pending_device_key(dev(&format!("a{i}"), &format!("D{i}"), i), 0).unwrap().unwrap();
+            s.activate_device_key(&format!("a{i}")).unwrap().unwrap();
+        }
+        // Pending enrollments are capped among themselves and leave the active keys alone.
+        for i in 0..=MAX_DEVICE_KEYS_PER_ISSUER as i64 {
+            s.add_pending_device_key(dev(&format!("p{i}"), &format!("P{i}"), 10 + i), 0).unwrap().unwrap();
+        }
+        let active = |s: &CompanionKeys| s.list().into_iter().filter(|k| k.is_active()).count();
+        assert_eq!(active(&s), MAX_DEVICE_KEYS_PER_ISSUER);
+        assert_eq!(s.list().len(), 2 * MAX_DEVICE_KEYS_PER_ISSUER);
+        assert!(s.get("p0").is_none(), "the oldest pending enrollment made room");
+        // Confirming a new device evicts the oldest active one.
+        let (_, gone) = s.activate_device_key("p1").unwrap().unwrap();
+        assert_eq!(gone.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(), vec!["a0"]);
+        assert_eq!(active(&s), MAX_DEVICE_KEYS_PER_ISSUER);
     }
 
     #[test]

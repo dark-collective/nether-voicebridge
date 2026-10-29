@@ -27,6 +27,22 @@ pub fn mint() -> Minted {
     Minted { token: format!("{TOKEN_PREFIX}{id}.{secret}"), secret_sha256: sha256_hex(&secret), id }
 }
 
+/// Alphabet of enrollment confirmation codes: no 0/O, 1/I/L.
+const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+/// Length of an enrollment confirmation code (≈ 39 bits; a member gets a handful of tries).
+pub const CODE_LEN: usize = 8;
+
+/// A fresh enrollment confirmation code (ADR 0005 §2), sent only to the member's DM.
+pub fn confirmation_code() -> String {
+    let mut rng = rand::thread_rng();
+    (0..CODE_LEN).map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char).collect()
+}
+
+/// A typed confirmation code as stored: uppercase, without spaces or dashes.
+pub fn normalize_code(code: &str) -> String {
+    code.chars().filter(|c| !c.is_whitespace() && *c != '-').flat_map(char::to_uppercase).collect()
+}
+
 /// Random lease id (hex, 128 bits).
 pub fn lease_id() -> String {
     let mut b = [0u8; 16];
@@ -87,6 +103,16 @@ mod tests {
         let other = mint();
         assert_ne!(other.id, m.id);
         assert!(!secret_matches(parse(&other.token).unwrap().1, &m.secret_sha256));
+    }
+
+    #[test]
+    fn confirmation_codes_are_fresh_and_typing_tolerant() {
+        let c = confirmation_code();
+        assert_eq!(c.len(), CODE_LEN);
+        assert!(c.bytes().all(|b| CODE_ALPHABET.contains(&b)));
+        assert_ne!(c, confirmation_code());
+        assert_eq!(normalize_code(" abcd-efgh "), "ABCDEFGH");
+        assert!(secret_matches(&normalize_code(&c.to_lowercase()), &sha256_hex(&c)));
     }
 
     #[test]

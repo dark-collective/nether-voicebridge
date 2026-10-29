@@ -31,6 +31,7 @@ mod lk_jwt;
 mod membership;
 mod openid;
 mod publish;
+mod selfview;
 mod session;
 // `pub(crate)`: the management bot's link preflight probes RTC-foci discovery.
 pub(crate) mod well_known;
@@ -41,7 +42,7 @@ pub(crate) mod well_known;
 mod tone;
 
 use anyhow::Result;
-use livekit::e2ee::key_provider::{KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions};
+use livekit::e2ee::key_provider::KeyProvider;
 use matrix_sdk::{
     Client,
     event_handler::RawEvent,
@@ -196,7 +197,13 @@ pub(crate) async fn run(
                     // Record BEFORE installing: keys that arrive while the session
                     // is down (disconnect recovery, #66) must be retained so the
                     // rejoin's replay restores them into the fresh provider.
-                    peer_keys_ref.record(&sender, &claimed_device_id, key_index, &key_b64);
+                    peer_keys_ref.record_with_member(
+                        &sender,
+                        &claimed_device_id,
+                        content.member.id.as_deref(),
+                        key_index,
+                        &key_b64,
+                    );
                     let installed = {
                         let guard = provider_ref.lock().expect("provider mutex poisoned");
                         match guard.as_ref() {
@@ -264,6 +271,27 @@ pub(crate) async fn run(
     // ── Static fields derived from config/client ──────────────────────────────
     let room_id = RoomId::parse(&mx_cfg.room_id)?;
     let room_id_str = mx_cfg.room_id.clone();
+
+    // A member's own listen-only device asks the companion hub about this room
+    // (ADR 0005); the hub reads it through these facts. Unregistered — and the
+    // view's channel closed — when this loop ends.
+    let self_view_cancel = shutdown.child_token();
+    let _self_view_guard = self_view_cancel.clone().drop_guard();
+    let _self_room = nvb_companion::selfcall::register_room(
+        &room_id_str,
+        selfview::SelfView::start(
+            selfview::ViewInputs {
+                client: client.clone(),
+                room_id: room_id.clone(),
+                bot_user_id: bot_user_id.clone(),
+                ghost_prefix: ghost_prefix.clone(),
+                media_e2ee,
+                peer_keys: peer_keys.clone(),
+            },
+            self_view_cancel.clone(),
+        ),
+    );
+    tokio::spawn(selfview::advertise_api(client.clone(), room_id.clone(), bot_user_id.clone(), self_view_cancel));
 
     // The bridge bot is a hidden subscriber and never posts its own call
     // membership — but a prior process killed mid-call may have left one behind.
@@ -563,8 +591,9 @@ pub(crate) async fn run(
                         // failed connect's backoff expires), then judge phantoms
                         // against the union of every roster we actually hold.
                         let snapshot = foreign.reconcile(&fctx).await;
-                        let mut live_mxids = live_roster_mxids(&sess.lk_session.room);
-                        foreign.extend_live_mxids(&mut live_mxids);
+                        let mut live = live_roster_identities(&sess.lk_session.room);
+                        foreign.extend_live_identities(&mut live);
+                        let live_mxids = roster_mxids(&live, &snapshot.entries, &peer_keys.snapshot());
                         let mut observed = foreign.observed_focus_urls();
                         observed.insert(crate::rtc::focus::normalize_service_url(&focus.service_url));
                         crate::matrix::reap_stale_memberships(
@@ -608,15 +637,50 @@ pub(crate) async fn run(
     Ok(())
 }
 
-/// The set of bare MXIDs currently present in the LiveKit room — the reaper's
-/// "who's really here" ground truth. LiveKit identities are `{mxid}:{device}`;
-/// [`session::participant_mxid`] strips the device so we match on the bare MXID
-/// (a present user is never reaped even if their membership device differs from
-/// their track device).
-fn live_roster_mxids(room: &livekit::Room) -> std::collections::HashSet<String> {
-    room.remote_participants()
-        .values()
-        .map(|p| session::participant_mxid(&p.identity().to_string()).to_owned())
+/// Every LiveKit identity currently present in the room — the raw input to the
+/// reaper's "who's really here" ground truth ([`roster_mxids`]).
+fn live_roster_identities(room: &livekit::Room) -> HashSet<String> {
+    room.remote_participants().values().map(|p| p.identity().to_string()).collect()
+}
+
+/// The bare MXIDs of the humans really present, from the identities on every
+/// SFU we watch:
+///
+/// * a member's enrolled listen-only device (ADR 0005) is dropped — it
+///   publishes nothing and stays connected after its owner's client crashes, so
+///   it is no evidence the owner's membership is live;
+/// * a legacy `{mxid}:{device}` identity counts as its bare MXID
+///   ([`session::participant_mxid`]) — a present user is never reaped even if
+///   their membership device differs from their track device;
+/// * an MSC4195 hashed identity counts as the member whose `(mxid, device,
+///   member.id)` hashes to it — member ids are learnt from the key to-device
+///   events, so a hashed member is recognised once its first key arrived.
+pub(crate) fn roster_mxids(
+    identities: &HashSet<String>,
+    entries: &[crate::matrix::MembershipEntry],
+    keys: &[nvb_companion::selfcall::PeerKey],
+) -> HashSet<String> {
+    use nvb_companion::selfcall::{device_identities, is_listen_only_identity};
+    let mut hashed: HashMap<String, &str> = HashMap::new();
+    // Every device of every membership event (a legacy event lists several).
+    for e in entries.iter().filter(|e| !e.is_bridge_owned) {
+        for dev in &e.devices {
+            let mids = keys
+                .iter()
+                .filter(|k| k.sender == e.mxid && k.device_id == dev.device_id)
+                .filter_map(|k| k.member_id.as_deref());
+            for id in device_identities(&e.mxid, &dev.device_id, mids).into_iter().skip(1) {
+                hashed.insert(id, e.mxid.as_str());
+            }
+        }
+    }
+    identities
+        .iter()
+        .filter(|id| !is_listen_only_identity(id))
+        .map(|id| match hashed.get(id.as_str()) {
+            Some(mxid) => (*mxid).to_owned(),
+            None => session::participant_mxid(id).to_owned(),
+        })
         .collect()
 }
 
@@ -718,10 +782,10 @@ impl ForeignSessions {
     }
 
     /// Add every foreign roster's bare MXIDs to `into` (dead sessions excluded).
-    fn extend_live_mxids(&self, into: &mut HashSet<String>) {
+    fn extend_live_identities(&self, into: &mut HashSet<String>) {
         for s in self.sessions.values() {
             if !s.lk_session.disconnected.is_cancelled() {
-                into.extend(live_roster_mxids(&s.lk_session.room));
+                into.extend(live_roster_identities(&s.lk_session.room));
             }
         }
     }
@@ -1027,13 +1091,7 @@ async fn join_livekit(
         // from the raw key bytes supplied via set_key. EC's livekit-client-js uses the
         // livekit SDK default "LKFrameEncryptionKey". Empty salt produces a different
         // derived key → decryption fails → raw encrypted bytes output as audio = noise.
-        let key_provider = KeyProvider::new(KeyProviderOptions {
-            ratchet_window_size: 16, // match livekit-client-js default
-            ratchet_salt: b"LKFrameEncryptionKey".to_vec(),
-            failure_tolerance: -1,
-            key_ring_size: 256,
-            key_derivation_algorithm: KeyDerivationAlgorithm::HKDF,
-        });
+        let key_provider = KeyProvider::new(keys::subscriber_key_provider_options());
         // Make the provider visible to the to-device receive handler so it can
         // install peers' keys and decrypt their inbound frames.
         {
@@ -1126,7 +1184,7 @@ mod foreign_foci_tests {
         Some(LivekitFocusInfo { alias: "!r:x".into(), service_url: url.into() })
     }
     fn human(key: &str, focus: Option<LivekitFocusInfo>, preferred: Option<LivekitFocusInfo>) -> MembershipEntry {
-        MembershipEntry { state_key: key.into(), mxid: key.into(), is_bridge_owned: false, legacy_state_key: false, focus, preferred }
+        MembershipEntry { state_key: key.into(), mxid: key.into(), is_bridge_owned: false, legacy_state_key: false, focus, preferred, devices: Vec::new() }
     }
 
     #[test]

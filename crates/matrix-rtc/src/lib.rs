@@ -229,6 +229,7 @@ pub async fn run(
                 media_e2ee,
                 timing.leave_grace(),
                 timing.paired_arrival_grace(),
+                timing.paired_departure_grace(),
                 call_active_tx,
                 members_gen_tx,
                 router.clone(),

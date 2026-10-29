@@ -12,11 +12,13 @@ path = "src/lib.rs"
 nvb-config = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "net"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
+# Enrollment (ADR 0005) verifies an OpenID token on the requester's homeserver once.
+reqwest = { workspace = true }
 # All already in the tree (reqwest/matrix-sdk pull them in); the companion
 # listener is the binary's first HTTP server, kept to plain hyper.
 sha2 = "0.10"
