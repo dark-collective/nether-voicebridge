@@ -1,6 +1,6 @@
 # Privacy Policy — Nether Voice Bridge (hosted instance)
 
-_Last updated: 2026-07-11. This is the hostable source for the policy required
+_Last updated: 2026-10-29. This is the hostable source for the policy required
 by Discord Developer Terms §5a; publish it at a public URL and link that URL in
 the **Privacy Policy** field of every Discord application in the bridge's
 puppet pool. The published copy for the nether.im instance is at
@@ -91,6 +91,15 @@ process data from anyone under these ages.
 - **Logs & audit trail:** service logs and the append-only audit trail are
   size-bounded and rotate on a short operational schedule — not kept
   indefinitely.
+- **Pairings and service-account records:** kept until you `unpair` (or the
+  room's moderators `relay deny`).
+- **Companion keys and your permissions for them:** kept until the key is
+  revoked or its room is unlinked; a permission you gave with `/bridge
+  companion allow` until you withdraw it (`/bridge companion deny` or
+  `/bridge optout`) or the key is gone.
+- **Your enrolled devices:** kept until you unlink or revoke the device, or a
+  newer enrollment of the same device replaces it; an enrollment you never
+  confirm is deleted after 10 minutes.
 
 ### Linked identities (optional)
 
@@ -101,6 +110,35 @@ Discord user ID, an optional delegate account you name, and when it was created
 created only by you, from both accounts, and `unpair` deletes it immediately.
 Room moderators may likewise record that a specific Matrix account is a service
 account in their room (`relay allow`); `relay deny` deletes that record.
+
+### Companion tools and your own devices (optional)
+
+Instances may offer an interface for companion tools (it is off unless the
+operator enables it). People with authority over a bridged room may issue
+keys to companion tools for that room. For each key the bridge stores its
+issuer (a Matrix user id), its scope, a hash of its secret (never the secret
+itself), its label and when it was created; the personal permissions you grant
+with `/bridge companion allow` (your Discord user id, the key and when); and
+audit lines for each lease (the key id, the room, the Discord user id and ghost
+it represents, the consent basis, and timestamps). A room's authorized
+companions may learn which Discord members the bridge represents in the call
+(Discord user id, display name and ghost), whether you are streaming on Discord
+and whether your ghost is present. In a room without media encryption, a companion holding a
+lease can receive the call's audio while the lease lasts. The bridge never
+carries a companion's media.
+
+If you enroll a listen-only device of your own Matrix account, the bridge
+stores your Matrix user id and the device id you chose as a key (and, until you
+confirm the enrollment from your account, the direct-message room the
+confirmation code was sent to), until you unlink or revoke the device or enroll
+it again; plus audit lines of the enrollment, your confirmation and each
+connection (room, device, time). The one-time sign-in token your device
+presents is checked once with your homeserver and is never stored or logged.
+When the device enrolls and while its event stream is open, the bridge sees its
+network address; it is kept only briefly in memory for rate limiting, not with
+the key or in the audit log. The bridge sends that device only your own media
+key, your own call state and whether your paired Discord account is in the
+channel — never anyone else's key, and never audio.
 
 ## Your rights (GDPR/UK GDPR/CCPA)
 

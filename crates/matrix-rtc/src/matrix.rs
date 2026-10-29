@@ -1647,10 +1647,20 @@ pub(crate) struct MembershipEntry {
     /// be publishing HERE rather than on `focus`. The RTC loop subscribes on
     /// both, and the reaper only judges a member once both are watched.
     pub(crate) preferred: Option<crate::rtc::well_known::LivekitFocusInfo>,
-    /// The device the (first) membership is for — what a member's own
-    /// listen-only device is told about (ADR 0005). `None` = no membership body.
-    pub(crate) device_id: Option<String>,
-    /// The membership has not expired.
+    /// Every device this event holds a membership for, each with its own
+    /// expiry — what a member's own listen-only device is told about and what
+    /// the reaper's hashed-identity resolution keys on (ADR 0005). A session
+    /// event has one; a legacy event (state key = MXID) lists one per device.
+    pub(crate) devices: Vec<MemberDevice>,
+    /// Some membership of the event has not expired.
+    pub(crate) active: bool,
+}
+
+/// One membership (one device) of an `m.call.member` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MemberDevice {
+    pub(crate) device_id: String,
+    /// This membership has not expired.
     pub(crate) active: bool,
 }
 
@@ -1698,16 +1708,24 @@ pub(crate) async fn snapshot_call_memberships(
         // the sender's foci. Expired-but-unretracted entries are kept — those are
         // exactly the phantoms the reaper exists to clear.
         let mems = o.content.memberships();
-        let (selection, preferred, created, device_id) = match mems.first() {
+        let (selection, preferred, created) = match mems.first() {
             Some(m) => (
                 Selection::from_active_focus(m.focus_active()),
                 first_livekit_focus(m.foci_preferred()),
                 m.created_ts().unwrap_or(o.origin_server_ts),
-                Some(m.device_id().to_string()),
             ),
-            None => (Selection::Unknown, None, o.origin_server_ts, None),
+            None => (Selection::Unknown, None, o.origin_server_ts),
         };
-        let active = !o.content.active_memberships(Some(o.origin_server_ts)).is_empty();
+        // Per membership: its device and its own expiry (a legacy event can hold
+        // a live phone next to an expired laptop).
+        let live: HashSet<String> = o
+            .content
+            .active_memberships(Some(o.origin_server_ts))
+            .iter()
+            .map(|m| m.device_id().to_string())
+            .collect();
+        let devices = member_devices(mems.iter().map(|m| m.device_id().to_string()), &live);
+        let active = !live.is_empty();
         let mxid = o.sender.as_str().to_owned();
         let is_bridge_owned = o.sender.as_str() == bot_user_id.as_str()
             || crate::rtc::ghost::is_bridge_excluded_identity(o.sender.as_str(), ghost_prefix);
@@ -1727,7 +1745,7 @@ pub(crate) async fn snapshot_call_memberships(
             legacy_state_key,
             focus: None,
             preferred,
-            device_id,
+            devices,
             active,
         });
     }
@@ -1737,6 +1755,19 @@ pub(crate) async fn snapshot_call_memberships(
     }
     let elected = elected_focus(&focus_inputs);
     Ok(CallMemberships { entries, elected })
+}
+
+/// The devices of one `m.call.member` event in membership order, each active
+/// iff it is among `live` (the event's unexpired memberships); a device listed
+/// twice is reported once.
+fn member_devices(all: impl IntoIterator<Item = String>, live: &HashSet<String>) -> Vec<MemberDevice> {
+    let mut out: Vec<MemberDevice> = Vec::new();
+    for device_id in all {
+        if !out.iter().any(|d| d.device_id == device_id) {
+            out.push(MemberDevice { active: live.contains(&device_id), device_id });
+        }
+    }
+    out
 }
 
 /// Pure reaper decision. Returns the state_keys to empty **now**, and mutates
@@ -2116,7 +2147,7 @@ mod tests {
     }
 
     // ── Stale-membership reaper (classify_stale_memberships) ───────────────────
-    use super::{classify_stale_memberships, MembershipEntry};
+    use super::{classify_stale_memberships, member_devices, MemberDevice, MembershipEntry};
     use crate::rtc::well_known::LivekitFocusInfo;
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
@@ -2139,7 +2170,7 @@ mod tests {
             legacy_state_key: legacy,
             focus: focus(OUR_SFU),
             preferred: focus(OUR_SFU),
-            device_id: None,
+            devices: Vec::new(),
             active: true,
         }
     }
@@ -2170,6 +2201,39 @@ mod tests {
         assert!(classify_stale_memberships(&live(&[]), &both, &unknown, &mut since, t0 + GRACE * 3, GRACE).is_empty());
     }
 
+    /// A legacy `m.call.member` (state key = MXID) lists one membership per
+    /// device: each keeps its own device id and expiry, and each device's
+    /// hashed identity resolves to the member (not only the first device's).
+    #[test]
+    fn legacy_events_report_every_device_with_its_own_expiry() {
+        use crate::rtc::roster_mxids;
+        use nvb_companion::selfcall::{hashed_identity_with_device, PeerKey};
+        let live: HashSet<String> = ["LAPTOP".to_owned()].into();
+        let devs = member_devices(["PHONE", "LAPTOP", "PHONE"].map(String::from), &live);
+        assert_eq!(
+            devs,
+            vec![
+                MemberDevice { device_id: "PHONE".into(), active: false },
+                MemberDevice { device_id: "LAPTOP".into(), active: true },
+            ]
+        );
+        let owner = "@legacy:example.org";
+        let e = MembershipEntry { devices: devs, ..entry("@legacy:example.org", owner, false, true) };
+        let key = PeerKey {
+            sender: owner.into(),
+            device_id: "LAPTOP".into(),
+            member_id: Some("m-2".into()),
+            index: 0,
+            key_b64: "k".into(),
+        };
+        let ids = HashSet::from([hashed_identity_with_device(owner, "LAPTOP", "m-2")]);
+        assert_eq!(roster_mxids(&ids, std::slice::from_ref(&e), &[key]), live_set(&[owner]));
+    }
+
+    fn live_set(mxids: &[&str]) -> HashSet<String> {
+        mxids.iter().map(|s| s.to_string()).collect()
+    }
+
     /// ADR 0005: an enrolled listen-only device stays connected after its owner's
     /// client dies, so it must not keep the dead membership alive; the owner's
     /// live client (legacy, Commet-style without `member.id`, or hashed) does.
@@ -2181,7 +2245,7 @@ mod tests {
         };
         let owner = "@reaper-owner:example.org";
         let with_dev = |key: &str, mxid: &str, dev: &str| MembershipEntry {
-            device_id: Some(dev.to_owned()),
+            devices: vec![MemberDevice { device_id: dev.to_owned(), active: true }],
             ..entry(key, mxid, false, false)
         };
         set_listen_only_devices([(owner.to_owned(), "LISTEN".to_owned())]);

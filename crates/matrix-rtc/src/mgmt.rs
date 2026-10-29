@@ -1301,6 +1301,27 @@ pub async fn run(
         });
     }
 
+    // Enrollment confirmations (ADR 0005 §2): the companion hub asks, this bot
+    // DMs the member their code; only their reply in that DM confirms.
+    if let Some(hub) = ctx.companions.clone() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<nvb_companion::hub::ApprovalRequest>();
+        hub.install_approval_sink(tx);
+        let ctx = ctx.clone();
+        let client = client.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    msg = rx.recv() => match msg {
+                        Some(a) => deliver_enroll_approval(&ctx, &client, &hub, a).await,
+                        None => break,
+                    }
+                }
+            }
+        });
+    }
+
     // Periodic maintenance: the #95 room power-level check runs for EVERY
     // deployment (a static bridge's room can be misconfigured too — it
     // happened in prod), while the #87/#89b reaps stay gated on
@@ -1366,7 +1387,12 @@ pub async fn run(
             }
             let MessageType::Text(text) = &ev.content.msgtype else { return };
             let sender = ev.sender.as_str();
-            if !ctx.is_operator(sender) && !ctx.may_self_serve(sender) {
+            let parsed = parse_command(&text.body);
+            // Confirming one's own enrolled device (ADR 0005) is open to every
+            // member with an enrollment waiting, self-serve tier or not.
+            let approving = matches!(&parsed, Parsed::Cmd(Command::CompanionApprove { .. }))
+                && ctx.companions.as_ref().is_some_and(|h| h.has_pending_approval(sender));
+            if !ctx.is_operator(sender) && !ctx.may_self_serve(sender) && !approving {
                 tracing::debug!(sender = %ev.sender, "ignoring message from non-self-serve user");
                 return;
             }
@@ -1375,7 +1401,7 @@ pub async fn run(
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(sender.to_owned(), room.room_id().to_owned());
-            match parse_command(&text.body) {
+            match parsed {
                 Parsed::Cmd(cmd) => {
                     // Self-serve tier (#43): non-operators get the scoped
                     // subset; operator verbs answer with a refusal rather
@@ -2057,6 +2083,11 @@ enum Command {
     CompanionRevoke {
         id: String,
     },
+    /// `companion key approve <code>`: confirm a listen-only device of the
+    /// sender's own account (ADR 0005 §2), with the code the bot sent to this DM.
+    CompanionApprove {
+        code: String,
+    },
     /// Start the guided walkthrough (#102). Self-serve tier.
     Tutorial,
     /// Advance / end the walkthrough (#102) — meaningful only with an active
@@ -2100,7 +2131,7 @@ const HELP_TEXT: &str = "Voice bridge management commands:\n  list — all bridg
 const SELF_SERVE_HELP_TEXT: &str = "Voice bridge commands:\n  tutorial — guided step-by-step walkthrough (start here if you're new)\n  link <name> <matrix-room-id> <discord-guild-id> <discord-channel-id> — bridge a Discord voice channel to a Matrix room. You must be a moderator of the Matrix room, and someone with Manage Server on the Discord side must approve the link with the `/bridge approve` command and the code you'll receive.\n  unlink <name> — remove a bridge you created\n  list — your bridges\n  report <owner|guild|room> <value> [reason] — report an abusive bridge for an operator to review\n  pair / unpair / pairings — link your Matrix account to your own Discord account so you are yourself on both sides (no ghost, no puppet while both are present)\n  relay allow|deny|list <room-id> [@mxid] — approve a helper client's Matrix account as a service account in a room you moderate\n  companion key create|list|revoke — keys for companion tools (`companion` for details)\n  help — this text\nQuote names containing spaces: link \"Guest Voice\" !abc:example.org 123456 789012";
 
 const PAIR_USAGE: &str = "Usage: `pair` — get a code, then run `/bridge pair code:<code>` on Discord as the account to link. `pair delegate <@mxid>` names a delegate account that acts for you (`pair delegate none` clears it). `unpair [discord-user-id]` removes one or all of your pairings. `pairings` lists them.";
-const COMPANION_USAGE: &str = "Usage: `companion key create <room-id|self> <kinds…> [label]` / `companion key list [room-id|self]` / `companion key revoke <key-id>` — keys for companion tools. Room keys (you need authority over the room): observe, stream:attach, stream:standalone. Self keys (your own pairings): stream:attach, listen:self.";
+const COMPANION_USAGE: &str = "Usage: `companion key create <room-id|self> <kinds…> [label]` / `companion key list [room-id|self]` / `companion key revoke <key-id>` / `companion key approve <code>` — keys for companion tools. Room keys (you need authority over the room): observe, stream:attach, stream:standalone. Self keys (your own pairings): stream:attach, listen:self. `approve` confirms a listen-only device of your own account with the code I sent you.";
 
 const RELAY_USAGE: &str = "Usage: `relay allow <room-id> <@mxid>` / `relay deny <room-id> <@mxid>` / `relay list <room-id>` — approve a helper client's Matrix account as a service account in a room you have authority over (it gets no Discord puppet and is not counted as a participant).";
 
@@ -2137,6 +2168,7 @@ fn allowed_for_self_serve(cmd: &Command) -> bool {
             | Command::CompanionCreate { .. }
             | Command::CompanionList { .. }
             | Command::CompanionRevoke { .. }
+            | Command::CompanionApprove { .. }
     )
 }
 
@@ -2166,6 +2198,10 @@ fn parse_companion(args: &[String]) -> Parsed {
         [verb] if verb == "list" => Parsed::Cmd(Command::CompanionList { scope: None }),
         [verb, scope] if verb == "list" => Parsed::Cmd(Command::CompanionList { scope: Some(scope.clone()) }),
         [verb, id] if verb == "revoke" => Parsed::Cmd(Command::CompanionRevoke { id: id.clone() }),
+        // A code may be typed in groups ("ABCD EFGH").
+        [verb, code @ ..] if verb == "approve" && !code.is_empty() => {
+            Parsed::Cmd(Command::CompanionApprove { code: code.concat() })
+        }
         _ => usage(),
     }
 }
@@ -2393,6 +2429,7 @@ async fn handle_command(ctx: &BotCtx, room: &Room, sender: &str, cmd: Command) {
         }
         Command::CompanionList { scope } => handle_companion_list(ctx, room, sender, scope.as_deref()).await,
         Command::CompanionRevoke { id } => handle_companion_revoke(ctx, room, sender, &id).await,
+        Command::CompanionApprove { code } => handle_companion_approve(ctx, room, sender, &code).await,
         Command::Tutorial => handle_tutorial_start(ctx, room).await,
         Command::TutorialNext => handle_tutorial_next(ctx, room).await,
         Command::TutorialStop => handle_tutorial_stop(ctx, room).await,
@@ -4384,6 +4421,14 @@ async fn dm_room_for(ctx: &BotCtx, client: &Client, uid: &UserId) -> Result<Room
 /// DM `text` to `mxid` as the bot, in the existing direct room when there is
 /// one ([`dm_room_for`], #150). Shared by `msg`, `announce` and every notice.
 async fn dm_user(ctx: &BotCtx, client: &Client, mxid: &str, text: &str) -> Result<(), String> {
+    let dm = dm_ready(ctx, client, mxid).await?;
+    dm.send(RoomMessageEventContent::text_plain(text)).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The DM [`dm_user`] would send to, with the recipient's membership fetched so
+/// the first encrypted message reaches them.
+async fn dm_ready(ctx: &BotCtx, client: &Client, mxid: &str) -> Result<Room, String> {
     let uid = UserId::parse(mxid).map_err(|e| e.to_string())?;
     let dm = dm_room_for(ctx, client, &uid).await?;
     // #97 residual, #100 mode 2: in an encrypted DM the SDK computes megolm
@@ -4406,8 +4451,45 @@ async fn dm_user(ctx: &BotCtx, client: &Client, mxid: &str, text: &str) -> Resul
             }
         }
     }
-    dm.send(RoomMessageEventContent::text_plain(text)).await.map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(dm)
+}
+
+/// DM a member the confirmation code of a listen-only device enrollment (ADR
+/// 0005 §2). The DM is recorded with the enrollment first: only a reply from
+/// the member in that room confirms it.
+async fn deliver_enroll_approval(
+    ctx: &BotCtx,
+    client: &Client,
+    hub: &nvb_companion::CompanionHub,
+    a: nvb_companion::hub::ApprovalRequest,
+) {
+    let dm = match dm_ready(ctx, client, &a.mxid).await {
+        Ok(dm) => dm,
+        Err(e) => {
+            tracing::warn!(target_user = %a.mxid, key_id = %a.key_id, error = %e, "cannot open a DM to confirm a device enrollment");
+            return;
+        }
+    };
+    if !hub.set_pending_dm(&a.key_id, dm.room_id().as_str()) {
+        return; // replaced, unlinked or expired meanwhile
+    }
+    let text = enroll_approval_text(&a);
+    if let Err(e) = dm.send(RoomMessageEventContent::text_plain(text)).await {
+        tracing::warn!(target_user = %a.mxid, key_id = %a.key_id, error = %e, "cannot send a device enrollment's confirmation code");
+    }
+}
+
+fn enroll_approval_text(a: &nvb_companion::hub::ApprovalRequest) -> String {
+    format!(
+        "🔑 A device asked to receive your own call data in {room}: listen-only device `{device}` (key `{key}`). \
+         If that was you, reply `companion key approve {code}` within {mins} minutes. \
+         Otherwise ignore this (it expires), or `companion key revoke {key}`.",
+        room = a.room_id,
+        device = a.device_id,
+        key = a.key_id,
+        code = a.code,
+        mins = a.expires_in.as_secs().div_ceil(60),
+    )
 }
 
 // ─── Linked identities (ADR 0001) ───────────────────────────────────────────
@@ -4586,13 +4668,14 @@ const COMPANIONS_OFF: &str = "Companion tools are not enabled on this bridge ins
 fn describe_companion_key(hub: &nvb_companion::CompanionHub, k: &nvb_config::companions::CompanionKey) -> String {
     let leases = hub.lease_count(&k.id);
     format!(
-        "  `{}` — {} — {}{} — issued by {}{}",
+        "  `{}` — {} — {}{} — issued by {}{}{}",
         k.id,
         k.scope.describe(),
         k.kinds.join(", "),
         if k.label.is_empty() { String::new() } else { format!(" — \"{}\"", k.label) },
         k.issuer,
         if leases > 0 { format!(" — {leases} live lease(s)") } else { String::new() },
+        if k.is_active() { "" } else { " — waiting for confirmation" },
     )
 }
 
@@ -4698,6 +4781,34 @@ async fn handle_companion_revoke(ctx: &BotCtx, room: &Room, sender: &str, id: &s
         Ok(None) => reply(room, &format!("No companion key `{id}`.")).await,
         Err(e) => reply(room, &format!("Cannot write the companions file: {e}")).await,
     }
+}
+
+async fn handle_companion_approve(ctx: &BotCtx, room: &Room, sender: &str, code: &str) {
+    use nvb_companion::hub::ApproveError;
+    let Some(hub) = &ctx.companions else {
+        reply(room, COMPANIONS_OFF).await;
+        return;
+    };
+    let text = match hub.approve_device_key(sender, room.room_id().as_str(), code) {
+        Ok(k) => format!(
+            "✅ Device `{}` confirmed (key `{}`): it now receives your own call data while you are in a bridged call. `companion key revoke {}` unlinks it.",
+            k.device.as_deref().unwrap_or("?"),
+            k.id,
+            k.id,
+        ),
+        Err(ApproveError::NothingPending) => {
+            "No device of yours is waiting for confirmation (a code expires after 10 minutes — enroll the device again).".to_string()
+        }
+        Err(ApproveError::WrongRoom) => "Reply with the code in the conversation where I sent it.".to_string(),
+        Err(ApproveError::WrongCode { dropped: false }) => {
+            "That code doesn't match. Check the code in my message and try again.".to_string()
+        }
+        Err(ApproveError::WrongCode { dropped: true }) => {
+            "Too many wrong codes — the waiting enrollment was cancelled. Enroll the device again.".to_string()
+        }
+        Err(ApproveError::Storage(e)) => format!("Cannot write the companions file: {e}"),
+    };
+    reply(room, &text).await;
 }
 
 /// Owner (tenant creator) of the bridge whose room is `room_id`, if any.
@@ -5196,6 +5307,22 @@ mod tests {
             Parsed::Cmd(Command::CompanionList { scope: Some("self".into()) })
         );
         assert_eq!(parse_command("companion key revoke abc"), Parsed::Cmd(Command::CompanionRevoke { id: "abc".into() }));
+        assert_eq!(
+            parse_command("companion key approve ABCD EFGH"),
+            Parsed::Cmd(Command::CompanionApprove { code: "ABCDEFGH".into() })
+        );
+        assert!(matches!(parse_command("companion key approve"), Parsed::Usage(_)));
+        assert!(allowed_for_self_serve(&Command::CompanionApprove { code: "X".into() }));
+        // The confirmation DM carries the exact reply to send (clients may automate it).
+        let text = enroll_approval_text(&nvb_companion::hub::ApprovalRequest {
+            mxid: "@me:hs".into(),
+            device_id: "APP".into(),
+            key_id: "k1".into(),
+            room_id: "!r:hs".into(),
+            code: "ABCDEFGH".into(),
+            expires_in: Duration::from_secs(600),
+        });
+        assert!(text.contains("`companion key approve ABCDEFGH`") && text.contains("10 minutes") && text.contains("`companion key revoke k1`"));
         assert!(matches!(parse_command("companion"), Parsed::Usage(_)));
         assert!(allowed_for_self_serve(&Command::CompanionList { scope: None }));
         assert!(allowed_for_self_serve(&Command::Pair));

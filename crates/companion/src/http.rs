@@ -42,6 +42,8 @@ const SELF_POLL: Duration = Duration::from_millis(500);
 const SELF_NOT_IN_CALL_GRACE: Duration = Duration::from_secs(15);
 /// How often a `/self/events` stream re-checks that its owner is still a member of the room.
 const SELF_MEMBER_RECHECK: Duration = Duration::from_secs(60);
+/// How long a `/self/events` stream waits for a slow client to take an event before dropping it.
+const SELF_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── response bodies ─────────────────────────────────────────────────────────────
 
@@ -285,10 +287,14 @@ fn client_address(hub: &CompanionHub, req: &Request<Incoming>, peer: SocketAddr)
         .as_deref()
         .and_then(|h| req.headers().get(h))
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+        .and_then(header_client)
         .unwrap_or_else(|| peer.ip().to_string())
+}
+
+/// The client address in a proxy header. A list (X-Forwarded-For) is appended to by each proxy, so only its last
+/// entry was written by ours; earlier ones are whatever the client sent.
+fn header_client(value: &str) -> Option<String> {
+    value.rsplit(',').next().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
 }
 
 fn discovery(hub: &CompanionHub) -> Response<NvbBody> {
@@ -365,6 +371,9 @@ async fn enroll(hub: &CompanionHub, req: Request<Incoming>, client: &str) -> Res
             "user_id": key.issuer,
             "device_id": key.device,
             "events_url": format!("{API_PREFIX}/self/events?room_id={{room_id}}"),
+            // The key opens nothing until the account itself confirms it in its DM with the bridge bot.
+            "status": "pending_approval",
+            "approval_expires_in": crate::hub::APPROVAL_TTL.as_secs(),
         })),
         Err(r) => refusal(r),
     }
@@ -380,8 +389,15 @@ async fn self_events(hub: &Arc<CompanionHub>, key: &CompanionKey, room_id: &str,
     sse_response(rx, None)
 }
 
+/// Queue one event for a `/self/events` client; false once the client is gone or has stalled for
+/// [`SELF_SEND_TIMEOUT`] (a stalled client must not hold up revoke or end checks).
+async fn push(tx: &mpsc::Sender<Bytes>, b: Bytes) -> bool {
+    tx.send_timeout(b, SELF_SEND_TIMEOUT).await.is_ok()
+}
+
 /// Feed one `/self/events` stream: the whole current state first, then changes, until the owner has been out of the
-/// call for [`SELF_NOT_IN_CALL_GRACE`], the key is revoked, the bridge stops, or the client leaves.
+/// call for [`SELF_NOT_IN_CALL_GRACE`], the key is revoked, a newer connection takes over, the bridge stops, or the
+/// client leaves or stalls. Final events are best-effort (`try_send`).
 async fn self_event_loop(stream: SelfStream, tx: mpsc::Sender<Bytes>, shutdown: CancellationToken) {
     let hub = stream.hub().clone();
     let keepalive = Duration::from_secs(hub.config().sse_keepalive_secs);
@@ -392,42 +408,48 @@ async fn self_event_loop(stream: SelfStream, tx: mpsc::Sender<Bytes>, shutdown: 
     let mut last = stream.state();
     let mut out_since: Option<tokio::time::Instant> = None;
     for (name, data) in last.events_since(None) {
-        if tx.send(sse(name, &data)).await.is_err() {
+        if !push(&tx, sse(name, &data)).await {
             return;
         }
     }
     let end = |reason: &str| sse("end", &serde_json::json!({ "room_id": stream.room_id, "reason": reason }));
+    let revoked = || sse("revoked", &serde_json::json!({ "reason": "key_revoked" }));
     loop {
         let refresh = tokio::select! {
             _ = tx.closed() => return,
             _ = shutdown.cancelled() => {
-                let _ = tx.send(end("shutdown")).await;
+                let _ = tx.try_send(end("shutdown"));
+                return;
+            }
+            _ = stream.cancel.cancelled() => {
+                // Revoked or replaced by the key's own newer connection.
+                let _ = tx.try_send(if hub.key_valid(&stream.key_id) { end("replaced") } else { revoked() });
                 return;
             }
             r = view_rx.changed() => {
                 if r.is_err() {
                     // The room's bridge stopped or restarted: the client reconnects and gets fresh state.
-                    let _ = tx.send(end("bridge_restarting")).await;
+                    let _ = tx.try_send(end("bridge_restarting"));
                     return;
                 }
                 true
             }
             _ = poll.tick() => {
                 if !hub.key_valid(&stream.key_id) {
-                    let _ = tx.send(sse("revoked", &serde_json::json!({ "reason": "key_revoked" }))).await;
+                    let _ = tx.try_send(revoked());
                     return;
                 }
                 true
             }
             _ = member_check.tick() => {
                 if !matches!(tokio::time::timeout(Duration::from_secs(5), stream.facts.is_joined(&stream.issuer)).await, Ok(Ok(true))) {
-                    let _ = tx.send(end("not_a_member")).await;
+                    let _ = tx.try_send(end("not_a_member"));
                     return;
                 }
                 false
             }
             _ = ka.tick() => {
-                if tx.send(Bytes::from_static(b": keep-alive\n\n")).await.is_err() {
+                if !push(&tx, Bytes::from_static(b": keep-alive\n\n")).await {
                     return;
                 }
                 false
@@ -438,14 +460,14 @@ async fn self_event_loop(stream: SelfStream, tx: mpsc::Sender<Bytes>, shutdown: 
         }
         let now = stream.state();
         for (name, data) in now.events_since(Some(&last)) {
-            if tx.send(sse(name, &data)).await.is_err() {
+            if !push(&tx, sse(name, &data)).await {
                 return;
             }
         }
         if now.in_call {
             out_since = None;
         } else if out_since.get_or_insert_with(tokio::time::Instant::now).elapsed() >= SELF_NOT_IN_CALL_GRACE {
-            let _ = tx.send(end("not_in_call")).await;
+            let _ = tx.try_send(end("not_in_call"));
             return;
         }
         last = now;
@@ -655,6 +677,13 @@ mod tests {
         let status = out.split(' ').nth(1).unwrap().parse().unwrap();
         let body = out.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
         (status, body)
+    }
+
+    #[test]
+    fn proxy_headers_yield_the_entry_our_proxy_wrote() {
+        assert_eq!(header_client("203.0.113.9").as_deref(), Some("203.0.113.9"));
+        assert_eq!(header_client("1.2.3.4, 10.0.0.1 , 203.0.113.9 ").as_deref(), Some("203.0.113.9"));
+        assert_eq!(header_client(" "), None);
     }
 
     #[tokio::test]

@@ -1,13 +1,16 @@
 //! Your own call data (ADR 0005), live: a Matrix member of the encrypted test room enrolls a listen-only device of
-//! their own account (a real OpenID token, verified by the bridge on the homeserver's federation API), then follows
-//! `/self/events`: their own `self_call` and their own media key, which the bridge received as a call member. When
-//! they leave the call the stream ends; unlinking revokes the device key.
+//! their own account (a real OpenID token, verified by the bridge on the homeserver's federation API). The key is
+//! pending until the member confirms it from their own account: the management bot DMs them a code, a wrong code is
+//! refused, the right one activates the key. Then the device follows `/self/events`: their own `self_call` and their
+//! own media key, which the bridge received as a call member. When they leave the call the stream ends; unlinking
+//! revokes the device key.
 //!
 //! Cases the harness can't drive live (another member's key, a forged `sub`, a private address, the reaper with a
 //! crashed client) are covered by the hermetic tests in `nvb-companion` and `nvb-matrix-rtc`.
 
 use super::audio::{await_quiescent, sweep_test_memberships};
 use crate::actors::matrix::MatrixSpeaker;
+use crate::actors::mgmt_client::MatrixManagementClient;
 use crate::bridge_proc::{BridgeUnderTest, tenant_entry};
 use crate::observers::RoomStatePoller;
 use crate::scenario::{Ctx, Expectation, ScenarioDef};
@@ -36,15 +39,25 @@ async fn run(ctx: Arc<Ctx>) -> Result<()> {
     };
     // The test homeserver may sit on a private network next to the runner; the address policy itself is unit-tested.
     let extra = format!(
-        "reap_grace_ms = 300000\n\n[companions]\nenabled = true\nlisten = \"127.0.0.1:{port}\"\ntrusted_private_servers = [\"{}\"]\n",
+        "reap_grace_ms = 300000\n\n[companions]\nenabled = true\nself_enroll = true\nlisten = \"127.0.0.1:{port}\"\ntrusted_private_servers = [\"{}\"]\n",
         cfg.server_domain()
     );
     let tenants = tenant_entry(bridge_name, room, &cfg.guild_id, channel);
     let workdir = ctx.artifacts.join("bridge");
-    let bridge = BridgeUnderTest::start_with_timing(cfg, ctx.profile, &tenants, &workdir, &extra)
+    // The management bot confirms enrollments in its DM.
+    let bridge = BridgeUnderTest::start_with_management_timing(cfg, ctx.profile, &tenants, &workdir, &extra)
         .await
         .context("starting bridge-under-test")?;
     if let Err(e) = bridge.await_ready(&[bridge_name], Duration::from_secs(120)).await {
+        bridge.kill().await;
+        return Err(e);
+    }
+    if let Err(e) = bridge
+        .scraper
+        .await_event(Duration::from_secs(120), |e| e.message.contains("management bot ready"))
+        .await
+        .context("management bot never became ready")
+    {
         bridge.kill().await;
         return Err(e);
     }
@@ -127,7 +140,76 @@ async fn read_events(
     }
 }
 
+/// The member's own client in their DM with the bot: the conversation the confirmation code arrives in.
+struct OwnClient {
+    mc: MatrixManagementClient,
+    dm: String,
+    marker: String,
+}
+
+async fn open_dm(cfg: &crate::config::E2eConfig) -> Result<OwnClient> {
+    let mc = MatrixManagementClient::register(cfg, "nvbtest_alice", "NVB Test Alice").await.context("registering the member's DM client")?;
+    let dm = mc.create_dm().await.context("opening the member's DM with the bot")?;
+    mc.await_bot_joined(&dm, Duration::from_secs(60)).await?;
+    mc.await_greeting(&dm, Duration::from_secs(30)).await?;
+    // Talk once so the bot knows this is the member's DM.
+    let marker = mc.send(&dm, "help").await?;
+    mc.wait_for_reply(&dm, &marker, Duration::from_secs(45)).await.context("no help reply in the member's DM")?;
+    Ok(OwnClient { mc, dm, marker })
+}
+
+/// What the member's own client does with the bot's message: read the code, send `companion key approve <code>`.
+/// A wrong code first, which must not activate anything.
+async fn confirm_in_dm(own: &OwnClient, http: &reqwest::Client, api: &str, room: &str, key: &str) -> Result<()> {
+    let msg = own
+        .mc
+        .wait_for_bot_message_containing(&own.dm, &own.marker, "companion key approve", Duration::from_secs(60))
+        .await
+        .context("the bot never DMed the enrollment's confirmation code")?;
+    if !msg.contains(APP_DEVICE) {
+        bail!("the confirmation DM does not name the device: {msg:?}");
+    }
+    let code: String = msg
+        .split("companion key approve ")
+        .nth(1)
+        .context("no code after `companion key approve`")?
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .collect();
+    if code.len() < 6 {
+        bail!("confirmation code looks wrong: {code:?} in {msg:?}");
+    }
+    let wrong = if code == "ZZZZZZZZ" { "YYYYYYYY" } else { "ZZZZZZZZ" };
+    let ev = own.mc.send(&own.dm, &format!("companion key approve {wrong}")).await?;
+    let reply = own.mc.wait_for_reply(&own.dm, &ev, Duration::from_secs(45)).await?;
+    if !reply.contains("doesn't match") {
+        bail!("a wrong code was not refused: {reply:?}");
+    }
+    let r = http.get(format!("{api}/self/events")).query(&[("room_id", room)]).bearer_auth(key).send().await?;
+    let v: serde_json::Value = r.json().await.unwrap_or_default();
+    if v["error"] != "pending_approval" {
+        bail!("after a wrong code the key should still be pending, got {v}");
+    }
+    let ev = own.mc.send(&own.dm, &format!("companion key approve {code}")).await?;
+    let reply = own.mc.wait_for_reply(&own.dm, &ev, Duration::from_secs(45)).await?;
+    if !reply.contains("confirmed") {
+        bail!("the right code did not confirm the device: {reply:?}");
+    }
+    eprintln!("   confirmed in the DM: {reply}");
+    Ok(())
+}
+
 async fn drive(ctx: &Ctx, room: &str, port: u16) -> Result<()> {
+    let cfg = &ctx.cfg;
+    let own = open_dm(cfg).await?;
+    let result = drive_call(ctx, room, port, &own).await;
+    if let Err(e) = own.mc.leave_as(&own.dm, own.mc.mxid()).await {
+        eprintln!("leaving the member's DM failed (non-fatal): {e}");
+    }
+    result
+}
+
+async fn drive_call(ctx: &Ctx, room: &str, port: u16, own: &OwnClient) -> Result<()> {
     let cfg = &ctx.cfg;
     let http = reqwest::Client::new();
     let api = format!("http://127.0.0.1:{port}/_nvb/v1");
@@ -158,11 +240,20 @@ async fn drive(ctx: &Ctx, room: &str, port: u16) -> Result<()> {
         if status != 201 {
             bail!("enrollment refused: {status} {v}");
         }
-        if v["user_id"] != mxid.as_str() || v["device_id"] != APP_DEVICE {
-            bail!("enrollment answered for the wrong device: {v}");
+        if v["user_id"] != mxid.as_str() || v["device_id"] != APP_DEVICE || v["status"] != "pending_approval" {
+            bail!("enrollment answered for the wrong device, or not pending: {v}");
         }
         let key = v["key"].as_str().context("key")?.to_string();
-        eprintln!("   enrolled {} as key {}", v["user_id"], v["key_id"]);
+        eprintln!("   enrolled {} as key {} (pending)", v["user_id"], v["key_id"]);
+
+        // A pending key opens nothing: the token alone is not proof enough (OpenID tokens are not audience-bound).
+        let r = http.get(format!("{api}/self/events")).query(&[("room_id", room)]).bearer_auth(&key).send().await?;
+        let s = r.status().as_u16();
+        let pv: serde_json::Value = r.json().await.unwrap_or_default();
+        if s != 403 || pv["error"] != "pending_approval" {
+            bail!("a pending device key should be refused as pending_approval, got {s} {pv}");
+        }
+        confirm_in_dm(own, &http, &api, room, &key).await?;
 
         // The stream opens once the bridge sees the membership.
         let mut resp = None;

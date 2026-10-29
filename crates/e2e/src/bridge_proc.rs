@@ -47,6 +47,9 @@ pub fn generate_config(cfg: &E2eConfig) -> String {
 /// scenarios can arm knobs the standing block leaves unset on purpose —
 /// `mgmt_cooldown_secs` foremost, whose absence is exactly why the suite
 /// never reproduced #97. Empty for everyone else.
+/// Test-only since ADR 0005: `start_inner` renders the management path through
+/// [`render_config`] directly so `[timing]` lines are threaded too.
+#[cfg(test)]
 pub fn generate_config_with_management(cfg: &E2eConfig, extra_limits: &str) -> String {
     render_config(cfg, &cfg.puppet_tokens, true, extra_limits, "")
 }
@@ -356,6 +359,21 @@ impl BridgeUnderTest {
             .await
     }
 
+    /// Like [`start_with_management`](Self::start_with_management) plus extra
+    /// raw `[timing]` lines (and any blocks after them) — ADR 0005's
+    /// `self_call_data` needs the management bot (enrollments are confirmed in
+    /// its DM) next to a `[companions]` block and a held-off reaper.
+    pub async fn start_with_management_timing(
+        cfg: &E2eConfig,
+        profile: Profile,
+        tenants_toml: &str,
+        workdir: &Path,
+        extra_timing: &str,
+    ) -> Result<Self> {
+        Self::start_inner(cfg, profile, tenants_toml, workdir, true, None, &[], "", extra_timing)
+            .await
+    }
+
     /// Like [`start`](Self::start) but with the puppet pool restricted to the
     /// first `pool_size` tokens (#7 `overflow_fcfs_promotion` forces a 1-bot
     /// pool so overflow is deterministic). See [`generate_config_with_pool_size`].
@@ -433,11 +451,7 @@ impl BridgeUnderTest {
         extra_timing: &str,
     ) -> String {
         if management {
-            debug_assert!(
-                extra_timing.is_empty(),
-                "the management render path does not thread [timing] overrides"
-            );
-            generate_config_with_management(cfg, extra_limits)
+            render_config(cfg, &cfg.puppet_tokens, true, extra_limits, extra_timing)
         } else {
             generate_config_with_pool_size_timing(
                 cfg,

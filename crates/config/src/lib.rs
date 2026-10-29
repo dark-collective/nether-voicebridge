@@ -142,7 +142,11 @@ pub struct CompanionsConfig {
     pub auth_failures_per_minute: u32,
     /// Request header carrying the real client address when the listener sits
     /// behind a proxy (e.g. `CF-Connecting-IP`). Unset ⇒ the TCP peer address.
-    /// Only set it when every request comes through that proxy.
+    /// Only set it when every request comes through that proxy. A single-value
+    /// header the proxy sets itself (`CF-Connecting-IP`, `X-Real-IP`) is
+    /// preferred; for a comma-separated list (`X-Forwarded-For`) the LAST entry
+    /// is used — the one your proxy appended — since earlier ones are
+    /// client-supplied.
     #[serde(default)]
     pub client_ip_header: Option<String>,
     /// Public base URL of the `/_nvb/v1` listener as companions reach it (through
@@ -152,8 +156,10 @@ pub struct CompanionsConfig {
     #[serde(default)]
     pub public_url: Option<String>,
     /// Serve `/_nvb/v1/self/*` (ADR 0005: a member's own call data for a
-    /// listen-only device of their own account). Only with `enabled`.
-    #[serde(default = "default_true")]
+    /// listen-only device of their own account). Only with `enabled`, and needs
+    /// the `[management]` bot (enrollments are confirmed in its DM). Off by
+    /// default: an instance that runs companions gains no new endpoint on upgrade.
+    #[serde(default)]
     pub self_enroll: bool,
     /// Enrollment attempts one client address may make per minute (checked
     /// before any verification work).
@@ -167,9 +173,6 @@ pub struct CompanionsConfig {
     pub trusted_private_servers: Vec<String>,
 }
 
-fn default_true() -> bool {
-    true
-}
 fn default_enrollments_per_minute() -> u32 {
     5
 }
@@ -209,7 +212,7 @@ impl Default for CompanionsConfig {
             auth_failures_per_minute: default_auth_failures_per_minute(),
             client_ip_header: None,
             public_url: None,
-            self_enroll: true,
+            self_enroll: false,
             enrollments_per_minute: default_enrollments_per_minute(),
             trusted_private_servers: Vec::new(),
         }

@@ -662,14 +662,16 @@ pub(crate) fn roster_mxids(
 ) -> HashSet<String> {
     use nvb_companion::selfcall::{device_identities, is_listen_only_identity};
     let mut hashed: HashMap<String, &str> = HashMap::new();
+    // Every device of every membership event (a legacy event lists several).
     for e in entries.iter().filter(|e| !e.is_bridge_owned) {
-        let Some(dev) = e.device_id.as_deref() else { continue };
-        let mids = keys
-            .iter()
-            .filter(|k| k.sender == e.mxid && k.device_id == dev)
-            .filter_map(|k| k.member_id.as_deref());
-        for id in device_identities(&e.mxid, dev, mids).into_iter().skip(1) {
-            hashed.insert(id, e.mxid.as_str());
+        for dev in &e.devices {
+            let mids = keys
+                .iter()
+                .filter(|k| k.sender == e.mxid && k.device_id == dev.device_id)
+                .filter_map(|k| k.member_id.as_deref());
+            for id in device_identities(&e.mxid, &dev.device_id, mids).into_iter().skip(1) {
+                hashed.insert(id, e.mxid.as_str());
+            }
         }
     }
     identities
@@ -1182,7 +1184,7 @@ mod foreign_foci_tests {
         Some(LivekitFocusInfo { alias: "!r:x".into(), service_url: url.into() })
     }
     fn human(key: &str, focus: Option<LivekitFocusInfo>, preferred: Option<LivekitFocusInfo>) -> MembershipEntry {
-        MembershipEntry { state_key: key.into(), mxid: key.into(), is_bridge_owned: false, legacy_state_key: false, focus, preferred, device_id: None, active: true }
+        MembershipEntry { state_key: key.into(), mxid: key.into(), is_bridge_owned: false, legacy_state_key: false, focus, preferred, devices: Vec::new(), active: true }
     }
 
     #[test]

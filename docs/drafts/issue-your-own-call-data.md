@@ -11,7 +11,9 @@ own media. The bridge is already a call member and already receives your key.
 
 **How (ADR 0005):**
 - enroll once: `POST /_nvb/v1/self/enroll` with an OpenID token from your homeserver, verified on its federation API;
-  you get a device-bound key, revocable, replaced on re-enroll;
+  you get a device-bound key, pending until you confirm it: the management bot DMs you a code and only
+  `companion key approve <code>` from your account, in that DM, within 10 minutes, activates it (an OpenID token isn't
+  audience-bound, so a replayed one must not be enough). Revocable, replaced on a confirmed re-enroll, 5 per account;
 - `GET /_nvb/v1/self/events?room_id=…` while you're in the call: `self_call`, `key`, `paired`, `revoked`;
 - the bridge advertises its API in the room (`im.nether.voicebridge.api`) when `[companions] public_url` is set;
 - the stale-membership reaper ignores enrolled listen-only devices, so they can't keep a crashed client's membership
@@ -19,4 +21,4 @@ own media. The bridge is already a call member and already receives your key.
 
 **Never:** another member's key, a ghost's key, any media, or a stored user credential.
 
-Off unless `[companions]` is enabled.
+Opt-in: off unless `[companions] enabled` and `self_enroll` are set, and needs the management bot.

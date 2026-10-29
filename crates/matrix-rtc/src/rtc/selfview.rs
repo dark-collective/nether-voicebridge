@@ -83,17 +83,19 @@ fn transport(f: Option<LivekitFocusInfo>) -> Option<Transport> {
 
 async fn build_view(i: &ViewInputs) -> RoomView {
     let members = match crate::matrix::snapshot_call_memberships(&i.client, &i.room_id, &i.bot_user_id, &i.ghost_prefix).await {
+        // One member per membership: a legacy event (state key = MXID) lists every device, each with its own expiry.
         Ok(snap) => snap
             .entries
             .into_iter()
-            .filter_map(|e| {
-                Some(CallMember {
-                    device_id: e.device_id?,
-                    mxid: e.mxid,
-                    active: e.active,
+            .flat_map(|e| {
+                let (focus, preferred) = (transport(e.focus), transport(e.preferred));
+                e.devices.into_iter().map(move |d| CallMember {
+                    device_id: d.device_id,
+                    mxid: e.mxid.clone(),
+                    active: d.active,
                     bridge_owned: e.is_bridge_owned,
-                    transport: transport(e.focus),
-                    preferred: transport(e.preferred),
+                    transport: focus.clone(),
+                    preferred: preferred.clone(),
                 })
             })
             .collect(),
@@ -154,23 +156,67 @@ impl RoomFacts for SelfView {
 
 // ── discovery: advertise the companion API in the room ───────────────────────
 
+/// After writing the member-content fallback, how long before the bridge writes it again if the field is missing:
+/// a homeserver may strip unknown member-content keys, and rewriting `m.room.member` every check would spam the room.
+const MEMBER_REWRITE_BACKOFF: Duration = Duration::from_secs(6 * 3600);
+
+/// What one discovery check did.
+#[derive(Debug, PartialEq, Eq)]
+enum Advertised {
+    /// The room already says what we want.
+    Current,
+    /// Wrote the state event.
+    State,
+    /// Wrote the member-content fallback.
+    Member,
+    /// The member field is missing again soon after we wrote it: held off (see [`MEMBER_REWRITE_BACKOFF`]).
+    MemberHeld,
+}
+
 /// Keep the room advertising the companion API (ADR 0005) while `[companions]
 /// public_url` is set: as the `im.nether.voicebridge.api` state event (state key
 /// = the bot) when the bot may send it, else as a field of the bot's own
 /// `m.room.member`. Re-checked every [`DISCOVERY_RECHECK`]; only written when the
-/// room's copy differs. Best-effort: failures are logged and retried next time.
+/// room's copy differs, and the member fallback at most once per
+/// [`MEMBER_REWRITE_BACKOFF`]. With `public_url` unset, an earlier advertisement
+/// is withdrawn once. Best-effort: failures are logged and retried next time.
 pub(crate) async fn advertise_api(client: Client, room_id: OwnedRoomId, bot_user_id: OwnedUserId, shutdown: CancellationToken) {
     let mut tick = tokio::time::interval(DISCOVERY_RECHECK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut member_written: Option<tokio::time::Instant> = None;
+    let mut held_logged = false;
+    let mut withdrawn = false;
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return,
             _ = tick.tick() => {}
         }
-        let Some(want) = nvb_companion::selfcall::discovery_content() else { continue };
         let Some(room) = client.get_room(&room_id) else { continue };
-        if let Err(e) = advertise_once(&room, &bot_user_id, &want).await {
-            tracing::warn!(error = %e, "could not advertise the companion API in the room");
+        let Some(want) = nvb_companion::selfcall::discovery_content() else {
+            if !withdrawn {
+                match withdraw_once(&room, &bot_user_id).await {
+                    Ok(()) => withdrawn = true,
+                    Err(e) => tracing::warn!(error = %e, "could not withdraw the companion API advertisement"),
+                }
+            }
+            continue;
+        };
+        withdrawn = false;
+        let may_write_member = member_written.is_none_or(|t| t.elapsed() >= MEMBER_REWRITE_BACKOFF);
+        match advertise_once(&room, &bot_user_id, &want, may_write_member).await {
+            Ok(Advertised::Member) => member_written = Some(tokio::time::Instant::now()),
+            Ok(Advertised::MemberHeld) => {
+                if !held_logged {
+                    held_logged = true;
+                    tracing::warn!(
+                        "the companion API field written to the bot's room membership did not stick (the homeserver \
+                         may drop unknown member keys) — not rewriting it for a while; allow the bot to send the \
+                         im.nether.voicebridge.api state event instead"
+                    );
+                }
+            }
+            Ok(Advertised::Current | Advertised::State) => held_logged = false,
+            Err(e) => tracing::warn!(error = %e, "could not advertise the companion API in the room"),
         }
     }
 }
@@ -183,25 +229,51 @@ async fn state_content(room: &matrix_sdk::Room, event_type: &str, state_key: &st
     ev.get("content").cloned()
 }
 
-async fn advertise_once(room: &matrix_sdk::Room, bot: &UserId, want: &serde_json::Value) -> anyhow::Result<()> {
+async fn advertise_once(room: &matrix_sdk::Room, bot: &UserId, want: &serde_json::Value, may_write_member: bool) -> anyhow::Result<Advertised> {
     use nvb_companion::selfcall::{API_MEMBER_FIELD, API_STATE_EVENT};
     if room.power_levels().await?.user_can_send_state(bot, API_STATE_EVENT.into()) {
-        if state_content(room, API_STATE_EVENT, bot.as_str()).await.as_ref() != Some(want) {
-            room.send_state_event_raw(API_STATE_EVENT, bot.as_str(), want.clone()).await?;
-            tracing::info!("advertised the companion API in room state");
+        if state_content(room, API_STATE_EVENT, bot.as_str()).await.as_ref() == Some(want) {
+            return Ok(Advertised::Current);
         }
-        return Ok(());
+        room.send_state_event_raw(API_STATE_EVENT, bot.as_str(), want.clone()).await?;
+        tracing::info!("advertised the companion API in room state");
+        return Ok(Advertised::State);
     }
     // Fallback: the bot's own membership (always writable by the bot itself).
     let Some(mut member) = state_content(room, "m.room.member", bot.as_str()).await else {
         anyhow::bail!("bot membership not in local state");
     };
     if member.get(API_MEMBER_FIELD) == Some(want) {
-        return Ok(());
+        return Ok(Advertised::Current);
+    }
+    if !may_write_member {
+        return Ok(Advertised::MemberHeld);
     }
     let Some(obj) = member.as_object_mut() else { anyhow::bail!("bot membership content is not an object") };
     obj.insert(API_MEMBER_FIELD.to_owned(), want.clone());
     room.send_state_event_raw("m.room.member", bot.as_str(), member).await?;
     tracing::info!("advertised the companion API in the bot's room membership (no power to send its state event)");
+    Ok(Advertised::Member)
+}
+
+/// `public_url` unset: withdraw an advertisement an earlier configuration left in the room (empty state event
+/// content; the member field removed), so devices stop finding an API that is no longer served.
+async fn withdraw_once(room: &matrix_sdk::Room, bot: &UserId) -> anyhow::Result<()> {
+    use nvb_companion::selfcall::{API_MEMBER_FIELD, API_STATE_EVENT};
+    let advertised = state_content(room, API_STATE_EVENT, bot.as_str()).await.is_some_and(|c| c.as_object().is_some_and(|o| !o.is_empty()));
+    if advertised {
+        if room.power_levels().await?.user_can_send_state(bot, API_STATE_EVENT.into()) {
+            room.send_state_event_raw(API_STATE_EVENT, bot.as_str(), serde_json::json!({})).await?;
+            tracing::info!("withdrew the companion API advertisement from room state (public_url is unset)");
+        } else {
+            tracing::warn!("the room still advertises the companion API, but the bot may no longer send that state event");
+        }
+    }
+    if let Some(mut member) = state_content(room, "m.room.member", bot.as_str()).await {
+        if member.as_object_mut().is_some_and(|o| o.remove(API_MEMBER_FIELD).is_some()) {
+            room.send_state_event_raw("m.room.member", bot.as_str(), member).await?;
+            tracing::info!("withdrew the companion API field from the bot's room membership (public_url is unset)");
+        }
+    }
     Ok(())
 }
