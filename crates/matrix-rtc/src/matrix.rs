@@ -5,7 +5,7 @@ use matrix_sdk::{
     config::SyncSettings,
     deserialized_responses::SyncOrStrippedState,
     ruma::{
-        MilliSecondsSinceUnixEpoch, OwnedUserId, RoomId, UserId,
+        MilliSecondsSinceUnixEpoch, OwnedRoomId, OwnedUserId, RoomId, UserId,
         events::{
             SyncStateEvent,
             call::member::{CallMemberEventContent, SyncCallMemberEvent},
@@ -1252,6 +1252,70 @@ pub(crate) async fn get_room_state(
 /// with a client produced by `build_client`. Drives the `SyncCallMemberEvent`
 /// handler and sends call-active signals through `call_active_tx` when the first
 /// human joins or the last human leaves.
+/// A departure grace in flight (see the `MatrixIncluded` handler in [`run`]).
+struct DepartureCtx {
+    mxid: OwnedUserId,
+    /// Cancelled when the half comes back or the member's leave takes effect.
+    token: CancellationToken,
+    grace: Duration,
+    router: Arc<dyn PlaybackRouter>,
+    participants: ParticipantSet,
+    pending_leaves: PendingLeaves,
+    pending_arrivals: PendingArrivals,
+    links: Arc<LinkBoard>,
+    client: Client,
+    room_id: OwnedRoomId,
+    shutdown: CancellationToken,
+}
+
+/// How often a departure grace re-checks a pending leave after it elapsed.
+const DEPARTURE_LEAVE_POLL: Duration = Duration::from_millis(250);
+
+/// Ends a departure grace: after `grace`, and once no leave of the member is
+/// pending, a member still present and still not bridge-owned gets its puppet
+/// (and the "your Discord session dropped" notice).
+async fn departure_grace_elapsed(d: DepartureCtx) {
+    let mut wait = d.grace;
+    loop {
+        tokio::select! {
+            biased;
+            _ = d.shutdown.cancelled() => return, // teardown owns final release
+            _ = d.token.cancelled() => return,    // half back / leave took effect
+            _ = tokio::time::sleep(wait) => {}
+        }
+        if !d.pending_leaves.lock().await.contains_key(&d.mxid) {
+            break;
+        }
+        wait = DEPARTURE_LEAVE_POLL; // their Matrix leave is being debounced — wait it out
+    }
+    {
+        // A newer timer for this member cancels ours on insert, so an uncancelled
+        // token means the entry is still ours.
+        let mut arrivals = d.pending_arrivals.lock().await;
+        if d.token.is_cancelled() {
+            return;
+        }
+        arrivals.remove(&d.mxid);
+    }
+    let user = d.mxid.as_str();
+    if !d.links.end_arrival_grace(user) {
+        return; // already ended (first voiced frame assigned, half back, leave)
+    }
+    let present = d.participants.lock().await.iter().any(|(u, _)| u == &d.mxid);
+    if !present || d.links.matrix_excluded(user) {
+        tracing::info!(mxid = %user, "departure grace elapsed — member gone or paired half back — no puppet");
+        return;
+    }
+    let name = match d.client.get_room(&d.room_id) {
+        Some(room) => resolve_member_name(&room, &d.mxid).await,
+        None => user.to_owned(),
+    };
+    tracing::info!(mxid = %user, display_name = %name, "departure grace elapsed — member stayed in the call — assigning puppet");
+    d.router.assign(user, &name);
+    d.router.unlisten(user); // after the assign: the anchor never lapses
+    crate::links_notice::emit(&d.links, user);
+}
+
 #[tracing::instrument(parent = None, name = "bridge", skip_all, fields(name = %bridge))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
@@ -1260,6 +1324,7 @@ pub(crate) async fn run(
     media_e2ee: bool,
     leave_grace: Duration,
     arrival_grace: Duration,
+    departure_grace: Duration,
     call_active_tx: watch::Sender<bool>,
     members_gen_tx: watch::Sender<u64>,
     router: Arc<dyn PlaybackRouter>,
@@ -1286,6 +1351,7 @@ pub(crate) async fn run(
         let room_id = room_id.clone();
         let links = links.clone();
         let pending_arrivals = pending_arrivals.clone();
+        let pending_leaves = pending_leaves.clone();
         let span = tracing::info_span!(parent: None, "bridge", name = %bridge);
         tokio::spawn(
             async move {
@@ -1322,6 +1388,41 @@ pub(crate) async fn run(
                             let present = participants.lock().await.iter().any(|(u, _)| u.as_str() == user);
                             if !present || links.matrix_excluded(&user) {
                                 continue;
+                            }
+                            // Departure grace (ADR 0005): the Discord half usually vanishes
+                            // because the person is leaving altogether, and their Matrix
+                            // membership goes a moment later. Assigning a puppet now would
+                            // flash a bot under their name on the way out. Keep them
+                            // listen-only instead (the arrival-grace claim: their first
+                            // voiced frame still assigns at once) until the grace elapses
+                            // and no leave of theirs is pending.
+                            if discord_half_vanished && !departure_grace.is_zero() && !links.in_arrival_grace(&user) {
+                                if let Ok(uid) = user.parse::<OwnedUserId>() {
+                                    tracing::info!(mxid = %user, grace_ms = departure_grace.as_millis() as u64, "paired Discord account left — listening, departure grace started");
+                                    links.begin_arrival_grace(&user);
+                                    router.listen(&user);
+                                    let token = CancellationToken::new();
+                                    if let Some(old) = pending_arrivals.lock().await.insert(uid.clone(), token.clone()) {
+                                        old.cancel();
+                                    }
+                                    tokio::spawn(
+                                        departure_grace_elapsed(DepartureCtx {
+                                            mxid: uid,
+                                            token,
+                                            grace: departure_grace,
+                                            router: router.clone(),
+                                            participants: participants.clone(),
+                                            pending_leaves: pending_leaves.clone(),
+                                            pending_arrivals: pending_arrivals.clone(),
+                                            links: links.clone(),
+                                            client: client.clone(),
+                                            room_id: room_id.clone(),
+                                            shutdown: shutdown.clone(),
+                                        })
+                                        .in_current_span(),
+                                    );
+                                    continue;
+                                }
                             }
                             // A pairing removed mid-grace: ordinary now, the grace is moot.
                             links.end_arrival_grace(&user);
@@ -1546,6 +1647,11 @@ pub(crate) struct MembershipEntry {
     /// be publishing HERE rather than on `focus`. The RTC loop subscribes on
     /// both, and the reaper only judges a member once both are watched.
     pub(crate) preferred: Option<crate::rtc::well_known::LivekitFocusInfo>,
+    /// The device the (first) membership is for — what a member's own
+    /// listen-only device is told about (ADR 0005). `None` = no membership body.
+    pub(crate) device_id: Option<String>,
+    /// The membership has not expired.
+    pub(crate) active: bool,
 }
 
 /// The call's memberships as read from room state, focus-resolved.
@@ -1592,13 +1698,14 @@ pub(crate) async fn snapshot_call_memberships(
         // the sender's foci. Expired-but-unretracted entries are kept — those are
         // exactly the phantoms the reaper exists to clear.
         let mems = o.content.memberships();
-        let (selection, preferred, created) = match mems.first() {
+        let (selection, preferred, created, device_id) = match mems.first() {
             Some(m) => (
                 Selection::from_active_focus(m.focus_active()),
                 first_livekit_focus(m.foci_preferred()),
                 m.created_ts().unwrap_or(o.origin_server_ts),
+                Some(m.device_id().to_string()),
             ),
-            None => (Selection::Unknown, None, o.origin_server_ts),
+            None => (Selection::Unknown, None, o.origin_server_ts, None),
         };
         let active = !o.content.active_memberships(Some(o.origin_server_ts)).is_empty();
         let mxid = o.sender.as_str().to_owned();
@@ -1620,6 +1727,8 @@ pub(crate) async fn snapshot_call_memberships(
             legacy_state_key,
             focus: None,
             preferred,
+            device_id,
+            active,
         });
     }
     let mut resolved = resolve_effective_foci(&focus_inputs);
@@ -2030,6 +2139,8 @@ mod tests {
             legacy_state_key: legacy,
             focus: focus(OUR_SFU),
             preferred: focus(OUR_SFU),
+            device_id: None,
+            active: true,
         }
     }
 
@@ -2057,6 +2168,66 @@ mod tests {
         // A member with no derivable SFU at all is never judged.
         let unknown = [MembershipEntry { focus: None, preferred: None, ..entry("_@x:y_D_m.call", "@x:y", false, false) }];
         assert!(classify_stale_memberships(&live(&[]), &both, &unknown, &mut since, t0 + GRACE * 3, GRACE).is_empty());
+    }
+
+    /// ADR 0005: an enrolled listen-only device stays connected after its owner's
+    /// client dies, so it must not keep the dead membership alive; the owner's
+    /// live client (legacy, Commet-style without `member.id`, or hashed) does.
+    #[test]
+    fn listen_only_devices_are_no_evidence_but_hashed_and_commet_members_are() {
+        use crate::rtc::roster_mxids;
+        use nvb_companion::selfcall::{
+            hashed_identity_with_device, legacy_identity, set_listen_only_devices, PeerKey,
+        };
+        let owner = "@reaper-owner:example.org";
+        let with_dev = |key: &str, mxid: &str, dev: &str| MembershipEntry {
+            device_id: Some(dev.to_owned()),
+            ..entry(key, mxid, false, false)
+        };
+        set_listen_only_devices([(owner.to_owned(), "LISTEN".to_owned())]);
+        let entries = [with_dev("_@reaper-owner:example.org_PHONE_m.call", owner, "PHONE")];
+        let t0 = Instant::now();
+
+        // Crashed client: only the listen-only device (both identity forms) is
+        // left → the membership is a phantom and is reaped after grace.
+        let only_app: HashSet<String> = [
+            legacy_identity(owner, "LISTEN"),
+            hashed_identity_with_device(owner, "LISTEN", "LISTEN"),
+        ]
+        .into();
+        let mxids = roster_mxids(&only_app, &entries, &[]);
+        assert!(mxids.is_empty());
+        let mut since = HashMap::new();
+        assert!(classify_stale_memberships(&mxids, &ours(), &entries, &mut since, t0, GRACE).is_empty());
+        assert_eq!(
+            classify_stale_memberships(&mxids, &ours(), &entries, &mut since, t0 + GRACE, GRACE),
+            vec![entries[0].state_key.clone()]
+        );
+
+        // Live client next to the app → kept.
+        let mut both = only_app.clone();
+        both.insert(legacy_identity(owner, "PHONE"));
+        let mxids = roster_mxids(&both, &entries, &[]);
+        let mut since = HashMap::new();
+        assert!(classify_stale_memberships(&mxids, &ours(), &entries, &mut since, t0 + GRACE * 3, GRACE).is_empty());
+
+        // A hashed member is recognised once a key named its member.id …
+        let hashed = HashSet::from([hashed_identity_with_device(owner, "PHONE", "mem-1")]);
+        assert!(roster_mxids(&hashed, &entries, &[]).is_empty());
+        let key = PeerKey {
+            sender: owner.into(),
+            device_id: "PHONE".into(),
+            member_id: Some("mem-1".into()),
+            index: 0,
+            key_b64: "k".into(),
+        };
+        assert_eq!(roster_mxids(&hashed, &entries, &[key]), live(&[owner]));
+
+        // … and a Commet-style member (legacy identity, no member.id) counts as is.
+        let commet = [with_dev("_@c:matrix.org_CDEV_m.call", "@c:matrix.org", "CDEV")];
+        let ids = HashSet::from([legacy_identity("@c:matrix.org", "CDEV")]);
+        assert_eq!(roster_mxids(&ids, &commet, &[]), live(&["@c:matrix.org"]));
+        set_listen_only_devices([]);
     }
 
     fn live(mxids: &[&str]) -> HashSet<String> {

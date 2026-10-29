@@ -133,6 +133,12 @@
 # lease_requests_per_minute = 10
 # auth_failures_per_minute = 20 # per client address, then 429
 # client_ip_header = "CF-Connecting-IP"   # only when every request comes through that proxy
+# Your own call data for your own tools (ADR 0005): a device of a member's own account
+# enrolls once with an OpenID token and then gets only that member's own media key and call state.
+# public_url = "https://bridge.example.org"   # advertised in each bridged room (unset = not advertised)
+# self_enroll = true                          # serve /_nvb/v1/self/*
+# enrollments_per_minute = 5                  # per client address, checked before any verification
+# trusted_private_servers = []                # homeservers allowed to resolve to private addresses
 
 # ── Admission limits (optional) ──────────────────────────────────────────────
 # Hard caps for a hosted deployment (#47). Every field is optional; an absent
@@ -177,6 +183,7 @@
 # session_rotate_min_interval_ms = 90000  # min spacing between ghost Olm session rotations (#52)
 # paired_leave_grace_ms = 30000  # a paired member's Discord session may drop and return this long before the puppet fallback + notice (ADR 0001)
 # paired_arrival_grace_ms = 30000  # a paired member joining the call without their Discord half only listens (standby anchor) this long before getting a puppet; speaking ends it early (ADR 0003)
+# paired_departure_grace_ms = 5000  # a paired member whose Discord half leaves stays listen-only this long (and while their own leave is pending) before getting a puppet; speaking ends it early (ADR 0005)
 
 [puppets]
 # One entry per puppet bot — each is a SEPARATE Discord application with its own

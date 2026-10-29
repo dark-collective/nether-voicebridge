@@ -1,6 +1,7 @@
 //! The `/_nvb/v1` listener (ADR 0004 §7): plain HTTP/1.1 meant to sit behind a
 //! TLS reverse proxy. Bearer companion keys; one server-sent-events stream per
-//! lease, which is also the lease's liveness.
+//! lease, which is also the lease's liveness. ADR 0005 adds `/self/enroll` and
+//! `/self/events`: a member's own call data for a listen-only device of theirs.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -23,7 +24,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::hub::{CompanionHub, LeaseShared, Refusal, SERVED_KINDS, StreamGuard};
+use crate::hub::{CompanionHub, EnrollRequest, LeaseShared, Refusal, SERVED_KINDS, SelfStream, StreamGuard};
 use crate::observe::Snapshot;
 
 pub const API_PREFIX: &str = "/_nvb/v1";
@@ -34,6 +35,13 @@ const MAX_BODY: usize = 16 * 1024;
 const MAX_CONNECTIONS: usize = 512;
 /// How often an `observe` stream checks the room for changes.
 const OBSERVE_POLL: Duration = Duration::from_millis(500);
+/// How often a `/self/events` stream re-checks pairing presence and its key.
+const SELF_POLL: Duration = Duration::from_millis(500);
+/// How long a `/self/events` stream stays open after its owner's last call membership is gone (a client re-posting
+/// its membership is not a departure).
+const SELF_NOT_IN_CALL_GRACE: Duration = Duration::from_secs(15);
+/// How often a `/self/events` stream re-checks that its owner is still a member of the room.
+const SELF_MEMBER_RECHECK: Duration = Duration::from_secs(60);
 
 // ── response bodies ─────────────────────────────────────────────────────────────
 
@@ -42,7 +50,7 @@ const OBSERVE_POLL: Duration = Duration::from_millis(500);
 /// body) starts the lease's grace.
 pub enum NvbBody {
     Full(Full<Bytes>),
-    Sse { rx: mpsc::Receiver<Bytes>, _guard: StreamGuard },
+    Sse { rx: mpsc::Receiver<Bytes>, _guard: Option<StreamGuard> },
 }
 
 impl Body for NvbBody {
@@ -212,11 +220,18 @@ async fn handle(
     if segs.is_empty() {
         return if req.method() == Method::GET { discovery(&hub) } else { method_not_allowed() };
     }
-    if segs[0] != "leases" {
+    if segs[0] != "leases" && segs[0] != "self" {
         return error(StatusCode::NOT_FOUND, "not_found", "unknown path");
     }
 
     let client = client_address(&hub, &req, peer);
+    if segs[0] == "self" && !hub.config().self_enroll {
+        return error(StatusCode::NOT_FOUND, "not_found", "unknown path");
+    }
+    // Enrollment is the one unauthenticated write: it carries an OpenID token instead of a key.
+    if segs.as_slice() == ["self", "enroll"] && req.method() == Method::POST {
+        return enroll(&hub, req, &client).await;
+    }
     let bearer = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -243,7 +258,18 @@ async fn handle(
             Ok(()) => json(StatusCode::OK, serde_json::json!({ "released": true })),
             Err(r) => refusal(r),
         },
+        (Method::DELETE, ["self", "enroll"]) => match hub.unenroll(&key) {
+            Ok(()) => json(StatusCode::OK, serde_json::json!({ "unlinked": true })),
+            Err(r) => refusal(r),
+        },
+        (Method::GET, ["self", "events"]) => {
+            let Some(room_id) = query_param(req.uri().query(), "room_id") else {
+                return error(StatusCode::BAD_REQUEST, "bad_request", "room_id is required");
+            };
+            self_events(&hub, &key, &room_id, shutdown).await
+        }
         (_, ["leases"]) | (_, ["leases", _]) | (_, ["leases", _, "events" | "renew" | "live"]) => method_not_allowed(),
+        (_, ["self", "enroll" | "events"]) => method_not_allowed(),
         _ => error(StatusCode::NOT_FOUND, "not_found", "unknown path"),
     }
 }
@@ -277,7 +303,153 @@ fn discovery(hub: &CompanionHub) -> Response<NvbBody> {
             "sse_grace_secs": c.sse_grace_secs,
             "sse_keepalive_secs": c.sse_keepalive_secs,
         },
+        "self": c.self_enroll,
     }))
+}
+
+/// One query parameter, percent-decoded.
+fn query_param(query: Option<&str>, name: &str) -> Option<String> {
+    query?.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == name).then(|| percent_decode(v)).flatten()
+    })
+}
+
+fn percent_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' => {
+                let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+#[derive(Deserialize)]
+struct EnrollBody {
+    room_id: String,
+    device_id: String,
+    openid_token: String,
+    matrix_server_name: String,
+}
+
+/// `POST /self/enroll` (ADR 0005). The body (and so the OpenID token) is never logged.
+async fn enroll(hub: &CompanionHub, req: Request<Incoming>, client: &str) -> Response<NvbBody> {
+    let body = match Limited::new(req.into_body(), MAX_BODY).collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "bad_request", "request body too large or unreadable"),
+    };
+    // serde's message could quote the input; answer a fixed sentence instead.
+    let Ok(b) = serde_json::from_slice::<EnrollBody>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "bad_request", "expected { room_id, device_id, openid_token, matrix_server_name }");
+    };
+    let req = EnrollRequest { room_id: b.room_id, device_id: b.device_id, openid_token: b.openid_token, matrix_server_name: b.matrix_server_name };
+    match hub.enroll(&req, client).await {
+        Ok((key, token)) => json(StatusCode::CREATED, serde_json::json!({
+            "key": token,
+            "key_id": key.id,
+            "user_id": key.issuer,
+            "device_id": key.device,
+            "events_url": format!("{API_PREFIX}/self/events?room_id={{room_id}}"),
+        })),
+        Err(r) => refusal(r),
+    }
+}
+
+async fn self_events(hub: &Arc<CompanionHub>, key: &CompanionKey, room_id: &str, shutdown: CancellationToken) -> Response<NvbBody> {
+    let stream = match hub.open_self_events(key, room_id).await {
+        Ok(s) => s,
+        Err(r) => return refusal(r),
+    };
+    let (tx, rx) = mpsc::channel(64);
+    tokio::spawn(self_event_loop(stream, tx, shutdown));
+    sse_response(rx, None)
+}
+
+/// Feed one `/self/events` stream: the whole current state first, then changes, until the owner has been out of the
+/// call for [`SELF_NOT_IN_CALL_GRACE`], the key is revoked, the bridge stops, or the client leaves.
+async fn self_event_loop(stream: SelfStream, tx: mpsc::Sender<Bytes>, shutdown: CancellationToken) {
+    let hub = stream.hub().clone();
+    let keepalive = Duration::from_secs(hub.config().sse_keepalive_secs);
+    let mut ka = tokio::time::interval_at(tokio::time::Instant::now() + keepalive, keepalive);
+    let mut poll = tokio::time::interval(SELF_POLL);
+    let mut member_check = tokio::time::interval_at(tokio::time::Instant::now() + SELF_MEMBER_RECHECK, SELF_MEMBER_RECHECK);
+    let mut view_rx = stream.facts.view();
+    let mut last = stream.state();
+    let mut out_since: Option<tokio::time::Instant> = None;
+    for (name, data) in last.events_since(None) {
+        if tx.send(sse(name, &data)).await.is_err() {
+            return;
+        }
+    }
+    let end = |reason: &str| sse("end", &serde_json::json!({ "room_id": stream.room_id, "reason": reason }));
+    loop {
+        let refresh = tokio::select! {
+            _ = tx.closed() => return,
+            _ = shutdown.cancelled() => {
+                let _ = tx.send(end("shutdown")).await;
+                return;
+            }
+            r = view_rx.changed() => {
+                if r.is_err() {
+                    // The room's bridge stopped or restarted: the client reconnects and gets fresh state.
+                    let _ = tx.send(end("bridge_restarting")).await;
+                    return;
+                }
+                true
+            }
+            _ = poll.tick() => {
+                if !hub.key_valid(&stream.key_id) {
+                    let _ = tx.send(sse("revoked", &serde_json::json!({ "reason": "key_revoked" }))).await;
+                    return;
+                }
+                true
+            }
+            _ = member_check.tick() => {
+                if !matches!(tokio::time::timeout(Duration::from_secs(5), stream.facts.is_joined(&stream.issuer)).await, Ok(Ok(true))) {
+                    let _ = tx.send(end("not_a_member")).await;
+                    return;
+                }
+                false
+            }
+            _ = ka.tick() => {
+                if tx.send(Bytes::from_static(b": keep-alive\n\n")).await.is_err() {
+                    return;
+                }
+                false
+            }
+        };
+        if !refresh {
+            continue;
+        }
+        let now = stream.state();
+        for (name, data) in now.events_since(Some(&last)) {
+            if tx.send(sse(name, &data)).await.is_err() {
+                return;
+            }
+        }
+        if now.in_call {
+            out_since = None;
+        } else if out_since.get_or_insert_with(tokio::time::Instant::now).elapsed() >= SELF_NOT_IN_CALL_GRACE {
+            let _ = tx.send(end("not_in_call")).await;
+            return;
+        }
+        last = now;
+    }
 }
 
 async fn open_lease(hub: &CompanionHub, key: &CompanionKey, req: Request<Incoming>) -> Response<NvbBody> {
@@ -349,6 +521,10 @@ fn events(hub: &Arc<CompanionHub>, key: &CompanionKey, lease_id: &str, shutdown:
     };
     let (tx, rx) = mpsc::channel(32);
     tokio::spawn(event_loop(hub.clone(), guard.shared.clone(), tx, shutdown));
+    sse_response(rx, Some(guard))
+}
+
+fn sse_response(rx: mpsc::Receiver<Bytes>, guard: Option<StreamGuard>) -> Response<NvbBody> {
     let mut r = Response::new(NvbBody::Sse { rx, _guard: guard });
     let h = r.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));

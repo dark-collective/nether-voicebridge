@@ -26,6 +26,12 @@ pub const ROOM_KINDS: &[&str] = &["observe", "stream:attach", "stream:standalone
 /// Kinds a self-scoped key may carry (the issuer's own pairings).
 pub const SELF_KINDS: &[&str] = &["stream:attach", "listen:self"];
 
+/// The one kind of a **device-bound** self key (ADR 0005): the issuer's own call
+/// data (`/_nvb/v1/self/events`) for one listen-only device of their own account.
+/// Minted only by `/_nvb/v1/self/enroll`, never from the management DM, so it is
+/// deliberately not in [`KINDS`] and [`validate_kinds`] refuses it.
+pub const SELF_CALL_KIND: &str = "self:call";
+
 /// A key's scope.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", content = "room_id", rename_all = "lowercase")]
@@ -67,6 +73,11 @@ pub struct CompanionKey {
     /// Unix epoch seconds.
     #[serde(default)]
     pub created: i64,
+    /// A device-bound self key (ADR 0005): the issuer's listen-only device this
+    /// key belongs to. Such a key needs no pairing and dies on unlink, revoke or
+    /// re-enrollment of the same device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
     /// Last, so it serializes as a sub-table after the plain values.
     pub scope: KeyScope,
 }
@@ -74,6 +85,11 @@ pub struct CompanionKey {
 impl CompanionKey {
     pub fn allows(&self, kind: &str) -> bool {
         self.kinds.iter().any(|k| k == kind)
+    }
+
+    /// Is this a device-bound self key (`/self/enroll`)?
+    pub fn is_device_key(&self) -> bool {
+        self.device.is_some() && self.scope == KeyScope::SelfScope
     }
 }
 
@@ -200,6 +216,20 @@ impl CompanionKeys {
         })
     }
 
+    /// Store a device-bound key, replacing any earlier key of the same
+    /// `(issuer, device)` (a re-enrollment). Returns the replaced keys.
+    pub fn replace_device_key(&self, key: CompanionKey) -> Result<Vec<CompanionKey>, ConfigError> {
+        self.edit(|f| {
+            let (gone, keep): (Vec<_>, Vec<_>) = f
+                .keys
+                .drain(..)
+                .partition(|k| k.id == key.id || (k.is_device_key() && k.issuer == key.issuer && k.device == key.device));
+            f.keys = keep;
+            f.keys.push(key);
+            gone
+        })
+    }
+
     pub fn get(&self, id: &str) -> Option<CompanionKey> {
         self.inner.read().unwrap_or_else(PoisonError::into_inner).keys.iter().find(|k| k.id == id).cloned()
     }
@@ -274,7 +304,40 @@ mod tests {
             kinds: vec!["observe".into()],
             label: String::new(),
             created: 1,
+            device: None,
         }
+    }
+
+    #[test]
+    fn device_keys_are_replaced_per_issuer_and_device_and_round_trip() {
+        let dir = std::env::temp_dir().join(format!("nvb-companions-dev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = companions_path(dir.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let s = CompanionKeys::open(path.clone()).unwrap();
+        let dev = |id: &str, issuer: &str, device: &str| CompanionKey {
+            issuer: issuer.into(),
+            kinds: vec![SELF_CALL_KIND.into()],
+            device: Some(device.into()),
+            ..key(id, KeyScope::SelfScope)
+        };
+        assert!(s.replace_device_key(dev("d1", "@a:hs", "DEV")).unwrap().is_empty());
+        s.replace_device_key(dev("d2", "@a:hs", "OTHER")).unwrap();
+        s.replace_device_key(dev("d3", "@b:hs", "DEV")).unwrap();
+        // A pairing-scoped self key of the same issuer is not a device key and stays.
+        s.add(key("p1", KeyScope::SelfScope)).unwrap();
+        let gone = s.replace_device_key(dev("d4", "@a:hs", "DEV")).unwrap();
+        assert_eq!(gone.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(), vec!["d1"]);
+        let again = CompanionKeys::open(path).unwrap();
+        let mut ids: Vec<String> = again.list().into_iter().map(|k| k.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["d2", "d3", "d4", "p1"]);
+        assert_eq!(again.get("d4").unwrap().device.as_deref(), Some("DEV"));
+        assert!(again.get("d4").unwrap().is_device_key());
+        assert!(!again.get("p1").unwrap().is_device_key());
+        // Never mintable from the management DM.
+        assert!(validate_kinds(&KeyScope::SelfScope, &[SELF_CALL_KIND.into()]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

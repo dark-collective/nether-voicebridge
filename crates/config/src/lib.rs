@@ -145,6 +145,33 @@ pub struct CompanionsConfig {
     /// Only set it when every request comes through that proxy.
     #[serde(default)]
     pub client_ip_header: Option<String>,
+    /// Public base URL of the `/_nvb/v1` listener as companions reach it (through
+    /// the operator's reverse proxy), e.g. `https://bridge.example.org`. When set,
+    /// each bridge advertises it in its room (ADR 0005 discovery) so a member's own
+    /// tools can find the API without configuration. Unset ⇒ nothing is published.
+    #[serde(default)]
+    pub public_url: Option<String>,
+    /// Serve `/_nvb/v1/self/*` (ADR 0005: a member's own call data for a
+    /// listen-only device of their own account). Only with `enabled`.
+    #[serde(default = "default_true")]
+    pub self_enroll: bool,
+    /// Enrollment attempts one client address may make per minute (checked
+    /// before any verification work).
+    #[serde(default = "default_enrollments_per_minute")]
+    pub enrollments_per_minute: u32,
+    /// Matrix server names whose federation endpoints may resolve to private,
+    /// loopback or this host's own addresses during enrollment — for a
+    /// homeserver that runs next to the bridge or on a private network.
+    /// Everything else resolving to such an address is refused.
+    #[serde(default)]
+    pub trusted_private_servers: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_enrollments_per_minute() -> u32 {
+    5
 }
 
 fn default_companions_listen() -> String {
@@ -181,6 +208,10 @@ impl Default for CompanionsConfig {
             lease_requests_per_minute: default_lease_requests_per_minute(),
             auth_failures_per_minute: default_auth_failures_per_minute(),
             client_ip_header: None,
+            public_url: None,
+            self_enroll: true,
+            enrollments_per_minute: default_enrollments_per_minute(),
+            trusted_private_servers: Vec::new(),
         }
     }
 }
@@ -338,6 +369,13 @@ pub struct TimingConfig {
     /// churn. Expiry (or their first voiced frame) assigns the puppet.
     /// Historical value: none (immediate) before 0.4.14.
     pub paired_arrival_grace_ms: u64,
+    /// Grace after a paired member's Discord half leaves the channel while their
+    /// Matrix half is still in the call (ADR 0005 "departure grace"): the member
+    /// only listens, so a Matrix half that is itself leaving never gets a puppet
+    /// that joins Discord under their name for a few seconds. Expiry (or their
+    /// first voiced frame) assigns the puppet; a pending Matrix leave extends it.
+    /// Historical value: none (immediate) before 0.4.16.
+    pub paired_departure_grace_ms: u64,
 }
 
 impl Default for TimingConfig {
@@ -356,6 +394,7 @@ impl Default for TimingConfig {
             session_rotate_min_interval_ms: 90_000,
             paired_leave_grace_ms: 30_000,
             paired_arrival_grace_ms: 30_000,
+            paired_departure_grace_ms: 5_000,
         }
     }
 }
@@ -379,6 +418,7 @@ impl TimingConfig {
             session_rotate_min_interval_ms: 3_000,
             paired_leave_grace_ms: 2_000,
             paired_arrival_grace_ms: 2_000,
+            paired_departure_grace_ms: 1_000,
         }
     }
 
@@ -432,6 +472,9 @@ impl TimingConfig {
     pub fn paired_arrival_grace(&self) -> Duration {
         Duration::from_millis(self.paired_arrival_grace_ms)
     }
+    pub fn paired_departure_grace(&self) -> Duration {
+        Duration::from_millis(self.paired_departure_grace_ms)
+    }
 }
 
 /// The raw `[timing]` block: per-key overrides, each optional. Kept separate
@@ -464,6 +507,8 @@ pub struct TimingOverrides {
     pub paired_leave_grace_ms: Option<u64>,
     #[serde(default)]
     pub paired_arrival_grace_ms: Option<u64>,
+    #[serde(default)]
+    pub paired_departure_grace_ms: Option<u64>,
 }
 
 impl TimingOverrides {
@@ -508,6 +553,7 @@ impl TimingOverrides {
         apply!(session_rotate_min_interval_ms);
         apply!(paired_leave_grace_ms);
         apply!(paired_arrival_grace_ms);
+        apply!(paired_departure_grace_ms);
         Ok(t)
     }
 }

@@ -231,6 +231,39 @@ pub fn install_peer_key(
     ok
 }
 
+// ── Frame-crypto parameters (CLAUDE.md constraint 3) ──────────────────────────
+
+/// HKDF salt Element Call's livekit-client-js uses (the livekit SDK default).
+/// An empty salt derives a different key → decryption fails → noise.
+const RATCHET_SALT: &str = "LKFrameEncryptionKey";
+const RATCHET_WINDOW_SIZE: i32 = 16;
+const FAILURE_TOLERANCE: i32 = -1;
+const KEY_RING_SIZE: i32 = 256;
+
+/// The key-provider options the bridge's subscriber decrypts peers' media with.
+pub(crate) fn subscriber_key_provider_options() -> livekit::e2ee::key_provider::KeyProviderOptions {
+    livekit::e2ee::key_provider::KeyProviderOptions {
+        ratchet_window_size: RATCHET_WINDOW_SIZE,
+        ratchet_salt: RATCHET_SALT.as_bytes().to_vec(),
+        failure_tolerance: FAILURE_TOLERANCE,
+        key_ring_size: KEY_RING_SIZE,
+        key_derivation_algorithm: livekit::e2ee::key_provider::KeyDerivationAlgorithm::HKDF,
+    }
+}
+
+/// The same parameters, as handed to a member's own listen-only device with its
+/// keys (ADR 0005) so it never hard-codes a client's constants.
+pub(crate) fn subscriber_key_params() -> nvb_companion::selfcall::KeyParams {
+    nvb_companion::selfcall::KeyParams {
+        key_derivation: "HKDF",
+        ratchet_salt: RATCHET_SALT.to_owned(),
+        ratchet_window_size: RATCHET_WINDOW_SIZE,
+        key_ring_size: KEY_RING_SIZE,
+        failure_tolerance: FAILURE_TOLERANCE,
+        encryption: "AES-GCM",
+    }
+}
+
 // ── Peer-key cache: survive a subscriber LiveKit rejoin (#66) ─────────────────
 
 /// Every peer media key delivered to the subscriber, keyed
@@ -247,9 +280,27 @@ pub fn install_peer_key(
 /// into each fresh provider. No roster flicker, no forced key rotation.
 ///
 /// [`replay`]: PeerKeyCache::replay
-#[derive(Default)]
+///
+/// It is also what a member's own listen-only device is told about (ADR 0005,
+/// [`snapshot`](PeerKeyCache::snapshot)): the hub filters it down to the
+/// requester's own keys. [`changes`](PeerKeyCache::changes) ticks on every
+/// record and clear.
 pub(crate) struct PeerKeyCache {
     keys: std::sync::Mutex<std::collections::HashMap<(String, String, u8), String>>,
+    /// `member.id`s seen per `(sender, claimed_device_id)` — they name the
+    /// device's hashed (MSC4195) LiveKit identities.
+    member_ids: std::sync::Mutex<std::collections::HashMap<(String, String), std::collections::BTreeSet<String>>>,
+    rev: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for PeerKeyCache {
+    fn default() -> Self {
+        Self {
+            keys: Default::default(),
+            member_ids: Default::default(),
+            rev: tokio::sync::watch::channel(0).0,
+        }
+    }
 }
 
 impl PeerKeyCache {
@@ -261,7 +312,19 @@ impl PeerKeyCache {
         key_index: u8,
         key_b64: &str,
     ) {
-        self.keys.lock().expect("peer-key cache mutex poisoned").insert(
+        self.record_with_member(sender_user_id, claimed_device_id, None, key_index, key_b64);
+    }
+
+    /// [`record`](Self::record), also noting the event's `member.id` when it has one.
+    pub(crate) fn record_with_member(
+        &self,
+        sender_user_id: &str,
+        claimed_device_id: &str,
+        member_id: Option<&str>,
+        key_index: u8,
+        key_b64: &str,
+    ) {
+        self.keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(
             (
                 sender_user_id.to_owned(),
                 claimed_device_id.to_owned(),
@@ -269,6 +332,45 @@ impl PeerKeyCache {
             ),
             key_b64.to_owned(),
         );
+        if let Some(m) = member_id.filter(|m| !m.is_empty()) {
+            self.member_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry((sender_user_id.to_owned(), claimed_device_id.to_owned()))
+                .or_default()
+                .insert(m.to_owned());
+        }
+        self.rev.send_modify(|r| *r = r.wrapping_add(1));
+    }
+
+    /// Every key held right now, as labelled by its sender (ADR 0005). Each
+    /// `member.id` seen for a device is reported on that device's keys.
+    pub(crate) fn snapshot(&self) -> Vec<nvb_companion::selfcall::PeerKey> {
+        let keys = self.keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mids = self.member_ids.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = Vec::with_capacity(keys.len());
+        for ((sender, device, index), key_b64) in keys.iter() {
+            let ids = mids.get(&(sender.clone(), device.clone()));
+            let mut push = |member_id: Option<String>| {
+                out.push(nvb_companion::selfcall::PeerKey {
+                    sender: sender.clone(),
+                    device_id: device.clone(),
+                    member_id,
+                    index: *index,
+                    key_b64: key_b64.clone(),
+                })
+            };
+            match ids {
+                Some(set) if !set.is_empty() => set.iter().for_each(|m| push(Some(m.clone()))),
+                _ => push(None),
+            }
+        }
+        out
+    }
+
+    /// Ticks on every change.
+    pub(crate) fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.rev.subscribe()
     }
 
     /// Whether ANY key has been delivered for the peer publishing as this
@@ -299,7 +401,9 @@ impl PeerKeyCache {
 
     /// Forget everything (call ended — the next call's keys are all fresh).
     pub(crate) fn clear(&self) {
-        self.keys.lock().expect("peer-key cache mutex poisoned").clear();
+        self.keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        self.member_ids.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        self.rev.send_modify(|r| *r = r.wrapping_add(1));
     }
 }
 
@@ -375,6 +479,26 @@ mod tests {
         }
         cache.clear();
         assert!(cache.keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn peer_key_cache_snapshots_member_ids_and_ticks_on_change() {
+        let cache = PeerKeyCache::default();
+        let mut changes = cache.changes();
+        cache.record_with_member("@a:x", "DEV1", Some("m1"), 0, "k0");
+        cache.record("@b:x", "DEV2", 1, "k1");
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        let mut snap = cache.snapshot();
+        snap.sort_by(|a, b| a.sender.cmp(&b.sender));
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].member_id.as_deref(), Some("m1"));
+        assert_eq!((snap[1].sender.as_str(), snap[1].member_id.as_deref(), snap[1].index), ("@b:x", None, 1));
+        cache.clear();
+        assert!(changes.has_changed().unwrap());
+        assert!(cache.snapshot().is_empty());
+        let p = subscriber_key_params();
+        assert_eq!((p.ratchet_salt.as_str(), p.ratchet_window_size), ("LKFrameEncryptionKey", 16));
     }
 
     #[test]

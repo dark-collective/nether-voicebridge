@@ -4,6 +4,8 @@
 one lease kind of this interface; its rejection of publishing under a ghost is revised in §9).
 **Amends:** ADR 0001 §7 (the contract between the bridge and any client gains item 3), ADR 0003 (the "future" paragraph
 is answered by the `listen:self` lease; its rejected per-pairing listening setting returns in a stale-proof form).
+**Amended by:** [ADR 0005](0005-your-own-call-data.md) §7 — constraint 1, §5.3, §10 and the "companion generates the
+media key" alternative (a member's own keys to that member's own device).
 
 ## Context
 
@@ -31,7 +33,8 @@ Constraints (unchanged from ADR 0001/0002, restated because they shape every cho
    speaks through its puppet pool, and never holds, drives or depends on a Discord user session. Companions are a
    Matrix-side concern: the bridge never asks a companion where its media comes from, never verifies it, and the
    interface must work identically for a tool that captures a local game window and for anything else. The bridge
-   never receives, inspects, transcodes or forwards a companion's media.
+   never receives, inspects, transcodes or forwards a companion's media. *(Amended by ADR 0005 §7: a member's own
+   device may get that member's own media key and call state.)*
 2. **Only the bridge is an appservice.** Ghosts are the bridge's. A companion never gets appservice powers, a Matrix
    login, a ghost's device, or any key that authenticates a ghost's voice.
 3. **Interop lives in one place.** MatrixRTC membership, SFU election (multi-SFU, CLAUDE.md #8), key distribution (Olm
@@ -149,7 +152,8 @@ For ghost `@<prefix><D>:<server>` with voice device `D<key>-<salt>`, the bridge 
    identity; only Olm sessions rotate). Peers map it to `@<ghost>:S…` (matrix-js-sdk `RTCEncryptionManager`: keys are
    held per `userId:deviceId` and installed once a matching membership exists; the bridge's own `install_peer_key`
    does the same by `sender:claimed_device_id`). **The voice device's key is a different key on a different identity
-   and is never sent to the companion.** In an unencrypted room there is no media key.
+   and is never sent to the companion.** In an unencrypted room there is no media key. *(ADR 0005 §7: the only keys
+   ever handed on are a member's own, to that member's own enrolled device.)*
 4. **Hands the companion** (§7) the SFU WebSocket URL, the JWT, the LiveKit identity, the key (base64) and its index,
    the key-provider parameters Element Call expects (HKDF over the raw key, ratchet salt `LKFrameEncryptionKey`,
    AES-GCM — CLAUDE.md constraint 3, already proven by the ghosts), and the allowed track sources.
@@ -278,7 +282,8 @@ without media encryption a lease-holder can receive **everyone's audio in the ca
 the same as any participant the room admits, but a companion is not a person others can see listening. The disclosure
 text must say so for unencrypted bridged rooms, and a room authority issuing a key there is granting that. In an
 encrypted room a lease-holder holds no peer key and receives only undecryptable media.
-The Discord-side link notice and the Matrix `status` text are extended as in §3.
+The Discord-side link notice and the Matrix `status` text are extended as in §3. *(ADR 0005 §8 adds the paragraph
+for enrolled listen-only devices.)*
 
 ## Alternatives considered
 
@@ -289,7 +294,8 @@ The Discord-side link notice and the Matrix `status` text are extended as in §3
   gave; the stream device removes them.
 - **Companion generates the media key and the bridge only distributes it.** Symmetric, but the bridge would then
   forward key material it did not make and could not vouch for; and the bridge must own rotation if it is ever added.
-  Bridge-generated, bridge-distributed, handed over once.
+  Bridge-generated, bridge-distributed, handed over once. *(ADR 0005 §7 forwards keys the bridge did not make in one
+  case only — a requester's own keys, to the requester — and states what is and isn't authenticated.)*
 - **Give the companion a scoped LiveKit token instead of policing sources.** Not possible: tokens come from lk-jwt
   services the bridge does not control (often a foreign homeserver's), and they never set `can_publish_sources`. The
   bridge could mint its own tokens only on an SFU whose API secret it holds — the opposite of the "SFU is derived,
