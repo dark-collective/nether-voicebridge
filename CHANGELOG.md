@@ -31,7 +31,8 @@ adheres to [Semantic Versioning](https://semver.org/).
   account — a recorder, a broadcast-software source, a second client that only listens — can enroll once
   (`POST /_nvb/v1/self/enroll` with an OpenID token, verified on your homeserver's federation API), confirm it with the
   code the management bot DMs you (`companion key approve <code>`, within 10 minutes; your client can answer it for
-  you — a replayed OpenID token alone gets nothing), and then follow `GET /_nvb/v1/self/events` while you are
+  you — a replayed OpenID token alone gets nothing; the DM names the key id, and a second enrollment of a device
+  while one waits is refused), and then follow `GET /_nvb/v1/self/events` while you are
   in a bridged call: your own call state and SFUs, your own media key in encrypted rooms, and whether your paired Discord
   account is in the channel. Never anyone else's key, never media. With `public_url` set, each bridge advertises its API
   in the room (`im.nether.voicebridge.api`). Up to 5 devices per account; a new connection replaces a device's old

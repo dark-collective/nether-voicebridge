@@ -4481,7 +4481,8 @@ async fn deliver_enroll_approval(
 
 fn enroll_approval_text(a: &nvb_companion::hub::ApprovalRequest) -> String {
     format!(
-        "🔑 A device asked to receive your own call data in {room}: listen-only device `{device}` (key `{key}`). \
+        "🔑 A device asked to receive your own call data in {room}: listen-only device `{device}`, key `{key}`. \
+         Your device shows the key id it got — approve only if it is `{key}`. \
          If that was you, reply `companion key approve {code}` within {mins} minutes. \
          Otherwise ignore this (it expires), or `companion key revoke {key}`.",
         room = a.room_id,
@@ -5322,7 +5323,8 @@ mod tests {
             code: "ABCDEFGH".into(),
             expires_in: Duration::from_secs(600),
         });
-        assert!(text.contains("`companion key approve ABCDEFGH`") && text.contains("10 minutes") && text.contains("`companion key revoke k1`"));
+        assert!(text.contains("`companion key approve ABCDEFGH`") && text.contains("10 minutes") && text.contains("`companion key revoke k1`")
+            && text.contains("approve only if it is `k1`"));
         assert!(matches!(parse_command("companion"), Parsed::Usage(_)));
         assert!(allowed_for_self_serve(&Command::CompanionList { scope: None }));
         assert!(allowed_for_self_serve(&Command::Pair));

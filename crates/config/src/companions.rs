@@ -259,21 +259,28 @@ impl CompanionKeys {
     }
 
     /// Store a new, **pending** device-bound key (an enrollment awaiting its
-    /// owner's confirmation). It replaces only an earlier *pending* key of the
-    /// same `(issuer, device)` — an active key is replaced on confirmation, so a
-    /// replayed sign-in token can never knock out a working device — and the
-    /// issuer's oldest pending key beyond [`MAX_DEVICE_KEYS_PER_ISSUER`]. Returns
-    /// the keys removed.
-    pub fn add_pending_device_key(&self, key: CompanionKey) -> Result<Vec<CompanionKey>, ConfigError> {
+    /// owner's confirmation). Refused (`Ok(None)`, nothing stored) while another
+    /// enrollment of the same `(issuer, device)` is still pending at `now`: the
+    /// first one stands until it is confirmed or expires, so a racing second
+    /// enrollment can't swap its own code in under the owner's DM. An *expired*
+    /// pending key of that device is replaced. An active key is never touched
+    /// here (it is replaced on confirmation, so a replayed sign-in token can't
+    /// knock out a working device); the issuer's oldest pending key beyond
+    /// [`MAX_DEVICE_KEYS_PER_ISSUER`] is evicted. Returns the keys removed.
+    pub fn add_pending_device_key(&self, key: CompanionKey, now: i64) -> Result<Option<Vec<CompanionKey>>, ConfigError> {
         self.edit(|f| {
             let same = |k: &CompanionKey| k.issuer == key.issuer && k.is_device_key() && !k.is_active();
+            let live = |k: &CompanionKey| k.pending.as_ref().is_some_and(|p| p.expires > now);
+            if f.keys.iter().any(|k| same(k) && k.device == key.device && live(k)) {
+                return None;
+            }
             let (mut gone, keep): (Vec<_>, Vec<_>) =
                 f.keys.drain(..).partition(|k| k.id == key.id || (same(k) && k.device == key.device));
             f.keys = keep;
             gone.extend(evict_oldest(&mut f.keys, same, MAX_DEVICE_KEYS_PER_ISSUER - 1));
             f.keys.push(key);
             f.grants.retain(|g| !gone.iter().any(|k| k.id == g.key_id));
-            gone
+            Some(gone)
         })
     }
 
@@ -421,14 +428,17 @@ mod tests {
             v.sort();
             v
         };
-        assert!(s.add_pending_device_key(dev("d1", "@a:hs", "DEV", 1)).unwrap().is_empty());
+        assert!(s.add_pending_device_key(dev("d1", "@a:hs", "DEV", 1), 0).unwrap().unwrap().is_empty());
         assert!(s.activate_device_key("d1").unwrap().unwrap().1.is_empty());
         assert!(s.get("d1").unwrap().is_active());
         // A new enrollment of the same device is pending and leaves the active key alone…
-        assert!(s.add_pending_device_key(dev("d2", "@a:hs", "DEV", 2)).unwrap().is_empty());
+        assert!(s.add_pending_device_key(dev("d2", "@a:hs", "DEV", 2), 0).unwrap().unwrap().is_empty());
         assert!(s.get("d1").unwrap().is_active() && !s.get("d2").unwrap().is_active());
-        // …a second pending one for that device replaces the first pending one…
-        let gone = s.add_pending_device_key(dev("d3", "@a:hs", "DEV", 3)).unwrap();
+        // …a second one for that device is refused while the first is pending (the first stands)…
+        assert!(s.add_pending_device_key(dev("d3", "@a:hs", "DEV", 3), 99).unwrap().is_none());
+        assert!(s.get("d3").is_none() && s.get("d2").is_some());
+        // …and replaces it once it expired…
+        let gone = s.add_pending_device_key(dev("d3", "@a:hs", "DEV", 3), 100).unwrap().unwrap();
         assert_eq!(gone.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(), vec!["d2"]);
         // …and confirming it replaces the active key.
         assert!(s.set_pending_dm("d3", "!dm:hs").unwrap());
@@ -438,7 +448,7 @@ mod tests {
         assert_eq!(gone.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(), vec!["d1"]);
         assert!(s.activate_device_key("d3").unwrap().is_none(), "already active");
         // Other issuers and pairing-scoped self keys are untouched.
-        s.add_pending_device_key(dev("b1", "@b:hs", "DEV", 4)).unwrap();
+        s.add_pending_device_key(dev("b1", "@b:hs", "DEV", 4), 0).unwrap().unwrap();
         s.add(key("p1", KeyScope::SelfScope)).unwrap();
         assert_eq!(ids(&s), vec!["b1", "d3", "p1"]);
 
@@ -470,12 +480,12 @@ mod tests {
             ..key(id, KeyScope::SelfScope)
         };
         for i in 0..MAX_DEVICE_KEYS_PER_ISSUER as i64 {
-            s.add_pending_device_key(dev(&format!("a{i}"), &format!("D{i}"), i)).unwrap();
+            s.add_pending_device_key(dev(&format!("a{i}"), &format!("D{i}"), i), 0).unwrap().unwrap();
             s.activate_device_key(&format!("a{i}")).unwrap().unwrap();
         }
         // Pending enrollments are capped among themselves and leave the active keys alone.
         for i in 0..=MAX_DEVICE_KEYS_PER_ISSUER as i64 {
-            s.add_pending_device_key(dev(&format!("p{i}"), &format!("P{i}"), 10 + i)).unwrap();
+            s.add_pending_device_key(dev(&format!("p{i}"), &format!("P{i}"), 10 + i), 0).unwrap().unwrap();
         }
         let active = |s: &CompanionKeys| s.list().into_iter().filter(|k| k.is_active()).count();
         assert_eq!(active(&s), MAX_DEVICE_KEYS_PER_ISSUER);

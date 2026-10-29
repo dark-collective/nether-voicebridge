@@ -142,11 +142,13 @@ pub struct CompanionsConfig {
     pub auth_failures_per_minute: u32,
     /// Request header carrying the real client address when the listener sits
     /// behind a proxy (e.g. `CF-Connecting-IP`). Unset ⇒ the TCP peer address.
-    /// Only set it when every request comes through that proxy. A single-value
-    /// header the proxy sets itself (`CF-Connecting-IP`, `X-Real-IP`) is
-    /// preferred; for a comma-separated list (`X-Forwarded-For`) the LAST entry
-    /// is used — the one your proxy appended — since earlier ones are
-    /// client-supplied.
+    /// Only set it when every request comes through that proxy. Use a
+    /// single-value header your outermost proxy sets itself
+    /// (`CF-Connecting-IP`, `X-Real-IP`). For a comma-separated list
+    /// (`X-Forwarded-For`) the LAST entry is used — the one the proxy next to the
+    /// bridge appended — so `X-Forwarded-For` is wrong behind more than one
+    /// proxy (every client then shares the inner proxy's address and its rate
+    /// limit).
     #[serde(default)]
     pub client_ip_header: Option<String>,
     /// Public base URL of the `/_nvb/v1` listener as companions reach it (through

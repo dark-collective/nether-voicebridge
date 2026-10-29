@@ -158,16 +158,17 @@ async fn open_dm(cfg: &crate::config::E2eConfig) -> Result<OwnClient> {
     Ok(OwnClient { mc, dm, marker })
 }
 
-/// What the member's own client does with the bot's message: read the code, send `companion key approve <code>`.
-/// A wrong code first, which must not activate anything.
-async fn confirm_in_dm(own: &OwnClient, http: &reqwest::Client, api: &str, room: &str, key: &str) -> Result<()> {
+/// What the member's own client does with the bot's message: check it names the key id from its own enroll response
+/// (a client must only ever auto-approve that one), read the code, send `companion key approve <code>`. A wrong code
+/// first, which must not activate anything.
+async fn confirm_in_dm(own: &OwnClient, http: &reqwest::Client, api: &str, room: &str, key: &str, key_id: &str) -> Result<()> {
     let msg = own
         .mc
         .wait_for_bot_message_containing(&own.dm, &own.marker, "companion key approve", Duration::from_secs(60))
         .await
         .context("the bot never DMed the enrollment's confirmation code")?;
-    if !msg.contains(APP_DEVICE) {
-        bail!("the confirmation DM does not name the device: {msg:?}");
+    if !msg.contains(APP_DEVICE) || !msg.contains(&format!("`{key_id}`")) {
+        bail!("the confirmation DM does not name this device and key {key_id}: {msg:?}");
     }
     let code: String = msg
         .split("companion key approve ")
@@ -244,6 +245,7 @@ async fn drive_call(ctx: &Ctx, room: &str, port: u16, own: &OwnClient) -> Result
             bail!("enrollment answered for the wrong device, or not pending: {v}");
         }
         let key = v["key"].as_str().context("key")?.to_string();
+        let key_id = v["key_id"].as_str().context("key_id")?.to_string();
         eprintln!("   enrolled {} as key {} (pending)", v["user_id"], v["key_id"]);
 
         // A pending key opens nothing: the token alone is not proof enough (OpenID tokens are not audience-bound).
@@ -253,7 +255,7 @@ async fn drive_call(ctx: &Ctx, room: &str, port: u16, own: &OwnClient) -> Result
         if s != 403 || pv["error"] != "pending_approval" {
             bail!("a pending device key should be refused as pending_approval, got {s} {pv}");
         }
-        confirm_in_dm(own, &http, &api, room, &key).await?;
+        confirm_in_dm(own, &http, &api, room, &key, &key_id).await?;
 
         // The stream opens once the bridge sees the membership.
         let mut resp = None;

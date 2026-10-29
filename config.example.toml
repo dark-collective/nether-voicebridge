@@ -132,8 +132,9 @@
 # max_leases_per_key = 4
 # lease_requests_per_minute = 10
 # auth_failures_per_minute = 20 # per client address, then 429
-# client_ip_header = "CF-Connecting-IP"   # only when every request comes through that proxy; prefer a
-#                                         # single-value header (for X-Forwarded-For the LAST entry is used)
+# client_ip_header = "CF-Connecting-IP"   # only when every request comes through that proxy. Use a
+#                                         # single-value header; X-Forwarded-For (LAST entry used) is wrong
+#                                         # behind more than one proxy
 # Your own call data for your own tools (ADR 0005): a device of a member's own account
 # enrolls once with an OpenID token and then gets only that member's own media key and call state.
 # public_url = "https://bridge.example.org"   # advertised in each bridged room (unset = not advertised)

@@ -52,9 +52,10 @@ the device obtained from its own homeserver (`/_matrix/client/v3/user/{userId}/o
 checks, in this order, and stops at the first failure:
 
 1. **Rate limit per client address**, before any other work (`[companions] enrollments_per_minute`, default 5). An
-   IPv6 client is counted per /64. Behind a proxy (`client_ip_header`), a single-value header the proxy sets itself
-   (`CF-Connecting-IP`) is preferred; for a list (`X-Forwarded-For`) the **last** entry — the one the operator's proxy
-   appended — is used.
+   IPv6 client is counted per /64; when the table of tracked clients is full, the client seen longest ago is
+   forgotten (nobody is refused for it). Behind a proxy (`client_ip_header`), use a single-value header the outermost
+   proxy sets itself (`CF-Connecting-IP`); for a list (`X-Forwarded-For`) the **last** entry — the one the proxy next to
+   the bridge appended — is used, so `X-Forwarded-For` is wrong behind more than one proxy.
 2. **Input shape:** a room id, a device id of `[A-Za-z0-9_.=-]{1,64}`, a bounded token, a valid server name.
 3. **Capacity:** the management bot must be running (it confirms enrollments, §2a; else 503
    `approval_unavailable`), and at most 16 verifications run at once across all clients (503 `busy` beyond).
@@ -70,7 +71,10 @@ checks, in this order, and stops at the first failure:
    `[companions] trusted_private_servers`.
 7. **`GET /_matrix/federation/v1/openid/userinfo`** on that server. The returned `sub` must be a user **of that same
    server** (a server vouches only for its own users) and must be **joined** to `room_id`.
-8. The token is used for that one request and dropped. It never appears in logs (the request type redacts it from
+8. **Per account:** at most 3 verified enrollments per 10 minutes (429), since each one DMs the account; and none
+   while another enrollment of the same device is still waiting for confirmation (409 `pending_exists` — the first
+   one stands until confirmed or expired).
+9. The token is used for that one request and dropped. It never appears in logs (the request type redacts it from
    debug output; error messages never echo the request body) and is never stored.
 
 The answer is `201 { key, key_id, user_id, device_id, events_url, status: "pending_approval", approval_expires_in }`;
@@ -88,16 +92,27 @@ the account, so it alone must not unlock the account's media keys (that would de
 So enrollment creates the device key **pending**, with a random 8-character confirmation code (stored hashed) that
 expires after 10 minutes. The management bot DMs the account, in its existing DM with the bot:
 
-> 🔑 A device asked to receive your own call data in `<room>`: listen-only device `<device>` (key `<key-id>`). If that
-> was you, reply `companion key approve <code>` within 10 minutes. Otherwise ignore this (it expires), or
+> 🔑 A device asked to receive your own call data in `<room>`: listen-only device `<device>`, key `<key-id>`. Your
+> device shows the key id it got — approve only if it is `<key-id>`. If that was you, reply
+> `companion key approve <code>` within 10 minutes. Otherwise ignore this (it expires), or
 > `companion key revoke <key-id>`.
 
 Only a message **from the enrolling MXID, in that DM room, with the right code** activates the key. A wrong code is
 refused; five wrong codes drop the account's pending enrollments. Reading the DM and answering it needs the account's
 own access token, which a token-only attacker does not have — but the person's own client has, so it can post the
 reply automatically. The code is never in the HTTP answer. Expired pending keys are deleted by the hub's sweep. Any
-member with a pending enrollment may send `companion key approve`, whatever their self-serve tier. Re-enrolling
-replaces an earlier pending enrollment of the same device.
+member with a pending enrollment may send `companion key approve`, whatever their self-serve tier.
+
+A second enrollment of a device while one is waiting is refused (§2.8), so a racing enrollment (someone replaying the
+person's token at the same moment) cannot swap its own code in under a DM that names the person's device; it gets the
+409, and the person's own enrollment is the one the DM describes. A client that answers the DM automatically **must
+only approve the `key_id` from its own enroll response** — the DM names it for exactly that check. A stale waiting
+enrollment expires after 10 minutes; then the device can enroll again.
+
+The reply must reach the bot readably. In an encrypted DM the bot needs the room keys of the reply; if it can't decrypt
+it (for example a client that withholds keys from unverified devices), nothing is confirmed and the enrollment
+expires — it fails safe. The fix is on the client side: share keys with the bot's device, or answer in an unencrypted
+DM with the bot. The audit log records the confirmation (key and device), not the DM room.
 
 ### 3. What the device receives: `GET /_nvb/v1/self/events`
 
@@ -207,10 +222,10 @@ state and whether your paired Discord account is in the channel.*
 
 | Threat | Answer |
 |---|---|
-| A replayed OpenID token (lk-jwt-service, a foreign SFU's token service, a widget or integration manager saw it) | Enrollment yields only a pending key (§2a); it activates only on a reply from the account itself, in its DM with the bot, with the code sent there. A pending re-enrollment never displaces a working key. |
+| A replayed OpenID token (lk-jwt-service, a foreign SFU's token service, a widget or integration manager saw it) | Enrollment yields only a pending key (§2a); it activates only on a reply from the account itself, in its DM with the bot, with the code sent there. A pending re-enrollment never displaces a working key; a second enrollment of a device while one waits is refused (409), so a racing replay can't put its code under the person's DM; at most 3 enrollments (DMs) per account per 10 minutes. |
 | Someone gets another member's key | Keys are filtered by sender = requester (§3); identity comes from the requester's own homeserver via OpenID, and `sub` must be a joined member on that server. |
 | A forged key labelled with someone's device | It can only be sent by its sender's account, and is delivered only back to that account (§3). |
-| A malicious server vouches for a foreign user | `sub` must be on the server that answered (§2.6). |
+| A malicious server vouches for a foreign user | `sub` must be on the server that answered (§2.7). |
 | Enrollment as an SSRF probe | Only servers with a joined member in a bridged room are contacted (§2.4); resolved addresses are policy-checked (§2.6); rate limit first (§2.1, IPv6 per /64), at most 16 verifications in flight (§2.3). |
 | Token leakage | Used once, never stored, redacted from logs (§2.7). |
 | A stolen device key | Usable only for its owner's own data, only while the owner is in a call; revocable from the DM or by the device; replaced on a confirmed re-enroll; the owner's own reconnect evicts a second holder's stream. |

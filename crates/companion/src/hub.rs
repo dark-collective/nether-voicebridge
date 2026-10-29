@@ -46,8 +46,12 @@ pub const APPROVAL_TTL: Duration = Duration::from_secs(600);
 const MAX_APPROVE_FAILURES: u32 = 5;
 /// Enrollment verifications (homeserver lookups) in flight at once, across all clients.
 const MAX_VERIFICATIONS_IN_FLIGHT: usize = 16;
-/// Distinct client addresses a rate-limit map tracks between sweeps; a new address beyond it is refused.
+/// Distinct client addresses a rate-limit map tracks between sweeps; a new address beyond it evicts the one seen
+/// longest ago (never refuses everyone).
 const MAX_TRACKED_CLIENTS: usize = 50_000;
+/// Enrollments one account may start per [`MEMBER_ENROLL_WINDOW`], whatever the address (each one DMs the account).
+const MAX_ENROLLMENTS_PER_MEMBER: usize = 3;
+const MEMBER_ENROLL_WINDOW: Duration = Duration::from_secs(600);
 /// How often the sweeper prunes rate-limit windows and expired enrollments.
 const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(30);
 
@@ -200,6 +204,8 @@ struct HubState {
     auth_failures: HashMap<String, VecDeque<Instant>>,
     /// `/self/enroll` attempts per client address (IPv6 per /64).
     enroll_attempts: HashMap<String, VecDeque<Instant>>,
+    /// Verified enrollments per account (each one DMs the account a code).
+    member_enrollments: HashMap<String, VecDeque<Instant>>,
     /// Open `/self/events` streams by device key: (generation, cancel). A new connection for the same key cancels
     /// the old one.
     self_streams: HashMap<String, (u64, CancellationToken)>,
@@ -232,10 +238,24 @@ pub struct Grant {
 
 /// Count of events in the last minute, after dropping older ones.
 fn window_count(q: &mut VecDeque<Instant>, now: Instant) -> usize {
-    while q.front().is_some_and(|t| now.saturating_duration_since(*t) >= Duration::from_secs(60)) {
+    window_count_over(q, now, Duration::from_secs(60))
+}
+
+fn window_count_over(q: &mut VecDeque<Instant>, now: Instant, span: Duration) -> usize {
+    while q.front().is_some_and(|t| now.saturating_duration_since(*t) >= span) {
         q.pop_front();
     }
     q.len()
+}
+
+/// Before tracking a new client in a full rate-limit map: forget the client seen longest ago.
+fn make_room(map: &mut HashMap<String, VecDeque<Instant>>, client: &str) {
+    if map.len() < MAX_TRACKED_CLIENTS || map.contains_key(client) {
+        return;
+    }
+    if let Some(oldest) = map.iter().min_by_key(|(_, q)| q.back().copied()).map(|(k, _)| k.clone()) {
+        map.remove(&oldest);
+    }
 }
 
 impl CompanionHub {
@@ -437,9 +457,8 @@ impl CompanionHub {
                 let mut st = self.state();
                 let client = rate_key(client);
                 // Bounded against address churn; the sweeper prunes idle windows.
-                if st.auth_failures.contains_key(&client) || st.auth_failures.len() < MAX_TRACKED_CLIENTS {
-                    st.auth_failures.entry(client).or_default().push_back(now);
-                }
+                make_room(&mut st.auth_failures, &client);
+                st.auth_failures.entry(client).or_default().push_back(now);
                 Err(Refusal::new(401, "unauthorized", "missing or invalid companion key"))
             }
         }
@@ -623,6 +642,7 @@ impl CompanionHub {
         let mut st = self.state();
         st.auth_failures.retain(|_, q| window_count(q, now) > 0);
         st.enroll_attempts.retain(|_, q| window_count(q, now) > 0);
+        st.member_enrollments.retain(|_, q| window_count_over(q, now, MEMBER_ENROLL_WINDOW) > 0);
         st.lease_requests.retain(|id, q| window_count(q, now) > 0 && self.keys.get(id).is_some());
         st.self_connects.retain(|id, q| window_count(q, now) > 0 && self.keys.get(id).is_some());
         st.approve_failures.retain(|mxid, _| pending.contains(mxid));
@@ -818,9 +838,7 @@ impl CompanionHub {
         {
             let mut st = self.state();
             let client = rate_key(client);
-            if !st.enroll_attempts.contains_key(&client) && st.enroll_attempts.len() >= MAX_TRACKED_CLIENTS {
-                return Err(Refusal::new(429, "rate_limited", "too many enrollment attempts; retry later"));
-            }
+            make_room(&mut st.enroll_attempts, &client);
             let q = st.enroll_attempts.entry(client).or_default();
             if window_count(q, now) >= self.cfg.enrollments_per_minute as usize {
                 return Err(Refusal::new(429, "rate_limited", "too many enrollment attempts; retry later"));
@@ -868,6 +886,15 @@ impl CompanionHub {
         if ask(facts.is_joined(&sub)).await != Some(true) {
             return Err(not_member());
         }
+        // Each enrollment DMs the account: bound how often anyone holding its tokens can make it do so.
+        {
+            let mut st = self.state();
+            let q = st.member_enrollments.entry(sub.clone()).or_default();
+            if window_count_over(q, Instant::now(), MEMBER_ENROLL_WINDOW) >= MAX_ENROLLMENTS_PER_MEMBER {
+                return Err(Refusal::new(429, "rate_limited", "too many enrollments for this account; retry later"));
+            }
+            q.push_back(Instant::now());
+        }
         let minted = token::mint();
         let code = token::confirmation_code();
         let key = CompanionKey {
@@ -887,8 +914,11 @@ impl CompanionHub {
         };
         let replaced = self
             .keys
-            .add_pending_device_key(key.clone())
-            .map_err(|e| Refusal::new(500, "storage", format!("cannot write the companions file: {e}")))?;
+            .add_pending_device_key(key.clone(), unix_now() as i64)
+            .map_err(|e| Refusal::new(500, "storage", format!("cannot write the companions file: {e}")))?
+            // The first enrollment stands until confirmed or expired: a racing second one must not swap its own
+            // code in under the DM that names the device.
+            .ok_or_else(|| Refusal::new(409, "pending_exists", "an enrollment of this device is already waiting for confirmation; confirm it or retry after it expires"))?;
         self.forget_keys(&replaced);
         let ask_owner = ApprovalRequest {
             mxid: sub.clone(),
@@ -976,7 +1006,7 @@ impl CompanionHub {
         self.forget_keys(&replaced);
         self.sync_listen_only();
         self.audit(sender, "self_enroll_approve", serde_json::json!({
-            "key_id": key.id, "device_id": key.device, "dm_room": dm_room,
+            "key_id": key.id, "device_id": key.device,
             "replaced": replaced.iter().map(|k| k.id.clone()).collect::<Vec<_>>(),
         }));
         tracing::info!(mxid = %sender, device_id = ?key.device, key_id = %key.id, replaced = replaced.len(), "listen-only device confirmed by its owner");
@@ -1577,6 +1607,26 @@ mod tests {
         assert_eq!(h.approve_device_key("@me:hs", "!dm:hs", &code).unwrap_err(), ApproveError::NothingPending);
         h.sweep(Instant::now());
         assert!(h.get_key(&k.id).is_none());
+    }
+
+    /// A second enrollment of a device while the first waits is refused — the first stands, so a racing enrollment
+    /// can't swap its own code in under the owner's DM. (A client must only auto-approve the `key_id` from its own
+    /// enroll response; the DM names it.) Each account can be made to receive only a few such DMs.
+    #[tokio::test]
+    async fn a_waiting_enrollment_stands_and_enrollments_per_account_are_limited() {
+        let room = "!self-approve-4:hs";
+        let (h, _, mut rx) = self_hub(self_cfg(), &[("me", Ok("@me:hs"))]);
+        let (_f, _reg) = facts(room, &["@me:hs"], RoomView::default());
+        let (first, _) = h.enroll(&req(room, "APP", "me", "hs"), "a").await.unwrap();
+        let r = h.enroll(&req(room, "APP", "me", "hs"), "b").await.unwrap_err();
+        assert_eq!((r.status, r.reason), (409, "pending_exists"));
+        assert!(h.get_key(&first.id).is_some_and(|k| !k.is_active()));
+        let a = rx.try_recv().unwrap();
+        assert_eq!(a.key_id, first.id);
+        assert!(rx.try_recv().is_err(), "the refused enrollment DMs nobody");
+        // Two verified attempts so far; one more device, then the account's limit.
+        h.enroll(&req(room, "APP2", "me", "hs"), "c").await.unwrap();
+        assert_eq!(h.enroll(&req(room, "APP3", "me", "hs"), "d").await.unwrap_err().status, 429);
     }
 
     #[tokio::test]
