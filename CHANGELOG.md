@@ -5,6 +5,8 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.16] - 2026-10-29
+
 ### Added
 - **Companion interface, phase 1 (off by default):** `[companions]` starts an HTTP listener at `/_nvb/v1` for
   companion tools. Keys are issued, listed and revoked in the management DM (`companion key create|list|revoke`;
