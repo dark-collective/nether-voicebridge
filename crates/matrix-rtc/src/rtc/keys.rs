@@ -304,18 +304,8 @@ impl Default for PeerKeyCache {
 }
 
 impl PeerKeyCache {
-    /// Record a delivered peer key (overwrites any previous key for the triple).
-    pub(crate) fn record(
-        &self,
-        sender_user_id: &str,
-        claimed_device_id: &str,
-        key_index: u8,
-        key_b64: &str,
-    ) {
-        self.record_with_member(sender_user_id, claimed_device_id, None, key_index, key_b64);
-    }
-
-    /// [`record`](Self::record), also noting the event's `member.id` when it has one.
+    /// Record a delivered peer key (overwrites any previous key for the triple),
+    /// noting the event's `member.id` when it has one.
     pub(crate) fn record_with_member(
         &self,
         sender_user_id: &str,
@@ -467,11 +457,11 @@ mod tests {
     #[test]
     fn peer_key_cache_records_last_writer_and_clears() {
         let cache = PeerKeyCache::default();
-        cache.record("@a:x", "DEV1", 0, "old");
-        cache.record("@a:x", "DEV1", 0, "new"); // same triple → overwrite
-        cache.record("@a:x", "DEV1", 1, "idx1"); // distinct index coexists
-        cache.record("@a:x", "DEV2", 0, "dev2"); // distinct device coexists
-        cache.record("@b:x", "DEV1", 0, "b"); // distinct sender coexists
+        cache.record_with_member("@a:x", "DEV1", None, 0, "old");
+        cache.record_with_member("@a:x", "DEV1", None, 0, "new"); // same triple → overwrite
+        cache.record_with_member("@a:x", "DEV1", None, 1, "idx1"); // distinct index coexists
+        cache.record_with_member("@a:x", "DEV2", None, 0, "dev2"); // distinct device coexists
+        cache.record_with_member("@b:x", "DEV1", None, 0, "b"); // distinct sender coexists
         {
             let keys = cache.keys.lock().unwrap();
             assert_eq!(keys.len(), 4);
@@ -486,7 +476,7 @@ mod tests {
         let cache = PeerKeyCache::default();
         let mut changes = cache.changes();
         cache.record_with_member("@a:x", "DEV1", Some("m1"), 0, "k0");
-        cache.record("@b:x", "DEV2", 1, "k1");
+        cache.record_with_member("@b:x", "DEV2", None, 1, "k1");
         assert!(changes.has_changed().unwrap());
         changes.borrow_and_update();
         let mut snap = cache.snapshot();
@@ -505,7 +495,7 @@ mod tests {
     fn peer_key_cache_knows_which_identities_are_keyed() {
         let cache = PeerKeyCache::default();
         assert!(!cache.has_key_for_identity("@a:x:DEV1"));
-        cache.record("@a:x", "DEV1", 3, "key");
+        cache.record_with_member("@a:x", "DEV1", None, 3, "key");
         assert!(cache.has_key_for_identity("@a:x:DEV1"));
         // Same user, different device (LiveKit identities are per-device).
         assert!(!cache.has_key_for_identity("@a:x:DEV2"));
@@ -520,7 +510,7 @@ mod tests {
 
         let cache = PeerKeyCache::default();
         // A real (valid-base64, 16-byte) key so install_peer_key succeeds.
-        cache.record("@a:x", "DEV1", 0, &encode_key(&[7u8; 16]));
+        cache.record_with_member("@a:x", "DEV1", None, 0, &encode_key(&[7u8; 16]));
 
         let provider = KeyProvider::new(KeyProviderOptions::default());
         cache.replay(&provider);
