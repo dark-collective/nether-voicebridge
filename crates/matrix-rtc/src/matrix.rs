@@ -1652,8 +1652,6 @@ pub(crate) struct MembershipEntry {
     /// the reaper's hashed-identity resolution keys on (ADR 0005). A session
     /// event has one; a legacy event (state key = MXID) lists one per device.
     pub(crate) devices: Vec<MemberDevice>,
-    /// Some membership of the event has not expired.
-    pub(crate) active: bool,
 }
 
 /// One membership (one device) of an `m.call.member` event.
@@ -1746,7 +1744,6 @@ pub(crate) async fn snapshot_call_memberships(
             focus: None,
             preferred,
             devices,
-            active,
         });
     }
     let mut resolved = resolve_effective_foci(&focus_inputs);
@@ -2171,7 +2168,6 @@ mod tests {
             focus: focus(OUR_SFU),
             preferred: focus(OUR_SFU),
             devices: Vec::new(),
-            active: true,
         }
     }
 

@@ -1184,7 +1184,7 @@ mod foreign_foci_tests {
         Some(LivekitFocusInfo { alias: "!r:x".into(), service_url: url.into() })
     }
     fn human(key: &str, focus: Option<LivekitFocusInfo>, preferred: Option<LivekitFocusInfo>) -> MembershipEntry {
-        MembershipEntry { state_key: key.into(), mxid: key.into(), is_bridge_owned: false, legacy_state_key: false, focus, preferred, devices: Vec::new(), active: true }
+        MembershipEntry { state_key: key.into(), mxid: key.into(), is_bridge_owned: false, legacy_state_key: false, focus, preferred, devices: Vec::new() }
     }
 
     #[test]
