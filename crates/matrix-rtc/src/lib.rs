@@ -21,6 +21,7 @@
 //! driven — mirroring how the Discord `PuppetPool` is shared.
 
 mod auth_error;
+mod bridge_info;
 pub mod cross_signing;
 mod device_prune;
 mod matrix;
@@ -172,6 +173,12 @@ pub async fn run(
     // EC/Commet can target it with media keys. Done here now that detection has run.
     if media_e2ee {
         matrix::apply_bot_profile(&client, matrix_cfg).await;
+    }
+
+    // The room's bridge record, so clients can mark our ghosts as Discord people.
+    match (client.get_room(&room_id), client.user_id()) {
+        (Some(room), Some(bot)) => bridge_info::publish(&room, bot).await,
+        _ => tracing::warn!(%room_id, "room or bot id unavailable; not posting the room's bridge record"),
     }
 
     // Clear any ghost m.call.member left by a prior crashed run before the
