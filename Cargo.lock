@@ -3473,7 +3473,7 @@ dependencies = [
 
 [[package]]
 name = "nether-voicebridge"
-version = "0.4.16"
+version = "0.4.17"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -3629,7 +3629,7 @@ dependencies = [
 
 [[package]]
 name = "nvb-audio"
-version = "0.4.16"
+version = "0.4.17"
 dependencies = [
  "anyhow",
  "hound",
@@ -3637,7 +3637,7 @@ dependencies = [
 
 [[package]]
 name = "nvb-companion"
-version = "0.4.16"
+version = "0.4.17"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3659,7 +3659,7 @@ dependencies = [
 
 [[package]]
 name = "nvb-config"
-version = "0.4.16"
+version = "0.4.17"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -3670,7 +3670,7 @@ dependencies = [
 
 [[package]]
 name = "nvb-discord"
-version = "0.4.16"
+version = "0.4.17"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3691,7 +3691,7 @@ dependencies = [
 
 [[package]]
 name = "nvb-e2e"
-version = "0.4.16"
+version = "0.4.17"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3718,7 +3718,7 @@ dependencies = [
 
 [[package]]
 name = "nvb-matrix-rtc"
-version = "0.4.16"
+version = "0.4.17"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -5,6 +5,15 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.17] - 2026-10-30
+
+### Added
+- **Room bridge record:** at startup each bridge posts `m.bridge` and `uk.half-shot.bridge` (state key
+  `nether-voicebridge`, protocol `discord-voice`) in its room, so clients can show that the bridge's people are
+  from Discord, and Element lists the bridge under room settings › Bridges. It names only the bot and the protocol,
+  no guild or channel ids. Needs the bot to have the power level for these event types (default: state level 50);
+  otherwise the bridge logs once what to change and carries on.
+
 ## [0.4.16] - 2026-10-29
 
 ### Added
