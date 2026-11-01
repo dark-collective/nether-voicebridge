@@ -385,6 +385,7 @@ jobs:
           API: http://${{ env.REGISTRY }}/api/v1/repos/${{ github.repository }}
           TOKEN: ${{ secrets.RELEASE_TOKEN }}
           TAG: ${{ github.ref_name }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
           set -eu
           packaging/publish-release.sh dist/*.deb dist/*.rpm dist/*.tar.gz dist/*.AppImage
