@@ -5,6 +5,11 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.18] - 2026-11-01
+
+### Fixed
+- Self enrollment (`POST /_nvb/v1/self/enroll`) accepts room v12 ids, which have no server part; it answered `bad_request` in every v12 room.
+
 ## [0.4.17] - 2026-10-30
 
 ### Added
