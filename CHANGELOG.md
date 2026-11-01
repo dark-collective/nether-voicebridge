@@ -61,6 +61,8 @@ adheres to [Semantic Versioning](https://semver.org/).
   `paired_departure_grace_ms` (default 5 s, and while their own leave is pending) before getting a puppet, so no bot
   flashes in under their name as they leave. Set it to 0 for the previous behavior.
 
+## [0.4.15] - 2026-10-28
+
 ### Fixed
 - **New Discord speakers couldn't join invite-only or restricted rooms (regression in 0.4.13):** once the bot account
   got a cross-signing identity, matrix-sdk's history sharing on invite (MSC4268, on by default) started running before

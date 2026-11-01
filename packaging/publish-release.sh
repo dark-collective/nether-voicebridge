@@ -11,6 +11,8 @@
 # this concurrently, so creation tolerates losing the race (re-looks the
 # release up), and an asset that already exists under the same name is
 # replaced — re-runs and the final SHA256SUMS refresh are idempotent.
+# `--publish` also sets the release notes from CHANGELOG.md (REPO_URL, when
+# set, adds a link to the full changelog; see release-notes.sh).
 set -euo pipefail
 
 : "${API:?}" "${TOKEN:?}" "${TAG:?}"
@@ -47,8 +49,10 @@ fi
 echo "release id: $rel_id"
 
 if [ "${1:-}" = "--publish" ]; then
+  # The release notes are the tag's CHANGELOG.md section (release-notes.sh).
+  body=$(packaging/release-notes.sh "${TAG}" | python3 -c 'import sys,json;print(json.dumps({"draft":False,"body":sys.stdin.read()}))')
   curl -fsS -X PATCH -H "$auth" -H 'Content-Type: application/json' \
-    -d '{"draft":false}' "${API}/releases/${rel_id}" >/dev/null
+    -d "$body" "${API}/releases/${rel_id}" >/dev/null
   echo "published ${TAG}"
   exit 0
 fi
