@@ -116,8 +116,9 @@ pub fn valid_device_id(d: &str) -> bool {
     (1..=64).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'='))
 }
 
+/// `!opaque:server`, or a room v12 id (`!` + the create event's hash, no server part).
 fn valid_room_id(r: &str) -> bool {
-    r.starts_with('!') && r.len() <= 255 && r.contains(':') && !r.chars().any(char::is_whitespace)
+    r.starts_with('!') && (2..=255).contains(&r.len()) && !r.chars().any(char::is_whitespace)
 }
 
 /// The server part of an MXID (`@local:server` → `server`).
@@ -1169,6 +1170,16 @@ impl Drop for StreamGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn room_ids_with_and_without_a_server_part() {
+        assert!(valid_room_id("!abc:example.org"));
+        assert!(valid_room_id("!31hneApxJ_1o-63DmFrpeqnkFfWppnzWso1JvH3ogLM")); // room v12
+        assert!(!valid_room_id("!"));
+        assert!(!valid_room_id("abc:example.org"));
+        assert!(!valid_room_id("!abc def"));
+        assert!(!valid_room_id(&format!("!{}", "a".repeat(255))));
+    }
 
     fn hub(cfg: CompanionsConfig) -> (Arc<CompanionHub>, LinkShared) {
         let links = LinkShared::in_memory();
